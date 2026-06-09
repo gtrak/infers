@@ -31,7 +31,28 @@ Nightly toolchain configuration, Rust edition, and cargo-oxide requirements for 
 
 ## Dependencies
 
-Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, serde 1.0.228, clap 4.6.1, prometheus 0.14.0, thiserror 2.0.18. CUDA deps (cudarc, cuda-oxide) deferred to Phase 2.
+Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, serde 1.0.228, clap 4.6.1, prometheus 0.14.0, thiserror 2.0.18. cudarc 0.19.7 with cublaslt, nccl, cuda-13020 features. cuda-oxide crates deferred to future phase.
+
+## CUDA Crate
+
+Feature-gated CUDA runtime crate for GPU inference. The `cuda` feature gates cudarc so the crate compiles on non-CUDA machines, providing stub types that panic at runtime when the feature is disabled.
+
+### Feature Gate Pattern
+
+The `cuda` feature enables cudarc. Without it, all GPU types are stubs that bail on construction with a descriptive error.
+
+### Module Structure
+
+Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
+
+| Module | Purpose |
+|--------|---------|
+| context | CUDA device context management, CudaRuntime |
+| stream | CUDA stream pool for async execution |
+| memory | Block pool GPU memory allocator (pure Rust, no cfg) |
+| kernels | Kernel registry for pre-compiled .cubin loading |
+| gemm | cuBLASLt GEMM engine for matrix multiplication |
+| nccl | Multi-GPU collective operations for TP/PP |
 
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.

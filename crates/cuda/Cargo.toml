@@ -5,5 +5,21 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+cuda = ["cudarc"]
+
 [dependencies]
 anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# CUDA runtime (cudarc) — feature-gated so the crate compiles without CUDA toolkit
+cudarc = { workspace = true, optional = true }
+
+# CUDA (cuda-oxide) — deferred to future phase; requires cargo-oxide toolchain
+# cuda-core = { workspace = true }
+# cuda-async = { workspace = true }
+# cuda-host = { workspace = true }
+
+[dev-dependencies]
