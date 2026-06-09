@@ -1,5 +1,10 @@
 # Before starting work
 
+
+## Project Status
+
+This is a **greenfield** project. Breaking changes are permitted and expected across all crate boundaries. Do not maintain backward compatibility with internal APIs — prefer clean, correct designs over compat shims.
+
 - Run `lat search` to find sections relevant to your task. Read them to understand the design intent before writing code.
 - Run `lat expand` on user prompts to expand any `[[refs]]` — this resolves section names to file locations and provides context.
 

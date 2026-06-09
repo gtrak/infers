@@ -24,36 +24,36 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Core async
-tokio = { version = "1.52", features = ["full"] }
-tokio-util = "0.7"
-futures = "0.3"
-async-stream = "0.3"
-pin-project = "1"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = "0.7.18"
+futures = "0.3.32"
+async-stream = "0.3.6"
+pin-project = "1.1.13"
 
 # HTTP / API
-axum = { version = "0.8", features = ["ws"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-hyper = "1"
+axum = { version = "0.8.9", features = ["ws"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+hyper = "1.10.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_with = "3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_with = "3.21.0"
 
 # Error handling
-anyhow = "1.0"
-thiserror = "2.0"
+anyhow = "1.0.102"
+thiserror = "2.0.18"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "4.6", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 
 # Metrics
-prometheus = "0.14"
+prometheus = "0.14.0"
 
 # CUDA (cudarc - stable)
 cudarc = { version = "0.19.7", features = ["cublaslt", "nccl", "cuda-13020"] }
@@ -64,12 +64,12 @@ cuda-async = { git = "https://github.com/NVlabs/cuda-oxide" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
 
 # ML / Data
-safetensors = "0.8"
-memmap2 = "0.9"
+safetensors = "0.8.0"
+memmap2 = "0.9.10"
 
 # Testing
-proptest = "1"
-tempfile = "3"
+proptest = "1.11.0"
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3
