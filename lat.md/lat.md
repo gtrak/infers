@@ -22,6 +22,12 @@ Workspace contains 12 crates across server, API, inference backend, and utility 
 | infers-metrics | crates/metrics | Prometheus exporter |
 | infers-mtp | crates/mtp | MTP draft/verify |
 
+
+## Dependency Graph
+Crate dependency relationships and feature propagation between workspace members.
+
+infers-backend-native and infers-parallelism both depend on infers-cuda for GPU kernel loading and NCCL communication respectively. The `cuda` feature propagates through: `infers-backend-native/cuda` -> `infers-cuda/cuda` -> `cudarc`. Same propagation applies to `infers-parallelism/cuda`.
+
 ## Toolchain
 Nightly toolchain configuration, Rust edition, and cargo-oxide requirements for CUDA support.
 
@@ -74,7 +80,7 @@ Handles three sources: GDN kernels, standard attention kernels, and FlashInfer s
 ### Build Script
 Compiles kernel source files to .cubin binaries using nvcc.
 
-Targets `sm_100a` (Blackwell) with `-O3 --use_fast_math`. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
+Targets `sm_100a` (Blackwell) with `-O3 --use_fast_math`. The `which_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). nvcc args include `-I` flags for `kernels/flashinfer-gdn` and `kernels/flashinfer-attn` include paths. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
 
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.

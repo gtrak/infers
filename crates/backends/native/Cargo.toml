@@ -7,3 +7,8 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+infers-cuda = { path = "../../cuda" }
+
+[features]
+default = []
+cuda = ["infers-cuda/cuda"]

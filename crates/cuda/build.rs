@@ -92,13 +92,15 @@ fn compile_kernel(src: &str, output: &str, arch: &str) -> Result<(), String> {
             &format!("-arch={}", arch),
             "-O3",
             "--use_fast_math",
+            "-I", "kernels/flashinfer-gdn",
+            "-I", "kernels/flashinfer-attn",
             src,
             "-o",
             output,
         ])
         .status()
         .map_err(|e| format!("nvcc execution failed: {}", e))?;
-
+    
     if status.success() {
         Ok(())
     } else {
@@ -107,15 +109,29 @@ fn compile_kernel(src: &str, output: &str, arch: &str) -> Result<(), String> {
 }
 
 fn which_nvcc() -> Option<String> {
-    Command::new("which")
-        .arg("nvcc")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
+    // Check PATH first
+    if let Ok(output) = Command::new("which").arg("nvcc").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
             }
-        })
+        }
+    }
+    
+    // Check common CUDA install locations
+    let common_paths = [
+        "/usr/local/cuda/bin/nvcc",
+        "/usr/local/cuda-13.2/bin/nvcc",
+        "/usr/local/cuda-13.0/bin/nvcc",
+        "/usr/bin/nvcc",
+    ];
+    
+    for path in &common_paths {
+        if Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    
+    None
 }
