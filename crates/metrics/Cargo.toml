@@ -1,0 +1,11 @@
+[package]
+name = "infers-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+prometheus = { workspace = true }
+lazy_static = "1.5"
+axum = { workspace = true }
