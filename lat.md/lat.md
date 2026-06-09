@@ -94,6 +94,21 @@ Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding 
 - Health check endpoint at /health
 - CLI argument parsing with clap
 
+# Phase 2 Deliverables
+Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline, and multi-GPU communication primitives.
+
+- Feature-gated CUDA crate (`infers-cuda`) that compiles with and without cudarc
+- CudaRuntime for multi-GPU device context management (cudarc CudaContext)
+- StreamPool for async CUDA stream management per device
+- GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
+- KernelRegistry for .cubin loading and LoadedKernelRegistry for GPU-loaded kernels
+- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support
+- NcclCommunicator for TP all-reduce and PP send/recv operations
+- build.rs for nvcc kernel compilation targeting sm_100a (Blackwell)
+- scripts/extract-kernels.sh for pulling FlashInfer kernels from vLLM
+- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)
+- Feature propagation: backends/native and parallelism crates forward `cuda` feature to infers-cuda
+
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
 
