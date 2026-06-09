@@ -86,16 +86,27 @@ let cublaslt = CudaBlasLt::new(stream)?;
 
 ### 5. Custom Kernels (if needed)
 
-**INT4 dequantization (AutoRound):**
+**INT4 GEMM (AutoRound on-the-fly):**
+
+Since AutoRound weights stay in packed INT4 format in GPU memory, the GEMM kernel must unpack and scale on-the-fly.
+
 ```cpp
-__global__ void int4_dequantize_kernel(
-    half* output,           // [N, K] FP16 output
-    const uint32_t* qweight, // [N, K/8] packed INT4 weights
-    const half* scales,     // [N, K/group_size] FP16 scales
-    const uint32_t* qzeros,  // [N, K/group_size] packed INT4 zeros
-    int N, int K, int group_size
-);
+__global__ void int4_gemm_onthefly_kernel(
+    half* output,
+    const uint32_t* qweight,  // Packed INT4 weights
+    const half* scales,        // FP16 per-group scales
+    const uint32_t* qzeros,    // Packed INT4 zero points
+    const half* input,
+    int M, int N, int K,
+    int group_size
+) {
+    // Unpack 8 INT4 weights from each uint32_t
+    // Apply (w - zero) * scale per group of 128
+    // Multiply with FP16 input, accumulate
+}
 ```
+
+**Key:** Weights never expand to FP16. Output is FP16, fed to next layer.
 
 **RMSNorm:**
 ```cpp

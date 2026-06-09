@@ -1,11 +1,11 @@
-# Rust Inference Server for Qwen 3.6 27B
+# Rust Inference Server for Qwen3.6-27B
 ## Product Requirements Document (PRD) + Implementation Specification
 
-Version: 0.1
+Version: 0.2
 Target Audience: Single engineer
 Primary Language: Rust
 Target Hardware: 2x NVIDIA RTX 5060 Ti
-Model Family: Qwen 3.6 (initially 27B)
+Model Family: Qwen3.6-27B
 Scope: Personal inference server optimized for agent workloads
 
 ---
@@ -14,25 +14,28 @@ Scope: Personal inference server optimized for agent workloads
 
 Build a high-performance inference server focused on:
 
-- Qwen 3.6 support
+- Qwen3.6-27B support
 - Tensor parallelism across 2 GPUs
-- Paged KV cache
+- Pipeline parallelism with microbatching across 2 GPUs
+- Hybrid KV cache (Mamba state + paged)
 - Continuous batching
-- Multi-Token Prediction (MTP)
+- Native Multi-Token Prediction (MTP)
+- OpenAI-compatible API with tool calls
+- Support for PrismaSCOUT (NVFP4), AutoRound (INT4), GGUF, and BF16 weights
+- KV cache quantization (BF16, FP8, NVFP4)
 - Long-lived agent sessions
 - Predictable latency
 - Minimal operational complexity
 
 Non-goals:
 
-- OpenAI API compatibility
 - Multi-tenant hosting
 - Kubernetes
 - Dynamic model loading
 - LoRA support
 - Multi-model serving
 - Distributed clusters
-- Vision models (phase 1)
+- Vision/text-to-image (text-only serving)
 
 ---
 
@@ -40,10 +43,13 @@ Non-goals:
 
 ## Functional
 
-- Load Qwen 3.6 27B
+- Load Qwen3.6-27B
 - Generate tokens correctly
 - Support concurrent sessions
-- Support MTP
+- Support native MTP
+- Support tool calls
+- Support OpenAI-compatible chat completions API
+- Support multiple quantization formats
 - Survive multi-hour agent runs
 
 ## Performance
@@ -58,66 +64,70 @@ Non-goals:
 
 Layers:
 
-1. API Layer
+1. API Layer (OpenAI-compatible)
 2. Scheduler
 3. Batch Builder
-4. KV Manager
+4. KV Manager (hybrid: Mamba state + paged)
 5. Model Runner
 6. CUDA Backend
 
----
+## Technology Choices
 
-# 4. Technology Choices
+### Rust
 
-## Rust
-
-- stable Rust
+- nightly Rust (nightly-2026-04-03)
 - tokio
 - tracing
 - anyhow
 - serde
 
-## CUDA
+### CUDA Orchestration
 
-Preferred:
+- cuda-oxide (NVlabs) for memory management, streams, and kernel launching
+- cudarc for cuBLASLt and NCCL bindings
 
-- cuBLASLt
-- NCCL
-- FlashInfer kernels
+### Kernels
 
-Fallback:
+- FlashInfer: Gated DeltaNet + standard PagedAttention (extract .cu files from vLLM)
+- cuBLASLt: GEMM (supports NVFP4 on Blackwell)
+- llama.cpp: GGUF backend via FFI
 
-- FlashAttention kernels
+### Parallelism
 
-Do not implement GEMMs manually.
+- TP=2: all-reduce/all-gather via NCCL
+- PP=2: P2P send/recv with microbatching
 
 ---
 
-# 5. Repository Layout
+# 4. Repository Layout
 
 ```text
 crates/
-
-api/
-scheduler/
-kv/
-model/
-cuda/
-mtp/
-tokenizer/
-metrics/
-server/
+  server/      # axum HTTP server, OpenAI routes, SSE streaming
+  api/         # OpenAI API types + streaming protocol
+  scheduler/   # Session lifecycle, batch construction, continuous batching
+  kv/          # Hybrid KV cache (Mamba state + paged blocks), quantization
+  model/       # Multi-format loader (safetensors/GGUF), config.json, weight registry
+  backends/
+    native/    # FlashInfer + cuBLASLt (PrismaSCOUT, AutoRound, BF16)
+    gguf/      # llama.cpp wrapper (GGUF models)
+  cuda/        # Tensor orchestration, cuda-oxide runtime, kernel launching
+  parallelism/ # TP=2 and PP=2 implementations
+  tokenizer/   # HuggingFace tokenizers (Qwen2Tokenizer class)
+  metrics/     # Prometheus exporter
+  mtp/         # Native MTP draft generation, verification, acceptance
 ```
 
 ---
 
-# 6. Model Loader
+# 5. Model Loader
 
 Responsibilities:
 
 - read config.json
 - read tokenizer
-- read safetensors
+- read safetensors or GGUF
+- detect quantization format automatically (PrismaSCOUT / AutoRound / GGUF / BF16)
 - build weight registry
 
 Interface:
@@ -130,105 +140,90 @@ trait ModelLoader {
 
 ---
 
-# 7. Tensor Parallelism
+# 6. Parallelism
 
-Phase 1:
+## Tensor Parallelism (TP=2)
 
-TP = 2 only
+Startup flag: `--parallelism tp`
 
-Assumptions:
+Weight sharding: column-parallel for Q/K/V/gate/up, row-parallel for O/down
 
-```text
-GPU0 = shard 0
-GPU1 = shard 1
-```
+Collectives: `ncclAllReduce` after attention and MLP
 
-Collectives:
+## Pipeline Parallelism (PP=2)
 
-```text
-all_reduce
-all_gather
-```
+Startup flag: `--parallelism pp --pp-microbatch-size N`
 
-Transport:
+Stage partitioning:
+- GPU0: layers 0-31
+- GPU1: layers 32-63
 
-```text
-NCCL
-```
+Communication: P2P send/recv of hidden states between stages
+
+Microbatching: split batch into N microbatches, pipeline through stages to reduce GPU bubbles
 
 ---
 
-# 8. KV Cache Design
+# 7. KV Cache Design
 
-## Block Size
+## Two State Types Required
 
-Initial:
+Qwen3.6 has a hybrid architecture:
+- 48 layers use Gated DeltaNet (linear attention) → Mamba-style recurrent state
+- 16 layers use full softmax attention → paged KV cache
 
-```text
-16 tokens
-```
-
-Configurable later.
-
-## Physical Block
+### Mamba State (GDN layers)
 
 ```rust
-struct PhysicalBlock {
-    id: u32,
-    device: DeviceId,
-    ptr: DevicePtr,
+struct MambaState {
+    conv_state: DeviceBuffer<f32>,
+    ssm_state: DeviceBuffer<f32>,
 }
 ```
 
-## Logical Mapping
+- Not paged in the traditional sense
+- Updated incrementally per decode step
+- Cannot be easily evicted to CPU/SSD
+
+### Paged KV (full attention layers)
 
 ```rust
-struct Sequence {
-    blocks: Vec<BlockId>
+struct PagedKvCache {
+    k_blocks: DeviceBuffer<half>,
+    v_blocks: DeviceBuffer<half>,
+    block_table: Vec<BlockTable>,
 }
 ```
 
-## Free Lists
+- Standard FlashInfer PagedAttention
+- Supports GPU → CPU → SSD eviction
+- Block size: 16 tokens (configurable)
 
-```rust
-gpu_free
-cpu_free
-```
+## KV Cache Quantization
+
+Supported formats:
+- BF16 (baseline)
+- FP8 (E4M3 / E5M2)
+- NVFP4 (Blackwell only)
+
+Format selectable at startup via `--kv-cache-dtype`
 
 ---
 
-# 9. PagedAttention
+# 8. FlashInfer Kernel Integration
 
-Core abstraction:
+Strategy: Extract `.cu` / `.cuh` files from local vLLM (`../vllm/`), compile to `.cubin` with nvcc, load via cuda-oxide.
 
-```rust
-struct BlockTable {
-    physical_blocks: Vec<u32>
-}
-```
-
-Attention kernel receives:
-
-```text
-query
-block table
-kv blocks
-```
-
-Kernel performs:
-
-```text
-lookup
-gather
-attention
-output
-```
-
-Reuse FlashInfer implementation where possible.
+Kernels:
+- GDN prefill: `chunk_gated_delta_rule`
+- GDN decode: `fused_sigmoid_gating_delta_rule_update`
+- Standard prefill: `BatchPrefillWithPagedKVCache`
+- Standard decode: `BatchDecodeWithPagedKVCache`
+- Sampling: `top_k_sampling_from_probs`, `top_p_sampling_from_probs`
 
 ---
 
-# 10. Session Lifecycle
+# 9. Session Lifecycle
 
 States:
 
@@ -253,17 +248,11 @@ Decoding -> Completed
 
 ---
 
-# 11. Scheduler
+# 10. Scheduler
 
-Objective:
+Objective: Latency fairness.
 
-Latency fairness.
-
-Algorithm:
-
-```text
-round robin
-```
+Algorithm: round robin.
 
 Each decode iteration:
 
@@ -276,7 +265,7 @@ distribute outputs
 
 ---
 
-# 12. Continuous Batching
+# 11. Continuous Batching
 
 Batch contains:
 
@@ -294,56 +283,57 @@ Requirements:
 
 ---
 
-# 13. Prefill Path
+# 12. Prefill Path
 
-Input:
-
-```text
-prompt tokens
-```
+Input: prompt tokens
 
 Steps:
 
 1. tokenize
-2. allocate blocks
-3. run transformer
+2. allocate blocks (Mamba state + paged KV)
+3. run transformer (dispatch GDN vs full attention per layer)
 4. write KV
 5. emit first token
 
 ---
 
-# 14. Decode Path
+# 13. Decode Path
 
-Input:
-
-```text
-1 token/session
-```
+Input: 1 token/session
 
 Steps:
 
 1. build decode batch
-2. run attention
+2. run attention (GDN or standard)
 3. sample
 4. append KV
 5. stream output
 
 ---
 
-# 15. MTP Support
+# 14. MTP Support
 
-Goal:
+Goal: Exploit Qwen3.6 native MTP head (`mtp_num_hidden_layers: 1`).
 
-Exploit Qwen native MTP heads.
-
-## Flow
+Flow:
 
 ```text
-main forward
-draft tokens
-verification
-accept/reject
-commit KV
+main forward (get hidden state)
+draft tokens from MTP head (greedy)
+verification: main model checks draft tokens in single forward pass
+accept/reject: accept longest valid prefix
+commit KV: write accepted tokens' KV cache
+```
+
+API parameter:
+
+```json
+{
+  "speculative_config": {
+    "method": "mtp",
+    "num_speculative_tokens": 2
+  }
+}
 ```
 
 ## Acceptance Logic
@@ -358,14 +348,12 @@ struct MtpResult {
 
 Metrics:
 
-```text
-acceptance rate
-tokens saved
-```
+- acceptance rate
+- tokens saved
 
 ---
 
-# 16. Sampling
+# 15. Sampling
 
 Support:
 
@@ -374,6 +362,8 @@ Support:
 - top-k
 - top-p
 - repetition penalty
+- presence penalty
+- frequency penalty
 
 Trait:
 
@@ -385,7 +375,7 @@ trait Sampler {
 
 ---
 
-# 17. KV Eviction
+# 16. KV Eviction
 
 Priority:
 
@@ -402,9 +392,11 @@ LRU
 manual pinning
 ```
 
+Note: Mamba states (GDN layers) cannot be easily evicted. Only paged KV (full attention layers) supports eviction.
+
 ---
 
-# 18. KV Serialization
+# 17. KV Serialization
 
 Format:
 
@@ -414,13 +406,11 @@ block metadata
 raw kv bytes
 ```
 
-Goal:
-
-Resume sessions after restart.
+Goal: Resume sessions after restart.
 
 ---
 
-# 19. Memory Budgeting
+# 18. Memory Budgeting
 
 Startup:
 
@@ -442,32 +432,42 @@ struct MemoryPlan {
 
 ---
 
-# 20. API
+# 19. API (OpenAI-Compatible)
 
-Phase 1:
+Endpoints:
 
-## Generate
-
-```http
-POST /generate
-```
-
-## Stream
+## Chat Completions
 
 ```http
-GET /stream/{id}
+POST /v1/chat/completions
 ```
 
-## Session
+Supports streaming via SSE (`stream: true`).
+
+## Models
 
 ```http
-POST /session
-DELETE /session/{id}
+GET /v1/models
 ```
+
+## Tool Calls
+
+Request format:
+
+```json
+{
+  "tools": [...],
+  "tool_choice": "auto"
+}
+```
+
+Streaming tool calls via `delta.tool_calls` array.
+
+No custom API (`/generate`, `/stream`, `/session` replaced by OpenAI compatibility).
 
 ---
 
-# 21. Metrics
+# 20. Metrics
 
 Expose:
 
@@ -484,7 +484,7 @@ Prometheus format preferred.
 
 ---
 
-# 22. Logging
+# 21. Logging
 
 Use:
 
@@ -503,7 +503,7 @@ debug
 
 ---
 
-# 23. Failure Recovery
+# 22. Failure Recovery
 
 Detect:
 
@@ -521,71 +521,121 @@ resume
 
 ---
 
-# 24. Development Phases
+# 23. Development Phases
 
-## Phase 1
+## Phase 1: Bootstrap
 
-- model loading
-- tokenizer
-- single GPU inference
+- workspace, nightly toolchain, crate skeletons
+- OpenAI API types and axum server scaffold
+- SSE streaming
+- Prometheus metrics
 
-Expected:
-4-6 weeks
+Expected: 2 weeks
 
-## Phase 2
+## Phase 2: CUDA Backend
 
-- TP=2
-- NCCL
+- cuda-oxide workspace setup
+- FlashInfer kernel compilation pipeline
+- cudarc cuBLASLt + NCCL
+- Memory allocator
 
-Expected:
-2-4 weeks
+Expected: 2 weeks
 
-## Phase 3
+## Phase 3: Model Loading
 
-- paged KV
-- continuous batching
+- Safetensors loader, multi-format detection
+- PrismaSCOUT, AutoRound, BF16 loaders
+- Weight sharding for TP=2
+- Memory budget calculator
 
-Expected:
-4-6 weeks
+Expected: 3 weeks
 
-## Phase 4
+## Phase 4: TP=2 Forward Pass
 
-- MTP
+- GDN prefill/decode (FlashInfer)
+- Standard attention prefill/decode (FlashInfer)
+- Layer dispatch per `layer_type`
+- GEMM: cuBLASLt (NVFP4, FP16, BF16)
+- NCCL all-reduce
 
-Expected:
-2-3 weeks
+Expected: 3 weeks
 
-## Phase 5
+## Phase 5: PP=2 + Microbatching
 
-- KV offload
-- persistence
+- Stage partitioning (layers 0-31 vs 32-63)
+- P2P communication
+- Microbatch scheduler
+- Pipeline bubble minimization
 
-Expected:
-3-5 weeks
+Expected: 3 weeks
+
+## Phase 6: Continuous Batching
+
+- Hybrid KV state manager (Mamba + paged)
+- Block allocator, free lists
+- Session lifecycle
+- Batch builder with dynamic join/leave
+- Round-robin scheduler
+
+Expected: 3 weeks
+
+## Phase 7: MTP
+
+- MTP head weight loading
+- MTP forward pass
+- Draft generation, verification, acceptance
+- `speculative-config` API parameter
+
+Expected: 2 weeks
+
+## Phase 8: Quantization Polish
+
+- AutoRound INT4 end-to-end
+- GGUF parser + llama.cpp integration
+- KV cache quantization (FP8, NVFP4)
+- Cross-format benchmarking
+- Backend routing
+
+Expected: 3 weeks
+
+## Phase 9: Tool Calls + Final Polish
+
+- Qwen3.6 chat template + tool parsing
+- Tool call streaming (delta format)
+- End-to-end benchmark vs vLLM
+- 24-hour stability test
+- Documentation
+
+Expected: 2 weeks
 
 ---
 
-# 25. Testing Strategy
+# 24. Testing Strategy
 
 Unit:
 
 - block allocator
 - sampler
 - scheduler
+- kernel loading
+- format detection
 
 Integration:
 
 - prefill correctness
 - decode correctness
 - TP correctness
+- PP correctness
+- MTP acceptance rate
+- tool call parsing
 
 Golden tests:
 
-Compare outputs against reference implementation.
+Compare outputs against reference implementation (vLLM).
 
 ---
 
-# 26. Stretch Goals
+# 25. Stretch Goals
 
 - CUDA Graphs
 - speculative scheduling
@@ -595,7 +645,7 @@ Compare outputs against reference implementation.
 
 ---
 
-# 27. Explicit Anti-Goals
+# 26. Explicit Anti-Goals
 
 Do not build:
 
@@ -603,5 +653,32 @@ Do not build:
 - plugin ecosystem
 - model zoo
 - training support
+- custom non-OpenAI API surface
 
-The server exists solely to run Qwen efficiently on a fixed hardware configuration.
+The server exists solely to run Qwen3.6-27B efficiently on a fixed hardware configuration.
+
+---
+
+# 27. Key Decisions
+
+| Decision | Choice |
+|---|---|
+| Target model | Qwen3.6-27B |
+| Primary quant | PrismaSCOUT (NVFP4+BF16) |
+| Secondary quant | AutoRound INT4 (W4A16) |
+| Tertiary quant | GGUF (all standard Q2_K–Q8_0) |
+| GGUF dequant | On-the-fly in llama.cpp kernels |
+| AutoRound dequant | On-the-fly in custom INT4 GEMM kernels (weights stay packed in VRAM) |
+| CUDA orchestration | cuda-oxide (NVlabs workspace) + cudarc |
+| Math kernels | FlashInfer (GDN + standard attention), cuBLASLt (GEMM) |
+| API | OpenAI-compatible only |
+| Vision | Text-only |
+| Thinking tokens | Stream as regular content |
+| TP | 2 GPUs via NCCL |
+| PP | 2 GPUs via P2P with microbatching |
+| Context | 262K native (no YaRN) |
+| MTP | Native Qwen3.6 MTP heads |
+| Tool calls | Yes |
+| Format detection | Auto-detect from model directory |
+| KV cache quants | BF16, FP8 (E4M3/E5M2), NVFP4 |
+| Rust toolchain | nightly-2026-04-03 |

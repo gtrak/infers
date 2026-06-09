@@ -74,10 +74,26 @@ vllm serve rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm \
 - Unquantized layers: `linear_attn.in_proj_a/b`, `mtp.fc`, norms, routers
 - MTP head preserved in BF16
 
-**Dequantization:** Software at load time
-```python
-w_dequant = (w_int4 - zero_point) * scale  # per group of 128
+**Dequantization:** On-the-fly in custom GEMM kernels (weights stay packed in GPU memory, never expanded)
+
+**Packed format:**
+- INT4 weights stored in `uint32_t` arrays (8 weights per uint32)
+- Scales: FP16, one per group of 128 weights
+- Zeros: INT4 packed, one per group of 128 weights
+
+**GEMM strategy:**
 ```
+For each output element:
+  1. Load 8 INT4 weights from uint32_t
+  2. Unpack to INT8 in registers
+  3. Subtract zero point, multiply by scale
+  4. Cast to FP16
+  5. Multiply with FP16 activation
+  6. Accumulate in FP32
+  7. Cast result to FP16
+```
+
+**VRAM savings:** ~75% vs BF16 (4 bits per weight instead of 16)
 
 **vLLM serve command:**
 ```bash
@@ -147,12 +163,12 @@ impl QuantizationFormat {
 
 ## Dequantization Strategy by Format
 
-| Format | When | How | Kernel |
-|---|---|---|---|
-| PrismaSCOUT | Runtime (GEMM) | Hardware (tensor core) | cuBLASLt (NVFP4 input) |
-| AutoRound | Load time | Software (unpack + scale) | Custom INT4 unpack kernel |
-| GGUF | Runtime (GEMM) | Hardware/Software | llama.cpp ggml CUDA |
-| BF16 | N/A | N/A | Standard cuBLASLt |
+| Format | When | How | Kernel | VRAM |
+|---|---|---|---|---|
+| PrismaSCOUT | Runtime (GEMM) | Hardware (tensor core) | cuBLASLt (NVFP4 input) | ~20 GB |
+| AutoRound | Runtime (GEMM) | Software (unpack + scale in registers) | Custom INT4 GEMM | ~18 GB |
+| GGUF | Runtime (GEMM) | Hardware/Software | llama.cpp ggml CUDA | varies |
+| BF16 | N/A | N/A | Standard cuBLASLt | ~54 GB |
 
 ## KV Cache Quantization
 

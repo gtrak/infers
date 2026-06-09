@@ -499,7 +499,7 @@ Weight registry will be consumed by the forward pass.
 3. Can detect AutoRound format automatically
 4. Can detect GGUF format automatically
 5. PrismaSCOUT weights load with correct mixed precision
-6. AutoRound weights dequantize to FP16 correctly
+6. AutoRound weights load in packed INT4 format (not dequantized)
 7. Weight sharding produces correct splits for TP=2
 8. Memory budget calculator returns reasonable values
 9. All tensor shapes match config expectations

@@ -17,10 +17,14 @@
 
 ### AutoRound INT4 End-to-End
 
+AutoRound weights are **kept in packed INT4 format** in GPU memory. We write custom GEMM kernels that unpack and scale on-the-fly, without ever expanding to FP16 in VRAM.
+
 ```rust
 pub struct AutoRoundEngine {
-    pub dequantized_weights: WeightRegistry,  // FP16 after load-time dequant
-    pub gemm_engine: GemmEngine,
+    pub packed_weights: PackedWeightRegistry,  // INT4 packed, stays in VRAM
+    pub scales: HashMap<String, DeviceBuffer<half>>,  // FP16 scales
+    pub zeros: HashMap<String, DeviceBuffer<u32>>,    // Packed INT4 zeros
+    pub gemm_engine: CustomInt4GemmEngine,
 }
 
 impl AutoRoundEngine {
@@ -33,23 +37,98 @@ impl AutoRoundEngine {
         let format = QuantizationFormat::detect(model_dir)?;
         assert_eq!(format, QuantizationFormat::AutoRound);
         
-        // 2. Load packed weights
+        // 2. Load packed weights (INT4 stays packed)
         let loader = AutoRoundLoader::new(model_dir)?;
-        let packed = loader.load_safetensors()?;
+        let (packed, scales, zeros) = loader.load_packed_weights(device, stream)?;
         
-        // 3. Dequantize to FP16
-        let dequantized = loader.dequantize_all(&packed, device, stream)?;
+        // 3. Shard for TP/PP (shard the packed tensors directly)
+        let sharded = shard_packed_weights(packed, scales, zeros, num_gpus)?;
         
-        // 4. Shard for TP/PP
-        let sharded = shard_weights(dequantized, num_gpus)?;
+        // 4. Build custom INT4 GEMM engine
+        let gemm = CustomInt4GemmEngine::new(
+            &sharded.packed,
+            &sharded.scales,
+            &sharded.zeros,
+            stream,
+        )?;
         
         Ok(Self {
-            dequantized_weights: sharded,
-            gemm_engine: GemmEngine::new(stream)?,
+            packed_weights: sharded.packed,
+            scales: sharded.scales,
+            zeros: sharded.zeros,
+            gemm_engine: gemm,
         })
     }
 }
 ```
+
+### Custom INT4 GEMM Kernel
+
+```cuda
+__global__ void int4_gemm_kernel(
+    half* __restrict__ output,          // [M, N] output
+    const uint32_t* __restrict__ weight,  // [N, K/8] packed INT4
+    const half* __restrict__ scales,      // [N, K/group_size] FP16
+    const uint32_t* __restrict__ zeros,   // [N, K/group_size/8] packed INT4
+    const half* __restrict__ input,       // [M, K] FP16 activation
+    int M, int N, int K,
+    int group_size
+) {
+    // Each thread computes one output element
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row >= M || col >= N) return;
+    
+    float acc = 0.0f;
+    
+    for (int k = 0; k < K; k += group_size) {
+        // Load scale and zero for this group
+        int group_idx = k / group_size;
+        half scale = scales[col * (K / group_size) + group_idx];
+        
+        // Unpack zero point
+        int zero_packed_idx = (col * (K / group_size) + group_idx) / 8;
+        int zero_shift = ((col * (K / group_size) + group_idx) % 8) * 4;
+        uint32_t zero_packed = zeros[zero_packed_idx];
+        int8_t zero = (int8_t)((zero_packed >> zero_shift) & 0xF);
+        
+        for (int kk = 0; kk < group_size; kk += 8) {
+            // Load 8 INT4 weights from one uint32_t
+            int weight_idx = (col * K + k + kk) / 8;
+            uint32_t packed = weight[weight_idx];
+            
+            // Unpack each of 8 weights
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                int shift = w * 4;
+                int8_t w_int4 = (int8_t)((packed >> shift) & 0xF);
+                
+                // Dequantize: (w - zero) * scale
+                float w_fp32 = ((float)(w_int4 - zero)) * __half2float(scale);
+                
+                // Load activation
+                half a = input[row * K + k + kk + w];
+                
+                // Multiply and accumulate
+                acc += w_fp32 * __half2float(a);
+            }
+        }
+    }
+    
+    // Write output
+    output[row * N + col] = __float2half(acc);
+}
+```
+
+**Key design decisions:**
+- Weights stay in INT4-packed format in GPU memory (~75% VRAM savings)
+- Dequantization happens in registers during GEMM
+- No FP16 weight copy ever exists
+- Output is FP16, fed directly into next layer (RMSNorm, activation, etc.)
+- Group size: 128 (fixed by AutoRound format)
+
+**Performance note:** This kernel is memory-bandwidth-bound, not compute-bound. The savings from INT4 storage (less memory bandwidth) roughly offset the cost of unpacking.
 
 ### GGUF Parser
 
