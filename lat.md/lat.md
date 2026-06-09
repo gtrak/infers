@@ -54,6 +54,28 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | gemm | cuBLASLt GEMM engine for matrix multiplication |
 | nccl | Multi-GPU collective operations for TP/PP |
 
+# Kernel Extraction and Build System
+Pipeline for extracting FlashInfer kernel source from vLLM and compiling to .cubin binaries.
+
+### Kernel Directory Structure
+Three directories hold kernel source and compiled binaries under `crates/cuda/kernels/`. All directories contain `.gitkeep` files for git tracking.
+
+| Directory | Contents |
+|-----------|----------|
+| `flashinfer-gdn/` | GDN (Gated DeltaNet) kernel source (.cu, .cuh, include/) |
+| `flashinfer-attn/` | Standard attention kernel source (prefill, decode, sampling) |
+| `compiled/` | Compiled .cubin output from nvcc |
+
+### Extraction Script
+Copies kernel source from a local vLLM checkout into `crates/cuda/kernels/`.
+
+Handles three sources: GDN kernels, standard attention kernels, and FlashInfer submodule headers. Missing directories produce warnings but do not abort.
+
+### Build Script
+Compiles kernel source files to .cubin binaries using nvcc.
+
+Targets `sm_100a` (Blackwell) with `-O3 --use_fast_math`. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
+
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.
 
