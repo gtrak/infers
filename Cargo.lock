@@ -764,6 +764,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "infers-api",
  "infers-metrics",
  "serde",

@@ -65,3 +65,47 @@ Request latency distribution in seconds with buckets at [0.01, 0.05, 0.1, 0.25, 
 ## Metrics HTTP Endpoint
 
 Axum handler exposes all registered metrics at `/metrics` in Prometheus text format.
+
+# Server
+
+Main binary crate for the inference server. Provides CLI argument parsing, Axum-based HTTP routing, and mock handlers for the OpenAI-compatible API.
+
+## CLI Arguments
+
+Uses `clap` derive API. Key arguments include model name, parallelism, KV cache dtype, context length, GPU utilization, speculative decoding, and bind address. All support environment variable override and defaults.
+
+## AppState
+
+Shared state struct holding the model name, wrapped in `Arc` for async-safe sharing across handler calls.
+
+## Route Structure
+
+All API routes registered on the Axum router with middleware layers.
+
+| Path | Method | Handler |
+|------|--------|---------|
+| `/health` | GET | `health_check` |
+| `/v1/models` | GET | `list_models` |
+| `/v1/chat/completions` | POST | `chat_completions` |
+| `/metrics` | GET | `metrics_handler` |
+
+Routes are wrapped with `TraceLayer` for request logging and `CorsLayer::permissive()` for cross-origin access.
+
+## Chat Completions Handler
+
+Handles the OpenAI-compatible chat completions endpoint with both streaming and non-streaming modes.
+
+### Non-streaming Response
+
+Returns a single `ChatCompletionResponse` with a mock assistant message. Response includes ID, timestamp, model name, one choice with `"stop"` finish reason, and token usage stats.
+
+### Streaming Response
+
+Returns an SSE stream of `ChatCompletionChunk` objects following the OpenAI streaming protocol:
+
+1. **Role delta chunk**: Sets `role: "assistant"` with empty content
+2. **Token chunks**: Four incremental token chunks (`"Hello"`, `" from"`, `" infers"`, `"!"`)
+3. **Finish chunk**: Empty delta with `finish_reason: "stop"`
+4. **[DONE]**: Final SSE event signaling stream completion
+
+Each chunk includes the same request ID, timestamp, and model name.
