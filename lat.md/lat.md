@@ -1,5 +1,50 @@
 This directory defines the high-level concepts, business logic, and architecture of this project using markdown. It is managed by [lat.md](https://www.npmjs.com/package/lat.md) — a tool that anchors source code to these definitions. Install the `lat` command with `npm i -g lat.md` and run `lat --help`.
 
+# Workspace Architecture
+Rust workspace for infers, a Qwen3.6-27B inference server using nightly toolchain with cuda-oxide orchestration.
+
+## Crates
+
+Workspace contains 12 crates across server, API, inference backend, and utility domains.
+
+| Crate | Path | Purpose |
+|-------|------|---------|
+| infers-server | crates/server | axum HTTP server, CLI, main entry point |
+| infers-api | crates/api | OpenAI-compatible types + SSE protocol |
+| infers-scheduler | crates/scheduler | Session lifecycle, batch construction |
+| infers-kv | crates/kv | Hybrid KV state manager |
+| infers-model | crates/model | Multi-format model loader |
+| infers-backend-native | crates/backends/native | FlashInfer + cuBLASLt backend |
+| infers-backend-gguf | crates/backends/gguf | llama.cpp backend |
+| infers-cuda | crates/cuda | cuda-oxide + cudarc hybrid |
+| infers-parallelism | crates/parallelism | TP=2 and PP=2 implementations |
+| infers-tokenizer | crates/tokenizer | HF tokenizers wrapper |
+| infers-metrics | crates/metrics | Prometheus exporter |
+| infers-mtp | crates/mtp | MTP draft/verify |
+
+## Toolchain
+Nightly toolchain configuration, Rust edition, and cargo-oxide requirements for CUDA support.
+
+- Rust nightly-2026-04-03 with rust-src, rustc-dev, llvm-tools
+- edition = "2024"
+- cargo-oxide for CUDA crates
+
+## Dependencies
+
+Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, serde 1.0.228, clap 4.6.1, prometheus 0.14.0, thiserror 2.0.18. CUDA deps (cudarc, cuda-oxide) deferred to Phase 2.
+
+# Phase 1 Deliverables
+Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.
+
+- Workspace Cargo.toml with 12 crate members and pinned dependencies
+- rust-toolchain.toml for nightly-2026-04-03
+- OpenAI-compatible API types (request, response, streaming, error)
+- Axum HTTP server with mock responses
+- SSE streaming scaffold for chat completions
+- Prometheus metrics endpoint at /metrics
+- Health check endpoint at /health
+- CLI argument parsing with clap
+
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
 
