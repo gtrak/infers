@@ -73,7 +73,7 @@ impl KvCache {
 /// - Zero CPU round-trips during decode
 /// - Prefix sharing across sequences
 /// - Copy-on-write page sharing
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvCache]]
+/// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#PagedKvCache]]
 #[derive(Debug)]
 pub struct PagedKvCache {
     /// GPU buffer holding all paged KV data: [num_pages * 2 * page_size * kv_dim].
@@ -104,7 +104,7 @@ impl PagedKvCache {
     /// if the dimensions match.
     ///
     /// Total elements: `num_pages * 2 * page_size * kv_dim` (K + V per page).
-    fn ensure_allocated(
+    pub fn ensure_allocated(
         &mut self,
         stream: &Arc<CudaStream>,
     ) -> Result<&CudaSlice<bf16>> {

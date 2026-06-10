@@ -305,8 +305,13 @@ impl PagedKvManager {
         }
         (total - free) as f64 / total as f64
     }
-}
 
+    /// Get the page size (tokens per page).
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+}
 #[cfg(test)]
 mod tests {
     use super::*;

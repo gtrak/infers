@@ -244,7 +244,7 @@ Attempts to share an existing page from the prefix cache.
 
 Orchestrator that ties together the page pool, prefix cache, and copy-on-write logic for multi-sequence management.
 
-`PagedKvManager` holds shared pool and cache via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, and prefix caching. Methods: `new()` initializes pool and cache, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
+`PagedKvManager` holds shared pool and cache via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, and prefix caching. Methods: `new()` initializes pool and cache, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`, `page_size()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
 
 ### ManagerError
 
@@ -311,7 +311,7 @@ Same K/V computation and RoPE as original `forward`, but writes to paged cache v
 Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
-- engine.rs integration: wire `PagedKvManager` into ForwardEngine dispatch loop (Task 10)
+- Full paged pipeline: complete `prefill_paged` and `decode_paged` with layer-by-layer dispatch (embedding, projections, RoPE, paged attention, MLP, sampling)
 - Stress tests and benchmark suite
 
 # Phase 4 Deliverables
@@ -321,7 +321,9 @@ Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full
 Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode inference. `prefill()` and `decode()` delegate to module-level functions with cached kernel handles and per-layer KV/GDN state vectors.
 
 ### Engine Structure
-`ForwardEngine` holds config, weights, 13 cached `CudaFunction` handles, GemmEngine, NcclCommunicator, StreamPool, and per-layer `kv_caches` and `gdn_states` vectors. Kernel handles are resolved from `LoadedKernelRegistry` at init time. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+`ForwardEngine` holds config, weights, 16 cached `CudaFunction` handles, GemmEngine, NcclCommunicator, StreamPool, and paged KV fields.
+
+The struct owns `Option<PagedKvManager>` for the paged system, plus `paged_kv_caches` for per-layer paged caches alongside legacy `kv_caches`. Three paged kernel handles (`paged_kv_write_kernel`, `paged_kv_read_kernel`, `paged_attention_decode_kernel`) are resolved from `LoadedKernelRegistry` at init. `init_paged()` creates the manager and caches. `prefill_paged()` and `decode_paged()` provide paged entry points. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Prefill Path
 
