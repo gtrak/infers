@@ -8,4 +8,6 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 blake3 = "1"
+cudarc = { workspace = true }
+half = { workspace = true }
 thiserror = { workspace = true }

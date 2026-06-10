@@ -290,6 +290,12 @@ Quantization data types for KV cache storage, supporting mixed-precision cache l
 
 `KvCacheDtype` is a pure data type with no GPU dependencies. Four variants trade memory footprint for numerical fidelity: `Bf16` (2 bytes/element), `Fp8E4M3` (1 byte), `Fp8E5M2` (1 byte), `Nvfp4` (1 byte, packed with block scales). The `bytes_per_element()` method returns the per-element size for memory budgeting. See [[crates/kv/src/quant.rs#KvCacheDtype]].
 
+### QuantizedKvCache
+
+GPU-side quantized paged KV cache storing K/V values in lower-precision formats.
+
+`QuantizedKvCache` holds a `KvCacheDtype` (e.g., FP8, NVFP4), an interleaved GPU page pool (`CudaSlice<u8>`), and optional BF16 block scales for NVFP4. The `allocate()` method pre-allocates and zeroes GPU memory for the page pool and scales. Layout matches `PagedKvCache`: `[K tokens | V tokens]` per page. See [[crates/kv/src/quant.rs#QuantizedKvCache]].
+
 
 ## Completed
 
@@ -302,7 +308,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 12 unit tests
 - `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 11 unit tests + 4 eviction/restore tests
 - `eviction` module: `CpuPagePool`, `EvictedSequence`, `EvictionError`, 9 unit tests
-- `quant` module: `KvCacheDtype` enum (Bf16, Fp8E4M3, Fp8E5M2, Nvfp4) with `bytes_per_element()`, 5 unit tests
+- `quant` module: `KvCacheDtype` enum (Bf16, Fp8E4M3, Fp8E5M2, Nvfp4) with `bytes_per_element()`, 5 unit tests; `QuantizedKvCache` struct with `allocate()` for GPU-side quantized page pool allocation
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension

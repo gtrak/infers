@@ -665,6 +665,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "cudarc",
+ "half",
  "thiserror 2.0.18",
 ]
 

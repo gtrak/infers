@@ -5,6 +5,9 @@
 /// carries a different trade-off between memory footprint and
 /// numerical fidelity.
 
+use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvCacheDtype {
     /// Brain float 16 — 2 bytes per element.
@@ -58,5 +61,75 @@ mod tests {
         assert_ne!(KvCacheDtype::Bf16, KvCacheDtype::Fp8E4M3);
         assert_ne!(KvCacheDtype::Fp8E4M3, KvCacheDtype::Fp8E5M2);
         assert_ne!(KvCacheDtype::Fp8E5M2, KvCacheDtype::Nvfp4);
+    }
+}
+
+/// Quantized paged KV cache using interleaved K+V per page layout.
+///
+/// Matches the PagedKvCache layout but stores quantized values:
+/// page_pool[page_id * page_stride + side * page_size * kv_dim + ...]
+/// where side=0 for K, side=1 for V.
+#[derive(Debug)]
+pub struct QuantizedKvCache {
+    /// Quantized data type for cache entries.
+    pub dtype: KvCacheDtype,
+    /// Interleaved page pool (K then V per page), quantized to dtype.
+    pub page_pool: CudaSlice<u8>,
+    /// Number of pages in the pool.
+    pub num_pages: usize,
+    /// Page size (tokens per page).
+    pub page_size: usize,
+    /// KV dimension (num_kv_heads * head_dim).
+    pub kv_dim: usize,
+    /// Block scales for NVFP4 (one per 128-element block).
+    /// Two scales per block: one for K, one for V.
+    pub scales: Option<CudaSlice<half::bf16>>,
+}
+
+impl QuantizedKvCache {
+    /// Allocate a new quantized KV cache on the GPU.
+    ///
+    /// # Arguments
+    /// * `stream` - CUDA stream for memory allocation
+    /// * `num_pages` - Total number of physical pages
+    /// * `page_size` - Number of tokens per page
+    /// * `kv_dim` - KV dimension (num_kv_heads * head_dim)
+    /// * `dtype` - Quantized data type for cache entries
+    ///
+    /// # Returns
+    /// A new `QuantizedKvCache` with GPU memory allocated and zeroed.
+    pub fn allocate(
+        stream: &std::sync::Arc<CudaStream>,
+        num_pages: usize,
+        page_size: usize,
+        kv_dim: usize,
+        dtype: KvCacheDtype,
+    ) -> anyhow::Result<Self> {
+        let bytes_per_elem = dtype.bytes_per_element();
+        let page_stride = 2 * page_size * kv_dim; // elements per page (K + V)
+        let page_bytes = page_stride * bytes_per_elem; // bytes per page
+        let total_bytes = num_pages * page_bytes;
+
+        let page_pool = stream
+            .alloc_zeros::<u8>(total_bytes)?;
+
+        let scales = if matches!(dtype, KvCacheDtype::Nvfp4) {
+            // NVFP4 uses block scales: one scale per 128 elements
+            // Each page has 2 * page_size * kv_dim elements, so:
+            let num_blocks = (num_pages * 2 * page_size * kv_dim).div_ceil(128);
+            // Two scale values per block (one for K-side, one for V-side)
+            Some(stream.alloc_zeros::<half::bf16>(num_blocks * 2)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            dtype,
+            page_pool,
+            num_pages,
+            page_size,
+            kv_dim,
+            scales,
+        })
     }
 }
