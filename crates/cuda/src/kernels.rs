@@ -71,6 +71,7 @@ impl KernelRegistry {
         self.register("infers_paged_kv_read_bf16", "kernels/compiled/paged_kv_read.cubin");
         self.register("infers_gdn_update_bf16", "kernels/compiled/gdn_update.cubin");
         self.register("infers_gdn_prefill_bf16", "kernels/compiled/gdn_prefill.cubin");
+        self.register("infers_paged_attention_decode_bf16", "kernels/compiled/paged_attention_decode.cubin");
     }
 }
 
