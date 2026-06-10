@@ -161,6 +161,9 @@ Per-layer CUDA kernel dispatch for transformer operations.
 ### Sampling
 `SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
 
+### Kernel Dispatch
+Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]].
+
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
 

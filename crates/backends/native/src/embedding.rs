@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Gather embeddings for a batch of token IDs from the embedding matrix.
 ///
@@ -25,18 +25,48 @@ use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
 /// Newly allocated `CudaSlice<bf16>` of shape `[seq_len × hidden_size]`
 pub fn embed_tokens(
     stream: &Arc<CudaStream>,
-    _kernel: &CudaFunction,
+    kernel: &CudaFunction,
     token_ids: &[u32],
-    _embedding_table: &CudaSlice<bf16>,
+    embedding_table: &CudaSlice<bf16>,
     hidden_size: usize,
-    _vocab_size: usize,
+    vocab_size: usize,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = token_ids.len();
     anyhow::ensure!(seq_len > 0, "Token ID array must not be empty");
 
+    // Copy token IDs to device
+    let token_ids_gpu = stream
+        .clone_htod(token_ids)
+        .map_err(|e| anyhow::anyhow!("Failed to copy token IDs to device: {e}"))?;
+
+    // Allocate output buffer [seq_len × hidden_size]
     let elem_count = seq_len * hidden_size;
-    // Kernel launch requires CUdeviceptr for host array pointers,
-    // which needs unsafe CUdeviceptr wrapping not available in safe cudarc.
-    // Actual implementation uses stream.launch_builder(kernel).arg(CUdeviceptr(token_ids.as_ptr())).launch(config)
-    todo!("embed_tokens: allocate output buffer, launch infers_embedding_gather_bf16 kernel with token_ids ptr, embedding_table, hidden_size, output")
+    let mut output = stream
+        .alloc_zeros::<bf16>(elem_count)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate embedding output: {e}"))?;
+
+    let seq_len_i32 = seq_len as i32;
+    let hidden_size_i32 = hidden_size as i32;
+    let vocab_size_i32 = vocab_size as i32;
+
+    let config = LaunchConfig {
+        grid_dim: (((seq_len as u32) + 15) / 16, 1, 1), // 16 tokens per block
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(&token_ids_gpu)
+            .arg(embedding_table)
+            .arg(&mut output)
+            .arg(&seq_len_i32)
+            .arg(&hidden_size_i32)
+            .arg(&vocab_size_i32)
+            .launch(config)
+            .map_err(|e| anyhow::anyhow!("Embedding kernel launch failed: {e}"))?;
+    }
+
+    Ok(output)
 }

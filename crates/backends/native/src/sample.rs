@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Sampling strategy selection for token generation.
 #[derive(Debug, Clone)]
@@ -46,15 +46,41 @@ pub struct SamplingConfig {
 /// The token ID with the highest logit
 pub fn greedy_sample(
     stream: &Arc<CudaStream>,
-    _kernel: &CudaFunction,
+    kernel: &CudaFunction,
     logits: &CudaSlice<f32>,
 ) -> Result<u32> {
     let vocab_size = logits.len();
     anyhow::ensure!(vocab_size > 0, "Logit vector must not be empty");
 
-    // Kernel launch: stream.launch_builder(kernel).arg(logits).arg(&mut result).arg(&vocab_size_i32).launch(config)
-    // Then stream.clone_dtoh(&result) to get the result on host
-    todo!("greedy_sample: allocate result buffer, launch infers_argmax_f32 kernel, copy result back to host")
+    // Allocate result buffer on device (a single i32 for the argmax index)
+    let mut result_gpu = stream
+        .alloc_zeros::<i32>(1)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate argmax result: {e}"))?;
+
+    let vocab_size_i32 = vocab_size as i32;
+
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1), // single block for argmax
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (256 * 8) as u32, // shared mem for reduction (2 values per thread: val + idx)
+    };
+
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(logits)
+            .arg(&mut result_gpu)
+            .arg(&vocab_size_i32)
+            .launch(config)
+            .map_err(|e| anyhow::anyhow!("Argmax kernel launch failed: {e}"))?;
+    }
+
+    // Copy result back to host
+    let result_host = stream
+        .clone_dtoh(&result_gpu)
+        .map_err(|e| anyhow::anyhow!("Failed to copy argmax result from device: {e}"))?;
+
+    Ok(result_host[0] as u32)
 }
 
 /// Temperature-scaled sampling.
