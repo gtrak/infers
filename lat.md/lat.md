@@ -1015,3 +1015,11 @@ The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Req
 End-to-end integration tests verifying full scheduling flows across module boundaries.
 
 The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable; (8) `test_memory_pressure_triggers_eviction` — end-to-end memory pressure detection when pool is full; (9) `test_evict_restore_round_trip_integration` — evict and restore a sequence through `PagedKvManager` with data integrity verification; (10) `test_lru_eviction_candidate_selection` — LRU eviction selection picks the oldest evictable session; (11) `test_cpu_page_pool_budget_integration` — `CpuPagePool` budget enforcement across store/retrieve cycles. See [[crates/scheduler/tests/integration.rs]].
+
+# MTP Verification
+Result types for verifying MTP speculative decoding drafts against the main model.
+
+## VerificationResult
+Describes which draft tokens were accepted and which (if any) should be regenerated after MTP speculative decoding verification.
+
+The verification process compares each draft token against the main model's greedy prediction at the same position. The longest prefix of matching tokens is accepted; the first mismatch (if any) produces a corrected token from the main model. See [[crates/mtp/src/verify.rs#VerificationResult]].
