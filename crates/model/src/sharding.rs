@@ -192,6 +192,48 @@ pub fn split_layers_pp(config: &ModelConfig, num_stages: usize) -> Vec<std::ops:
         .collect()
 }
 
+/// Filter a WeightRegistry to only contain weights for a specific stage's layers.
+///
+/// For PP=2, stage 0 gets layers 0-31 and stage 1 gets layers 32-63.
+/// Shared weights (embedding, norm, lm_head, mtp) are kept in both stages.
+/// Layer-specific tensors not in the given range are removed from the
+/// `tensors` HashMap, and the `layers` Vec is filtered to only contain
+/// layers in the range.
+// @lat: [[lat#Weight Sharding#Pipeline Parallelism Split]]
+pub fn shard_weights_for_stage(
+    registry: &super::weights::WeightRegistry,
+    layer_range: &std::ops::Range<usize>,
+) -> super::weights::WeightRegistry {
+    let mut shard = registry.clone();
+
+    // Filter layer-specific weights to only this stage's range
+    shard.layers = shard.layers
+        .into_iter()
+        .filter(|layer| layer_range.contains(&layer.layer_idx))
+        .collect();
+
+    // Keep only tensors whose layer index is in range, plus global tensors
+    // Global tensors are those that don't contain "layers." in their name
+    shard.tensors = shard.tensors
+        .into_iter()
+        .filter(|(name, _)| {
+            // Check if this is a layer-specific tensor
+            if let Some(layer_str) = name.strip_prefix("model.layers.") {
+                // Extract the layer index from e.g. "0.self_attn.q_proj.weight"
+                if let Some(idx_str) = layer_str.split('.').next() {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        return layer_range.contains(&idx);
+                    }
+                }
+            }
+            // Global tensors (embedding, norm, lm_head, etc.) are always kept
+            true
+        })
+        .collect();
+
+    shard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
