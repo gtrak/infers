@@ -4,3 +4,4 @@
 //! PP=2: P2P send/recv between pipeline stages with microbatching.
 
 pub mod comm;
+pub mod microbatch;
