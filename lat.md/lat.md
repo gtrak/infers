@@ -156,7 +156,20 @@ The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel
 See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/prefill.rs#upload_weight]].
 
 ### Decode Path
-Embeds single token, loops through layers with KV cache (full attention) or recurrent state (GDN), applies final norm + LM head, samples next token. See [[crates/backends/native/src/decode.rs#decode]].
+
+Embeds a single token, loops through layers dispatching GDN recurrent steps or single-token attention over cached KV, applies final norm + LM head, samples next token via greedy argmax.
+
+The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel handles (`rmsnorm`, `silu_glu`, `rope`, `embedding`, `add`, `argmax`, `softmax`, `kv_cache_write`, `gdn_update`), a `GemmEngine`, CUDA stream, `NcclCommunicator`, `ModelConfig`, `WeightRegistry`, a single `token_id`, `position`, and mutable vectors of `KvCache` and `GdnState` for each layer.
+
+**Phase 1 — Embedding**: Uploads embedding weights via `upload_weight()` (converts `WeightData` bytes to BF16 Vec and copies to GPU), then dispatches the embedding gather kernel for a single token.
+
+**Phase 2 — Layer Loop**: For each layer, dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), `mlp::mlp_forward`, and another residual add. All GEMMs use m=1 (single token).
+
+**Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[1 × vocab_size]` BF16 vector.
+
+**Phase 4 — Sampling**: Downloads BF16 logits to host, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
+
+See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/decode.rs#upload_weight]].
 
 ## Module Structure
 Twelve modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add.
