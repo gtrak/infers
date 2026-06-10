@@ -7,6 +7,8 @@
 //! For multiple microbatches, sends and receives are interleaved to keep
 //! both GPUs busy.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use half::bf16;
 use infers_cuda::nccl::NcclCommunicator;
@@ -22,8 +24,8 @@ use infers_cuda::CudaSlice;
 /// from peer rank 0.
 #[derive(Debug)]
 pub struct StageComm {
-    /// NCCL communicator shared across stages.
-    pub nccl: NcclCommunicator,
+    /// NCCL communicator shared across stages (wrapped in Arc for sharing).
+    pub nccl: Arc<NcclCommunicator>,
     /// Rank of this stage within the NCCL communicator.
     pub rank: usize,
     /// Peer rank (the adjacent stage).
@@ -32,7 +34,7 @@ pub struct StageComm {
 
 impl StageComm {
     /// Create a new stage communicator.
-    pub fn new(nccl: NcclCommunicator, rank: usize, peer_rank: usize) -> Self {
+    pub fn new(nccl: Arc<NcclCommunicator>, rank: usize, peer_rank: usize) -> Self {
         Self { nccl, rank, peer_rank }
     }
 

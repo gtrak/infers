@@ -5,4 +5,5 @@
 
 pub mod comm;
 pub mod microbatch;
+pub mod pp;
 pub mod stage;

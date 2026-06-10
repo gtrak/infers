@@ -5,6 +5,7 @@
 //! by the pipeline engine.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use infers_cuda::nccl::NcclCommunicator;
 use infers_kv::manager::{PagedKvManager, SequenceId};
@@ -40,7 +41,7 @@ impl PipelineStage {
         start_layer: usize,
         end_layer: usize,
         weights: infers_model::weights::WeightRegistry,
-        nccl: NcclCommunicator,
+        nccl: Arc<NcclCommunicator>,
         rank: usize,
         peer_rank: usize,
     ) -> Self {
