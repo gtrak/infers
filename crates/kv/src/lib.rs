@@ -13,6 +13,7 @@ pub mod page;
 pub mod pool;
 pub mod prefix;
 pub mod quant;
+pub use quant::{KvCacheDtype, QuantizedKvCache};
 pub mod table;
 
 pub use cow::{ensure_mutable_page, CowError, CowResult};

@@ -69,22 +69,22 @@ mod tests {
 // Production will use CUDA kernel implementations.
 
 /// Quantize BF16 slice to FP8 E4M3 bytes (CPU reference).
-fn quantize_fp8_e4m3(data: &[half::bf16]) -> Vec<u8> {
+pub fn quantize_fp8_e4m3(data: &[half::bf16]) -> Vec<u8> {
     data.iter().map(|&v| f32_to_fp8_e4m3(v.to_f32())).collect()
 }
 
 /// Dequantize FP8 E4M3 bytes to BF16 slice (CPU reference).
-fn dequantize_fp8_e4m3(data: &[u8]) -> Vec<half::bf16> {
+pub fn dequantize_fp8_e4m3(data: &[u8]) -> Vec<half::bf16> {
     data.iter().map(|&v| half::bf16::from_f32(fp8_e4m3_to_f32(v))).collect()
 }
 
 /// Quantize BF16 slice to FP8 E5M2 bytes (CPU reference).
-fn quantize_fp8_e5m2(data: &[half::bf16]) -> Vec<u8> {
+pub fn quantize_fp8_e5m2(data: &[half::bf16]) -> Vec<u8> {
     data.iter().map(|&v| f32_to_fp8_e5m2(v.to_f32())).collect()
 }
 
 /// Dequantize FP8 E5M2 bytes to BF16 slice (CPU reference).
-fn dequantize_fp8_e5m2(data: &[u8]) -> Vec<half::bf16> {
+pub fn dequantize_fp8_e5m2(data: &[u8]) -> Vec<half::bf16> {
     data.iter().map(|&v| half::bf16::from_f32(fp8_e5m2_to_f32(v))).collect()
 }
 
@@ -151,7 +151,7 @@ fn f32_to_fp8_e5m2(value: f32) -> u8 {
 
     let fp8_exp = exp - 127 + 15;
     if fp8_exp >= 0x1F {
-        return if sign == 0 { 0x7C } else { 0xFC };
+        return if sign == 0 { 0x7B } else { 0xFB }; // Clamp to max finite
     }
     if fp8_exp < 0 {
         return if sign == 0 { 0x00 } else { 0x80 };

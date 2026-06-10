@@ -1118,7 +1118,7 @@ Max finite value is exp=14, mant=7 → 240.0. Values beyond this range are clamp
 
 FP8 E5M2 encoding: 1 sign, 5 exponent (bias 15), 2 mantissa bits.
 
-Max finite value is exp=30, mant=3 → 57344.0. Overflow clamps to 0x6F (positive) or 0xEF (negative). NaN encodes as exp=0x1F with non-zero mantissa (0x7F positive, 0xFF negative). See [[crates/kv/src/quant.rs#f32_to_fp8_e5m2]], [[crates/kv/src/quant.rs#fp8_e5m2_to_f32]].
+Max finite value is exp=30, mant=3 → 57344.0. Overflow clamps to 0x7B (positive) or 0xFB (negative). NaN encodes as exp=0x1F with non-zero mantissa (0x7F positive, 0xFF negative). See [[crates/kv/src/quant.rs#f32_to_fp8_e5m2]], [[crates/kv/src/quant.rs#fp8_e5m2_to_f32]].
 
 ## Public API
 
@@ -1132,3 +1132,7 @@ Four public functions provide quantize/dequantize pairs for both formats.
 | `dequantize_fp8_e5m2` | Convert `&[u8]` (E5M2) back to `Vec<bf16>` |
 
 See [[crates/kv/src/quant.rs#quantize_fp8_e4m3]], [[crates/kv/src/quant.rs#dequantize_fp8_e4m3]], [[crates/kv/src/quant.rs#quantize_fp8_e5m2]], [[crates/kv/src/quant.rs#dequantize_fp8_e5m2]].
+
+## Delegation Pattern
+
+FP8 helpers live in `infers-kv::quant` and are re-exported by `infers-backend-native::quant` to eliminate duplication. `KvCacheDtype` and `QuantizedKvCache` are additionally re-exported from the `infers-kv` crate root. See [[crates/kv/src/lib.rs]], [[crates/backends/native/src/quant.rs]].
