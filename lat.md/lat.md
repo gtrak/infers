@@ -792,6 +792,8 @@ For PP=2, stage 0 (rank 0) sends to peer rank 1, and stage 1 (rank 1) receives f
 
 P2P data transfer between NCCL ranks for pipeline parallelism hidden state exchange. See [[crates/cuda/src/nccl.rs#NcclCommunicator]].
 
+NcclCommunicator implements `Send` and `Sync` (unsafe) so it can be wrapped in `Arc` and shared across threads — a requirement for the PP engine which shares the communicator between stages.
+
 `send(rank, data, peer)` sends a `CudaSlice` to the peer rank. `recv(rank, data, peer)` receives into a mutable buffer. Both lookup the comm by rank index and delegate to cudarc `Comm::send`/`recv`.
 
 ## Pipeline Stage Data Structures
