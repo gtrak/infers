@@ -644,6 +644,7 @@ dependencies = [
  "infers-cuda",
  "infers-kv",
  "infers-model",
+ "infers-mtp",
  "tracing",
 ]
 
