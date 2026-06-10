@@ -294,7 +294,7 @@ Quantization data types for KV cache storage, supporting mixed-precision cache l
 
 GPU-side quantized paged KV cache storing K/V values in lower-precision formats.
 
-`QuantizedKvCache` holds a `KvCacheDtype` (e.g., FP8, NVFP4), an interleaved GPU page pool (`CudaSlice<u8>`), and optional BF16 block scales for NVFP4. The `allocate()` method pre-allocates and zeroes GPU memory for the page pool and scales. Layout matches `PagedKvCache`: `[K tokens | V tokens]` per page. See [[crates/kv/src/quant.rs#QuantizedKvCache]].
+`QuantizedKvCache` holds a `KvCacheDtype` (e.g., FP8, NVFP4), an interleaved GPU page pool (`CudaSlice<u8>`), and optional BF16 block scales for NVFP4. The `allocate()` method pre-allocates and zeroes GPU memory for the page pool and scales. `write_fp8()` downloads BF16 K/V from GPU, quantizes to the configured FP8 format on CPU, and uploads quantized bytes into the interleaved page pool. `read_fp8()` downloads quantized bytes, dequantizes to BF16 on CPU, and uploads to new GPU buffers. Both methods route through `match dtype` to handle E4M3/E5M2/Nvfp4; NVFP4 paths are placeholders. Layout matches `PagedKvCache`: `[K tokens | V tokens]` per page. See [[crates/kv/src/quant.rs#QuantizedKvCache]], [[crates/kv/src/quant.rs#QuantizedKvCache#write_fp8]], [[crates/kv/src/quant.rs#QuantizedKvCache#read_fp8]].
 
 
 ## Completed
@@ -308,7 +308,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 12 unit tests
 - `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 11 unit tests + 4 eviction/restore tests
 - `eviction` module: `CpuPagePool`, `EvictedSequence`, `EvictionError`, 9 unit tests
-- `quant` module: `KvCacheDtype` enum (Bf16, Fp8E4M3, Fp8E5M2, Nvfp4) with `bytes_per_element()`, 5 unit tests; `QuantizedKvCache` struct with `allocate()` for GPU-side quantized page pool allocation
+- `quant` module: `KvCacheDtype` enum (Bf16, Fp8E4M3, Fp8E5M2, Nvfp4) with `bytes_per_element()`, 5 unit tests; `QuantizedKvCache` struct with `allocate()` for GPU-side quantized page pool allocation; FP8 CPU reference helpers (`f32_to_fp8_e4m3`, `fp8_e4m3_to_f32`, `f32_to_fp8_e5m2`, `fp8_e5m2_to_f32`) and `write_fp8()`/`read_fp8()` methods for GPU data movement with CPU quantization, 6 unit tests for FP8 roundtrips
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension
@@ -1112,13 +1112,13 @@ The `quant` module provides CPU-based reference implementations for converting b
 
 FP8 E4M3 encoding: 1 sign, 4 exponent (bias 7), 3 mantissa bits.
 
-Max finite value is exp=14, mant=7 → 240.0. Values beyond this range are clamped to the max finite (0x77 positive, 0xF7 negative). NaN is encoded as exp=0xF with non-zero mantissa (0x7F positive). See [[crates/backends/native/src/quant.rs#f32_to_fp8_e4m3]], [[crates/backends/native/src/quant.rs#fp8_e4m3_to_f32]].
+Max finite value is exp=14, mant=7 → 240.0. Values beyond this range are clamped to the max finite (0x77 positive, 0xF7 negative). NaN is encoded as exp=0xF with non-zero mantissa (0x7F positive). See [[crates/kv/src/quant.rs#f32_to_fp8_e4m3]], [[crates/kv/src/quant.rs#fp8_e4m3_to_f32]].
 
 ## E5M2 Format
 
 FP8 E5M2 encoding: 1 sign, 5 exponent (bias 15), 2 mantissa bits.
 
-Max finite value is exp=30, mant=3 → 57344.0. Overflow clamps to 0x6F (positive) or 0xEF (negative). NaN encodes as exp=0x1F with non-zero mantissa (0x7F positive, 0xFF negative). See [[crates/backends/native/src/quant.rs#f32_to_fp8_e5m2]], [[crates/backends/native/src/quant.rs#fp8_e5m2_to_f32]].
+Max finite value is exp=30, mant=3 → 57344.0. Overflow clamps to 0x6F (positive) or 0xEF (negative). NaN encodes as exp=0x1F with non-zero mantissa (0x7F positive, 0xFF negative). See [[crates/kv/src/quant.rs#f32_to_fp8_e5m2]], [[crates/kv/src/quant.rs#fp8_e5m2_to_f32]].
 
 ## Public API
 
@@ -1131,4 +1131,4 @@ Four public functions provide quantize/dequantize pairs for both formats.
 | `quantize_fp8_e5m2` | Convert `&[bf16]` to `Vec<u8>` (E5M2 bytes) |
 | `dequantize_fp8_e5m2` | Convert `&[u8]` (E5M2) back to `Vec<bf16>` |
 
-See [[crates/backends/native/src/quant.rs#quantize_fp8_e4m3]], [[crates/backends/native/src/quant.rs#dequantize_fp8_e4m3]], [[crates/backends/native/src/quant.rs#quantize_fp8_e5m2]], [[crates/backends/native/src/quant.rs#dequantize_fp8_e5m2]].
+See [[crates/kv/src/quant.rs#quantize_fp8_e4m3]], [[crates/kv/src/quant.rs#dequantize_fp8_e4m3]], [[crates/kv/src/quant.rs#quantize_fp8_e5m2]], [[crates/kv/src/quant.rs#dequantize_fp8_e5m2]].
