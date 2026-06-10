@@ -207,29 +207,23 @@ pub fn shard_weights_for_stage(
     let mut shard = registry.clone();
 
     // Filter layer-specific weights to only this stage's range
-    shard.layers = shard.layers
-        .into_iter()
-        .filter(|layer| layer_range.contains(&layer.layer_idx))
-        .collect();
+    shard.layers.retain(|layer| layer_range.contains(&layer.layer_idx));
 
     // Keep only tensors whose layer index is in range, plus global tensors
     // Global tensors are those that don't contain "layers." in their name
-    shard.tensors = shard.tensors
-        .into_iter()
-        .filter(|(name, _)| {
-            // Check if this is a layer-specific tensor
-            if let Some(layer_str) = name.strip_prefix("model.layers.") {
-                // Extract the layer index from e.g. "0.self_attn.q_proj.weight"
-                if let Some(idx_str) = layer_str.split('.').next() {
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        return layer_range.contains(&idx);
-                    }
-                }
+    shard.tensors.retain(|name, _| {
+        // Check if this is a layer-specific tensor
+        if let Some(layer_str) = name.strip_prefix("model.layers.") {
+            // Extract the layer index from e.g. "0.self_attn.q_proj.weight"
+            if let Some(idx_str) = layer_str.split('.').next()
+                && let Ok(idx) = idx_str.parse::<usize>()
+            {
+                return layer_range.contains(&idx);
             }
-            // Global tensors (embedding, norm, lm_head, etc.) are always kept
-            true
-        })
-        .collect();
+        }
+        // Global tensors (embedding, norm, lm_head, etc.) are always kept
+        true
+    });
 
     shard
 }
