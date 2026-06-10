@@ -1,0 +1,87 @@
+// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+/// Rotary Position Embedding (RoPE) kernel for BF16 tensors.
+///
+/// Applies standard RoPE to query and key tensors. Operates on
+/// tensors of shape [seq_len, num_heads, head_dim] (or batched).
+///
+/// RoPE rotates pairs of dimensions by position-dependent angles
+/// using precomputed sin/cos values.
+
+#include "common.cuh"
+
+/// RoPE kernel applying rotary position embeddings.
+///
+/// For each position `pos` and head `h`, each pair of dimensions
+/// (2k, 2k+1) within the head is rotated by angle `pos * freq[k]`.
+__launch_bounds__(INFERS_BLOCK_SIZE)
+__global__ void rope_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k_tensor,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int* __restrict__ positions,
+    int total_tokens,
+    int head_dim
+) {
+    int idx = INFERS_THREAD_IDX;
+    int stride = blockDim.x * gridDim.x;
+    int half_dim = head_dim / 2;
+
+    for (int t = idx; t < total_tokens * half_dim; t += stride) {
+        int token_idx = t / half_dim;
+        int dim_pair = t % half_dim;
+        int pos = positions[token_idx];
+
+        int cos_idx = pos * half_dim + dim_pair;
+        float cos_val = cos[cos_idx];
+        float sin_val = sin[cos_idx];
+
+        // Index into the paired dimensions
+        int i0 = token_idx * head_dim + dim_pair * 2;
+        int i1 = i0 + 1;
+
+        float q0 = __bfloat162float(q[i0]);
+        float q1 = __bfloat162float(q[i1]);
+        float k0 = __bfloat162float(k_tensor[i0]);
+        float k1 = __bfloat162float(k_tensor[i1]);
+
+        // Apply rotation: [x0*cos - x1*sin, x0*sin + x1*cos]
+        q[i0] = __float2bfloat16(q0 * cos_val - q1 * sin_val);
+        q[i1] = __float2bfloat16(q0 * sin_val + q1 * cos_val);
+        k_tensor[i0] = __float2bfloat16(k0 * cos_val - k1 * sin_val);
+        k_tensor[i1] = __float2bfloat16(k0 * sin_val + k1 * cos_val);
+    }
+}
+
+extern "C" {
+
+/// Launch RoPE for BF16 query and key tensors.
+///
+/// # Arguments
+/// * `q` — Query tensor [total_tokens × head_dim], modified in-place
+/// * `k` — Key tensor [total_tokens × head_dim], modified in-place
+/// * `cos` — Cosine embedding table (FP32) [max_seq_len × head_dim/2]
+/// * `sin` — Sine embedding table (FP32) [max_seq_len × head_dim/2]
+/// * `positions` — Position IDs [total_tokens]
+/// * `total_tokens` — Total number of tokens (batch × seq)
+/// * `head_dim` — Head dimension (must be even)
+void infers_rope_bf16(
+    __nv_bfloat16* q,
+    __nv_bfloat16* k,
+    const float* cos,
+    const float* sin,
+    const int* positions,
+    int total_tokens,
+    int head_dim
+) {
+    int half_dim = head_dim / 2;
+    int total_pairs = total_tokens * half_dim;
+    int block_size = INFERS_BLOCK_SIZE;
+    int grid_size = (total_pairs + block_size - 1) / block_size;
+
+    rope_kernel<<<grid_size, block_size>>>(
+        q, k, cos, sin, positions, total_tokens, head_dim
+    );
+}
+
+} // extern "C"

@@ -57,26 +57,35 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | nccl | Multi-GPU collective operations for TP/PP |
 
 # Kernel Extraction and Build System
-Pipeline for extracting FlashInfer kernel source from vLLM and compiling to .cubin binaries.
+Pipeline for compiling infers CUDA kernel source to .cubin binaries.
 
 ### Kernel Directory Structure
 Three directories hold kernel source and compiled binaries under `crates/cuda/kernels/`. All directories contain `.gitkeep` files for git tracking.
 
 | Directory | Contents |
 |-----------|----------|
-| `flashinfer-gdn/` | GDN (Gated DeltaNet) kernel source (.cu, .cuh, include/) |
-| `flashinfer-attn/` | Standard attention kernel source (prefill, decode, sampling) |
+| `flashinfer-gdn/` | Reserved for future GDN kernel source |
+| `flashinfer-attn/` | Reserved for future attention kernel source |
+| `infers/` | Custom CUDA kernel source (.cu, .cuh) for inference operations |
 | `compiled/` | Compiled .cubin output from nvcc |
 
-### Extraction Script
-Copies kernel source from a local vLLM checkout into `crates/cuda/kernels/`.
+### Kernel Source Files
+Seven kernel implementations for transformer forward-pass operations using BF16 data.
 
-Handles three sources: GDN kernels, standard attention kernels, and FlashInfer submodule headers. Missing directories produce warnings but do not abort.
+| File | Kernels | Description |
+|------|---------|-------------|
+| `common.cuh` | — | Shared utilities: `__nv_bfloat16` conversion helpers, `INFERS_BLOCK_SIZE` (256), thread indexing macros |
+| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * weight |
+| `silu.cu` | `infers_silu_bf16`, `infers_silu_glu_bf16` | SiLU activation and SwiGLU gating: output = x * sigmoid(gate) |
+| `rope.cu` | `infers_rope_bf16` | Rotary Position Embedding applied to query and key tensors |
+| `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |
+| `elementwise.cu` | `infers_add_bf16` | Element-wise addition for residual connections |
+| `sampling.cu` | `infers_argmax_f32` | Greedy argmax sampling from FP32 logits |
 
 ### Build Script
-Compiles kernel source files to .cubin binaries using nvcc.
+Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
 
-Targets `sm_100a` (Blackwell) by default, configurable via the `INFERS_CUDA_ARCH` environment variable. With `-O3 --use_fast_math`. The `which_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). nvcc args include `-I` flags for `kernels/flashinfer-gdn` and `kernels/flashinfer-attn` include paths. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
+Targets `sm_120` (Blackwell RTX 5060 Ti) by default, configurable via the `INFERS_CUDA_ARCH` environment variable. Uses `-O3 --use_fast_math` flags with `-I kernels/infers` include path for common.cuh. The `find_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` with matching names and loaded at runtime by the KernelRegistry.
 
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.
@@ -97,12 +106,12 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (5 kernels: gdn_prefill, gdn_decode, batch_prefill, batch_decode, sampling) and LoadedKernelRegistry for GPU-loaded kernels
+- KernelRegistry for .cubin loading (7 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax) and LoadedKernelRegistry for GPU-loaded kernels
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
-- build.rs for nvcc kernel compilation (default sm_100a, configurable via INFERS_CUDA_ARCH env var)
-- scripts/extract-kernels.sh for pulling FlashInfer kernels from vLLM
-- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)
+- build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, common.cuh
+- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for future integration
 
 # Phase 3 Deliverables
 Phase 3 (Model Loading) implements multi-format model loading with auto-detection, weight registry, TP sharding, and memory budgeting.

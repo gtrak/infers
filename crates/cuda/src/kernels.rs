@@ -56,14 +56,16 @@ impl KernelRegistry {
         self.kernels.is_empty()
     }
 
-    /// Register the standard set of FlashInfer kernels.
+    /// Register the standard set of infers CUDA kernels.
     /// Paths point to .cubin files in the kernels/compiled/ directory.
-    pub fn register_flashinfer_kernels(&mut self) {
-        self.register("gdn_prefill", "kernels/compiled/gdn_prefill.cubin");
-        self.register("gdn_decode", "kernels/compiled/gdn_decode.cubin");
-        self.register("batch_prefill", "kernels/compiled/batch_prefill.cubin");
-        self.register("batch_decode", "kernels/compiled/batch_decode.cubin");
-        self.register("sampling", "kernels/compiled/sampling.cubin");
+    pub fn register_infers_kernels(&mut self) {
+        self.register("infers_rmsnorm_bf16", "kernels/compiled/rmsnorm.cubin");
+        self.register("infers_silu_bf16", "kernels/compiled/silu.cubin");
+        self.register("infers_silu_glu_bf16", "kernels/compiled/silu.cubin");
+        self.register("infers_rope_bf16", "kernels/compiled/rope.cubin");
+        self.register("infers_embedding_gather_bf16", "kernels/compiled/embedding.cubin");
+        self.register("infers_add_bf16", "kernels/compiled/elementwise.cubin");
+        self.register("infers_argmax_f32", "kernels/compiled/sampling.cubin");
     }
 }
 
