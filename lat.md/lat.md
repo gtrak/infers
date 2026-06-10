@@ -237,6 +237,24 @@ Attempts to share an existing page from the prefix cache.
 
 `try_share_from_prefix_cache(cache, hash, pool, table)` looks up `hash` in the prefix cache. If found, increments the cached page's refcount and appends the page ID to the sequence table, returning `true`. If not found, returns `false`. See [[crates/kv/src/cow.rs#try_share_from_prefix_cache]].
 
+### PagedKvManager
+
+Orchestrator that ties together the page pool, prefix cache, and copy-on-write logic for multi-sequence management.
+
+`PagedKvManager` holds shared pool and cache via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, and prefix caching. Methods: `new()` initializes pool and cache, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
+
+### ManagerError
+
+Custom error type for manager operations using thiserror.
+
+`ManagerError` has two variants: `InvalidSequence(seq_id)` when a sequence is not found or already deleted, and `PoolExhausted` when the page pool has no free pages. See [[crates/kv/src/manager.rs#ManagerError]].
+
+### SequenceId
+
+`usize` alias for identifying sequences in the manager.
+
+`SequenceId` is a `usize` used as the index into `PagedKvManager.sequences`. Deleted IDs are recycled via a free list. See [[crates/kv/src/manager.rs#SequenceId]].
+
 ## Completed
 
 Types and tests shipped for Phase 4.6 paged KV foundations.
@@ -246,6 +264,7 @@ Types and tests shipped for Phase 4.6 paged KV foundations.
 - `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
 - `PrefixCache` with Blake3 content hashing, LRU eviction, `CacheEntry`, `PageHash`, 12 unit tests
 - `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 11 unit tests
+- `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 7 unit tests
 
 ## Remaining
 
@@ -254,7 +273,7 @@ Future deliverables for Phase 4.6 completion.
 - Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
 - attention.rs rewrite: paged decode with zero CPU round-trips
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
-- engine.rs integration: PagedKvManager with pool + cache orchestration
+- engine.rs integration: wire `PagedKvManager` into ForwardEngine dispatch loop
 - Stress tests and benchmark suite
 
 # Phase 4 Deliverables
