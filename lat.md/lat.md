@@ -994,7 +994,7 @@ Lifecycle states that track where a session is in the inference pipeline.
 
 Struct tracking generation state, tokens, and paged KV cache page table for a single inference session.
 
-`Session` holds `id` (`SequenceId` from `PagedKvManager`), `state`, `tokens`, `num_prompt_tokens`, `num_generated_tokens`, `max_tokens`, `page_table`, `created_at`, `last_activity`, and `priority`. Methods: `is_active()` (true for Prefilling/Decoding), `is_evictable()` (true if idle >30s), `is_complete()` (true if generated >= max), `total_tokens()` (sum of prompt + generated). See [[crates/scheduler/src/session.rs#Session]].
+`Session` holds `id` (`SequenceId` from `PagedKvManager`), `state`, `tokens`, `num_prompt_tokens`, `num_generated_tokens`, `max_tokens`, `page_table`, `created_at`, `last_activity`, `priority`, and `routing_id` (correlates with response channel). Methods: `is_active()` (true for Prefilling/Decoding), `is_evictable()` (true if idle >30s), `is_complete()` (true if generated >= max), `total_tokens()` (sum of prompt + generated). See [[crates/scheduler/src/session.rs#Session]].
 
 ## Sampling Strategy
 
@@ -1012,7 +1012,7 @@ Sampling configuration for token generation.
 
 A tokenized inference request waiting to be scheduled.
 
-`Request` holds `id`, `tokens` (input token IDs), `session_id` (KV cache lookup key), `config` (`SamplingConfig`), and `priority` (higher = more important). `new()` creates with default session_id and priority 0. See [[crates/scheduler/src/queue.rs#Request]].
+`Request` holds `id`, `tokens` (input token IDs), `session_id` (KV cache lookup key), `config` (`SamplingConfig`), `priority` (higher = more important), and `routing_id` (correlates request with response channel). `new()` creates with default session_id, priority 0, and routing_id None. See [[crates/scheduler/src/queue.rs#Request]].
 
 ## RequestQueue
 
@@ -1055,6 +1055,12 @@ Output of a single scheduling iteration containing decode and optional prefill b
 Round-robin scheduler for continuous batching that manages session lifecycle and batch construction.
 
 `RoundRobinScheduler` holds `request_queue`, `active_sessions`, `max_concurrent_sessions`, `batch_builder`, `kv_manager`, and `pressure_config` (`PressureConfig` for eviction thresholds). `schedule()` runs one iteration: (1) admits new requests up to capacity, (2) removes completed sessions and frees KV resources, (3) handles memory pressure by evicting idle sessions if pool utilization exceeds threshold, (4) builds a decode batch, (5) builds a prefill batch if under half capacity. `handle_memory_pressure()` checks pool utilization and evicts LRU idle session. `select_and_evict_idle_session()` finds and transitions the oldest evictable session to Evicted. Helper methods: `enqueue_request()`, `active_count()`, `pending_count()`, `is_busy()`. See [[crates/scheduler/src/scheduler.rs#RoundRobinScheduler]].
+
+## InferenceOrchestrator
+
+Central orchestrator connecting HTTP server, scheduler, GPU inference engine, and response channels.
+
+`InferenceOrchestrator` owns `RoundRobinScheduler`, `ForwardEngine`, `BackendEvictionStore`, `Arc<CudaStream>`, and response channel maps. `response_tx` (`HashMap<SequenceId, mpsc::Sender<u32>>`) routes tokens to active sessions. `pending_tx` (`HashMap<usize, mpsc::Sender<u32>>`) holds channels for requests not yet admitted. `next_routing_id` assigns unique routing IDs to correlate requests with response channels. `step()` runs one scheduling iteration: (1) calls `schedule()` to admit requests and build batches, (2) maps new sessions to pending channels via `routing_id`, (3) handles eviction, (4) runs prefill for admitted sessions, (5) runs decode for active sessions, (6) sends tokens through response channels, (7) cleans up completed sessions. `enqueue_request()` creates a request with a unique routing ID and returns it. `register_response_channel()` stores a channel under the routing ID. Helper methods: `active_count()`, `pending_count()`, `is_busy()`. See [[crates/server/src/orchestrator.rs#InferenceOrchestrator]].
 
 # Re-exports
 

@@ -79,6 +79,7 @@ mod tests {
             created_at: Instant::now(),
             last_activity,
             priority: 0,
+            routing_id: None,
         }
     }
 

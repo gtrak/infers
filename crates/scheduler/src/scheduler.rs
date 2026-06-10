@@ -221,6 +221,7 @@ impl RoundRobinScheduler {
             created_at: Instant::now(),
             last_activity: Instant::now(),
             priority: request.priority,
+            routing_id: request.routing_id,
         })
     }
 

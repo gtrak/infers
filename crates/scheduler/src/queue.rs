@@ -54,6 +54,8 @@ pub struct Request {
     pub config: SamplingConfig,
     /// Scheduling priority (higher = more important).
     pub priority: i32,
+    /// Routing ID used to correlate the request with its response channel.
+    pub routing_id: Option<usize>,
 }
 
 impl Request {
@@ -65,6 +67,7 @@ impl Request {
             session_id: 0,
             config,
             priority: 0,
+            routing_id: None,
         }
     }
 }
@@ -165,9 +168,9 @@ mod tests {
     fn test_queue_fifo_within_priority() {
         let mut queue = RequestQueue::new();
         let config = SamplingConfig::default();
-        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 0 });
-        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 0 });
-        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 0 });
+        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
+        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
+        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 0, routing_id: None });
 
         assert_eq!(queue.dequeue().unwrap().id, 0);
         assert_eq!(queue.dequeue().unwrap().id, 1);
@@ -178,9 +181,9 @@ mod tests {
     fn test_queue_priority_ordering() {
         let mut queue = RequestQueue::new();
         let config = SamplingConfig::default();
-        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 1 });
-        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 3 });
-        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 2 });
+        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 1, routing_id: None });
+        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 3, routing_id: None });
+        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 2, routing_id: None });
 
         // Should be ordered by priority: 3, 2, 1
         assert_eq!(queue.dequeue().unwrap().id, 1); // priority 3

@@ -1,6 +1,7 @@
 mod handlers;
 mod server;
 mod state;
+mod orchestrator;
 
 use anyhow::{Context, Result};
 use clap::Parser;

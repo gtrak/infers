@@ -141,6 +141,7 @@ mod tests {
             created_at: Instant::now(),
             last_activity: Instant::now(),
             priority: 0,
+            routing_id: None,
         }
     }
 

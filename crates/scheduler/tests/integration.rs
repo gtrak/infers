@@ -107,6 +107,7 @@ fn test_batch_builder_with_real_kv_manager() {
         created_at: Instant::now(),
         last_activity: Instant::now(),
         priority: 0,
+        routing_id: None,
     });
 
     // Session 2: 1 page, 10 tokens
@@ -126,6 +127,7 @@ fn test_batch_builder_with_real_kv_manager() {
         created_at: Instant::now(),
         last_activity: Instant::now(),
         priority: 0,
+        routing_id: None,
     });
 
     let batch = builder.build_decode_batch(&sessions, &kv).unwrap();
@@ -227,10 +229,10 @@ fn test_priority_queue_integration() {
     let config = SamplingConfig::default();
 
     // Mix priorities: interactive (high=10), background (low=0)
-    queue.enqueue(Request { id: 0, tokens: vec![1], session_id: 0, config: config.clone(), priority: 0 });
-    queue.enqueue(Request { id: 1, tokens: vec![2], session_id: 0, config: config.clone(), priority: 10 });
-    queue.enqueue(Request { id: 2, tokens: vec![3], session_id: 0, config: config.clone(), priority: 5 });
-    queue.enqueue(Request { id: 3, tokens: vec![4], session_id: 0, config, priority: 10 });
+    queue.enqueue(Request { id: 0, tokens: vec![1], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
+    queue.enqueue(Request { id: 1, tokens: vec![2], session_id: 0, config: config.clone(), priority: 10, routing_id: None });
+    queue.enqueue(Request { id: 2, tokens: vec![3], session_id: 0, config: config.clone(), priority: 5, routing_id: None });
+    queue.enqueue(Request { id: 3, tokens: vec![4], session_id: 0, config, priority: 10, routing_id: None });
 
     // Order should be: id1(10), id3(10), id2(5), id0(0)
     assert_eq!(queue.dequeue().unwrap().id, 1);
@@ -253,6 +255,7 @@ fn test_session_eviction_timing() {
         created_at: Instant::now(),
         last_activity: Instant::now(),
         priority: 0,
+        routing_id: None,
     };
 
     // Just created — not evictable yet
@@ -359,6 +362,7 @@ fn test_lru_eviction_candidate_selection() {
             page_table: SequencePageTable::new(16),
             created_at: now, last_activity: now - Duration::from_secs(100),
             priority: 0,
+            routing_id: None,
         },
         Session {
             id: 1, state: SessionState::Decoding, tokens: vec![2],
@@ -366,6 +370,7 @@ fn test_lru_eviction_candidate_selection() {
             page_table: SequencePageTable::new(16),
             created_at: now, last_activity: now - Duration::from_secs(200),
             priority: 0,
+            routing_id: None,
         },
         Session {
             id: 2, state: SessionState::Prefilling, tokens: vec![3],
@@ -373,6 +378,7 @@ fn test_lru_eviction_candidate_selection() {
             page_table: SequencePageTable::new(16),
             created_at: now, last_activity: now, // too recent
             priority: 0,
+            routing_id: None,
         },
     ];
 

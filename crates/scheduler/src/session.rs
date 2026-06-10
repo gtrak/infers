@@ -48,6 +48,8 @@ pub struct Session {
     pub last_activity: Instant,
     /// Scheduling priority (higher = more important).
     pub priority: i32,
+    /// Routing ID from the original request, used to correlate with response channel.
+    pub routing_id: Option<usize>,
 }
 
 impl Session {

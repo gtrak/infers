@@ -23,6 +23,8 @@ infers-scheduler = { path = "../scheduler" }
 infers-backend-native = { path = "../backends/native" }
 infers-tokenizer = { path = "../tokenizer" }
 infers-kv = { path = "../kv" }
+infers-cuda = { path = "../cuda" }
+infers-mtp = { path = "../mtp" }
 
 # External
 tokio-stream = "0.1"
