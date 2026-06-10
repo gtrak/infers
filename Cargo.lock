@@ -713,6 +713,7 @@ name = "infers-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "infers-kv",
 ]
 
 [[package]]

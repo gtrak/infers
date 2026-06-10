@@ -883,3 +883,85 @@ Enum wrapping either `TensorParallelEngine` or `PipelineEngine`. `select()` cons
 ### ParallelismMode
 
 Enum specifying parallelism strategy: `TensorParallel(n)` or `PipelineParallel(n)`. Default is TP=2. `is_tp()`, `is_pp()`, and `parallelism_degree()` provide inspection methods. See [[crates/parallelism/src/engine.rs#ParallelismMode]].
+
+# Scheduler
+
+Session lifecycle management and batch construction for inference scheduling.
+
+## Session State
+
+Lifecycle states that track where a session is in the inference pipeline.
+
+`SessionState` has six variants: `Created` (just allocated), `Prefilling` (processing prompt tokens), `Decoding` (generating response tokens), `Paused` (waiting for client), `Evicted` (KV cache moved to CPU/SSD), and `Completed` (finished generating). See [[crates/scheduler/src/session.rs#SessionState]].
+
+## Session
+
+Struct tracking generation state, tokens, and paged KV cache page table for a single inference session.
+
+`Session` holds `id` (`SequenceId` from `PagedKvManager`), `state`, `tokens`, `num_prompt_tokens`, `num_generated_tokens`, `max_tokens`, `page_table`, `created_at`, `last_activity`, and `priority`. Methods: `is_active()` (true for Prefilling/Decoding), `is_evictable()` (true if idle >30s), `is_complete()` (true if generated >= max), `total_tokens()` (sum of prompt + generated). See [[crates/scheduler/src/session.rs#Session]].
+
+## Sampling Strategy
+
+Sampling strategy selection for token generation during inference.
+
+`SamplingStrategy` has four variants: `Greedy` (highest logit), `Temperature { temp }` (scaled softmax), `TopK { k, temp }` (top-k with temperature), and `TopP { p, temp }` (nucleus sampling with temperature). See [[crates/scheduler/src/queue.rs#SamplingStrategy]].
+
+## SamplingConfig
+
+Sampling configuration for token generation.
+
+`SamplingConfig` holds `strategy` (`SamplingStrategy`), `max_tokens` (generation limit), and `stop_sequences` (early termination triggers). Default uses Greedy strategy with 512 max tokens and empty stop sequences. See [[crates/scheduler/src/queue.rs#SamplingConfig]].
+
+## Request
+
+A tokenized inference request waiting to be scheduled.
+
+`Request` holds `id`, `tokens` (input token IDs), `session_id` (KV cache lookup key), `config` (`SamplingConfig`), and `priority` (higher = more important). `new()` creates with default session_id and priority 0. See [[crates/scheduler/src/queue.rs#Request]].
+
+## RequestQueue
+
+Priority-ordered request queue for inference scheduling.
+
+Uses `VecDeque<Request>` internally. `enqueue()` inserts in priority order (higher first, FIFO within same priority). Methods: `new()`, `enqueue()`, `dequeue()`, `peek()`, `is_empty()`, `len()`, `clear()`, `drain()`. See [[crates/scheduler/src/queue.rs#RequestQueue]].
+
+## DecodeBatch
+
+Batch of sessions ready for GPU decode execution.
+
+`DecodeBatch` holds `sessions` (SequenceId list), `input_tokens` (one latest token per session), and `block_tables` (paged KV cache block IDs for each session). Used by the inference engine to execute a single forward pass over multiple sessions. See [[crates/scheduler/src/batch.rs#DecodeBatch]].
+
+## BatchBuilder
+
+Constructs decode and prefill batches from session state.
+
+`BatchBuilder` enforces `max_batch_size` (max sessions per batch) and `max_tokens_per_batch` limits. `build_decode_batch()` collects active sessions up to the size limit. `build_prefill_batch()` takes one Created session, transitions it to Prefilling, and returns a single-session batch with all prompt tokens. See [[crates/scheduler/src/batch.rs#BatchBuilder]].
+
+## Lifecycle Transitions
+
+Valid state transition rules for session lifecycle management.
+
+`TransitionError` holds `from` and `to` states when an invalid transition is attempted. `transition()` validates the `(from, to)` pair against eight allowed transitions: Created→Prefilling, Prefilling→Decoding, Decoding→Completed, Decoding→Paused, Paused→Decoding, Prefilling→Completed, Decoding→Evicted, Evicted→Prefilling. Convenience wrappers: `start_prefill()`, `finish_prefill()`, `complete_session()`, `pause_session()`, `resume_session()`. See [[crates/scheduler/src/lifecycle.rs#transition]].
+
+## ScheduledWork
+
+Output of a single scheduling iteration containing decode and optional prefill batches.
+
+`ScheduledWork` holds `decode_batch` (`DecodeBatch` of active sessions for single-token generation) and `prefill_batch` (`Option<DecodeBatch>` for a new session being prefilled). Produced by `RoundRobinScheduler::schedule()`. See [[crates/scheduler/src/scheduler.rs#ScheduledWork]].
+
+## RoundRobinScheduler
+
+Round-robin scheduler for continuous batching that manages session lifecycle and batch construction.
+
+`RoundRobinScheduler` holds `request_queue`, `active_sessions`, `max_concurrent_sessions`, `batch_builder`, and `kv_manager`. `schedule()` runs one iteration: (1) admits new requests up to capacity, (2) removes completed sessions and frees KV resources, (3) builds a decode batch, (4) builds a prefill batch if the decode batch is under half capacity. `create_session()` allocates KV pages for a request's prompt tokens. Helper methods: `enqueue_request()`, `active_count()`, `pending_count()`, `is_busy()`. See [[crates/scheduler/src/scheduler.rs#RoundRobinScheduler]].
+
+# Re-exports
+
+Convenience re-exports from `infers_scheduler` crate root for ergonomic downstream usage.
+
+The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Request`, `RequestQueue`, `SamplingConfig`, `SamplingStrategy`, `RoundRobinScheduler`, `ScheduledWork`, `Session`, and `SessionState` so consumers can import directly from `infers_scheduler::` without nested module paths. See [[crates/scheduler/src/lib.rs]].
+
+## Integration Tests
+
+End-to-end integration tests verifying full scheduling flows across module boundaries.
+
+The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable. See [[crates/scheduler/tests/integration.rs]].
