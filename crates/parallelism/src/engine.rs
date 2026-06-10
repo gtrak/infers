@@ -79,6 +79,7 @@ impl ParallelEngine {
     /// * `num_pages` — Total KV cache pages (used for PP only).
     /// * `page_size` — Tokens per KV page (used for PP only).
     /// * `max_cache_bytes` — KV cache memory budget (used for PP only).
+    #[allow(clippy::too_many_arguments)]
     pub fn select(
         mode: ParallelismMode,
         config: Arc<ModelConfig>,

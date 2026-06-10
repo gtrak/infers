@@ -35,6 +35,7 @@ pub struct PipelineStage {
 
 impl PipelineStage {
     /// Create a new pipeline stage.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stage_id: usize,
         gpu_id: usize,

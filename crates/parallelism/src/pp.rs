@@ -87,6 +87,7 @@ impl PipelineEngine {
     /// * `num_pages` — Total KV cache pages
     /// * `page_size` — Tokens per KV page
     /// * `max_cache_bytes` — Maximum KV cache memory budget
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<ModelConfig>,
         weights: WeightRegistry,
@@ -272,49 +273,6 @@ impl PipelineEngine {
         //      b. Attention layer: attention_forward(layer_idx, hidden, microbatch, &self.stages[0])
         //   3. Return final hidden state tensor
         Ok(Vec::new())
-    }
-
-    /// Forward pass through stage 1 (layers mid to end).
-    ///
-    /// Receives hidden states from stage 0, runs through remaining layers,
-    /// applies final norm and LM head, and returns logits for sampling.
-    ///
-    /// NOTE: This is a placeholder implementation. The actual forward
-    /// pass logic depends on Phase 4.
-    #[allow(dead_code)]
-    fn forward_stage1(&self, _microbatch: &Microbatch) -> Result<Vec<u8>> {
-        // Placeholder: return empty vec
-        // In production, this would:
-        //   1. Receive hidden states from StageComm
-        //   2. For each layer in stage 1 range:
-        //      a. GDN layer: gdn_forward(layer_idx, hidden, microbatch, &self.stages[1])
-        //      b. Attention layer: attention_forward(layer_idx, hidden, microbatch, &self.stages[1])
-        //   3. Apply final layer norm
-        //   4. Apply LM head → logits
-        //   5. Sample tokens from logits
-        Ok(Vec::new())
-    }
-
-    /// Ensure GDN states are initialized for all sessions in a microbatch.
-    #[allow(dead_code)]
-    fn ensure_session_states(
-        &mut self,
-        microbatch: &Microbatch,
-    ) -> Result<()> {
-        for stage_idx in 0..self.num_stages() {
-            let stage = &self.stages[stage_idx];
-            let state = &mut self.stage_states[stage_idx];
-
-            for req in &microbatch.requests {
-                state.ensure_gdn_states(
-                    req.session_id,
-                    &self.config,
-                    stage.start_layer,
-                    stage.end_layer,
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Create sessions in both stages for each request.

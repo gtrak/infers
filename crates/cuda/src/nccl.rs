@@ -21,6 +21,11 @@ pub struct NcclCommunicator {
     world_size: usize,
 }
 
+// SAFETY: NCCL communicators are designed for multi-threaded use.
+// The underlying ncclComm_t handles are thread-safe per NCCL documentation.
+unsafe impl Send for NcclCommunicator {}
+unsafe impl Sync for NcclCommunicator {}
+
 impl NcclCommunicator {
     /// Create a new NCCL communicator using the provided streams.
     ///
