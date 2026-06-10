@@ -16,8 +16,16 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
+# Internal crates
 infers-api = { path = "../api" }
 infers-metrics = { path = "../metrics" }
+infers-scheduler = { path = "../scheduler" }
+infers-backend-native = { path = "../backends/native" }
+infers-tokenizer = { path = "../tokenizer" }
+infers-kv = { path = "../kv" }
+
+# External
+tokio-stream = "0.1"
 
 [[bin]]
 name = "infers"
