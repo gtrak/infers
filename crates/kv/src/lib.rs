@@ -7,7 +7,9 @@
 //! - Copy-on-write page sharing for branching prompts
 
 pub mod page;
+pub mod pool;
 pub mod table;
 
 pub use page::{INVALID_PAGE_ID, PageId, PageLocation, PageState, PhysicalPage};
+pub use pool::{PagePool, PagePoolError};
 pub use table::SequencePageTable;

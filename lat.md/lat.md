@@ -172,18 +172,30 @@ Maps logical token positions to physical page IDs for kernel dispatch.
 
 `SequencePageTable` does not own pages — it holds a `Vec<PageId>` pointing into the shared `PagePool`. Methods: `push_page()`, `add_token()`, `remove_last_page()`, `is_tail_page_full()`, `tail_page_id()`, `block_table()`. See [[crates/kv/src/table.rs#SequencePageTable]].
 
+### PagePool
+
+Pre-allocated pool of physical pages with O(1) allocate and free via a stack-based free list.
+
+`PagePool` pre-allocates `total_pages` `PhysicalPage` entries at engine init time. Each page starts `Mutable` on the GPU with refcount 1. The `free_list` is a `Vec<PageId>` supporting O(1) pop for allocation and push for deallocation. Methods: `allocate()`, `free()`, `seal()`, `get()`, `get_mut()`, `page_size()`, `page_bytes()`, `is_full()`, `is_empty()`, `num_free()`, `num_total()`. Page byte size is `page_size * num_kv_heads * head_dim * 2` (BF16). CPU-side bookkeeping only — GPU buffer management lives at the integration layer. See [[crates/kv/src/pool.rs#PagePool]].
+
+### PagePoolError
+
+Custom error type for page pool operations using thiserror.
+
+`PagePoolError` has two variants: `PoolExhausted` when no free pages remain, and `InvalidPageId` when a lookup targets an out-of-range page ID. See [[crates/kv/src/pool.rs#PagePoolError]].
+
 ## Completed
 
 Types and tests shipped for Phase 4.6 paged KV foundations.
 
 - `infers-kv` crate: `PhysicalPage`, `PageId`, `SequencePageTable` types with 11 unit tests
 - `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
+- `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
 
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
 
-- PagePool with O(1) alloc/free and free list
 - Prefix cache: Blake3 content hashing, page chain storage, LRU eviction
 - Copy-on-write: refcount-based page sharing, GPU-side memcpy for COW copies
 - Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
