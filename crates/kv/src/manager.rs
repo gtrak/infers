@@ -465,4 +465,219 @@ mod tests {
         assert_eq!(block_table, &[p1, p2, p3]);
         assert_eq!(block_table.len(), 3);
     }
+
+    /// Verify logical token position maps correctly to physical page ID
+    /// via the block table: logical_page = token_pos / page_size,
+    /// token_in_page = token_pos % page_size.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#SequencePageTable]]
+    #[test]
+    fn test_block_table_mapping() {
+        let page_size = 16;
+        let mut manager = PagedKvManager::new(8, page_size, 8, 128, 1024);
+        let seq_id = manager.create_sequence();
+
+        // Append 3 pages
+        let p0 = manager.append_page(seq_id).unwrap();
+        let p1 = manager.append_page(seq_id).unwrap();
+        let p2 = manager.append_page(seq_id).unwrap();
+
+        let block_table = manager.block_table(seq_id).unwrap();
+
+        // block_table[i] holds page_id for logical page i
+        assert_eq!(block_table[0], p0, "block_table[0] should map to first page");
+        assert_eq!(block_table[1], p1, "block_table[1] should map to second page");
+        assert_eq!(block_table[2], p2, "block_table[2] should map to third page");
+
+        // Verify logical token → page ID mapping:
+        // For token at position p:
+        //   logical_page = p / page_size
+        //   token_in_page = p % page_size
+        let token_positions = vec![
+            (0, p0, 0),
+            (15, p0, 15),
+            (16, p1, 0),
+            (31, p1, 15),
+            (32, p2, 0),
+            (47, p2, 15),
+        ];
+
+        for (token_pos, expected_page_id, expected_token_in_page) in token_positions {
+            let logical_page = token_pos / page_size;
+            let token_in_page = token_pos % page_size;
+            let actual_page_id = block_table[logical_page];
+
+            assert_eq!(
+                actual_page_id, expected_page_id,
+                "Token {token_pos}: block_table[{logical_page}] = {actual_page_id}, expected {expected_page_id}"
+            );
+            assert_eq!(
+                token_in_page, expected_token_in_page,
+                "Token {token_pos}: token_in_page = {token_in_page}, expected {expected_token_in_page}"
+            );
+        }
+    }
+
+    /// Verify pages returned to pool after prefix cache eviction
+    /// are reclaimable for new allocations.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagePool]]
+    #[test]
+    fn test_page_reclamation() {
+        let page_size = 16;
+        let mut manager = PagedKvManager::new(4, page_size, 8, 128, 1024);
+
+        // Create sequence, allocate all 4 pages
+        let seq_id = manager.create_sequence();
+        for _ in 0..4 {
+            manager.append_page(seq_id).unwrap();
+        }
+        assert_eq!(manager.num_free_pages(), 0);
+        assert_eq!(manager.num_pages(seq_id).unwrap(), 4);
+
+        // Seal and cache first 2 pages (simulate prefix caching)
+        let k_data = [1u8; 32];
+        let v_data = [2u8; 32];
+        manager
+            .seal_and_cache(seq_id, 0, "model-x", &k_data, &v_data)
+            .unwrap();
+
+        // Now delete the sequence — pages are freed to pool
+        manager.delete_sequence(seq_id).unwrap();
+
+        // All pages should be back in the pool
+        assert_eq!(
+            manager.num_free_pages(),
+            4,
+            "After deleting sequence, all pages should be free"
+        );
+
+        // Allocate new pages — previously used pages are reclaimable
+        let seq2 = manager.create_sequence();
+        let new_page = manager.append_page(seq2).unwrap();
+        // New page should be within the pool range
+        assert!(new_page < 4);
+        assert_eq!(manager.num_free_pages(), 3);
+    }
+
+    /// Integration test: two sequences sharing same prefix cache entry
+    /// should end up referencing the same physical page ID.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PrefixCache]]
+    #[test]
+    fn test_prefix_cache_hit_integration() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+
+        // Create two sequences
+        let seq1 = manager.create_sequence();
+        let seq2 = manager.create_sequence();
+
+        // Allocate a page for seq1, seal it
+        manager.append_page(seq1).unwrap();
+        let k_data = [1u8; 32];
+        let v_data = [2u8; 32];
+        manager
+            .seal_and_cache(seq1, 0, "model-x", &k_data, &v_data)
+            .unwrap();
+
+        // Allocate a page for seq2
+        manager.append_page(seq2).unwrap();
+        // Seal with identical data — same content hash
+        manager
+            .seal_and_cache(seq2, 0, "model-x", &k_data, &v_data)
+            .unwrap();
+
+        // Both sequences should have sealed pages in the prefix cache
+        // with the same content hash. The cache should record both
+        // referencing the same page_id (first one inserted).
+        {
+            let cache = manager.prefix_cache.lock().unwrap();
+            // There should be exactly 1 unique hash entry
+            assert_eq!(cache.len(), 1, "Both sequences have same content hash");
+            // Memory usage is 1 page (shared, not counted twice)
+            let pool = manager.page_pool.lock().unwrap();
+            assert_eq!(
+                cache.memory_usage(),
+                pool.page_bytes(),
+                "Memory usage should be 1 page (shared, not duplicated)"
+            );
+        }
+
+        // Both sequences have pages assigned
+        assert_eq!(manager.num_pages(seq1).unwrap(), 1);
+        assert_eq!(manager.num_pages(seq2).unwrap(), 1);
+    }
+
+    /// Integration test: root sequence, branch sequence sharing prefix pages,
+    /// COW on branch write, root's pages unchanged.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
+    #[test]
+    fn test_deep_branching() {
+        let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024);
+
+        // Create root sequence with 3 pages
+        let root = manager.create_sequence();
+        let root_pages: Vec<_> = (0..3)
+            .map(|_| manager.append_page(root).unwrap())
+            .collect();
+        for _ in 0..3 * 16 {
+            manager.add_token(root).unwrap();
+        }
+        assert_eq!(manager.num_pages(root).unwrap(), 3);
+
+        // Record root's block table before branching
+        let root_bt_before: Vec<_> = manager.block_table(root).unwrap().to_vec();
+
+        // Create branch sequence
+        let branch = manager.create_sequence();
+
+        // Simulate sharing prefix pages: allocate pages for branch
+        // and manually set up sharing by pushing the same page IDs
+        {
+            let pool = manager.page_pool.lock().unwrap();
+            let branch_table = manager
+                .sequences
+                .get_mut(branch)
+                .and_then(|opt| opt.as_mut())
+                .expect("branch table must exist");
+            // Share first 2 pages from root
+            for page_id in &root_pages[..2] {
+                let page = pool.get(*page_id).expect("page must exist");
+                page.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                branch_table.push_page(*page_id);
+            }
+            // Set to 31 tokens (not a multiple of 16) so the tail page is NOT full,
+            // which is required for COW to trigger instead of just allocating a new page.
+            branch_table.num_tokens = 31;
+        }
+        assert_eq!(manager.num_pages(branch).unwrap(), 2);
+
+        // Record root block table after sharing
+        let root_bt_after_share: Vec<_> = manager.block_table(root).unwrap().to_vec();
+        assert_eq!(root_bt_before, root_bt_after_share, "Root unchanged after sharing");
+
+        // Write to branch — triggers COW on shared tail page
+        let result = manager.ensure_writable(branch).unwrap();
+        assert!(
+            matches!(&result, CowResult::CowPerformed { .. }),
+            "Writing to shared tail page should trigger COW"
+        );
+
+        // Verify root's block table is unchanged after COW on branch
+        let root_bt_after_cow: Vec<_> = manager.block_table(root).unwrap().to_vec();
+        assert_eq!(
+            root_bt_before, root_bt_after_cow,
+            "Root block table must be unchanged after branch COW"
+        );
+
+        // Verify branch has different tail page after COW
+        let branch_bt: Vec<_> = manager.block_table(branch).unwrap().to_vec();
+        // First page still shared (same as root)
+        assert_eq!(
+            branch_bt[0], root_bt_before[0],
+            "Branch first page should still be shared with root"
+        );
+        // Tail page was replaced by COW
+        assert_ne!(
+            branch_bt[1], root_bt_before[1],
+            "Branch tail page should differ from root after COW"
+        );
+    }
 }

@@ -266,8 +266,8 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
 - `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
 - `PrefixCache` with Blake3 content hashing, LRU eviction, `CacheEntry`, `PageHash`, 12 unit tests
-- `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 11 unit tests
-- `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 7 unit tests
+- `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 12 unit tests
+- `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 11 unit tests
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension

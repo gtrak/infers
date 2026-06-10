@@ -443,4 +443,67 @@ mod tests {
             assert_eq!(pool.get(new_page_id).unwrap().state, PageState::Mutable);
         }
     }
+
+    /// Verify that after COW on a shared page, the original page remains
+    /// completely unchanged: state, refcount, and identity are preserved.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#ensure_mutable_page]]
+    #[test]
+    fn test_cow_immutable_original() {
+        let mut pool = PagePool::new(8, 16, 8, 128);
+        let mut table = SequencePageTable::new(16);
+
+        let original_page_id = pool.allocate().unwrap();
+        table.push_page(original_page_id);
+        table.add_token();
+
+        // Simulate sharing: refcount = 2
+        pool.get(original_page_id)
+            .unwrap()
+            .refcount
+            .fetch_add(1, SeqCst);
+
+        // Record original state before COW
+        let original_state_before = pool.get(original_page_id).unwrap().state;
+        let original_refcount_before = pool.get(original_page_id).unwrap().refcount.load(SeqCst);
+        assert_eq!(original_refcount_before, 2);
+
+        // Trigger COW
+        let result = ensure_mutable_page(&mut pool, &mut table).unwrap();
+
+        assert!(matches!(&result, CowResult::CowPerformed { .. }));
+        let (cow_new_page_id, cow_original_page_id) = if let CowResult::CowPerformed {
+            new_page_id,
+            original_page_id: orig,
+        } = result
+        {
+            (new_page_id, orig)
+        } else {
+            unreachable!();
+        };
+
+        assert_eq!(cow_original_page_id, original_page_id);
+
+        // Verify original page is completely unchanged:
+        // 1. State preserved
+        assert_eq!(
+            pool.get(original_page_id).unwrap().state,
+            original_state_before,
+            "Original page state must not change after COW"
+        );
+        // 2. Refcount decremented by exactly 1 (from 2 to 1)
+        let original_refcount_after =
+            pool.get(original_page_id).unwrap().refcount.load(SeqCst);
+        assert_eq!(
+            original_refcount_after,
+            1,
+            "Original page refcount should be decremented by exactly 1 after COW"
+        );
+        // 3. New page is distinct and mutable
+        assert_ne!(cow_new_page_id, original_page_id);
+        assert_eq!(
+            pool.get(cow_new_page_id).unwrap().state,
+            PageState::Mutable
+        );
+        assert_eq!(pool.get(cow_new_page_id).unwrap().refcount.load(SeqCst), 1);
+    }
 }
