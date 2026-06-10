@@ -1,36 +1,120 @@
 //! Rotary Position Embedding (RoPE) kernel dispatch.
 //!
 //! Applies rotary embeddings to query and key tensors in-place using the
-//! `infers_rope_bf16` CUDA kernel.
+//! `infers_rope_bf16` CUDA kernel. Requires precomputed sin/cos tables.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+
+/// Precompute RoPE sin/cos embedding tables.
+///
+/// Generates the rotation matrices for the given positions using the
+/// standard RoPE formulation: `freq[k] = 1.0 / (theta^(2k/d))`
+///
+/// # Arguments
+/// * `positions` — Position IDs (e.g., 0, 1, 2, ... for prefill; single value for decode)
+/// * `head_dim` — Per-head dimension (must be even)
+/// * `rope_theta` — Base frequency (typically 10000000.0 for Qwen)
+/// * `partial_rotary_factor` — Fraction of head dimensions to apply RoPE to (typically 0.25)
+///
+/// # Returns
+/// `(cos_table, sin_table)` as Vec<f32>, each of length `positions.len() * (head_dim * partial_rotary_factor / 2)`
+fn precompute_rope_tables(
+    positions: &[u32],
+    head_dim: usize,
+    rope_theta: f64,
+    partial_rotary_factor: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
+    let half_dim = rotary_dim / 2;
+    let num_positions = positions.len();
+    let table_len = num_positions * half_dim;
+
+    let mut cos_table = Vec::with_capacity(table_len);
+    let mut sin_table = Vec::with_capacity(table_len);
+
+    for &pos in positions {
+        for k in 0..half_dim {
+            let freq = 1.0 / (rope_theta.powf(2.0 * k as f64 / rotary_dim as f64));
+            let angle = pos as f64 * freq;
+            cos_table.push(angle.cos() as f32);
+            sin_table.push(angle.sin() as f32);
+        }
+    }
+
+    (cos_table, sin_table)
+}
 
 /// Apply RoPE to query and key tensors in-place.
 ///
-/// Rotates the q and k tensors by the given position indices using the
-/// rotary embedding defined by the model's `rope_theta` and `partial_rotary_factor`.
+/// Precomputes sin/cos tables, copies them and position IDs to device,
+/// then launches the `infers_rope_bf16` kernel.
 ///
 /// # Arguments
-/// * `stream` — CUDA stream to enqueue the kernel on
-/// * `kernel` — Loaded CUDA function handle for `infers_rope_bf16`
-/// * `q` — Query tensor `[batch_size × seq_len × num_heads × head_dim]` (mutated in-place)
-/// * `k` — Key tensor `[batch_size × seq_len × num_kv_heads × head_dim]` (mutated in-place)
-/// * `positions` — Per-token position indices for rotary embedding
-/// * `head_dim` — Per-head dimension (e.g. 256)
-/// * `num_heads` — Number of attention heads
+/// * `stream` — CUDA stream
+/// * `kernel` — Loaded function handle for `infers_rope_bf16`
+/// * `q` — Query tensor `[total_tokens × num_heads × head_dim]`, modified in-place
+/// * `k` — Key tensor `[total_tokens × num_kv_heads × head_dim]`, modified in-place
+/// * `positions` — Per-token position indices (host slice)
+/// * `head_dim` — Per-head dimension (e.g., 256)
+/// * `rope_theta` — RoPE base frequency (typically 10000000.0)
+/// * `partial_rotary_factor` — Fraction of head_dim to apply RoPE to (typically 0.25)
 pub fn apply_rope(
-    _stream: &Arc<CudaStream>,
-    _kernel: &CudaFunction,
-    _q: &mut CudaSlice<bf16>,
-    _k: &mut CudaSlice<bf16>,
-    _positions: &[u32],
-    _head_dim: usize,
-    _num_heads: usize,
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    q: &mut CudaSlice<bf16>,
+    k: &mut CudaSlice<bf16>,
+    positions: &[u32],
+    head_dim: usize,
+    rope_theta: f64,
+    partial_rotary_factor: f32,
 ) -> Result<()> {
-    // Kernel launch: stream.launch_builder(kernel).arg(q).arg(k).arg(CUdeviceptr(positions.as_ptr())).arg(&seq_len_i32).arg(&head_dim_i32).arg(&num_heads_i32).launch(config)
-    todo!("apply_rope: launch infers_rope_bf16 kernel with q, k, positions ptr, head_dim, num_heads")
+    anyhow::ensure!(!positions.is_empty(), "Positions must not be empty");
+    anyhow::ensure!(head_dim % 2 == 0, "head_dim must be even, got {}", head_dim);
+
+    // Precompute sin/cos tables on host
+    let (cos_table, sin_table) = precompute_rope_tables(positions, head_dim, rope_theta, partial_rotary_factor);
+
+    // Copy data to device
+    let positions_gpu = stream
+        .clone_htod(positions)
+        .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
+    let cos_gpu = stream
+        .clone_htod(&cos_table)
+        .map_err(|e| anyhow::anyhow!("Failed to copy cos table to device: {e}"))?;
+    let sin_gpu = stream
+        .clone_htod(&sin_table)
+        .map_err(|e| anyhow::anyhow!("Failed to copy sin table to device: {e}"))?;
+
+    let total_tokens = positions.len() as i32;
+    let head_dim_i32 = head_dim as i32;
+
+    // Calculate grid size based on total_tokens * half_dim work items
+    let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
+    let half_dim = rotary_dim / 2;
+    let total_pairs = positions.len() * half_dim;
+    let config = LaunchConfig {
+        grid_dim: (((total_pairs as u32) + 255) / 256, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(q)               // query (mutable, in-place)
+            .arg(k)               // key (mutable, in-place)
+            .arg(&cos_gpu)       // cos table
+            .arg(&sin_gpu)       // sin table
+            .arg(&positions_gpu)  // position IDs
+            .arg(&total_tokens)  // total_tokens
+            .arg(&head_dim_i32)  // head_dim
+            .launch(config)
+            .map_err(|e| anyhow::anyhow!("RoPE kernel launch failed: {e}"))?;
+    }
+
+    Ok(())
 }

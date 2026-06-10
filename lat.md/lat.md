@@ -142,7 +142,7 @@ Embeds prompt tokens, loops through layers dispatching GDN or full attention bas
 Embeds single token, loops through layers with KV cache (full attention) or recurrent state (GDN), applies final norm + LM head, samples next token. See [[crates/backends/native/src/decode.rs#decode]].
 
 ## Module Structure
-Eleven modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync.
+Twelve modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add.
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -157,12 +157,13 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `attention` | Full attention with KV cache (FlashInfer placeholder) |
 | `gdn` | Gated DeltaNet recurrent state update (FlashInfer placeholder) |
 | `sync` | NCCL all-reduce for TP collectives |
+| `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 
 ### Sampling
 `SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
 
 ### Kernel Dispatch
-Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]].
+Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]].
 
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.

@@ -6,6 +6,7 @@
 //! - NCCL all-reduce for tensor parallelism
 //! - Hybrid GDN/FullAttention layer dispatch
 
+pub mod add;
 pub mod engine;
 pub mod prefill;
 pub mod decode;
