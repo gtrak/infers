@@ -5,8 +5,7 @@
 /// carries a different trade-off between memory footprint and
 /// numerical fidelity.
 
-use cudarc::driver::CudaSlice;
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaSlice, CudaStream};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvCacheDtype {
@@ -65,8 +64,10 @@ mod tests {
 }
 
 // ── FP8 CPU reference helpers ────────────────────────────────────────────
-// These are used by QuantizedKvCache write/read methods as a CPU fallback.
-// Production will use CUDA kernel implementations.
+// These public functions provide CPU reference implementations for FP8
+// quantization and dequantization. Used by tests and re-exported by
+// `infers-backend-native` for CPU fallback paths.
+// Production GPU paths use CUDA kernels (infers_fp8_quantize_bf16, etc.).
 
 /// Quantize BF16 slice to FP8 E4M3 bytes (CPU reference).
 pub fn quantize_fp8_e4m3(data: &[half::bf16]) -> Vec<u8> {
@@ -247,128 +248,6 @@ impl QuantizedKvCache {
             kv_dim,
             scales,
         })
-    }
-
-    /// Write FP8-quantized K/V data into the cache.
-    ///
-    /// Downloads BF16 data from GPU, quantizes to FP8 on CPU,
-    /// then uploads the quantized bytes into the interleaved page pool.
-    /// The quantize format is determined by `self.dtype`.
-    ///
-    /// # Arguments
-    /// * `page_id` - Target physical page
-    /// * `page_offset` - Token offset within the page
-    /// * `k` - GPU buffer of key values (BF16, length = kv_dim)
-    /// * `v` - GPU buffer of value values (BF16, length = kv_dim)
-    /// * `stream` - CUDA stream for data movement
-    pub fn write_fp8(
-        &mut self,
-        page_id: usize,
-        page_offset: usize,
-        k: &CudaSlice<half::bf16>,
-        v: &CudaSlice<half::bf16>,
-        stream: &std::sync::Arc<CudaStream>,
-    ) -> anyhow::Result<()> {
-        let dtype = self.dtype;
-        let bpe = dtype.bytes_per_element();
-        let per_side_bytes = self.page_size * self.kv_dim * bpe;
-
-        // Download BF16 K/V from GPU
-        let k_host: Vec<half::bf16> = stream.clone_dtoh(k)?;
-        let v_host: Vec<half::bf16> = stream.clone_dtoh(v)?;
-
-        // Quantize based on dtype
-        let (k_q, v_q): (Vec<u8>, Vec<u8>) = match dtype {
-            KvCacheDtype::Fp8E4M3 => (
-                quantize_fp8_e4m3(&k_host),
-                quantize_fp8_e4m3(&v_host),
-            ),
-            KvCacheDtype::Fp8E5M2 => (
-                quantize_fp8_e5m2(&k_host),
-                quantize_fp8_e5m2(&v_host),
-            ),
-            KvCacheDtype::Nvfp4 => {
-                // NVFP4: quantize with block scaling (placeholder — full impl deferred)
-                (quantize_fp8_e4m3(&k_host), quantize_fp8_e4m3(&v_host))
-            }
-            KvCacheDtype::Bf16 => anyhow::bail!("write_fp8 called on Bf16 cache — use BF16 write path instead"),
-        };
-
-        // Calculate byte offsets in the interleaved page pool
-        let page_stride = 2 * self.page_size * self.kv_dim * bpe;
-        let base = page_id * page_stride;
-        let k_offset = base + page_offset * self.kv_dim * bpe;
-        let v_offset = base + per_side_bytes + page_offset * self.kv_dim * bpe;
-
-        // Download current pool, modify, re-upload
-        let mut pool_host: Vec<u8> = stream.clone_dtoh(&self.page_pool)?;
-        let k_len = k_q.len();
-        let v_len = v_q.len();
-        pool_host[k_offset..k_offset + k_len].copy_from_slice(&k_q);
-        pool_host[v_offset..v_offset + v_len].copy_from_slice(&v_q);
-        self.page_pool = stream.clone_htod(&pool_host)?;
-
-        Ok(())
-    }
-
-    /// Read FP8-quantized K/V data from the cache.
-    ///
-    /// Downloads FP8 bytes from the interleaved page pool, dequantizes
-    /// to BF16 on CPU, and uploads the dequantized values to new GPU buffers.
-    ///
-    /// # Arguments
-    /// * `page_id` - Source physical page
-    /// * `page_offset` - Token offset within the page
-    /// * `len` - Number of tokens to read
-    /// * `stream` - CUDA stream for data movement
-    ///
-    /// # Returns
-    /// `(k_gpu, v_gpu)` — dequantized BF16 K and V buffers on GPU
-    pub fn read_fp8(
-        &self,
-        page_id: usize,
-        page_offset: usize,
-        len: usize,
-        stream: &std::sync::Arc<CudaStream>,
-    ) -> anyhow::Result<(CudaSlice<half::bf16>, CudaSlice<half::bf16>)> {
-        let dtype = self.dtype;
-        let bpe = dtype.bytes_per_element();
-        let per_side_elems = self.page_size * self.kv_dim;
-        let per_side_bytes = per_side_elems * bpe;
-        let page_stride = 2 * per_side_elems * bpe;
-        let base = page_id * page_stride;
-        let k_offset = base + page_offset * self.kv_dim * bpe;
-        let v_offset = base + per_side_bytes + page_offset * self.kv_dim * bpe;
-        let read_bytes = len * self.kv_dim * bpe;
-
-        // Download quantized page pool from GPU
-        let pool_host: Vec<u8> = stream.clone_dtoh(&self.page_pool)?;
-
-        let k_q = &pool_host[k_offset..k_offset + read_bytes];
-        let v_q = &pool_host[v_offset..v_offset + read_bytes];
-
-        // Dequantize based on dtype
-        let (k_bf16, v_bf16): (Vec<half::bf16>, Vec<half::bf16>) = match dtype {
-            KvCacheDtype::Fp8E4M3 => (
-                dequantize_fp8_e4m3(k_q),
-                dequantize_fp8_e4m3(v_q),
-            ),
-            KvCacheDtype::Fp8E5M2 => (
-                dequantize_fp8_e5m2(k_q),
-                dequantize_fp8_e5m2(v_q),
-            ),
-            KvCacheDtype::Nvfp4 => {
-                // NVFP4: dequantize with block scales (placeholder — full impl deferred)
-                (dequantize_fp8_e4m3(k_q), dequantize_fp8_e4m3(v_q))
-            }
-            KvCacheDtype::Bf16 => anyhow::bail!("read_fp8 called on Bf16 cache — use BF16 read path instead"),
-        };
-
-        // Upload dequantized BF16 back to GPU
-        let k_gpu = stream.clone_htod(&k_bf16)?;
-        let v_gpu = stream.clone_htod(&v_bf16)?;
-
-        Ok((k_gpu, v_gpu))
     }
 }
 

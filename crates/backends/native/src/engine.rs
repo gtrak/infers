@@ -21,6 +21,7 @@ use crate::gdn::GdnState;
 use infers_kv::PagedKvManager;
 
 use half::bf16;
+use infers_kv::KvCacheDtype;
 use infers_cuda::CudaSlice;
 use infers_model::MtpWeights;
 
@@ -62,6 +63,13 @@ pub struct ForwardEngine {
     /// Paged attention decode kernel. Used by paged pipeline (wiring in progress).
     #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
     paged_attention_decode_kernel: CudaFunction,
+
+    /// FP8 quantize kernel: BF16→FP8 on GPU.
+    #[allow(dead_code)]
+    fp8_quantize_kernel: CudaFunction,
+    /// FP8 dequantize kernel: FP8→BF16 on GPU.
+    #[allow(dead_code)]
+    fp8_dequantize_kernel: CudaFunction,
 
     /// Paged KV cache manager (pool + prefix cache + COW).
     paged_kv_manager: Option<PagedKvManager>,
@@ -122,6 +130,11 @@ impl ForwardEngine {
         let paged_kv_write_kernel = kernels.get_function("infers_paged_kv_write_bf16")?;
         let paged_kv_read_kernel = kernels.get_function("infers_paged_kv_read_bf16")?;
         let paged_attention_decode_kernel = kernels.get_function("infers_paged_attention_decode_bf16")?;
+
+        // Resolve quantization kernel handles
+        let fp8_quantize_kernel = kernels.get_function("infers_fp8_quantize_bf16")?;
+        let fp8_dequantize_kernel = kernels.get_function("infers_fp8_dequantize_bf16")?;
+
         // Create GEMM engine using the first stream
         let default_stream = streams.get(0)
             .ok_or_else(|| anyhow::anyhow!("StreamPool is empty"))?;
@@ -165,6 +178,8 @@ impl ForwardEngine {
             paged_kv_write_kernel,
             paged_kv_read_kernel,
             paged_attention_decode_kernel,
+            fp8_quantize_kernel,
+            fp8_dequantize_kernel,
             paged_kv_manager: None,
             gemm,
             nccl,
@@ -290,6 +305,64 @@ impl ForwardEngine {
         );
 
         Ok(())
+    }
+
+    /// Write FP8-quantized K/V to a page pool using GPU kernels.
+    ///
+    /// GPU-only: quantizes BF16→FP8 on device, copies into page pool via D2D memcpy.
+    /// See [`attention::fp8_quantize_and_write`] for details.
+    pub fn fp8_quantize_and_write(
+        &self,
+        stream: &Arc<CudaStream>,
+        page_pool: &mut CudaSlice<u8>,
+        page_id: usize,
+        page_offset: usize,
+        page_size: usize,
+        kv_dim: usize,
+        dtype: KvCacheDtype,
+        k: &CudaSlice<half::bf16>,
+        v: &CudaSlice<half::bf16>,
+    ) -> Result<()> {
+        crate::attention::fp8_quantize_and_write(
+            stream,
+            &self.fp8_quantize_kernel,
+            page_pool,
+            page_id,
+            page_offset,
+            page_size,
+            kv_dim,
+            dtype,
+            k,
+            v,
+        )
+    }
+
+    /// Read FP8-quantized K/V from a page pool using GPU kernels.
+    ///
+    /// GPU-only: copies from page pool via D2D memcpy, dequantizes FP8→BF16 on device.
+    /// See [`attention::fp8_dequantize_and_read`] for details.
+    pub fn fp8_dequantize_and_read(
+        &self,
+        stream: &Arc<CudaStream>,
+        page_pool: &CudaSlice<u8>,
+        page_id: usize,
+        page_offset: usize,
+        len: usize,
+        page_size: usize,
+        kv_dim: usize,
+        dtype: KvCacheDtype,
+    ) -> Result<(CudaSlice<half::bf16>, CudaSlice<half::bf16>)> {
+        crate::attention::fp8_dequantize_and_read(
+            stream,
+            &self.fp8_dequantize_kernel,
+            page_pool,
+            page_id,
+            page_offset,
+            len,
+            page_size,
+            kv_dim,
+            dtype,
+        )
     }
 
     /// Run paged prefill — writes K/V to paged cache for all layers.

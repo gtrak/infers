@@ -12,6 +12,8 @@ use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelA
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
 use infers_model::{AttentionWeights, WeightData};
 
+use infers_kv::KvCacheDtype;
+
 use crate::add;
 use crate::rope;
 
@@ -1751,4 +1753,217 @@ pub fn decode_forward_paged(
     )?;
 
     Ok(output)
+}
+
+// ── GPU-native FP8 KV cache operations ──────────────────────────────
+
+/// Quantize BF16 K/V to FP8 and write into a `QuantizedKvCache` page pool — GPU-only.
+///
+/// Launches `infers_fp8_quantize_bf16` on K and V, then copies the quantized
+/// bytes into the interleaved page pool via device-to-device memcpy.
+/// No CPU round-trip.
+///
+/// # Arguments
+/// * `stream` — CUDA stream for kernel launches and memcpys
+/// * `quant_kernel` — The `infers_fp8_quantize_bf16` kernel handle
+/// * `page_pool` — Mutable reference to the `QuantizedKvCache` page pool
+/// * `page_id` — Target physical page
+/// * `page_offset` — Token offset within the page
+/// * `page_size` — Page size (tokens per page)
+/// * `kv_dim` — KV dimension
+/// * `dtype` — Quantized data type (Fp8E4M3 or Fp8E5M2)
+/// * `k` — GPU buffer of key values (BF16, length = kv_dim)
+/// * `v` — GPU buffer of value values (BF16, length = kv_dim)
+pub fn fp8_quantize_and_write(
+    stream: &Arc<CudaStream>,
+    quant_kernel: &CudaFunction,
+    page_pool: &mut CudaSlice<u8>,
+    page_id: usize,
+    page_offset: usize,
+    page_size: usize,
+    kv_dim: usize,
+    dtype: KvCacheDtype,
+    k: &CudaSlice<half::bf16>,
+    v: &CudaSlice<half::bf16>,
+) -> Result<()> {
+    let bpe = dtype.bytes_per_element();
+    let elem_count = kv_dim; // one token's worth of K or V
+
+    // Determine FP8 mode from dtype
+    let mode: i32 = match dtype {
+        KvCacheDtype::Fp8E4M3 => 0,
+        KvCacheDtype::Fp8E5M2 => 1,
+        _ => anyhow::bail!("fp8_quantize_and_write requires Fp8E4M3 or Fp8E5M2 dtype"),
+    };
+
+    // Allocate temp GPU buffers for quantized output (1 token's K and V)
+    let mut k_q = stream
+        .alloc_zeros::<u8>(elem_count * bpe)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate temp K quant buffer: {e}"))?;
+    let mut v_q = stream
+        .alloc_zeros::<u8>(elem_count * bpe)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate temp V quant buffer: {e}"))?;
+
+    // Launch quantize kernel on K
+    let grid = ((elem_count as u32 + BLOCK_SIZE as u32 - 1) / BLOCK_SIZE as u32, 1, 1);
+    let block = (BLOCK_SIZE as u32, 1, 1);
+    let launch_cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: 0 };
+
+    let elem_count_i32 = elem_count as i32;
+
+    unsafe {
+        stream
+            .launch_builder(quant_kernel)
+            .arg(k)
+            .arg(&mut k_q)
+            .arg(&elem_count_i32)
+            .arg(&mode)
+            .launch(launch_cfg)
+            .map_err(|e| anyhow::anyhow!("FP8 quantize kernel (K) launch failed: {e}"))?;
+
+        // Launch quantize kernel on V
+        stream
+            .launch_builder(quant_kernel)
+            .arg(v)
+            .arg(&mut v_q)
+            .arg(&elem_count_i32)
+            .arg(&mode)
+            .launch(launch_cfg)
+            .map_err(|e| anyhow::anyhow!("FP8 quantize kernel (V) launch failed: {e}"))?;
+    }
+
+    // Calculate byte offsets in the interleaved page pool
+    let per_side_bytes = page_size * kv_dim * bpe;
+    let page_stride = 2 * per_side_bytes;
+    let base = page_id * page_stride;
+    let k_offset = base + page_offset * kv_dim * bpe;
+    let v_offset = base + per_side_bytes + page_offset * kv_dim * bpe;
+    let copy_bytes = elem_count * bpe;
+
+    // Device-to-device copy quantized K into page pool
+    {
+        let mut dst = page_pool.slice_mut(k_offset..k_offset + copy_bytes);
+        stream
+            .memcpy_dtod(&k_q, &mut dst)
+            .map_err(|e| anyhow::anyhow!("D2D copy K failed: {e}"))?;
+    }
+
+    // Device-to-device copy quantized V into page pool
+    {
+        let mut dst = page_pool.slice_mut(v_offset..v_offset + copy_bytes);
+        stream
+            .memcpy_dtod(&v_q, &mut dst)
+            .map_err(|e| anyhow::anyhow!("D2D copy V failed: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Dequantize FP8 K/V from a `QuantizedKvCache` page pool to BF16 — GPU-only.
+///
+/// Copies FP8 bytes from the interleaved page pool to temp buffers via
+/// device-to-device memcpy, then launches `infers_fp8_dequantize_bf16`.
+/// No CPU round-trip.
+///
+/// # Arguments
+/// * `stream` — CUDA stream for memcpys and kernel launches
+/// * `dequant_kernel` — The `infers_fp8_dequantize_bf16` kernel handle
+/// * `page_pool` — Reference to the `QuantizedKvCache` page pool
+/// * `page_id` — Source physical page
+/// * `page_offset` — Token offset within the page
+/// * `len` — Number of tokens to read
+/// * `page_size` — Page size (tokens per page)
+/// * `kv_dim` — KV dimension
+/// * `dtype` — Quantized data type (Fp8E4M3 or Fp8E5M2)
+///
+/// # Returns
+/// `(k_gpu, v_gpu)` — dequantized BF16 K and V buffers on GPU
+pub fn fp8_dequantize_and_read(
+    stream: &Arc<CudaStream>,
+    dequant_kernel: &CudaFunction,
+    page_pool: &CudaSlice<u8>,
+    page_id: usize,
+    page_offset: usize,
+    len: usize,
+    page_size: usize,
+    kv_dim: usize,
+    dtype: KvCacheDtype,
+) -> Result<(CudaSlice<half::bf16>, CudaSlice<half::bf16>)> {
+    let bpe = dtype.bytes_per_element();
+    let total_elems = len * kv_dim;
+    let total_bytes = total_elems * bpe;
+
+    // Calculate byte offsets
+    let per_side_bytes = page_size * kv_dim * bpe;
+    let page_stride = 2 * per_side_bytes;
+    let base = page_id * page_stride;
+    let k_offset = base + page_offset * kv_dim * bpe;
+    let v_offset = base + per_side_bytes + page_offset * kv_dim * bpe;
+
+    // Allocate temp GPU buffers for quantized reads
+    let mut k_q = stream
+        .alloc_zeros::<u8>(total_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate temp K dequant buffer: {e}"))?;
+    let mut v_q = stream
+        .alloc_zeros::<u8>(total_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate temp V dequant buffer: {e}"))?;
+
+    // Device-to-device copy FP8 bytes from page pool to temp buffers
+    {
+        let src = page_pool.slice(k_offset..k_offset + total_bytes);
+        stream
+            .memcpy_dtod(&src, &mut k_q)
+            .map_err(|e| anyhow::anyhow!("D2D copy K read failed: {e}"))?;
+    }
+    {
+        let src = page_pool.slice(v_offset..v_offset + total_bytes);
+        stream
+            .memcpy_dtod(&src, &mut v_q)
+            .map_err(|e| anyhow::anyhow!("D2D copy V read failed: {e}"))?;
+    }
+
+    // Allocate output BF16 buffers
+    let mut k_out = stream
+        .alloc_zeros::<half::bf16>(total_elems)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate K output buffer: {e}"))?;
+    let mut v_out = stream
+        .alloc_zeros::<half::bf16>(total_elems)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate V output buffer: {e}"))?;
+
+    // Determine FP8 mode
+    let mode: i32 = match dtype {
+        KvCacheDtype::Fp8E4M3 => 0,
+        KvCacheDtype::Fp8E5M2 => 1,
+        _ => anyhow::bail!("fp8_dequantize_and_read requires Fp8E4M3 or Fp8E5M2 dtype"),
+    };
+
+    // Launch dequantize kernel on K
+    let grid = ((total_elems as u32 + BLOCK_SIZE as u32 - 1) / BLOCK_SIZE as u32, 1, 1);
+    let block = (BLOCK_SIZE as u32, 1, 1);
+    let launch_cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: 0 };
+
+    let total_elems_i32 = total_elems as i32;
+
+    unsafe {
+        stream
+            .launch_builder(dequant_kernel)
+            .arg(&k_q)
+            .arg(&mut k_out)
+            .arg(&total_elems_i32)
+            .arg(&mode)
+            .launch(launch_cfg)
+            .map_err(|e| anyhow::anyhow!("FP8 dequantize kernel (K) launch failed: {e}"))?;
+
+        // Launch dequantize kernel on V
+        stream
+            .launch_builder(dequant_kernel)
+            .arg(&v_q)
+            .arg(&mut v_out)
+            .arg(&total_elems_i32)
+            .arg(&mode)
+            .launch(launch_cfg)
+            .map_err(|e| anyhow::anyhow!("FP8 dequantize kernel (V) launch failed: {e}"))?;
+    }
+
+    Ok((k_out, v_out))
 }
