@@ -1068,6 +1068,22 @@ End-to-end integration tests verifying full scheduling flows across module bound
 
 The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable; (8) `test_memory_pressure_triggers_eviction` — end-to-end memory pressure detection when pool is full; (9) `test_evict_restore_round_trip_integration` — evict and restore a sequence through `PagedKvManager` with data integrity verification; (10) `test_lru_eviction_candidate_selection` — LRU eviction selection picks the oldest evictable session; (11) `test_cpu_page_pool_budget_integration` — `CpuPagePool` budget enforcement across store/retrieve cycles. See [[crates/scheduler/tests/integration.rs]].
 
+# Tokenizer
+
+HF `tokenizers` crate wrapper for encoding prompts into token IDs and decoding IDs back to text.
+
+`infers-tokenizer` wraps `tokenizers::Tokenizer` with `anyhow::Result` error handling. The crate provides a single public `Tokenizer` struct with two constructors (`from_file` and `from_pretrained`) and three core methods (`encode`, `decode`, `vocab_size`). It depends on `tokenizers 0.21` with `onig` and `http` features enabled.
+
+## Tokenizer
+
+Wrapper around `tokenizers::Tokenizer` with `anyhow::Result` error handling. See [[crates/tokenizer/src/lib.rs#Tokenizer]].
+
+`Tokenizer` holds a single `inner` field (`tokenizers::Tokenizer`). Implements `Clone`. `from_file(path)` loads from a local `tokenizer.json`. `from_pretrained(model_id)` downloads from HuggingFace Hub. `encode(text)` returns `Vec<u32>` of token IDs with add_special_tokens=true. `decode(tokens)` returns decoded string with skip_special_tokens=false. `vocab_size()` returns vocabulary size with add_special_tokens=true.
+
+## Error Handling
+
+All public methods convert `tokenizers` errors (which return `Box<dyn Error + Send + Sync>`) into `anyhow::Error` via `map_err(|e| anyhow::Error::msg(e.to_string()))`, then attach context using anyhow's `with_context`. See [[crates/tokenizer/src/lib.rs#Tokenizer#from_file]], [[crates/tokenizer/src/lib.rs#Tokenizer#from_pretrained]], [[crates/tokenizer/src/lib.rs#Tokenizer#encode]], [[crates/tokenizer/src/lib.rs#Tokenizer#decode]].
+
 # MTP Verification
 Result types for verifying MTP speculative decoding drafts against the main model.
 

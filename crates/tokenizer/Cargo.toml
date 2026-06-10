@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "http"] }
