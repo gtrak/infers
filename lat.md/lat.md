@@ -751,7 +751,15 @@ Memory budget calculator for estimating VRAM requirements across different quant
 
 ## KV Cache Estimation
 
-`estimate_kv_cache_bytes()` calculates KV cache per GPU based on full attention layers, KV heads, head dimension, and max position embeddings. Only full attention layers use paged KV cache. See [[crates/model/src/budget.rs#MemoryBudget#estimate_kv_cache_bytes]].
+Two estimation modes for KV cache sizing:
+
+### Flat Estimation
+
+`estimate_kv_cache_bytes()` calculates KV cache per GPU based on full attention layers, KV heads, head dimension, and max position embeddings. Allocates max_seq_len for every sequence. See [[crates/model/src/budget.rs#MemoryBudget#estimate_kv_cache_bytes]].
+
+### Paged Estimation
+
+`estimate_paged_kv_cache_bytes()` computes block-based KV cache allocation. Returns [[crates/model/src/budget.rs#PagedKvEstimate]] with page count, bytes, and concurrent session limits. Page-level allocation reduces waste for short sequences and enables sharing across sessions. See [[crates/model/src/budget.rs#MemoryBudget#estimate_paged_kv_cache_bytes]].
 
 ## Concurrent Session Planning
 

@@ -6,6 +6,21 @@ use super::formats::QuantizationFormat;
 /// Default workspace size (4 GB) for activation and temporary buffers.
 const DEFAULT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Result of paged KV cache estimation.
+#[derive(Debug, Clone)]
+pub struct PagedKvEstimate {
+    /// Total number of pages that fit in available KV memory per GPU.
+    pub total_pages_per_gpu: usize,
+    /// Bytes per page (2 * page_size * num_kv_heads * head_dim * bytes_per_element * num_attn_layers).
+    pub page_bytes: usize,
+    /// Total KV cache bytes used per GPU.
+    pub kv_cache_bytes_per_gpu: usize,
+    /// Maximum concurrent sessions given max context length.
+    pub max_concurrent_sessions: usize,
+    /// Number of attention layers using KV cache.
+    pub num_attn_layers: usize,
+}
+
 /// Memory budget estimate for a model configuration.
 #[derive(Debug, Clone)]
 pub struct MemoryBudget {
@@ -139,6 +154,60 @@ impl MemoryBudget {
         // KV cache scales linearly with context length
         let kv_per_session = self.kv_cache_bytes_per_gpu * avg_context_len / self.max_position_embeddings;
         self.available_for_kv / kv_per_session.max(1)
+    }
+
+    /// Estimate paged KV cache bytes per GPU using block-based allocation.
+    ///
+    /// Unlike the flat model which allocates max_seq_len for every sequence,
+    /// the paged model allocates pages on demand. Total page pool size is:
+    /// `num_attn_layers * total_pages_per_gpu * page_size * 2 * kv_per_token_per_layer`
+    ///
+    /// where total_pages_per_gpu = available_kv_memory / page_bytes
+    // @lat: [[lat#Memory Budget#KV Cache Estimation]]
+    pub fn estimate_paged_kv_cache_bytes(
+        config: &ModelConfig,
+        format: QuantizationFormat,
+        _num_gpus: usize,
+        page_size: usize,
+        available_kv_bytes: usize,
+    ) -> PagedKvEstimate {
+        let num_attn_layers = config.num_full_attention_layers();
+
+        let bytes_per_kv_element = match format {
+            QuantizationFormat::PrismaScout | QuantizationFormat::AutoRound => 2,
+            _ => 2,
+        };
+
+        let kv_per_token_per_layer = 2 * config.num_key_value_heads * config.head_dim * bytes_per_kv_element;
+
+        // Bytes per page per layer
+        let page_bytes_per_layer = page_size * kv_per_token_per_layer;
+        // Bytes per page across ALL attention layers (shared pool)
+        let page_bytes = page_bytes_per_layer * num_attn_layers;
+
+        // Total pages that fit in available memory
+        let total_pages_per_gpu = available_kv_bytes / page_bytes.max(1);
+
+        // Actual memory used
+        let kv_cache_bytes_per_gpu = total_pages_per_gpu * page_bytes;
+
+        // Pages needed per session for average context
+        // Each session needs ceil(avg_context / page_size) pages per attention layer
+        // Max concurrent = total_pages / (pages_per_session * num_attn_layers)
+        let pages_per_session_per_layer = (config.max_position_embeddings + page_size - 1) / page_size;
+        let max_concurrent_sessions = if pages_per_session_per_layer > 0 && num_attn_layers > 0 {
+            total_pages_per_gpu / (pages_per_session_per_layer * num_attn_layers)
+        } else {
+            0
+        };
+
+        PagedKvEstimate {
+            total_pages_per_gpu,
+            page_bytes,
+            kv_cache_bytes_per_gpu,
+            max_concurrent_sessions,
+            num_attn_layers,
+        }
     }
 }
 
@@ -292,5 +361,145 @@ mod tests {
 
         // Zero context length should return 0
         assert_eq!(budget.max_concurrent_sessions(0), 0);
+    }
+
+    #[test]
+    fn test_paged_kv_estimate_basic() {
+        let config = qwen3_6_config();
+        let page_size = 16;
+        // 2 * 4 KV heads * 256 head_dim * 2 bytes = 4096 bytes per token per layer
+        let kv_per_token_per_layer = 2 * config.num_key_value_heads * config.head_dim * 2;
+        // page_bytes = page_size * kv_per_token_per_layer * num_attn_layers
+        let expected_page_bytes = page_size * kv_per_token_per_layer * config.num_full_attention_layers();
+
+        let estimate = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            page_size,
+            4 * 1024 * 1024 * 1024, // 4 GB available
+        );
+
+        assert_eq!(estimate.page_bytes, expected_page_bytes, "page_bytes mismatch");
+        assert_eq!(estimate.num_attn_layers, config.num_full_attention_layers());
+    }
+
+    #[test]
+    fn test_paged_kv_estimate_with_budget() {
+        let config = qwen3_6_config();
+        let available = 2 * 1024 * 1024 * 1024; // 2 GB
+
+        let estimate = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            16,
+            available,
+        );
+
+        // total_pages * page_bytes should not exceed available
+        assert!(
+            estimate.kv_cache_bytes_per_gpu <= available,
+            "KV cache bytes {} exceeds available {}",
+            estimate.kv_cache_bytes_per_gpu,
+            available
+        );
+        // total_pages * page_bytes should equal kv_cache_bytes_per_gpu
+        assert_eq!(
+            estimate.total_pages_per_gpu * estimate.page_bytes,
+            estimate.kv_cache_bytes_per_gpu,
+            "KV cache bytes mismatch"
+        );
+    }
+
+    #[test]
+    fn test_paged_kv_estimate_concurrent_sessions() {
+        let config = qwen3_6_config();
+        // page_bytes = 16 * 4096 * 16 = 1,048,576
+        // pages_per_session_per_layer = ceil(262144 / 16) = 16384
+        // One session needs 16384 * 16 = 262,144 pages = 256 GB
+        // Use enough memory for 2 sessions
+        let available = 512 * 1024 * 1024 * 1024; // 512 GB
+
+        let estimate = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            16,
+            available,
+        );
+
+        // Verify max_concurrent_sessions formula
+        let pages_per_session = (config.max_position_embeddings + 16 - 1) / 16;
+        let expected_max = estimate.total_pages_per_gpu / (pages_per_session * estimate.num_attn_layers);
+        assert_eq!(
+            estimate.max_concurrent_sessions, expected_max,
+            "max_concurrent_sessions mismatch"
+        );
+        // Should be at least 2 sessions with 512 GB
+        assert!(
+            estimate.max_concurrent_sessions >= 2,
+            "Should support at least 2 sessions with 512 GB, got {}",
+            estimate.max_concurrent_sessions
+        );
+    }
+
+    #[test]
+    fn test_paged_kv_estimate_page_size_16() {
+        let config = qwen3_6_config();
+        let available = 4 * 1024 * 1024 * 1024; // 4 GB
+
+        let estimate_16 = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            16,
+            available,
+        );
+
+        // page_bytes with size 16
+        let kv_per_token_per_layer = 2 * config.num_key_value_heads * config.head_dim * 2;
+        let expected_page_bytes_16 = 16 * kv_per_token_per_layer * config.num_full_attention_layers();
+        assert_eq!(estimate_16.page_bytes, expected_page_bytes_16);
+
+        // Verify page_bytes is positive
+        assert!(estimate_16.page_bytes > 0, "page_bytes should be positive");
+        // Verify total_pages is positive
+        assert!(estimate_16.total_pages_per_gpu > 0, "total_pages should be positive");
+    }
+
+    #[test]
+    fn test_paged_kv_estimate_page_size_32() {
+        let config = qwen3_6_config();
+        let available = 4 * 1024 * 1024 * 1024; // 4 GB
+
+        let estimate_32 = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            32,
+            available,
+        );
+
+        // page_bytes with size 32
+        let kv_per_token_per_layer = 2 * config.num_key_value_heads * config.head_dim * 2;
+        let expected_page_bytes_32 = 32 * kv_per_token_per_layer * config.num_full_attention_layers();
+        assert_eq!(estimate_32.page_bytes, expected_page_bytes_32);
+
+        // With larger page_size, fewer total pages but each page is bigger
+        let estimate_16 = MemoryBudget::estimate_paged_kv_cache_bytes(
+            &config,
+            QuantizationFormat::Bf16,
+            2,
+            16,
+            available,
+        );
+
+        assert!(
+            estimate_32.page_bytes > estimate_16.page_bytes,
+            "page_bytes for size 32 ({}) should be > size 16 ({})",
+            estimate_32.page_bytes,
+            estimate_16.page_bytes
+        );
     }
 }
