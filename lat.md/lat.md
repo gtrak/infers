@@ -130,6 +130,21 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 - LayerType enum with default pattern (every 4th layer full attention, rest GDN)
 - QuantizationConfig parsing from `quantization_config.json` or embedded config
 
+# Phase 4.5 Deliverables
+Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for attention softmax, KV cache management, and Gated DeltaNet state updates, and wires them into the prefill/decode paths.
+
+- `softmax.cu` + `.cubin`: Online softmax with causal masking (3-phase reduction)
+- `kv_cache.cu` + `.cubin`: Scattered KV cache write with position-based indexing
+- `gdn_update.cu` + `.cubin`: Single-token decode recurrent state update
+- `gdn_prefill.cu` + `.cubin`: Chunked prefill state update across all tokens
+- `attention.rs` wired: per-head weight slicing, QKV/RoPE/KV cache/scores/softmax/O-proj/all-reduce (prefill + decode)
+- `gdn.rs` wired: projection GEMMs, GDN kernel dispatch, output projection (prefill + decode)
+- `prefill.rs` wired: embed → layer loop (norm1 → GDN/attention → residual → norm2 → MLP → residual) → final norm → LM head → sample
+- `decode.rs` wired: embed single token → layer loop (decode variants) → final norm → LM head → sample
+- `engine.rs`: 11 cached CudaFunction handles, per-layer kv_caches and gdn_states, prefill/decode delegation
+- Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
+- `lat check` passes
+
 # Phase 4 Deliverables
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
 
