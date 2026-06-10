@@ -109,6 +109,19 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)
 - Feature propagation: backends/native and parallelism crates forward `cuda` feature to infers-cuda
 
+# Phase 3 Deliverables
+Phase 3 (Model Loading) implements multi-format model loading with auto-detection, weight registry, TP sharding, and memory budgeting.
+
+- Multi-format model loader (`infers-model`) with safetensors support
+- ModelConfig struct for parsing `config.json` with hybrid attention layer types
+- QuantizationFormat auto-detection (GGUF, PrismaSCOUT, AutoRound, BF16)
+- WeightRegistry and WeightData for storing tensors as raw bytes
+- SafetensorsLoader with single-file and sharded index support
+- Weight sharding for TP=2 (column/row parallel) and PP=2 (layer split)
+- MemoryBudget calculator for VRAM estimation across quantization formats
+- LayerType enum with default pattern (every 4th layer full attention, rest GDN)
+- QuantizationConfig parsing from `quantization_config.json` or embedded config
+
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
 
@@ -225,19 +238,27 @@ Config parser and quantization format auto-detection for the infers-model crate.
 
 ## ModelConfig
 
-Parsed from `config.json` with architecture parameters and hybrid attention layer types.
+Parsed from `config.json` with architecture parameters and hybrid attention layer types. See [[crates/model/src/config.rs#ModelConfig]].
+
+### Key Fields
+
+Fields include `num_hidden_layers`, `hidden_size`, `intermediate_size`, `vocab_size`, attention heads, `head_dim`, `max_position_embeddings`, and MTP configuration.
+
+### LayerType Enum
+
+`LayerType` has two variants: `GatedDeltaNet` for linear attention and `FullAttention` for softmax attention. See [[crates/model/src/config.rs#LayerType]].
 
 ### Layer Type Pattern
 
-Default pattern: every 4th layer is full attention, others use GDN linear attention.
+Default pattern: every 4th layer (1-indexed) is full attention, others use GDN linear attention.
 
 ## Quantization Format Detection
 
-Auto-detects quantization format from model directory contents.
+`QuantizationFormat` enum with `Bf16`, `PrismaScout`, `AutoRound`, and `Gguf` variants. Auto-detection checks for `.gguf` files, `quantization_config.json`, and embedded config. See [[crates/model/src/formats.rs#QuantizationFormat]].
 
 ## QuantizationConfig
 
-Parsed from quantization config JSON with arbitrary format-specific fields.
+Parsed from quantization config JSON with arbitrary format-specific fields. See [[crates/model/src/formats.rs#QuantizationConfig]].
 
 # Weight Registry and Tensors
 

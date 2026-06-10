@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use super::config::LayerType;
 
 /// Raw tensor data with shape metadata, stored as bytes until GPU upload.
+// @lat: [[lat#Weight Registry and Tensors#WeightData]]
 #[derive(Debug, Clone)]
 pub struct WeightData {
     /// Raw tensor bytes (BF16, FP16, INT4 packed, or NVFP4 packed).
@@ -120,6 +121,7 @@ pub struct MtpWeights {
 }
 
 /// Complete model weight registry.
+// @lat: [[lat#Weight Registry and Tensors#WeightRegistry]]
 #[derive(Debug, Clone)]
 pub struct WeightRegistry {
     /// Token embedding weights.

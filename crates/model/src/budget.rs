@@ -20,6 +20,7 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     /// Calculate memory budget for a given model, quant format, and GPU config.
+    // @lat: [[lat#Memory Budget#Budget Calculation]]
     pub fn calculate(
         config: &ModelConfig,
         quant_format: QuantizationFormat,
@@ -53,6 +54,7 @@ impl MemoryBudget {
     }
 
     /// Estimate total weight size in bytes for the given quant format.
+    // @lat: [[lat#Memory Budget#Weight Size Estimation]]
     pub fn estimate_weight_bytes(config: &ModelConfig, format: QuantizationFormat) -> usize {
         // Rough estimate based on parameter count and quantization
         let vocab_size = config.vocab_size;
@@ -97,6 +99,7 @@ impl MemoryBudget {
     }
 
     /// Estimate KV cache bytes per GPU for full context.
+    // @lat: [[lat#Memory Budget#KV Cache Estimation]]
     fn estimate_kv_cache_bytes(
         config: &ModelConfig,
         format: QuantizationFormat,
@@ -122,6 +125,7 @@ impl MemoryBudget {
     }
 
     /// Estimate maximum concurrent sessions given average context length.
+    // @lat: [[lat#Memory Budget#Concurrent Session Planning]]
     pub fn max_concurrent_sessions(&self, avg_context_len: usize) -> usize {
         if self.kv_cache_bytes_per_gpu == 0 || avg_context_len == 0 {
             return 0;

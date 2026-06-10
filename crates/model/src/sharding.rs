@@ -12,6 +12,7 @@ use super::weights::{WeightData, WeightShard};
 ///
 /// Column-parallel: Q, K, V, gate, up projections are split along the output dimension.
 /// Row-parallel: O, down projections are replicated on each GPU.
+// @lat: [[lat#Weight Sharding#Tensor Parallelism Sharding]]
 pub fn shard_weights_tp(
     registry: &super::weights::WeightRegistry,
     _config: &ModelConfig,
@@ -81,6 +82,7 @@ pub enum ShardType {
 }
 
 /// Determine sharding type for a weight tensor by its name.
+// @lat: [[lat#Weight Sharding#Shard Type Detection]]
 fn determine_shard_type(name: &str) -> ShardType {
     // Column-parallel: projections that produce per-head outputs
     if name.contains("q_proj") || name.contains("k_proj") || name.contains("v_proj") {
@@ -175,6 +177,7 @@ fn slice_weight_last_dim(weight: &WeightData, gpu_id: usize, num_gpus: usize) ->
 }
 
 /// Split model layers across pipeline stages for PP=2.
+// @lat: [[lat#Weight Sharding#Pipeline Parallelism Split]]
 ///
 /// Stage 0: layers 0 to (num_layers / 2 - 1)
 /// Stage 1: layers (num_layers / 2) to (num_layers - 1)

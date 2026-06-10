@@ -37,6 +37,7 @@ pub struct LoadedModel {
 }
 
 /// Load a model from a directory.
+// @lat: [[lat#Safetensors Loader#Loading Pipeline]]
 ///
 /// This is the main entry point for model loading. It:
 /// 1. Reads config.json
@@ -64,6 +65,7 @@ pub fn load_model(model_dir: &Path) -> Result<LoadedModel> {
 }
 
 /// Load all safetensors files from a model directory.
+// @lat: [[lat#Safetensors Loader#Single vs Sharded]]
 ///
 /// Handles both single-file (`model.safetensors`) and sharded
 /// (`model.safetensors.index.json` + multiple shard files) formats.
