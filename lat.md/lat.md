@@ -218,3 +218,23 @@ Returns an SSE stream of `ChatCompletionChunk` objects following the OpenAI stre
 4. **[DONE]**: Final SSE event signaling stream completion
 
 Each chunk includes the same request ID, timestamp, and model name.
+
+# Model Config and Format Detection
+
+Config parser and quantization format auto-detection for the infers-model crate. Parses HuggingFace `config.json` to extract Qwen3.6-27B architecture parameters and auto-detects weight quantization format from model directory contents.
+
+## ModelConfig
+
+Parsed from `config.json` with architecture parameters and hybrid attention layer types.
+
+### Layer Type Pattern
+
+Default pattern: every 4th layer is full attention, others use GDN linear attention.
+
+## Quantization Format Detection
+
+Auto-detects quantization format from model directory contents.
+
+## QuantizationConfig
+
+Parsed from quantization config JSON with arbitrary format-specific fields.
