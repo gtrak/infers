@@ -13,6 +13,7 @@ use crate::queue::{Request, RequestQueue};
 use crate::session::{Session, SessionState};
 
 /// The output of a single scheduling iteration.
+#[derive(Debug)]
 pub struct ScheduledWork {
     /// Decode batch: active sessions needing single-token generation.
     pub decode_batch: DecodeBatch,
@@ -27,6 +28,7 @@ pub struct ScheduledWork {
 /// 2. Removes completed sessions and frees their KV resources
 /// 3. Builds a decode batch from active sessions
 /// 4. If the decode batch has room, prefills a new session
+#[derive(Debug)]
 pub struct RoundRobinScheduler {
     /// Incoming request queue (priority-ordered).
     pub request_queue: RequestQueue,
@@ -103,10 +105,11 @@ impl RoundRobinScheduler {
                 None => break,
             };
 
+            let request_id = request.id;
             match self.create_session(request) {
                 Ok(session) => self.active_sessions.push(session),
-                Err(_e) => {
-                    // Log and drop the request on creation failure
+                Err(e) => {
+                    eprintln!("Failed to create session for request {request_id}: {e:?}");
                 }
             }
         }
@@ -135,7 +138,7 @@ impl RoundRobinScheduler {
         // Create KV sequence and allocate pages for prompt tokens
         let seq_id = self.kv_manager.create_sequence();
         let page_size = self.kv_manager.page_size();
-        let num_pages = (num_prompt_tokens + page_size - 1) / page_size;
+        let num_pages = num_prompt_tokens.div_ceil(page_size);
         for _ in 0..num_pages {
             self.kv_manager
                 .append_page(seq_id)

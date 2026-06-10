@@ -24,6 +24,7 @@ pub struct DecodeBatch {
 }
 
 /// Constructs decode and prefill batches from session state.
+#[derive(Debug)]
 pub struct BatchBuilder {
     /// Maximum number of sessions in a single batch.
     pub max_batch_size: usize,
