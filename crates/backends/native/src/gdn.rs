@@ -1,7 +1,7 @@
 //! Gated DeltaNet (GDN) forward pass.
 //!
 //! Implements the recurrent linear-attention layer used in the hybrid
-//! attention pattern. Uses FlashInfer-style GDN kernels for state update.
+//! attention pattern. Uses custom CUDA GDN kernels for state update.
 
 use std::sync::Arc;
 

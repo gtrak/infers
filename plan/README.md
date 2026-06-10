@@ -33,7 +33,7 @@ Rust Host (cuda-oxide orchestration)
   └─ Server: axum HTTP
 
 CUDA Kernels
-  ├─ FlashInfer: GDN prefill/decode, standard attention
+  ├─ Custom CUDA kernels: GDN prefill/decode, standard attention
   ├─ cuBLASLt: GEMM (NVFP4, FP16, BF16)
   ├─ Custom: RMSNorm, RoPE, INT4 dequant
   └─ llama.cpp: GGUF backend
@@ -44,7 +44,7 @@ CUDA Kernels
 | Phase | Duration | Description | Key Deliverable |
 |-------|----------|-------------|-----------------|
 | [Phase 1](phase-1-bootstrap.md) | 2 weeks | Workspace, crates, API types, server scaffold | Running HTTP server with mock responses |
-| [Phase 2](phase-2-cuda-backend.md) | 2 weeks | CUDA runtime, kernel compilation, memory allocator | Loaded FlashInfer kernels on GPU |
+| [Phase 2](phase-2-cuda-backend.md) | 2 weeks | CUDA runtime, kernel compilation, memory allocator | Loaded custom CUDA kernels on GPU |
 | [Phase 3](phase-3-model-loading.md) | 3 weeks | Multi-format loader, weight sharding, memory budget | Weights loaded and sharded for TP=2 |
 | [Phase 4](phase-4-tp-forward.md) | 3 weeks | Single GPU forward pass with GDN + standard attention | Correct token generation |
 | [Phase 5](phase-5-pp-microbatching.md) | 3 weeks | Pipeline parallelism with microbatching | PP=2 producing correct results |
@@ -59,9 +59,9 @@ CUDA Kernels
 
 | Document | Contents |
 |----------|----------|
-| [architecture.md](research/architecture.md) | Qwen3.6-27B architecture, hybrid attention, FlashInfer kernels |
+| [architecture.md](research/architecture.md) | Qwen3.6-27B architecture, hybrid attention |
 | [quantization.md](research/quantization.md) | PrismaSCOUT, AutoRound, GGUF formats, memory calculations |
-| [kernels.md](research/kernels.md) | FlashInfer GDN + standard attention, compilation pipeline |
+| [kernels.md](research/kernels.md) | Kernel compilation strategy (deprecated — custom kernels used instead) |
 | [api.md](research/api.md) | OpenAI chat completions API, tool calls, SSE streaming |
 | [parallelism.md](research/parallelism.md) | TP=2, PP=2, NCCL, P2P, memory distribution |
 
@@ -121,7 +121,7 @@ See individual phase documents for detailed decisions. Key ones:
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| FlashInfer GDN kernels Python-bound | High | High | Extract .cu files from vLLM |
+| Custom CUDA kernel development | Medium | Medium | Prototype early, benchmark against targets |
 | cuda-oxide alpha breakage | Medium | High | Pin to specific commit |
 | llama.cpp Qwen3.6 support | Low | Medium | Verify before Phase 8 |
 | 2× RTX 5060 Ti insufficient for 262K | Medium | High | Benchmark early, limit context |

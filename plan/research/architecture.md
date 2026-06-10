@@ -75,30 +75,27 @@ Result: 48 GDN layers, 16 full attention layers.
 **Key characteristics:**
 - Standard transformer attention
 - Uses Paged KV cache
-- Supports FlashInfer kernels
+- Supports custom CUDA kernels
 - Evictable to CPU/SSD
 
 **vLLM implementation:** `vllm/model_executor/models/qwen3_next.py`
 
-## FlashInfer Kernel Support
+## Custom CUDA Kernel Support
 
-From vLLM codebase (`../vllm/`):
+The project uses custom CUDA kernels compiled and loaded via the infers kernel pipeline.
 
 ### GDN Kernels
 
-**Prefill:** `flashinfer.gdn_prefill.chunk_gated_delta_rule`  
-**Decode:** `fused_sigmoid_gating_delta_rule_update`  
+**Prefill:** `infers_gdn_prefill_bf16` (custom CUDA kernel)  
+**Decode:** `infers_gdn_update_bf16` (custom CUDA kernel)
 
-**Backend selection (from `qwen_gdn_linear_attn.py` lines 150-211):**
-1. **FlashInfer** — default on CUDA, requires `head_k_dim == 128` for Blackwell
-2. **CuteDSL** — opt-in for Blackwell with `head_k_dim == 128`
-3. **Triton/FLA** — fallback
+### Standard Attention
 
-### Standard Attention Kernels
+Custom attention kernels are implemented for prefill/decode paths using per-head weight slicing and online softmax.
 
-**Prefill:** `BatchPrefillWithPagedKVCache`  
-**Decode:** `BatchDecodeWithPagedKVCache`  
-**Sampling:** `top_k_sampling_from_probs`, `top_p_sampling_from_probs`  
+### Sampling
+
+Custom argmax sampling kernel (`infers_argmax_f32`) with greedy strategy.  
 
 ## KV Cache Requirements
 
@@ -189,7 +186,7 @@ struct HybridKvManager {
 
 1. Qwen3.6 Model Card: https://huggingface.co/Qwen/Qwen3.6-27B
 2. vLLM Qwen3.6 Implementation: `../vllm/vllm/model_executor/models/qwen3_next.py`
-3. FlashInfer GDN: `../vllm/vllm/model_executor/layers/mamba/gdn/`
+3. vLLM GDN Implementation: `../vllm/vllm/model_executor/layers/mamba/gdn/`
 4. vLLM Attention Backends: `../vllm/vllm/v1/attention/backends/`
 
 ## Cross-References

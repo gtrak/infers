@@ -5,9 +5,9 @@
 
 ## Deliverables
 
-1. GDN prefill kernel integration (FlashInfer)
-2. GDN decode kernel integration (FlashInfer)
-3. Standard attention prefill/decode (FlashInfer)
+1. GDN prefill kernel integration (custom CUDA kernels)
+2. GDN decode kernel integration (custom CUDA kernels)
+3. Standard attention prefill/decode (custom CUDA kernels)
 4. Layer dispatch based on `layer_type`
 5. GEMM via cuBLASLt (NVFP4, FP16, BF16)
 6. NCCL all-reduce after attention/MLP
@@ -149,7 +149,7 @@ fn gdn_forward(
 }
 ```
 
-### GDN Prefill (FlashInfer)
+### GDN Prefill (Custom CUDA Kernels)
 
 ```rust
 fn gdn_prefill(
@@ -230,7 +230,7 @@ fn attention_forward(
             // Write KV to paged cache
             self.write_kv_cache(&k_rot, &v_rot, &kv_blocks, layer_idx)?;
             
-            // FlashInfer prefill
+            // Custom CUDA kernel prefill
             let attn_out = self.flashinfer_prefill(&q_rot, &kv_blocks)?;
             
             // Update session KV metadata
@@ -243,7 +243,7 @@ fn attention_forward(
             let kv_block = session.get_kv_block(layer_idx, session.current_position())?;
             self.append_kv_cache(&k_rot, &v_rot, &kv_block, layer_idx)?;
             
-            // FlashInfer decode
+            // Custom CUDA kernel decode
             let attn_out = self.flashinfer_decode(&q_rot, &kv_block)?;
             
             attn_out
@@ -382,7 +382,7 @@ Continuous batching will call `prefill` and `decode` in loops.
 
 ## Cross-References
 
-- **Research:** See `../research/kernels.md` for FlashInfer kernel signatures
+- **Research:** See `../research/kernels.md` for kernel compilation strategy (deprecated FlashInfer notes)
 - **Research:** See `../research/parallelism.md` for TP synchronization details
 - **Phase 2:** Uses compiled kernels and CUDA runtime
 - **Phase 3:** Uses loaded weights and config

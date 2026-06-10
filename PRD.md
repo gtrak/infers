@@ -88,7 +88,7 @@ Layers:
 
 ### Kernels
 
-- FlashInfer: Gated DeltaNet + standard PagedAttention (extract .cu files from vLLM)
+- Custom CUDA kernels: GDN prefill/decode, attention, RMSNorm, RoPE, sampling
 - cuBLASLt: GEMM (supports NVFP4 on Blackwell)
 - llama.cpp: GGUF backend via FFI
 
@@ -109,7 +109,7 @@ crates/
   kv/          # Hybrid KV cache (Mamba state + paged blocks), quantization
   model/       # Multi-format loader (safetensors/GGUF), config.json, weight registry
   backends/
-    native/    # FlashInfer + cuBLASLt (PrismaSCOUT, AutoRound, BF16)
+    native/    # Custom CUDA kernels + cuBLASLt (PrismaSCOUT, AutoRound, BF16)
     gguf/      # llama.cpp wrapper (GGUF models)
   cuda/        # Tensor orchestration, cuda-oxide runtime, kernel launching
   parallelism/ # TP=2 and PP=2 implementations
@@ -195,7 +195,7 @@ struct PagedKvCache {
 }
 ```
 
-- Standard FlashInfer PagedAttention
+- Standard attention with custom CUDA kernels
 - Supports GPU → CPU → SSD eviction
 - Block size: 16 tokens (configurable)
 
@@ -210,16 +210,15 @@ Format selectable at startup via `--kv-cache-dtype`
 
 ---
 
-# 8. FlashInfer Kernel Integration
+# 8. Custom CUDA Kernel Integration
 
-Strategy: Extract `.cu` / `.cuh` files from local vLLM (`../vllm/`), compile to `.cubin` with nvcc, load via cuda-oxide.
+Strategy: Write custom CUDA kernels in `crates/cuda/kernels/infers/`, compile to `.cubin` with nvcc, load at runtime via cudarc.
 
 Kernels:
-- GDN prefill: `chunk_gated_delta_rule`
-- GDN decode: `fused_sigmoid_gating_delta_rule_update`
-- Standard prefill: `BatchPrefillWithPagedKVCache`
-- Standard decode: `BatchDecodeWithPagedKVCache`
-- Sampling: `top_k_sampling_from_probs`, `top_p_sampling_from_probs`
+- GDN prefill: `infers_gdn_prefill_bf16`
+- GDN decode: `infers_gdn_update_bf16`
+- Attention: custom softmax + KV cache kernels
+- Sampling: `infers_argmax_f32`
 
 ---
 
@@ -535,7 +534,7 @@ Expected: 2 weeks
 ## Phase 2: CUDA Backend
 
 - cuda-oxide workspace setup
-- FlashInfer kernel compilation pipeline
+- Custom CUDA kernel compilation pipeline
 - cudarc cuBLASLt + NCCL
 - Memory allocator
 
@@ -552,8 +551,8 @@ Expected: 3 weeks
 
 ## Phase 4: TP=2 Forward Pass
 
-- GDN prefill/decode (FlashInfer)
-- Standard attention prefill/decode (FlashInfer)
+- GDN prefill/decode (custom CUDA kernels)
+- Standard attention prefill/decode (custom CUDA kernels)
 - Layer dispatch per `layer_type`
 - GEMM: cuBLASLt (NVFP4, FP16, BF16)
 - NCCL all-reduce
@@ -670,7 +669,7 @@ The server exists solely to run Qwen3.6-27B efficiently on a fixed hardware conf
 | GGUF dequant | On-the-fly in llama.cpp kernels |
 | AutoRound dequant | On-the-fly in custom INT4 GEMM kernels (weights stay packed in VRAM) |
 | CUDA orchestration | cuda-oxide (NVlabs workspace) + cudarc |
-| Math kernels | FlashInfer (GDN + standard attention), cuBLASLt (GEMM) |
+| Math kernels | Custom CUDA kernels (GDN + standard attention), cuBLASLt (GEMM) |
 | API | OpenAI-compatible only |
 | Vision | Text-only |
 | Thinking tokens | Stream as regular content |

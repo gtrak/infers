@@ -1,14 +1,14 @@
 # Phase 2: CUDA Backend
 
 **Duration:** 2 weeks  
-**Goal:** Set up CUDA runtime, compile FlashInfer kernels, and establish the kernel launching pipeline.
+**Goal:** Set up CUDA runtime, compile custom CUDA kernels, and establish the kernel launching pipeline.
 
 ## Deliverables
 
 1. cuda-oxide workspace integration (`cuda-core`, `cuda-async`, `cuda-host`)
 2. cudarc cuBLASLt bindings
 3. NCCL communicator setup for 2 GPUs
-4. FlashInfer kernel compilation pipeline
+4. Custom CUDA kernel compilation pipeline
 5. Kernel loading test (load `.cubin` via cuda-oxide)
 6. Memory allocator (GPU block pool, pinned host buffers)
 7. Stream management for 2 GPUs
@@ -165,27 +165,19 @@ impl NcclCommunicator {
 }
 ```
 
-### FlashInfer Kernel Compilation Pipeline
+### Custom CUDA Kernel Compilation Pipeline
 
-**Step 1: Extract kernels from vLLM**
+**Step 1: Compile custom kernel source**
 
 ```bash
-#!/bin/bash
-# scripts/extract-kernels.sh
+# scripts/compile-kernels.sh
+# NOTE: Project uses custom CUDA kernels in kernels/infers/
+# No extraction from vLLM needed
 
-VLLM_DIR="../vllm"
-KERNEL_DIR="kernels"
+KERNEL_DIR="kernels/infers"
+COMPILED_DIR="kernels/compiled"
 
-mkdir -p $KERNEL_DIR/flashinfer-gdn
-mkdir -p $KERNEL_DIR/flashinfer-attn
-
-# Extract GDN kernels
-cp $VLLM_DIR/vllm/model_executor/layers/mamba/gdn/*.cu $KERNEL_DIR/flashinfer-gdn/
-cp -r $VLLM_DIR/vllm/model_executor/layers/mamba/gdn/include/* $KERNEL_DIR/flashinfer-gdn/
-
-# Extract standard attention kernels
-cp $VLLM_DIR/vllm/v1/attention/backends/flashinfer.py $KERNEL_DIR/flashinfer-attn/
-# (Note: actual .cu files are in vLLM's FlashInfer submodule)
+mkdir -p $COMPILED_DIR
 ```
 
 **Step 2: Build script (`crates/cuda/build.rs`)**
@@ -196,42 +188,18 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=kernels/");
     
-    let cuda_arch = "sm_100";  // Blackwell (RTX 5060 Ti)
-    
-    // Compile GDN prefill kernel
-    compile_kernel(
-        "kernels/flashinfer-gdn/gdn_prefill.cu",
-        "gdn_prefill.cubin",
-        cuda_arch,
-    );
-    
-    // Compile GDN decode kernel
-    compile_kernel(
-        "kernels/flashinfer-gdn/gdn_decode.cu",
-        "gdn_decode.cubin",
-        cuda_arch,
-    );
-    
-    // Compile standard attention prefill
-    compile_kernel(
-        "kernels/flashinfer-attn/batch_prefill.cu",
-        "batch_prefill.cubin",
-        cuda_arch,
-    );
-    
-    // Compile standard attention decode
-    compile_kernel(
-        "kernels/flashinfer-attn/batch_decode.cu",
-        "batch_decode.cubin",
-        cuda_arch,
-    );
-    
-    // Compile sampling kernels
-    compile_kernel(
-        "kernels/flashinfer-attn/sampling.cu",
-        "sampling.cubin",
-        cuda_arch,
-    );
+    let cuda_arch = std::env::var("INFERS_CUDA_ARCH").unwrap_or_else(|_| "sm_120".to_string());
+
+    // Compile all custom kernels from kernels/infers/
+    let kernel_dir = Path::new("kernels/infers");
+    if kernel_dir.exists() {
+        for entry in fs::read_dir(kernel_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension() == Some(OsStr::new("cu")) {
+                compile_kernel(&path, &cuda_arch);
+            }
+        }
+    }
 }
 
 fn compile_kernel(src: &str, output: &str, arch: &str) {
@@ -440,7 +408,7 @@ CUDA runtime will be used by model loading for device memory allocation.
 ## Success Criteria
 
 1. cuda-oxide and cudarc coexist without context conflicts
-2. FlashInfer kernels compile to `.cubin` without errors
+2. Custom CUDA kernels compile to `.cubin` without errors
 3. All `.cubin` files load successfully at runtime
 4. cuBLASLt GEMM works for FP16 matrices
 5. NCCL all-reduce works across 2 GPUs
@@ -449,7 +417,7 @@ CUDA runtime will be used by model loading for device memory allocation.
 
 ## Cross-References
 
-- **Research:** See `../research/kernels.md` for FlashInfer kernel details
+- **Research:** See `../research/kernels.md` for kernel compilation strategy (deprecated FlashInfer notes)
 - **Research:** See `../research/parallelism.md` for NCCL usage in TP/PP
 - **Phase 3:** Model loader will use `GpuAllocator` for weight loading
 - **Phase 4:** Forward pass will use `KernelRegistry`

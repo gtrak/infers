@@ -14,7 +14,7 @@ Workspace contains 12 crates across server, API, inference backend, and utility 
 | infers-scheduler | crates/scheduler | Session lifecycle, batch construction |
 | infers-kv | crates/kv | Hybrid KV state manager |
 | infers-model | crates/model | Multi-format model loader |
-| infers-backend-native | crates/backends/native | FlashInfer + cuBLASLt backend |
+| infers-backend-native | crates/backends/native | Custom CUDA kernels + cuBLASLt backend |
 | infers-backend-gguf | crates/backends/gguf | llama.cpp backend |
 | infers-cuda | crates/cuda | cuda-oxide + cudarc hybrid |
 | infers-parallelism | crates/parallelism | TP=2 and PP=2 implementations |
@@ -64,8 +64,8 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 
 | Directory | Contents |
 |-----------|----------|
-| `flashinfer-gdn/` | Reserved for future GDN kernel source |
-| `flashinfer-attn/` | Reserved for future attention kernel source |
+| `flashinfer-gdn/` | Reserved for future custom GDN kernel source |
+| `flashinfer-attn/` | Reserved for future custom attention kernel source |
 | `infers/` | Custom CUDA kernel source (.cu, .cuh) for inference operations |
 | `compiled/` | Compiled .cubin output from nvcc |
 
@@ -117,7 +117,7 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
 - CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, gdn_update.cu, gdn_prefill.cu, common.cuh
-- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for future integration
+- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 
 # Phase 3 Deliverables
 Phase 3 (Model Loading) implements multi-format model loading with auto-detection, weight registry, TP sharding, and memory budgeting.

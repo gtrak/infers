@@ -1,4 +1,6 @@
-# Kernel Strategy Research
+# DEPRECATED: Kernel Strategy Research
+
+> **DEPRECATED:** This research document describes FlashInfer which is no longer planned for integration. The project uses custom CUDA kernels in `kernels/infers/`.
 
 ## Kernel Sources
 

@@ -25,7 +25,7 @@ crates/
   kv/                  # Hybrid KV state manager
   model/               # Multi-format model loader
   backends/
-    native/            # FlashInfer + cuBLASLt backend
+    native/            # Custom CUDA kernels + cuBLASLt backend
     gguf/              # llama.cpp backend
   cuda/                # cuda-oxide + cudarc hybrid
   parallelism/         # TP=2 and PP=2 implementations
