@@ -260,7 +260,7 @@ Custom error type for manager operations using thiserror.
 
 ## Completed
 
-Types and tests shipped for Phase 4.6 paged KV foundations.
+Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundations.
 
 - `infers-kv` crate: `PhysicalPage`, `PageId`, `SequencePageTable` types with 11 unit tests
 - `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
@@ -271,14 +271,47 @@ Types and tests shipped for Phase 4.6 paged KV foundations.
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension
+- `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection), `forward_paged` (paged KV write + per-head GEMM attention)
+- `infers-backend-native` now depends on `infers-kv` crate
+
+## Paged Attention Implementation
+
+Paged attention functions and types in `attention.rs` for zero CPU round-trip decode.
+
+### PagedKvCache
+
+GPU-side paged KV cache replacing flat contiguous buffers. See [[crates/backends/native/src/attention.rs#PagedKvCache]].
+
+Unlike `KvCache` which allocates `[2 * max_seq_len * kv_dim]` for a flat buffer, `PagedKvCache` allocates `[num_pages * 2 * page_size * kv_dim]` for the interleaved page layout. Per-page layout: `[K tokens | V tokens]`, each side = `page_size * kv_dim` elements. Uses lazy allocation via `ensure_allocated()`.
+
+### Paged Kernel Dispatch
+
+Three dispatch functions for paged attention CUDA kernels.
+
+`paged_kv_write()` launches `infers_paged_kv_write_bf16` with grid `(seq_len * kv_dim + 255) / 256`, block `(256, 1, 1)` — writes K and V into paged cache using block-table address translation. See [[crates/backends/native/src/attention.rs#paged_kv_write]].
+
+`paged_kv_read()` launches `infers_paged_kv_read_bf16` with grid `(num_cached_tokens * kv_dim + 255) / 256`, block `(256, 1, 1)` — gathers K and V from page pool into contiguous output buffers for GEMM consumption. See [[crates/backends/native/src/attention.rs#paged_kv_read]].
+
+`paged_attention_decode()` launches `infers_paged_attention_decode_bf16` with grid `(num_kv_heads, 1, 1)`, block `(256, 1, 1)`, shared memory `3 * 256 * 4 = 3072` bytes — one block per KV head, computes full decode attention (score, softmax, V accumulation) in a single kernel call. See [[crates/backends/native/src/attention.rs#paged_attention_decode]].
+
+### Paged Decode Forward
+
+Zero CPU round-trip decode attention. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].
+
+Computes single-token K/V via GEMM, applies RoPE, writes to paged cache, computes Q with RoPE, launches paged attention decode kernel for full attention computation, then applies O-projection via a single GEMM. Replaces the per-head loop that required CPU download/re-upload of KV cache data.
+
+### Paged Prefill Forward
+
+Prefill with paged KV cache write. See [[crates/backends/native/src/attention.rs#forward_paged]].
+
+Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once).
 
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
-- attention.rs rewrite: paged decode with zero CPU round-trips
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
-- engine.rs integration: wire `PagedKvManager` into ForwardEngine dispatch loop
+- engine.rs integration: wire `PagedKvManager` into ForwardEngine dispatch loop (Task 10)
 - Stress tests and benchmark suite
 
 # Phase 4 Deliverables
