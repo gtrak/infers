@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use infers_api::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     Choice, ChunkChoice, Delta, FunctionCall, FunctionCallDelta, MessageContent,
-    ToolCall, ToolCallDelta, Usage, SSE_DONE,
+    QwenChatTemplate, ToolCall, ToolCallDelta, Usage, SSE_DONE,
 };
 use crate::state::SharedState;
 
@@ -24,15 +24,30 @@ pub async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
 
-    // Extract tool name from request (if tools provided) before req is consumed
-    let tool_name = req
-        .tools
-        .as_ref()
-        .and_then(|t| t.first())
-        .map(|t| t.function.name.clone());
+    // Build QwenChatTemplate from chat_template_kwargs
+    let template = build_template_from_kwargs(&req);
+
+    // Apply template to format the prompt (useful for engine integration / logging)
+    let _formatted_prompt = template.apply(
+        &req.messages,
+        req.tools.as_deref(),
+    );
+
+    // Determine whether tools should be used, respecting enable_auto_tool_choice
+    let should_use_tools = should_use_tools(&req);
+
+    // Extract tool name if tools will be used
+    let tool_name = if should_use_tools {
+        req.tools
+            .as_ref()
+            .and_then(|t| t.first())
+            .map(|t| t.function.name.clone())
+    } else {
+        None
+    };
 
     if req.stream {
-        if let Some(name) = tool_name.clone() {
+        if let Some(name) = tool_name {
             let stream = create_mock_tool_call_stream(state.model_name.clone(), now, name);
             let sse = Sse::new(stream).keep_alive(
                 axum::response::sse::KeepAlive::new()
@@ -48,8 +63,8 @@ pub async fn chat_completions(
             Ok(sse.into_response())
         }
     } else {
-        if let Some(name) = tool_name.clone() {
-            let response = create_mock_tool_call_response(&state.model_name, now, &name);
+        if let Some(ref name) = tool_name {
+            let response = create_mock_tool_call_response(&state.model_name, now, name);
             Ok(Json(response).into_response())
         } else {
             let response = ChatCompletionResponse {
@@ -76,6 +91,56 @@ pub async fn chat_completions(
             Ok(Json(response).into_response())
         }
     }
+}
+
+/// Determine whether tools should be used based on request parameters.
+///
+/// Respects `enable_auto_tool_choice`: when false, tools are only activated
+/// if `tool_choice` explicitly requires them (i.e., is not "none"). When true
+/// (default), tools are automatically available for the model to call.
+fn should_use_tools(req: &ChatCompletionRequest) -> bool {
+    let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
+    if !has_tools {
+        return false;
+    }
+
+    // If tool_choice is explicitly set to a string other than "none", use tools
+    if let Some(tool_choice) = &req.tool_choice {
+        match tool_choice {
+            infers_api::ToolChoice::String(s) if s == "none" => return false,
+            _ => return true,
+        }
+    }
+
+    // Otherwise, use tools only if enable_auto_tool_choice is true
+    req.enable_auto_tool_choice
+}
+
+/// Build a QwenChatTemplate from the request's chat_template_kwargs.
+///
+/// Reads `enable_thinking` (default: true) and `preserve_thinking` (default: false)
+/// from the chat_template_kwargs JSON object. Falls back to defaults if kwargs
+/// are absent or malformed.
+fn build_template_from_kwargs(req: &ChatCompletionRequest) -> QwenChatTemplate {
+    let default_enable_thinking = true;
+    let default_preserve_thinking = false;
+
+    let (enable_thinking, preserve_thinking) = match &req.chat_template_kwargs {
+        Some(kwargs) if kwargs.is_object() => {
+            let enable = kwargs
+                .get("enable_thinking")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default_enable_thinking);
+            let preserve = kwargs
+                .get("preserve_thinking")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default_preserve_thinking);
+            (enable, preserve)
+        }
+        _ => (default_enable_thinking, default_preserve_thinking),
+    };
+
+    QwenChatTemplate::new(enable_thinking, preserve_thinking)
 }
 
 /// Create a mock non-streaming response with tool calls.
@@ -126,7 +191,7 @@ fn create_mock_tool_call_stream(
     let call_id = format!("call_{}", generate_id());
 
     // Simulated incremental arguments to stream
-    let arg_chunks = vec![
+    let arg_chunks: Vec<&str> = vec![
         "{\"",
         "location",
         "\":\"",
@@ -207,7 +272,7 @@ fn create_mock_tool_call_stream(
         })
     };
 
-    // Pre-clone for closures
+    // Pre-clone for move closures
     let id_for_args = id.clone();
     let model_for_args = model_c.clone();
 
