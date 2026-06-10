@@ -20,6 +20,7 @@ use infers_cuda::CudaSlice;
 ///
 /// For PP=2: rank 0 (stage 0) sends to peer rank 1; rank 1 (stage 1) receives
 /// from peer rank 0.
+#[derive(Debug)]
 pub struct StageComm {
     /// NCCL communicator shared across stages.
     pub nccl: NcclCommunicator,

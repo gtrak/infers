@@ -11,6 +11,7 @@ use std::sync::Arc;
 ///
 /// Created via `NcclCommunicator::new()` using `Comm::from_devices()`,
 /// which returns one `Comm` per GPU stream.
+#[derive(Debug)]
 pub struct NcclCommunicator {
     /// One NCCL communicator per GPU stream.
     comms: Vec<Comm>,

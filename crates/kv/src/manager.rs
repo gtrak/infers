@@ -35,6 +35,7 @@ pub enum ManagerError {
 /// Manages sequences, page allocation, prefix caching, and copy-on-write
 /// logic. The pool and cache are shared via `Arc<Mutex<>>` to allow
 /// safe access from multiple contexts.
+#[derive(Debug)]
 pub struct PagedKvManager {
     /// Shared page pool for allocation and deallocation.
     page_pool: Arc<Mutex<PagePool>>,
@@ -325,6 +326,11 @@ impl PagedKvManager {
     /// Get the KV dimension (num_kv_heads * head_dim).
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
+    }
+
+    /// Get the number of active sequences.
+    pub fn num_sequences(&self) -> usize {
+        self.sequences.iter().filter(|s| s.is_some()).count()
     }
 
 }
