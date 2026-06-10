@@ -7,3 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+infers-cuda = { path = "../cuda" }
+infers-model = { path = "../model" }
+half = { workspace = true }
+tracing = { workspace = true }
