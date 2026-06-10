@@ -1041,3 +1041,13 @@ Callback bundle for GPU operations required by the MTP engine.
 Single-layer transformer head that predicts the next token from the main model's hidden state.
 
 `MtpHead` stores GPU-resident weight buffers for the MTP prediction head (norms, FC projections, decoder layer, final norm). The `forward()` method takes callbacks for embedding lookup, RMSNorm, and decoder layer execution. Architecture: normalize embedding and hidden state, project via FC layers, add element-wise, run decoder layer, final norm. See [[crates/mtp/src/head.rs#MtpHead]].
+
+# MTP Metrics
+
+Lightweight metrics collection for tracking MTP speculative decoding performance.
+
+## MtpMetrics
+
+Collects running statistics on draft token acceptance rate, tokens saved, and provides helpers for speedup estimation.
+
+`MtpMetrics` tracks `total_drafts`, `total_accepted`, `verification_steps`, and `rate_sum` (for rolling average). `record_step()` updates counters per verification step. `acceptance_rate()` returns overall acceptance (accepted/drafts), `average_step_rate()` returns rolling mean of per-step rates. `estimated_speedup()` computes rough speedup factor: `1 / (1 - r + r/k)` where `r` is acceptance rate and `k` is draft count. `tokens_saved()` returns total accepted tokens. `reset()` zeroes all counters. See [[crates/mtp/src/metrics.rs#MtpMetrics]].

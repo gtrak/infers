@@ -2,4 +2,5 @@
 
 pub mod engine;
 pub mod head;
+pub mod metrics;
 pub mod verify;
