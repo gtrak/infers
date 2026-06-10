@@ -18,19 +18,31 @@
 ### Stage Partitioning
 
 ```rust
+use infers_model::{ModelConfig, WeightRegistry};
+use infers_kv::PagedKvManager;
+use infers_cuda::nccl::NcclCommunicator;
+
+/// A single pipeline stage holding a subset of layers on one GPU.
+///
+/// PP=2 splits 64 layers into two stages of 32 layers each. Each stage
+/// runs on a separate GPU and communicates hidden states via NCCL.
 pub struct PipelineStage {
     pub stage_id: usize,
     pub gpu_id: usize,
     pub start_layer: usize,
     pub end_layer: usize,
+    /// Sharded weights for this stage's layers.
     pub weights: WeightRegistry,
-    pub kv_manager: StageKvManager,
+    /// Paged KV manager for full-attention layers in this stage.
+    pub kv_manager: PagedKvManager,
 }
 
+/// Pipeline engine orchestrating two stages with microbatching.
 pub struct PipelineEngine {
     pub stages: Vec<PipelineStage>,
     pub microbatch_size: usize,
-    pub p2p_comm: P2PCommunicator,
+    /// NCCL communicator for stage-to-stage hidden state transfer.
+    pub nccl: NcclCommunicator,
 }
 
 impl PipelineEngine {
@@ -38,34 +50,51 @@ impl PipelineEngine {
         config: &ModelConfig,
         weights: WeightRegistry,
         microbatch_size: usize,
+        num_pages: usize,
+        page_size: usize,
+        max_cache_bytes: usize,
     ) -> Result<Self> {
         let num_layers = config.num_hidden_layers;
-        let layers_per_stage = num_layers / 2;  // PP=2
-        
+        let layers_per_stage = num_layers / 2; // PP=2
+
+        // Use existing split_layers_pp() from infers-model
+        let stage_ranges = split_layers_pp(config, 2);
+
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+
         let stage0 = PipelineStage {
             stage_id: 0,
             gpu_id: 0,
-            start_layer: 0,
-            end_layer: layers_per_stage,
-            weights: weights.slice_layers(0..layers_per_stage),
-            kv_manager: StageKvManager::new(),
+            start_layer: stage_ranges[0].start,
+            end_layer: stage_ranges[0].end,
+            weights: shard_weights_for_stage(&weights, &stage_ranges[0]),
+            kv_manager: PagedKvManager::new(
+                num_pages, page_size, num_kv_heads, head_dim, max_cache_bytes,
+            ),
         };
-        
+
         let stage1 = PipelineStage {
             stage_id: 1,
             gpu_id: 1,
-            start_layer: layers_per_stage,
-            end_layer: num_layers,
-            weights: weights.slice_layers(layers_per_stage..num_layers),
-            kv_manager: StageKvManager::new(),
+            start_layer: stage_ranges[1].start,
+            end_layer: stage_ranges[1].end,
+            weights: shard_weights_for_stage(&weights, &stage_ranges[1]),
+            kv_manager: PagedKvManager::new(
+                num_pages, page_size, num_kv_heads, head_dim, max_cache_bytes,
+            ),
         };
-        
-        let p2p = P2PCommunicator::new(0, 1)?;
-        
+
+        // NCCL communicator for P2P between stages
+        let nccl = NcclCommunicator::new(vec![
+            get_stage_stream(0).clone(),
+            get_stage_stream(1).clone(),
+        ])?;
+
         Ok(Self {
             stages: vec![stage0, stage1],
             microbatch_size,
-            p2p_comm: p2p,
+            nccl,
         })
     }
 }
@@ -73,73 +102,59 @@ impl PipelineEngine {
 
 ### P2P Communication
 
+PP uses NCCL for stage-to-stage hidden state transfer. Each pipeline stage
+runs on a separate GPU. The output hidden states from stage N are sent to
+stage N+1 via NCCL `send`/`recv` operations on dedicated peer streams.
+
 ```rust
-pub struct P2PCommunicator {
-    pub src_device: usize,
-    pub dst_device: usize,
-    pub can_access_peer: bool,
+use infers_cuda::nccl::NcclCommunicator;
+use infers_cuda::{CudaSlice, CudaStream};
+use std::sync::Arc;
+
+/// Stage-to-stage hidden state transfer via NCCL P2P.
+///
+/// Each `PipelineStage` holds its own `NcclCommunicator` initialized with
+/// the stage's CUDA stream and the peer stage's stream. Hidden states are
+/// BF16 tensors of shape `[microbatch_size × seq_len × hidden_size]`.
+///
+/// For PP=2 with a single microbatch, stage 0 sends and stage 1 receives.
+/// For multiple microbatches, sends and receives are interleaved to keep
+/// both GPUs busy.
+pub struct StageComm {
+    /// NCCL communicator initialized with this stage and peer streams.
+    pub nccl: NcclCommunicator,
+    /// Rank within the NCCL communicator (0 for stage 0, 1 for stage 1).
+    pub rank: usize,
+    /// Peer rank.
+    pub peer_rank: usize,
 }
 
-impl P2PCommunicator {
-    pub fn new(src: usize, dst: usize) -> Result<Self> {
-        let can_access = unsafe {
-            let mut can_access = 0i32;
-            cudaDeviceCanAccessPeer(&mut can_access, src as i32, dst as i32);
-            can_access != 0
-        };
-        
-        if can_access {
-            unsafe {
-                cudaDeviceEnablePeerAccess(dst as i32, 0);
-            }
-        }
-        
-        Ok(Self {
-            src_device: src,
-            dst_device: dst,
-            can_access_peer: can_access,
-        })
-    }
-    
-    pub fn send(
+impl StageComm {
+    /// Send hidden states to the next stage.
+    pub fn send_hidden(
         &self,
-        buffer: &DeviceBuffer<half>,
-        stream: &CudaStream,
+        hidden: &CudaSlice<bf16>,
     ) -> Result<()> {
-        if self.can_access_peer {
-            // Direct P2P copy
-            stream.memcpy_peer(
-                buffer,
-                self.dst_device,
-            )?;
-        } else {
-            // Fallback: copy through CPU pinned memory
-            let pinned = stream.alloc_pinned(buffer.len())?;
-            stream.memcpy_dtoh(buffer, &pinned)?;
-            // ... send to other GPU ...
-        }
-        
-        Ok(())
+        self.nccl.send(hidden, self.peer_rank)
+            .map_err(|e| anyhow!("NCCL send failed: {e}"))
     }
-    
-    pub fn recv(
+
+    /// Receive hidden states from the previous stage.
+    pub fn recv_hidden(
         &self,
-        buffer: &mut DeviceBuffer<half>,
-        stream: &CudaStream,
+        hidden: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        if self.can_access_peer {
-            stream.memcpy_peer_from(
-                buffer,
-                self.src_device,
-            )?;
-        } else {
-            // Fallback: copy through CPU pinned memory
-        }
-        
-        Ok(())
+        self.nccl.recv(hidden, self.peer_rank)
+            .map_err(|e| anyhow!("NCCL recv failed: {e}"))
     }
 }
 ```
+
+**Key design decisions:**
+- NCCL handles P2P memory copies transparently (peer access or host staging)
+- No raw CUDA runtime calls — all GPU communication goes through `cudarc::nccl`
+- Each stage's `CudaStream` is passed to `NcclCommunicator::new()` at init
+- For multi-GPU nodes, NCCL automatically uses NVLink/PCIe as available
 
 ### Microbatch Scheduler
 
@@ -155,7 +170,7 @@ pub struct Microbatch {
     pub id: usize,
     pub requests: Vec<Request>,
     pub stage: usize,  // Current pipeline stage
-    pub hidden_states: Option<DeviceBuffer<half>>,
+    pub hidden_states: Option<CudaSlice<bf16>>,
 }
 
 impl MicrobatchScheduler {
@@ -212,41 +227,57 @@ impl PipelineEngine {
         for req in requests {
             scheduler.add_request(req);
         }
-        
+
         let mut results = Vec::new();
         let mut microbatch_id = 0;
-        
+
         // 2. Pipeline loop
         loop {
             // Stage 0: Process new microbatches
             if let Some(mut microbatch) = scheduler.next_microbatch() {
                 let hidden = self.forward_stage0(&microbatch)?;
                 microbatch.hidden_states = Some(hidden);
-                
-                // Send to stage 1
-                self.p2p_comm.send(
+
+                // Send to stage 1 via NCCL
+                self.stages[0].comm.send_hidden(
                     microbatch.hidden_states.as_ref().unwrap(),
-                    &self.stages[0].stream,
                 )?;
-                
+
                 scheduler.in_flight.push(microbatch);
             }
-            
+
             // Stage 1: Process received microbatches
             for microbatch in &mut scheduler.in_flight {
                 if microbatch.stage == 1 {
-                    let mut hidden = DeviceBuffer::alloc(
-                        microbatch.hidden_states.as_ref().unwrap().len()
-                    )?;
-                    
-                    self.p2p_comm.recv(&mut hidden, &self.stages[1].stream)?;
-                    
+                    let hidden_size = microbatch.hidden_states.as_ref().unwrap().len();
+                    let mut hidden = self.stages[1].stream
+                        .alloc_zeros::<bf16>(hidden_size)?;
+
+                    self.stages[1].comm.recv_hidden(&mut hidden)?;
+
                     let output = self.forward_stage1(&hidden, microbatch)?;
-                    
+
                     // Sample tokens
                     let tokens = self.sample_batch(&output, &microbatch.requests)?;
                     results.push(tokens);
-                    
+
+                    microbatch.stage = 2; // Complete
+                }
+            }
+
+            scheduler.advance_pipeline();
+
+            // Check if done
+            if scheduler.pending_requests.is_empty()
+                && scheduler.in_flight.is_empty() {
+                break;
+            }
+
+            microbatch_id += 1;
+        }
+
+        Ok(results)
+    }
                     microbatch.stage = 2; // Complete
                 }
             }
@@ -268,7 +299,7 @@ impl PipelineEngine {
     fn forward_stage0(
         &self,
         microbatch: &Microbatch,
-    ) -> Result<DeviceBuffer<half>> {
+    ) -> Result<CudaSlice<bf16>> {
         let stage = &self.stages[0];
         let mut hidden = self.embed_batch(&microbatch.requests, stage.gpu_id)?;
         
@@ -294,9 +325,9 @@ impl PipelineEngine {
     
     fn forward_stage1(
         &self,
-        hidden: &DeviceBuffer<half>,
+        hidden: &CudaSlice<bf16>,
         microbatch: &Microbatch,
-    ) -> Result<DeviceBuffer<half>> {
+    ) -> Result<CudaSlice<bf16>> {
         let stage = &self.stages[1];
         let mut hidden = hidden.clone();  // Or use P2P buffer directly
         
@@ -327,50 +358,67 @@ impl PipelineEngine {
 
 ### Stage KV Cache Management
 
+Each stage manages its own subset of layers. Full-attention layers use the
+paged KV system (`infers_kv::PagedKvManager`). GDN layers use recurrent
+state vectors (`GdnState`).
+
 ```rust
-pub struct StageKvManager {
-    // For full attention layers in this stage
-    pub paged_kv: PagedKvCache,
-    
-    // For GDN layers in this stage
-    pub mamba_states: HashMap<SessionId, Vec<MambaState>>,
+use infers_kv::{PagedKvManager, SequenceId};
+use crate::gdn::GdnState;
+use std::collections::HashMap;
+
+/// Per-stage state management: paged KV for attention, GDN states for recurrent layers.
+pub struct StageState {
+    /// Paged KV manager for full-attention layers in this stage's range.
+    pub kv_manager: PagedKvManager,
+    /// Per-session GDN recurrent states for layers in this stage's range.
+    /// Key: (session_id, layer_idx) → GdnState.
+    pub gdn_states: HashMap<(usize, usize), GdnState>,
 }
 
-impl StageKvManager {
-    pub fn new(max_pages: usize, page_size: usize) -> Self {
+impl StageState {
+    pub fn new(
+        num_pages: usize,
+        page_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_cache_bytes: usize,
+    ) -> Self {
         Self {
-            paged_kv: PagedKvCache::new(max_pages, page_size),
-            mamba_states: HashMap::new(),
+            kv_manager: PagedKvManager::new(
+                num_pages, page_size, num_kv_heads, head_dim, max_cache_bytes,
+            ),
+            gdn_states: HashMap::new(),
         }
     }
-    
-    pub fn allocate_for_microbatch(
+
+    /// Allocate KV pages for a new session's attention layers in this stage.
+    pub fn create_session(&mut self) -> SequenceId {
+        self.kv_manager.create_sequence()
+    }
+
+    /// Ensure GDN states exist for all GDN layers in this stage.
+    pub fn ensure_gdn_states(
         &mut self,
-        microbatch: &Microbatch,
-        stage: &PipelineStage,
-    ) -> Result<()> {
-        for request in &microbatch.requests {
-            // Allocate Mamba states for GDN layers in this stage
-            for layer_idx in stage.start_layer..stage.end_layer {
-                if stage.config.get_layer_type(layer_idx) == LayerType::GatedDeltaNet {
-                    self.mamba_states
-                        .entry(request.id)
-                        .or_insert_with(Vec::new)
-                        .push(MambaState::new()?);
-                }
-            }
-            
-            // Allocate KV blocks for full attention layers
-            for layer_idx in stage.start_layer..stage.end_layer {
-                if stage.config.get_layer_type(layer_idx) == LayerType::FullAttention {
-                    let num_blocks = (request.num_tokens + stage.page_size - 1) / stage.page_size;
-                    let blocks = self.paged_kv.allocate(num_blocks)?;
-                    request.set_kv_blocks(layer_idx, blocks)?;
-                }
+        session_id: usize,
+        config: &ModelConfig,
+        start_layer: usize,
+        end_layer: usize,
+    ) {
+        for layer_idx in start_layer..end_layer {
+            if config.get_layer_type(layer_idx) == LayerType::GatedDeltaNet {
+                self.gdn_states
+                    .entry((session_id, layer_idx))
+                    .or_insert_with(GdnState::new);
             }
         }
-        
-        Ok(())
+    }
+
+    /// Free all resources for a session.
+    pub fn free_session(&mut self, session_id: SequenceId) {
+        let _ = self.kv_manager.delete_sequence(session_id);
+        self.gdn_states
+            .retain(|(sid, _), _| *sid != session_id as usize);
     }
 }
 ```
@@ -444,13 +492,13 @@ GPU1:
 crates/parallelism/
   Cargo.toml
   src/
-    lib.rs
-    tp.rs               # TensorParallel (from Phase 4)
-    pp.rs               # PipelineParallel
+    lib.rs              # TP=2 all-reduce, PP=2 stage orchestration
+    tp.rs               # TensorParallel: NCCL all-reduce after attention/MLP
+    pp.rs               # PipelineParallel: stage partitioning, microbatch scheduling
     microbatch.rs       # MicrobatchScheduler
-    stage.rs            # PipelineStage
-    p2p.rs              # P2PCommunicator
-    engine.rs           # Unified ParallelEngine (TP or PP)
+    stage.rs            # PipelineStage, StageState
+    comm.rs             # StageComm: NCCL send/recv between stages
+    engine.rs           # Unified ParallelEngine (TP or PP dispatch)
 ```
 
 ## Testing
@@ -460,16 +508,18 @@ crates/parallelism/
 ```rust
 #[test]
 fn test_pp_bubble_fraction() {
-    let engine = PipelineEngine::new(&config, weights, 2)?;
-    
+    let engine = PipelineEngine::new(
+        &config, weights, 2, 1000, 16, 1024 * 1024 * 1024,
+    )?;
+
     let batch = vec![request; 8];
     let (_, timing) = engine.forward_batch(batch)?;
-    
+
     // Measure GPU utilization
     let gpu0_active = timing.gpu0_active_time;
     let gpu1_active = timing.gpu1_active_time;
     let total_time = timing.total_time;
-    
+
     let bubble = 1.0 - (gpu0_active + gpu1_active) / (2.0 * total_time);
     assert!(bubble < 0.25, "Bubble too high: {}", bubble);
 }
@@ -481,8 +531,10 @@ fn test_pp_bubble_fraction() {
 #[test]
 fn test_pp_correctness() {
     // PP should produce same results as TP
-    let tp_engine = TensorParallel::new(&config, weights.clone())?;
-    let pp_engine = PipelineParallel::new(&config, weights, 1)?;
+    let tp_engine = TensorParallelEngine::new(&config, weights.clone())?;
+    let pp_engine = PipelineEngine::new(
+        &config, weights, 1, 1000, 16, 1024 * 1024 * 1024,
+    )?;
     
     let prompt = "Hello, world!";
     let tokens = tokenizer.encode(prompt)?;

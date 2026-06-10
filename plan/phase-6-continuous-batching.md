@@ -31,14 +31,16 @@ pub enum SessionState {
 }
 
 pub struct Session {
-    pub id: SessionId,
+    pub id: SequenceId,
     pub state: SessionState,
     pub tokens: Vec<u32>,
     pub num_prompt_tokens: usize,
     pub num_generated_tokens: usize,
     pub max_tokens: usize,
     pub sampling_config: SamplingConfig,
-    pub kv_cache: SessionKvCache,
+    /// Page table mapping this session's tokens to physical pages.
+    /// Managed by the global PagedKvManager.
+    pub page_table: SequencePageTable,
     pub created_at: Instant,
     pub last_activity: Instant,
     pub priority: i32,  // Higher = more important
@@ -48,124 +50,111 @@ impl Session {
     pub fn is_active(&self) -> bool {
         matches!(self.state, SessionState::Prefilling | SessionState::Decoding)
     }
-    
+
     pub fn is_evictable(&self) -> bool {
-        // Mamba state cannot be evicted easily
-        // Only evict if session has been inactive for a while
+        // GDN state is small (HxH matrix per layer) — always kept on GPU.
+        // Only evict if session has been inactive for a while.
         self.last_activity.elapsed() > Duration::from_secs(30)
     }
 }
 ```
 
-### Hybrid KV Manager
+### Paged KV Manager
+
+The paged KV system lives in `infers-kv` and is already built (Phase 4.6).
+Key types:
 
 ```rust
-pub struct HybridKvManager {
-    // Configuration
-    pub block_size: usize,           // 16 tokens per block
-    pub num_layers: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    
-    // Paged KV cache (for full attention layers)
-    pub paged_k: DeviceBuffer<half>,   // [num_pages, page_size, num_kv_heads, head_dim]
-    pub paged_v: DeviceBuffer<half>,   // same shape
-    pub block_table: Vec<BlockTable>,  // per-session
-    pub free_gpu_blocks: Vec<u32>,
-    pub free_cpu_blocks: Vec<u32>,
-    pub cpu_buffer: PinnedBuffer<half>, // CPU staging for eviction
-    
-    // Mamba states (for GDN layers)
-    pub mamba_states: HashMap<SessionId, Vec<MambaState>>, // 48 layers per session
-    
-    // Memory tracking
-    pub total_gpu_pages: usize,
-    pub used_gpu_pages: usize,
-    pub total_cpu_pages: usize,
-    pub used_cpu_pages: usize,
-}
+use infers_kv::{PagedKvManager, SequencePageTable, SequenceId};
 
-pub struct BlockTable {
-    pub session_id: SessionId,
-    pub physical_blocks: Vec<u32>,  // Maps logical block idx → physical block id
-    pub num_tokens: usize,          // How many tokens valid in last block
-}
+// PagedKvManager: orchestration layer wrapping PagePool + PrefixCache + COW
+// Already implemented — see crates/kv/src/manager.rs
+// API:
+//   create_sequence() → SequenceId
+//   delete_sequence(seq_id)
+//   append_page(seq_id) → PageId
+//   ensure_writable(seq_id) → CowResult
+//   add_token(seq_id)
+//   seal_and_cache(seq_id, layer_idx, model_id, k_data, v_data) → Option<PageId>
+//   block_table(seq_id) → &[PageId]
+//   num_tokens(seq_id) → usize
+//   num_free_pages() → usize
 
-pub struct MambaState {
-    pub conv_state: DeviceBuffer<f32>,
-    pub ssm_state: DeviceBuffer<f32>,
-}
+// SequencePageTable: page table for one sequence
+// Already implemented — see crates/kv/src/table.rs
+// pub struct SequencePageTable {
+//     pub page_ids: Vec<PageId>,
+//     pub num_tokens: usize,
+//     pub page_size: usize,
+// }
+
+// PhysicalPage: metadata for one page in the pool
+// Already implemented — see crates/kv/src/page.rs
+// pub struct PhysicalPage {
+//     pub page_id: PageId,
+//     pub refcount: AtomicU32,
+//     pub state: PageState,
+//     pub location: PageLocation,
+// }
+
+// The page pool uses a SINGLE interleaved GPU buffer:
+//   page_pool[page_id * page_stride + ...]
+// with per-page layout: [K tokens | V tokens]
+// page_stride = 2 * page_size * kv_dim
+
+// GDN state is managed separately in the native backend:
+//   See crates/backends/native/src/gdn.rs → GdnState
+// pub struct GdnState {
+//     pub state: Option<CudaSlice<bf16>>,  // HxH recurrent state matrix
+// }
 ```
 
 ### Block Allocator
 
+Block allocation is handled by `infers_kv::PagedKvManager` (fully implemented
+in Phase 4.6). The scheduler wraps it for session management:
+
 ```rust
-impl HybridKvManager {
-    pub fn allocate_blocks(
+use infers_kv::{PagedKvManager, PageId, SequenceId};
+use infers_kv::Sequencer; // Session → sequence binding for continuous batching
+
+impl PagedKvManager {
+    /// Allocate blocks for a new session with the given number of prompt tokens.
+    /// Returns the session's SequenceId.
+    pub fn allocate_session(&mut self, num_prompt_tokens: usize) -> Result<SequenceId> {
+        let seq_id = self.create_sequence();
+
+        // Allocate enough pages for the prompt
+        let num_pages = (num_prompt_tokens + self.page_size() - 1) / self.page_size();
+        for _ in 0..num_pages {
+            self.append_page(seq_id)?;
+        }
+
+        Ok(seq_id)
+    }
+
+    /// Append a token to a session — ensures writable page, increments count.
+    /// Returns the block table slice for GPU kernel consumption.
+    pub fn append_token_to_session(
         &mut self,
-        session_id: SessionId,
-        num_tokens: usize,
-    ) -> Result<Vec<u32>> {
-        let num_blocks = (num_tokens + self.block_size - 1) / self.block_size;
-        
-        if self.free_gpu_blocks.len() < num_blocks {
-            // Try to evict least recently used sessions
-            self.evict_lru_sessions(num_blocks - self.free_gpu_blocks.len())?;
-        }
-        
-        let mut blocks = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            blocks.push(self.free_gpu_blocks.pop()
-                .ok_or_else(|| anyhow!("Out of GPU KV cache memory"))?);
-        }
-        
-        self.block_table.push(BlockTable {
-            session_id,
-            physical_blocks: blocks.clone(),
-            num_tokens,
-        });
-        
-        self.used_gpu_pages += num_blocks;
-        
-        Ok(blocks)
+        seq_id: SequenceId,
+    ) -> Result<&[PageId]> {
+        // Ensure tail page is writable (handles COW if page is shared)
+        self.ensure_writable(seq_id)?;
+
+        // Increment token count (may trigger page sealing at boundaries)
+        self.add_token(seq_id);
+
+        // Return block table for kernel dispatch
+        self.block_table(seq_id)
     }
-    
-    pub fn append_token(&mut self, session_id: SessionId) -> Result<u32> {
-        let table = self.block_table
-            .iter_mut()
-            .find(|t| t.session_id == session_id)
-            .ok_or_else(|| anyhow!("Session not found"))?;
-        
-        table.num_tokens += 1;
-        
-        // Check if we need a new block
-        if table.num_tokens > table.physical_blocks.len() * self.block_size {
-            let new_block = self.free_gpu_blocks.pop()
-                .ok_or_else(|| anyhow!("Out of blocks"))?;
-            table.physical_blocks.push(new_block);
-            self.used_gpu_pages += 1;
-        }
-        
-        Ok(*table.physical_blocks.last().unwrap())
+
+    /// Free a session's resources — returns pages to pool.
+    pub fn free_session_blocks(&mut self, seq_id: SequenceId) {
+        let _ = self.delete_sequence(seq_id);
     }
-    
-    pub fn free_session(&mut self, session_id: SessionId) -> Result<()> {
-        let idx = self.block_table
-            .iter()
-            .position(|t| t.session_id == session_id)
-            .ok_or_else(|| anyhow!("Session not found"))?;
-        
-        let table = self.block_table.remove(idx);
-        
-        // Return blocks to free list
-        for block in &table.physical_blocks {
-            self.free_gpu_blocks.push(*block);
-        }
-        
-        self.used_gpu_pages -= table.physical_blocks.len();
-        
-        // Free Mamba states
-        self.mamba_states.remove(&session_id);
+}
+```
         
         Ok(())
     }
@@ -174,71 +163,32 @@ impl HybridKvManager {
 
 ### Eviction to CPU/SSD
 
+CPU eviction is **not yet implemented**. The `infers_kv::PageLocation::Cpu`
+variant is reserved for this but requires:
+
+1. GPU-side page copy kernels (`cudaMemcpyAsync` from page pool → pinned CPU buffer)
+2. CPU page pool management (allocating pinned host memory for evicted pages)
+3. LRU session tracking (which sessions haven't been accessed recently)
+4. Restoration logic (copy evicted pages back to GPU on cache hit)
+
+The `PagedKvManager::PrefixCache` already handles LRU eviction of **shared
+sealed pages** (when prefix cache memory budget is exceeded). Session-level
+eviction is a future addition:
+
 ```rust
-impl HybridKvManager {
-    pub fn evict_lru_sessions(&mut self, num_blocks_needed: usize) -> Result<()> {
-        let mut lru_sessions: Vec<_> = self.block_table
-            .iter()
-            .filter(|t| t.session_id != SessionId::current())  // Don't evict active
-            .map(|t| (t.session_id, self.get_last_access(t.session_id)))
-            .collect();
-        
-        lru_sessions.sort_by(|a, b| a.1.cmp(&b.1));
-        
-        let mut freed = 0;
-        for (session_id, _) in lru_sessions {
-            if freed >= num_blocks_needed {
-                break;
-            }
-            
-            freed += self.evict_session_to_cpu(session_id)?;
-        }
-        
-        Ok(())
-    }
-    
-    fn evict_session_to_cpu(&mut self, session_id: SessionId) -> Result<usize> {
-        let table = self.block_table
-            .iter_mut()
-            .find(|t| t.session_id == session_id)
-            .ok_or_else(|| anyhow!("Session not found"))?;
-        
-        let num_blocks = table.physical_blocks.len();
-        
-        // Copy KV blocks to CPU pinned memory
-        for (i, block_id) in table.physical_blocks.iter().enumerate() {
-            let gpu_offset = *block_id as usize * self.block_size * self.num_kv_heads * self.head_dim;
-            let cpu_offset = i * self.block_size * self.num_kv_heads * self.head_dim;
-            
-            // Copy K
-            self.paged_k.copy_to_cpu(
-                gpu_offset..gpu_offset + self.block_size * self.num_kv_heads * self.head_dim,
-                &mut self.cpu_buffer,
-                cpu_offset,
-            )?;
-            
-            // Copy V
-            self.paged_v.copy_to_cpu(
-                gpu_offset..gpu_offset + self.block_size * self.num_kv_heads * self.head_dim,
-                &mut self.cpu_buffer,
-                cpu_offset + self.total_cpu_pages * self.block_size * self.num_kv_heads * self.head_dim,
-            )?;
-        }
-        
-        // Mark blocks as free (but keep table for restoration)
-        for block_id in &table.physical_blocks {
-            self.free_gpu_blocks.push(*block_id);
-        }
-        
-        self.used_gpu_pages -= num_blocks;
-        self.used_cpu_pages += num_blocks;
-        
-        // Note: Mamba states are NOT evicted (too complex)
-        // For now, sessions with Mamba state cannot be evicted
-        
-        Ok(num_blocks)
-    }
-}
+// Conceptual approach (not yet implemented):
+// Evict LRU sessions by copying their page data to CPU pinned memory.
+// GDN states (H×H matrices) stay on GPU — only paged KV pages are evicted.
+
+// 1. Select LRU session using last_activity timestamps
+// 2. For each page in the session's page table:
+//    a. Launch cudaMemcpyAsync to copy page_pool[...] → pinned_cpu_buffer
+//    b. Record page → CPU address mapping in eviction table
+// 3. Free the GPU pages via PagedKvManager::delete_sequence
+// 4. Mark session as SessionState::Evicted
+//
+// Restoration happens on cache hit: reverse the copy and re-register
+// pages with the PagedKvManager.
 ```
 
 ### Batch Builder
@@ -250,72 +200,66 @@ pub struct BatchBuilder {
 }
 
 pub struct DecodeBatch {
-    pub sessions: Vec<SessionId>,
+    pub sessions: Vec<SequenceId>,
     pub input_tokens: Vec<u32>,
-    pub block_tables: Vec<BlockTable>,
-    pub mamba_states: Vec<Vec<MambaState>>,
+    /// GPU block table slices for each session's paged KV.
+    /// A single contiguous slice per session for paged kernel dispatch.
+    pub block_tables: Vec<Vec<PageId>>,
 }
 
 impl BatchBuilder {
     pub fn build_decode_batch(
         &self,
         active_sessions: &mut Vec<Session>,
+        kv_manager: &PagedKvManager,
     ) -> Result<DecodeBatch> {
         let mut batch = DecodeBatch {
             sessions: Vec::new(),
             input_tokens: Vec::new(),
             block_tables: Vec::new(),
-            mamba_states: Vec::new(),
         };
-        
-        let mut total_tokens = 0;
-        
+
         for session in active_sessions.iter_mut() {
             if !session.is_active() {
                 continue;
             }
-            
+
             if batch.sessions.len() >= self.max_batch_size {
                 break;
             }
-            
-            if total_tokens + session.num_generated_tokens >= self.max_tokens_per_batch {
-                break;
-            }
-            
-            // Get next token from previous generation
-            let next_token = session.get_last_generated_token()
-                .ok_or_else(|| anyhow!("No generated token"))?;
-            
+
+            // Get the block table from PagedKvManager for this sequence
+            let block_table = kv_manager.block_table(session.id)?.to_vec();
+            let latest_token = session.tokens.last()
+                .copied()
+                .ok_or_else(|| anyhow!("Session has no tokens"))?;
+
             batch.sessions.push(session.id);
-            batch.input_tokens.push(next_token);
-            batch.block_tables.push(session.kv_cache.block_table.clone());
-            batch.mamba_states.push(session.kv_cache.mamba_states.clone());
-            
-            total_tokens += 1;
+            batch.input_tokens.push(latest_token);
+            batch.block_tables.push(block_table);
         }
-        
+
         Ok(batch)
     }
-    
+
     pub fn build_prefill_batch(
         &self,
         pending_sessions: &mut Vec<Session>,
+        kv_manager: &PagedKvManager,
     ) -> Result<DecodeBatch> {
-        // Similar to decode batch, but with prompt tokens
-        // For now, prefill one session at a time (simpler)
-        
         if let Some(session) = pending_sessions.first_mut() {
             if session.state == SessionState::Created {
                 session.state = SessionState::Prefilling;
-                
+
                 let prompt_tokens = session.tokens.clone();
-                
+                let block_table = kv_manager.block_table(session.id)
+                    .map(|bt| bt.to_vec())
+                    .unwrap_or_default();
+
                 Ok(DecodeBatch {
                     sessions: vec![session.id],
                     input_tokens: prompt_tokens,
-                    block_tables: vec![session.kv_cache.block_table.clone()],
-                    mamba_states: vec![session.kv_cache.mamba_states.clone()],
+                    block_tables: vec![block_table],
                 })
             } else {
                 Err(anyhow!("No sessions to prefill"))
@@ -335,7 +279,7 @@ pub struct RoundRobinScheduler {
     pub active_sessions: Vec<Session>,
     pub max_concurrent_sessions: usize,
     pub batch_builder: BatchBuilder,
-    pub kv_manager: HybridKvManager,
+    pub kv_manager: PagedKvManager,
 }
 
 impl RoundRobinScheduler {
@@ -349,40 +293,43 @@ impl RoundRobinScheduler {
                 break;
             }
         }
-        
+
         // 2. Check for completed sessions
         self.active_sessions.retain(|s| {
             if s.state == SessionState::Completed {
-                self.kv_manager.free_session(s.id).ok();
+                self.kv_manager.delete_sequence(s.id).ok();
                 false
             } else {
                 true
             }
         });
-        
+
         // 3. Build decode batch (highest priority)
-        let decode_batch = self.batch_builder.build_decode_batch(&mut self.active_sessions)?;
-        
+        let decode_batch = self.batch_builder
+            .build_decode_batch(&mut self.active_sessions, &self.kv_manager)?;
+
         // 4. If decode batch is small, try to prefill new sessions
         let prefill_batch = if decode_batch.sessions.len() < self.batch_builder.max_batch_size / 2 {
-            self.batch_builder.build_prefill_batch(&mut self.active_sessions).ok()
+            self.batch_builder
+                .build_prefill_batch(&mut self.active_sessions, &self.kv_manager)
+                .ok()
         } else {
             None
         };
-        
+
         Ok(ScheduledWork {
             decode_batch,
             prefill_batch,
         })
     }
-    
+
     pub fn create_session(&mut self, request: Request) -> Result<Session> {
-        let id = SessionId::new();
+        let id = SequenceId::default();
         let tokens = self.tokenizer.encode(&request.prompt)?;
-        
-        // Allocate KV cache
-        let kv_cache = self.kv_manager.allocate_for_session(id, tokens.len())?;
-        
+
+        // Allocate KV pages via PagedKvManager
+        let _ = self.kv_manager.allocate_session(tokens.len())?;
+
         Ok(Session {
             id,
             state: SessionState::Created,
@@ -391,7 +338,7 @@ impl RoundRobinScheduler {
             num_generated_tokens: 0,
             max_tokens: request.max_tokens.unwrap_or(512),
             sampling_config: request.sampling_config,
-            kv_cache,
+            page_table: SequencePageTable::new(self.page_size),
             created_at: Instant::now(),
             last_activity: Instant::now(),
             priority: request.priority,
@@ -403,24 +350,30 @@ impl RoundRobinScheduler {
 ## File Structure
 
 ```
-crates/scheduler/
+crates/scheduler/          # NEW: session lifecycle, batch builder, scheduler
   Cargo.toml
   src/
     lib.rs
-    session.rs           # Session, SessionState, SessionId
+    session.rs           # Session, SessionState, SequenceId
     lifecycle.rs         # Session lifecycle transitions
-    batch.rs             # BatchBuilder, DecodeBatch, PrefillBatch
+    batch.rs             # BatchBuilder, DecodeBatch
     scheduler.rs         # RoundRobinScheduler
     queue.rs             # RequestQueue
-    
-crates/kv/
+
+crates/kv/                # ALREADY EXISTS (Phase 4.6)
   Cargo.toml
   src/
     lib.rs
-    manager.rs           # HybridKvManager
-    paged.rs             # PagedKvCache, BlockTable, BlockAllocator
-    mamba.rs             # MambaState
-    eviction.rs          # LRU eviction to CPU/SSD
+    page.rs              # PhysicalPage, PageId, PageState, PageLocation
+    pool.rs              # PagePool with O(1) free-list alloc/free
+    table.rs             # SequencePageTable
+    prefix.rs            # PrefixCache with Blake3 hashing, LRU eviction
+    cow.rs               # Copy-on-write page sharing
+    manager.rs           # PagedKvManager — orchestration layer
+
+# Note: GDN state is in crates/backends/native/src/gdn.rs (GdnState),
+# not in crates/kv. Eviction to CPU/SSD is not yet implemented — see
+# the "Eviction" section above for the deferred design.
 ```
 
 ## Testing
@@ -430,50 +383,82 @@ crates/kv/
 ```rust
 #[test]
 fn test_batch_builder() {
+    let mut kv_manager = PagedKvManager::new(
+        500,    // total_pages
+        16,     // page_size (tokens per page)
+        4,      // num_kv_heads
+        256,    // head_dim
+        1024 * 1024 * 1024, // max_cache_bytes
+    );
+
     let mut sessions = vec![
-        Session::new("Hello", 10),
-        Session::new("World", 10),
-        Session::new("Test", 10),
+        Session {
+            id: kv_manager.create_sequence(),
+            state: SessionState::Decoding,
+            tokens: vec![1, 2, 3, 4, 5],
+            num_prompt_tokens: 5,
+            num_generated_tokens: 0,
+            max_tokens: 100,
+            sampling_config: SamplingConfig::default(),
+            page_table: SequencePageTable::new(16),
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+            priority: 0,
+        },
+        // ... second session ...
     ];
-    
+
     let builder = BatchBuilder {
         max_batch_size: 2,
         max_tokens_per_batch: 100,
     };
-    
-    let batch = builder.build_decode_batch(&mut sessions).unwrap();
+
+    let batch = builder.build_decode_batch(&mut sessions, &kv_manager).unwrap();
     assert_eq!(batch.sessions.len(), 2);
 }
 ```
 
-### Eviction Test
+### PagedKvManager Integration Test
+
+**Note:** CPU eviction is not yet implemented (see "Eviction to CPU/SSD" section).
+Test the PagedKvManager's existing page lifecycle and prefix cache instead:
 
 ```rust
 #[test]
-fn test_kv_eviction() {
-    let mut kv = HybridKvManager::new(100, 16, 64, 4, 256);
-    
-    // Allocate for 3 sessions
-    let id1 = SessionId::new();
-    let blocks1 = kv.allocate_blocks(id1, 1000).unwrap();
-    
-    let id2 = SessionId::new();
-    let blocks2 = kv.allocate_blocks(id2, 1000).unwrap();
-    
-    let id3 = SessionId::new();
-    let blocks3 = kv.allocate_blocks(id3, 1000).unwrap();
-    
-    // Simulate activity
-    // id1 is active, id2 and id3 are inactive
-    
-    // Try to allocate for id4 (should evict id2)
-    let id4 = SessionId::new();
-    let blocks4 = kv.allocate_blocks(id4, 500).unwrap();
-    
-    // Verify id2 was evicted
-    assert!(kv.block_table.iter().any(|t| t.session_id == id4));
-    // id2 might still be in CPU cache, not GPU
+fn test_page_lifecycle_with_sessions() {
+    let mut kv = PagedKvManager::new(
+        100,    // total_pages
+        16,     // page_size
+        4,      // num_kv_heads
+        256,    // head_dim
+        1024 * 1024 * 1024, // max_cache_bytes
+    );
+
+    // Create 3 sequences
+    let id1 = kv.create_sequence();
+    let id2 = kv.create_sequence();
+    let id3 = kv.create_sequence();
+
+    // Allocate pages for id1
+    for _ in 0..3 {
+        kv.append_page(id1).unwrap();
+    }
+    for _ in 0..2 {
+        kv.append_page(id2).unwrap();
+    }
+
+    // Verify usage
+    assert_eq!(kv.num_pages(id1).unwrap(), 3);
+    assert_eq!(kv.num_pages(id2).unwrap(), 2);
+    assert!(kv.num_pages(id3).unwrap() == 0);
+
+    // Verify pool reflects allocated pages
+    let free_before = kv.num_free_pages();
+    kv.delete_sequence(id1).unwrap();
+    let free_after = kv.num_free_pages();
+    assert_eq!(free_after, free_before + 3);
 }
+```
 ```
 
 ## Dependencies

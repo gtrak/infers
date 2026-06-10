@@ -17,50 +17,30 @@
 
 ### AutoRound INT4 End-to-End
 
-AutoRound weights are **kept in packed INT4 format** in GPU memory. We write custom GEMM kernels that unpack and scale on-the-fly, without ever expanding to FP16 in VRAM.
+**Not yet implemented.** The format detection exists (`QuantizationFormat::detect`
+returns `AutoRound` for `quantization_config.json`), but the weight loading and
+custom INT4 GEMM are not yet implemented.
+
+AutoRound weights are in packed INT4 format. The planned approach:
 
 ```rust
 pub struct AutoRoundEngine {
-    pub packed_weights: PackedWeightRegistry,  // INT4 packed, stays in VRAM
-    pub scales: HashMap<String, DeviceBuffer<half>>,  // FP16 scales
-    pub zeros: HashMap<String, DeviceBuffer<u32>>,    // Packed INT4 zeros
-    pub gemm_engine: CustomInt4GemmEngine,
-}
-
-impl AutoRoundEngine {
-    pub fn from_model(
-        model_dir: &Path,
-        device: &CudaDevice,
-        stream: &CudaStream,
-    ) -> Result<Self> {
-        // 1. Detect format
-        let format = QuantizationFormat::detect(model_dir)?;
-        assert_eq!(format, QuantizationFormat::AutoRound);
-        
-        // 2. Load packed weights (INT4 stays packed)
-        let loader = AutoRoundLoader::new(model_dir)?;
-        let (packed, scales, zeros) = loader.load_packed_weights(device, stream)?;
-        
-        // 3. Shard for TP/PP (shard the packed tensors directly)
-        let sharded = shard_packed_weights(packed, scales, zeros, num_gpus)?;
-        
-        // 4. Build custom INT4 GEMM engine
-        let gemm = CustomInt4GemmEngine::new(
-            &sharded.packed,
-            &sharded.scales,
-            &sharded.zeros,
-            stream,
-        )?;
-        
-        Ok(Self {
-            packed_weights: sharded.packed,
-            scales: sharded.scales,
-            zeros: sharded.zeros,
-            gemm_engine: gemm,
-        })
-    }
+    pub weight_registry: WeightRegistry, // INT4 packed weights (stays compressed in GPU)
+    pub scales: HashMap<String, CudaSlice<bf16>>,  // FP16 group scales
+    pub zeros: HashMap<String, CudaSlice<u32>>,    // Packed INT4 zeros
 }
 ```
+
+**Key design decisions:**
+- Weights stay in INT4-packed format in GPU memory (~75% VRAM savings)
+- Dequantization happens in registers during custom GEMM kernel
+- No FP16 weight copy ever exists
+- Output is BF16, fed directly into next layer (RMSNorm, activation, etc.)
+- Group size: 128 (fixed by AutoRound format)
+
+**Performance note:** The INT4 GEMM kernel is memory-bandwidth-bound, not
+compute-bound. The savings from INT4 storage (less memory bandwidth) roughly
+offset the cost of unpacking.
 
 ### Custom INT4 GEMM Kernel
 
@@ -192,121 +172,68 @@ impl GgufParser {
 
 ### llama.cpp Backend
 
+**Deferred.** The `infers-backend-gguf` crate exists as a stub (`crates/backends/gguf/`).
+Integration with llama.cpp requires:
+
+1. Adding llama.cpp as a git submodule (or system dependency)
+2. Building `libllama.a` via `build.rs`
+3. Generating Rust FFI bindings via `bindgen` for `llama.h`
+4. Implementing `LlamaCppBackend` wrapping `llama_context`/`llama_model`:
+   - `load(path, n_gpu_layers)` → model loading with GPU offload
+   - `decode(tokens)` → batch encode + sample next token
+   - Compatible with `KvCacheDtype` for KV cache quantization
+5. Adding a `Backend` enum and router for format-based dispatch
+
+This is a self-contained integration that can be done independently of
+the native backend. The `infers-backend-gguf` crate is already set up
+with the correct dependency structure.
+
 ```rust
+// Conceptual approach (not yet implemented):
 pub struct LlamaCppBackend {
     pub ctx: *mut llama_context,
     pub model: *mut llama_model,
-    pub params: llama_model_params,
 }
 
 impl LlamaCppBackend {
-    pub fn load(path: &Path, n_gpu_layers: i32) -> Result<Self> {
-        let model_params = llama_model_default_params();
-        model_params.n_gpu_layers = n_gpu_layers;
-        
-        let model = unsafe {
-            llama_load_model_from_file(
-                path.as_ptr(),
-                model_params,
-            )
-        };
-        
-        if model.is_null() {
-            return Err(anyhow!("Failed to load GGUF model"));
-        }
-        
-        let ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = 262144;
-        
-        let ctx = unsafe {
-            llama_new_context_with_model(model, ctx_params)
-        };
-        
-        if ctx.is_null() {
-            unsafe { llama_free_model(model) };
-            return Err(anyhow!("Failed to create context"));
-        }
-        
-        Ok(Self {
-            ctx,
-            model,
-            params: model_params,
-        })
-    }
-    
-    pub fn decode(&self, tokens: &[u32]) -> Result<u32> {
-        let batch = unsafe {
-            llama_batch_init(tokens.len(), 0, 1)
-        };
-        
-        // Add tokens to batch
-        for (i, &token) in tokens.iter().enumerate() {
-            unsafe {
-                llama_batch_add(batch, token as i32, i as i32, &[0], i == tokens.len() - 1);
-            }
-        }
-        
-        // Decode
-        let result = unsafe {
-            llama_decode(self.ctx, batch)
-        };
-        
-        if result != 0 {
-            return Err(anyhow!("llama_decode failed"));
-        }
-        
-        // Sample next token
-        let logits = unsafe {
-            llama_get_logits_ith(self.ctx, tokens.len() - 1)
-        };
-        
-        let token = self.sample(logits)?;
-        
-        unsafe { llama_batch_free(batch); }
-        
-        Ok(token)
-    }
+    pub fn load(path: &Path, n_gpu_layers: i32) -> Result<Self>;
+    pub fn decode(&self, tokens: &[u32]) -> Result<u32>;
 }
 ```
 
 ### Backend Router
 
+### Backend Router (Deferred)
+
+A `Backend` enum and `BackendRouter` do not yet exist. Once llama.cpp
+integration is complete, the router will auto-detect format at load time:
+
 ```rust
 pub enum Backend {
     Native(NativeEngine),      // Our implementation (PrismaSCOUT, AutoRound, BF16)
-    LlamaCpp(LlamaCppBackend), // llama.cpp (GGUF)
+    // LlamaCpp(LlamaCppBackend), // Future: llama.cpp GGUF support
 }
 
-pub struct BackendRouter {
-    pub backend: Backend,
-}
-
-impl BackendRouter {
+impl Backend {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let format = QuantizationFormat::detect(model_dir)?;
-        
         match format {
             QuantizationFormat::Gguf => {
-                let backend = LlamaCppBackend::load(model_dir, 999)?; // All layers on GPU
-                Ok(Self { backend: Backend::LlamaCpp(backend) })
+                anyhow::bail!("GGUF backend not yet implemented — see crates/backends/gguf/");
             }
             _ => {
-                let backend = NativeEngine::load(model_dir)?;
-                Ok(Self { backend: Backend::Native(backend) })
+                let engine = NativeEngine::load(model_dir)?;
+                Ok(Self::Native(engine))
             }
-        }
-    }
-    
-    pub fn chat_completions(&self, req: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        match &self.backend {
-            Backend::Native(engine) => engine.chat_completions(req),
-            Backend::LlamaCpp(engine) => engine.chat_completions(req),
         }
     }
 }
 ```
 
 ### KV Cache Quantization
+
+KV cache quantization must work with the existing `PagedKvCache` interleaved
+page layout (`[K tokens | V tokens]` per page, `page_stride = 2 * page_size * kv_dim`).
 
 ```rust
 pub enum KvCacheDtype {
@@ -321,44 +248,61 @@ impl KvCacheDtype {
         match self {
             Self::Bf16 => 2,
             Self::Fp8E4M3 | Self::Fp8E5M2 => 1,
-            Self::Nvfp4 => 1,  // Packed with scales
+            Self::Nvfp4 => 1,  // Packed with block scales
         }
     }
 }
 
+/// Quantized paged KV cache using interleaved K+V per page layout.
+///
+/// Matches the PagedKvCache layout but stores quantized values:
+/// page_pool[page_id * page_stride + side * page_size * kv_dim + ...]
+/// where side=0 for K, side=1 for V.
 pub struct QuantizedKvCache {
     pub dtype: KvCacheDtype,
-    pub k_cache: DeviceBuffer<u8>,  // Raw bytes
-    pub v_cache: DeviceBuffer<u8>,
-    pub scales: Option<DeviceBuffer<half>>,  // For NVFP4
+    /// Interleaved page pool (K then V per page), quantized to dtype.
+    pub page_pool: CudaSlice<u8>,
+    /// Number of pages in the pool.
+    pub num_pages: usize,
+    /// Page size (tokens per page).
+    pub page_size: usize,
+    /// KV dimension.
+    pub kv_dim: usize,
+    /// Block scales for NVFP4 (one per 128-element block).
+    pub scales: Option<CudaSlice<bf16>>,
 }
 
 impl QuantizedKvCache {
     pub fn allocate(
+        stream: &CudaStream,
         num_pages: usize,
         page_size: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
+        kv_dim: usize,
         dtype: KvCacheDtype,
     ) -> Result<Self> {
         let bytes_per_elem = dtype.bytes_per_element();
-        let page_bytes = page_size * num_kv_heads * head_dim * bytes_per_elem;
-        
-        let k_cache = DeviceBuffer::alloc(num_pages * page_bytes)?;
-        let v_cache = DeviceBuffer::alloc(num_pages * page_bytes)?;
-        
+        let page_bytes = 2 * page_size * kv_dim * bytes_per_elem; // K+V per page
+
+        let page_pool = stream
+            .alloc_zeros::<u8>(num_pages * page_bytes)?;
+
         let scales = if matches!(dtype, KvCacheDtype::Nvfp4) {
-            // NVFP4 requires FP8 block scales
-            let num_blocks = (num_pages * page_size * num_kv_heads * head_dim) / 128;
-            Some(DeviceBuffer::alloc(num_blocks * 2)?)
+            let num_blocks = (num_pages * 2 * page_size * kv_dim) / 128;
+            Some(stream.alloc_zeros::<bf16>(num_blocks * 2)?)
         } else {
             None
         };
-        
+
         Ok(Self {
             dtype,
-            k_cache,
-            v_cache,
+            page_pool,
+            num_pages,
+            page_size,
+            kv_dim,
+            scales,
+        })
+    }
+}
             scales,
         })
     }
@@ -373,8 +317,8 @@ impl QuantizedKvCache {
         &mut self,
         page_id: usize,
         page_offset: usize,
-        k: &DeviceBuffer<half>,
-        v: &DeviceBuffer<half>,
+        k: &CudaSlice<bf16>,
+        v: &CudaSlice<bf16>,
         stream: &CudaStream,
     ) -> Result<()> {
         // Quantize BF16 → FP8 (E4M3)
@@ -395,7 +339,7 @@ impl QuantizedKvCache {
         page_offset: usize,
         len: usize,
         stream: &CudaStream,
-    ) -> Result<(DeviceBuffer<half>, DeviceBuffer<half>)> {
+    ) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>)> {
         let offset = page_id * self.page_size + page_offset;
         
         let k_fp8 = self.k_cache.slice(offset, offset + len)?;
@@ -416,64 +360,73 @@ impl QuantizedKvCache {
 crates/backends/
   native/
     src/
-      quant.rs            # Quantization helpers (FP8, NVFP4)
-      
-  gguf/
+      quant.rs            # NEW: Quantization helpers (FP8, NVFP4), INT4 GEMM kernel dispatch
+
+  gguf/                   # EXISTS AS STUB — needs implementation
     Cargo.toml
-    build.rs              # Build llama.cpp submodule
+    build.rs              # FUTURE: Build llama.cpp submodule
     src/
       lib.rs
-      backend.rs          # LlamaCppBackend
-      parser.rs           # GGUF parser
-      ffi.rs              # llama.cpp FFI bindings
-      
+      backend.rs          # FUTURE: LlamaCppBackend
+      parser.rs           # FUTURE: GGUF parser
+      ffi.rs              # FUTURE: llama.cpp FFI bindings
+
+crates/cuda/
+  src/
+    gemm.rs               # UPDATE: Add INT4 GEMM engine
+  kernels/infers/
+    int4_gemm.cu          # NEW: Custom INT4 GEMM kernel (future)
+
 crates/kv/
   src/
-    quant.rs              # KvCacheDtype, QuantizedKvCache
+    quant.rs              # NEW: KvCacheDtype, QuantizedKvCache
 ```
 
 ## Testing
 
-### AutoRound Correctness
+### Format Detection
 
 ```rust
 #[test]
-fn test_autoround_vs_bf16() {
-    let prompt = "The capital of France is";
-    
-    let bf16_engine = NativeEngine::load("/models/Qwen3.6-27B-BF16").unwrap();
-    let int4_engine = NativeEngine::load("/models/Qwen3.6-27B-AutoRound").unwrap();
-    
-    let bf16_tokens = bf16_engine.generate(prompt, 10).unwrap();
-    let int4_tokens = int4_engine.generate(prompt, 10).unwrap();
-    
-    // Allow some divergence
-    let match_rate = bf16_tokens.iter()
-        .zip(int4_tokens.iter())
-        .filter(|(a, b)| a == b)
-        .count() as f32 / bf16_tokens.len() as f32;
-    
-    assert!(match_rate > 0.8, "AutoRound divergence too high: {}", match_rate);
+fn test_autoround_format_detection() {
+    // Format detection works, loading doesn't yet (INT4 GEMM not implemented)
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create quantization_config.json for AutoRound
+    std::fs::write(
+        dir.path().join("quantization_config.json"),
+        r#"{"quantization_method":"auto-round","group_size":128}"#,
+    ).unwrap();
+
+    let format = QuantizationFormat::detect(dir.path()).unwrap();
+    assert_eq!(format, QuantizationFormat::AutoRound);
 }
 ```
 
-### GGUF Loading
+### KV Cache Quantization (Unit Test)
 
 ```rust
 #[test]
-fn test_gguf_load() {
-    let parser = GgufParser::parse("/models/Qwen3.6-27B-Q4_K_M.gguf").unwrap();
-    
-    assert!(parser.metadata.contains_key("general.architecture"));
-    assert!(!parser.tensor_infos.is_empty());
-    
-    let backend = LlamaCppBackend::load("/models/Qwen3.6-27B-Q4_K_M.gguf", 999).unwrap();
-    
-    let tokens = vec![1, 2, 3];  // dummy
-    let output = backend.decode(&tokens).unwrap();
-    
-    assert!(output > 0);
+fn test_quantized_kv_cache_alloc() {
+    let stream = CudaStream::new(0).unwrap();
+    let cache = QuantizedKvCache::allocate(
+        &stream, 100, // num_pages
+        16,           // page_size
+        1024,         // kv_dim
+        KvCacheDtype::Fp8E4M3,
+    ).unwrap();
+
+    assert_eq!(cache.num_pages, 100);
+    // page_pool = 100 * 2 * 16 * 1024 * 1 byte = 3,276,800 bytes
+    assert_eq!(cache.page_pool.len(), 3_276_800);
 }
+```
+
+### GGUF Parser (Deferred)
+
+```rust
+// GGUF parsing and llama.cpp backend tests will be added once
+// crates/backends/gguf/ is implemented. See that crate for details.
 ```
 
 ## Dependencies

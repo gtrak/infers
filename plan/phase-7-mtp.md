@@ -17,38 +17,93 @@
 
 ### MTP Architecture
 
-Qwen3.6 has `mtp_num_hidden_layers: 1` — a single MTP layer that:
-- Takes the hidden state from the main model
-- Projects to a new set of logits
-- Predicts future tokens greedily
-- Acts as a draft for speculative decoding
+Qwen3.6 has `mtp_num_hidden_layers: 1` — the MTP head is a full transformer
+layer that predicts future tokens from the main model's hidden state:
+
+1. Normalizes the input embedding (`pre_fc_norm_embedding`) and the main model's
+   hidden state (`pre_fc_norm_hidden`)
+2. Concatenates them and projects through an FC layer to `hidden_size`
+3. Passes through one full transformer decoder layer (self-attention + MLP)
+4. Applies final layer norm
+5. Projects to logits via the shared LM head (same weights as main model)
 
 ```rust
+use crate::forward::LayerWeights;
+
+/// MTP head: full transformer layer that predicts the next token from
+/// the main model's hidden state + the MTP input embedding.
+///
+/// Architecture (from MtpWeights):
+/// 1. pre_fc_norm_embedding → normalize input embedding
+/// 2. pre_fc_norm_hidden → normalize main model hidden state
+/// 3. fc → concat and project [embed, hidden] → hidden_size
+/// 4. Full decoder layer (attention + MLP)
+/// 5. norm → final layer norm
+/// 6. LM head → logits (shared with main model)
 pub struct MtpHead {
-    pub layer: TransformerLayer,  // Single full attention layer
-    pub lm_head: DeviceBuffer<half>,
+    /// Pre-FC norm for the token embedding.
+    pub pre_fc_norm_embedding: WeightData,
+    /// Pre-FC norm for the main model's hidden state.
+    pub pre_fc_norm_hidden: WeightData,
+    /// FC projection: concat([embed_norm, hidden_norm]) → hidden_size.
+    pub fc_weight: CudaSlice<bf16>,
+    /// Full transformer decoder layer (attention + MLP/MoE).
+    pub layer: LayerWeights,
+    /// Final post-layer norm.
+    pub norm: WeightData,
+    /// Whether to use dedicated MTP embeddings (default: false = share main model).
+    pub use_dedicated_embeddings: bool,
 }
 
 impl MtpHead {
-    pub fn from_weights(weights: &MtpWeights) -> Result<Self> {
+    pub fn from_weights(weights: &MtpWeights, stream: &Arc<CudaStream>) -> Result<Self> {
+        let fc_weight = upload_weight(stream, &weights.fc)?;
+        let layer = LayerWeights::from_mtp_weights(weights, stream)?;
         Ok(Self {
-            layer: TransformerLayer::new(weights.layer)?,
-            lm_head: weights.lm_head.clone(),
+            pre_fc_norm_embedding: weights.pre_fc_norm_embedding.clone(),
+            pre_fc_norm_hidden: weights.pre_fc_norm_hidden.clone(),
+            fc_weight,
+            layer,
+            norm: weights.norm.clone(),
+            use_dedicated_embeddings: weights.embed_tokens.is_some(),
         })
     }
-    
+
+    /// Forward MTP head: produce logits for the next token.
+    ///
+    /// # Arguments
+    /// * `hidden` — Main model's hidden state `[hidden_size]`
+    /// * `input_token` — Token ID to embed (input to MTP)
+    /// * `embed_fn` — Function to embed token IDs (main model's embedding)
+    /// * `stream` — CUDA stream for kernel launches
     pub fn forward(
         &self,
-        hidden: &DeviceBuffer<half>,
-        position: usize,
-    ) -> Result<DeviceBuffer<half>> {
-        // Single transformer layer
-        let output = self.layer.forward(hidden, position)?;
-        
-        // LM head projection
-        let logits = matmul(&output, &self.lm_head)?;
-        
-        Ok(logits)
+        hidden: &CudaSlice<bf16>,
+        input_token: u32,
+        embed_fn: impl Fn(u32, &CudaStream) -> Result<CudaSlice<bf16>>,
+        stream: &Arc<CudaStream>,
+    ) -> Result<CudaSlice<bf16>> {
+        // 1. Embed the input token (shared with main model)
+        let embedding = embed_fn(input_token, stream)?;
+
+        // 2. Norms
+        let embed_norm = rms_norm(stream, &embedding, &self.pre_fc_norm_embedding)?;
+        let hidden_norm = rms_norm(stream, hidden, &self.pre_fc_norm_hidden)?;
+
+        // 3. Concat and FC project: [embed_norm | hidden_norm] @ fc_weight
+        let concat = concat_bf16(stream, &[&embed_norm, &hidden_norm])?;
+        let mut projected = stream.alloc_zeros::<bf16>(hidden.len())?;
+        gemm::matmul_bf16(
+            &GemmConfig { m: 1, n: hidden.len(), k: 2 * hidden.len(), ... },
+            &concat, &self.fc_weight, &mut projected,
+        )?;
+
+        // 4. Full decoder layer (attention + MLP)
+        let mut layer_out = self.layer.forward(&projected, stream)?;
+
+        // 5. Final norm → logits via shared LM head (done by caller)
+        let output = rms_norm(stream, &layer_out, &self.norm)?;
+        Ok(output)
     }
 }
 ```
@@ -66,87 +121,112 @@ impl MtpEngine {
     pub fn new(
         mtp_weights: &MtpWeights,
         num_draft_tokens: usize,
+        stream: &Arc<CudaStream>,
     ) -> Result<Self> {
         Ok(Self {
-            mtp_head: MtpHead::from_weights(mtp_weights)?,
+            mtp_head: MtpHead::from_weights(mtp_weights, stream)?,
             num_draft_tokens,
             acceptance_history: Vec::new(),
         })
     }
-    
-    /// Generate draft tokens from the MTP head
+
+    /// Generate draft tokens from the MTP head.
+    ///
+    /// Iteratively runs the MTP head: embed token → MTP forward → sample.
+    /// The LM head projection uses the main model's LM head (shared weights).
     pub fn generate_drafts(
         &self,
-        hidden: &DeviceBuffer<half>,
+        hidden: &CudaSlice<bf16>,
         num_drafts: usize,
+        main_model: &ForwardEngine,
+        stream: &Arc<CudaStream>,
     ) -> Result<Vec<u32>> {
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_hidden = hidden.clone();
-        
+        let mut current_token = main_model.last_token(); // last generated token
+
         for _ in 0..num_drafts {
-            // Forward MTP head
-            let logits = self.mtp_head.forward(&current_hidden, 0)?;
-            
+            // Forward MTP head: produces hidden state
+            let mtp_hidden = self.mtp_head.forward(
+                &current_hidden,
+                current_token,
+                |token, s| main_model.embed(token, s),
+                stream,
+            )?;
+
+            // LM head projection (shared with main model)
+            let logits = main_model.lm_head_projection(&mtp_hidden, stream)?;
+
             // Greedy sample
-            let token = self.greedy_sample(&logits)?;
+            let token = sample::greedy_sample(stream, main_model.argmax_kernel(), &logits)?;
             drafts.push(token);
-            
-            // Get token embedding for next draft
-            current_hidden = self.embed_token(token)?;
+
+            current_token = token;
+            current_hidden = mtp_hidden;
         }
-        
+
         Ok(drafts)
     }
     
-    /// Verify draft tokens against main model
+    /// Verify draft tokens against main model.
+    ///
+    /// **Prerequisite:** ForwardEngine must expose a method that returns
+    /// per-token hidden states (not just sampled tokens). Currently
+    /// `ForwardEngine::decode()` returns only `u32` — the sampled token.
+    ///
+    /// This requires adding a method like:
+    ///   `ForwardEngine::decode_with_hidden(token, position, seq) -> (u32, CudaSlice<bf16>)`
+    /// which returns both the sampled token and the final hidden state.
+    ///
+    /// Until that exists, MTP verification must run the main model's forward
+    /// pass separately for each draft position, embedding → layer loop → LM head.
     pub fn verify_drafts(
         &self,
         main_model: &ForwardEngine,
-        session: &mut Session,
+        draft_position: usize,
         draft_tokens: &[u32],
+        hidden_state: &CudaSlice<bf16>,
+        stream: &Arc<CudaStream>,
     ) -> Result<VerificationResult> {
-        // Prepare input: [confirmed_token, draft_token_1, draft_token_2, ...]
-        let mut verification_tokens = vec![session.get_last_token()];
-        verification_tokens.extend_from_slice(draft_tokens);
-        
-        // Run main model forward on all draft positions
         let mut all_logits = Vec::new();
-        let mut current_hidden = session.get_last_hidden_state()?.clone();
-        
-        for (i, &token) in verification_tokens.iter().enumerate().skip(1) {
-            // Embed token
-            let embedded = main_model.embed_single(token)?;
-            
-            // Forward through main model (all layers)
-            let hidden = main_model.forward_decode(&embedded, session)?;
-            
-            // Get logits
-            let logits = main_model.lm_head(&hidden)?;
+        let mut current_hidden = hidden_state.clone();
+
+        for &draft_token in draft_tokens {
+            // Embed the draft token (uses main model's embedding table)
+            let embedded = main_model.embed_single(draft_token, stream)?;
+
+            // Forward through all layers: RMSNorm → GDN/Attention → MLP → residual
+            // Returns the hidden state at the final layer (pre LM head)
+            let hidden = main_model.forward_layer_loop(&embedded, stream)?;
+
+            // Project to logits via shared LM head
+            let logits = main_model.lm_head_projection(&hidden, stream)?;
             all_logits.push(logits);
-            
+
             current_hidden = hidden;
         }
-        
+
         // Check which draft tokens match main model's prediction
         let mut accepted = 0;
         for (i, &draft_token) in draft_tokens.iter().enumerate() {
-            let main_token = self.greedy_sample(&all_logits[i])?;
-            
+            let main_token = sample::greedy_sample(stream, main_model.argmax_kernel(), &all_logits[i])?;
+
             if main_token == draft_token {
                 accepted += 1;
             } else {
                 break;
             }
         }
-        
+
         // Accept accepted tokens, reject the rest
         let accepted_tokens = draft_tokens[..accepted].to_vec();
         let rejected_token = if accepted < draft_tokens.len() {
-            Some(self.sample_from_logits(&all_logits[accepted])?)
+            let logits = &all_logits[accepted];
+            Some(sample::greedy_sample(stream, main_model.argmax_kernel(), logits)?)
         } else {
             None
         };
-        
+
         Ok(VerificationResult {
             accepted_tokens,
             rejected_token,
@@ -218,22 +298,78 @@ impl MtpEngine {
 
 ### Integration with Decode Loop
 
+**Prerequisite:** ForwardEngine needs to expose hidden states. Currently
+`decode()` returns only a `u32` token ID. For MTP, we need a method like:
+
+```rust
+impl ForwardEngine {
+    /// Decode a single token and return both the next token and the
+    /// final hidden state (pre-LM-head) for MTP drafting.
+    pub fn decode_with_hidden(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        seq_id: SequenceId,
+    ) -> Result<(u32, CudaSlice<bf16>)> {
+        // Same as decode(), but return the final hidden state
+        // before LM head projection
+    }
+}
+```
+
+Once that exists, the MTP decode loop looks like:
+
 ```rust
 impl ForwardEngine {
     pub fn decode_with_mtp(
-        &self,
-        session: &mut Session,
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        seq_id: SequenceId,
         mtp: &MtpEngine,
+        max_tokens: usize,
     ) -> Result<Vec<u32>> {
         let mut output_tokens = Vec::new();
-        
-        while session.num_generated_tokens < session.max_tokens {
-            // 1. Get current hidden state from last token
-            let hidden = session.get_last_hidden_state()?;
-            
+        let mut current_token = token_id;
+        let mut current_pos = position;
+
+        while output_tokens.len() < max_tokens {
+            // 1. Get current hidden state from main model
+            let (sampled_token, hidden_state) = self.decode_with_hidden(
+                stream, current_token, current_pos, seq_id,
+            )?;
+            output_tokens.push(sampled_token);
+            current_pos += 1;
+
             // 2. Generate draft tokens from MTP
             let num_drafts = mtp.adaptive_num_drafts();
-            let drafts = mtp.generate_drafts(&hidden, num_drafts)?;
+            let drafts = mtp.generate_drafts(
+                &hidden_state, num_drafts, self, stream,
+            )?;
+
+            // 3. Verify drafts with main model
+            let verification = mtp.verify_drafts(
+                self, current_pos, &drafts, &hidden_state, stream,
+            )?;
+
+            // 4. Accept/reject
+            let accepted = mtp.accept_prefix(&verification);
+            output_tokens.extend(accepted);
+            current_pos += accepted.len() as u32;
+
+            // Check for stop
+            if let Some(&token) = accepted.last() {
+                if token == self.tokenizer_eos_id() {
+                    break;
+                }
+            }
+        }
+
+        Ok(output_tokens)
+    }
+}
             
             // 3. Verify drafts with main model
             let verification = mtp.verify_drafts(self, session, &drafts)?;

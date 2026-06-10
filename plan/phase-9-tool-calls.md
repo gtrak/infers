@@ -178,7 +178,7 @@ pub struct PartialToolCall {
 
 ```rust
 async fn stream_tool_call_response(
-    engine: &BackendRouter,
+    engine: &ForwardEngine,
     req: ChatCompletionRequest,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut parser = ToolCallParser;
@@ -186,22 +186,23 @@ async fn stream_tool_call_response(
         buffer: String::new(),
         index: 0,
     };
-    
+
     let stream = async_stream::stream! {
-        let mut tokens = engine.generate_streaming(&req).await?;
-        
-        while let Some(token) = tokens.next().await {
-            // Try to parse tool call from accumulated text
-            if let Some(tool_call) = parser.parse_streaming_delta(&mut partial, &token)? {
-                yield Event::default().data(json!({
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": partial.index,
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
+        // Generate streaming tokens (uses ForwardEngine::prefill + decode loop)
+        let stream_result = engine.generate_stream(
+            &req,
+            |token| {
+                // Token callback: parse tool calls from accumulated text
+                if let Some(tool_call) = parser.parse_streaming_delta(&mut partial, &token)? {
+                    yield Event::default().data(json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": partial.index,
+                                    "id": tool_call.id,
+                                    "type": "function",
+                                    "function": {
                                     "name": tool_call.function.name,
                                     "arguments": tool_call.function.arguments
                                 }
@@ -246,22 +247,23 @@ async fn stream_tool_call_response(
 
 ```rust
 pub struct Benchmark {
-    pub engine: BackendRouter,
+    pub engine: ForwardEngine,
     pub vllm_baseline: Option<f32>,  // tok/s from vLLM
 }
 
 impl Benchmark {
     pub async fn run(&self) -> Result<BenchmarkResults> {
         let mut results = BenchmarkResults::new();
-        
+
         // Test 1: Single request latency
         let prompt = "Explain quantum computing in one paragraph";
+        let tokens = self.tokenizer.encode(prompt)?;
         let start = Instant::now();
-        let _ = self.engine.chat_completions(ChatCompletionRequest {
-            messages: vec![Message::user(prompt.to_string())],
-            max_tokens: Some(256),
-            ..Default::default()
-        }).await?;
+        let _ = self.engine.prefill(stream, &tokens)?;
+        let mut token = *tokens.last().unwrap();
+        for pos in tokens.len()..tokens.len() + 256 {
+            token = self.engine.decode(stream, token, pos as u32)?;
+        }
         let latency = start.elapsed();
         results.single_latency = latency;
         
@@ -322,42 +324,58 @@ impl Benchmark {
 ### Stability Test
 
 ```rust
-#[tokio::test]
-async fn test_24_hour_stability() {
-    let engine = BackendRouter::load("/models/Qwen3.6-27B-PrismaSCOUT").unwrap();
-    
+#[test]
+fn test_24_hour_stability() -> Result<()> {
+    // NOTE: This test requires real GPU hardware and model weights.
+    // Run with: cargo test -- --ignored --nocapture
+    use std::time::{Duration, Instant};
+
+    let config = Arc::new(load_test_config());
+    let weights = vec![load_test_weights()];
+    let ctx = Arc::new(CudaContext::new(0)?);
+    let kernel_registry = KernelRegistry::new_infers_kernels();
+    let streams = StreamPool::new(1, ctx.clone())?;
+    let mut engine = ForwardEngine::new(
+        config, weights, ctx, kernel_registry, streams,
+    )?;
+    engine.init_paged(5000, 16, 1024 * 1024 * 1024)?;
+
     let prompts = vec![
-        "Hello, world!",
-        "What is the capital of France?",
-        "Explain quantum computing",
-        "Write a Python function",
-        "Tell me a joke",
+        vec![1, 2, 3, 4, 5],  // tokenized prompts
+        vec![6, 7, 8, 9, 10],
     ];
-    
+
     let start = Instant::now();
     let mut iteration = 0;
-    
+    let stream = engine.get_stream(0).clone();
+
     while start.elapsed() < Duration::from_secs(24 * 3600) {
         let prompt = &prompts[iteration % prompts.len()];
-        
-        let result = engine.chat_completions(ChatCompletionRequest {
-            messages: vec![Message::user(prompt.to_string())],
-            max_tokens: Some(100),
-            ..Default::default()
-        }).await;
-        
-        assert!(result.is_ok(), "Failed at iteration {}", iteration);
-        
+        let seq_id = engine.paged_kv_manager.as_ref().unwrap()
+            .lock().unwrap().create_sequence();
+
+        // Prefill
+        let _ = engine.prefill(&stream, prompt)?;
+
+        // Decode loop
+        let mut token = *prompt.last().unwrap();
+        for pos in prompt.len()..prompt.len() + 100 {
+            token = engine.decode(&stream, token, pos as u32)?;
+        }
+
         // Memory check every 100 iterations
         if iteration % 100 == 0 {
-            let mem_usage = get_gpu_memory_usage();
-            assert!(mem_usage < 0.95, "Memory leak detected: {}%", mem_usage * 100.0);
+            // Check GPU memory utilization
+            let free_pages = engine.paged_kv_manager.as_ref().unwrap()
+                .lock().unwrap().num_free_pages();
+            assert!(free_pages > 10, "Possible memory leak: only {} free pages", free_pages);
         }
-        
+
         iteration += 1;
     }
-    
+
     println!("Completed {} iterations over 24 hours", iteration);
+    Ok(())
 }
 ```
 
@@ -390,7 +408,7 @@ benchmarks/
 
 | Metric | Target | vLLM Baseline |
 |---|---|---|
-| Single request decode | >20 tok/s | ~15 tok/s (PrismaSCOUT) |
+| Single request decode | >20 tok/s | ~15 tok/s (PrismaScout) |
 | Throughput (10 concurrent) | >100 tok/s total | ~80 tok/s |
 | First token latency (1K prompt) | <500ms | ~400ms |
 | First token latency (128K prompt) | <5s | ~4s |
