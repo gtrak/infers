@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use infers_cuda::gemm::GemmEngine;
+use infers_cuda::gemm::Int4GemmConfig;
 use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
@@ -70,6 +71,10 @@ pub struct ForwardEngine {
     /// FP8 dequantize kernel: FP8→BF16 on GPU.
     #[allow(dead_code)]
     fp8_dequantize_kernel: CudaFunction,
+
+    /// INT4 GEMM kernel: matmul with on-the-fly per-group dequantization.
+    #[allow(dead_code)]
+    int4_gemm_kernel: CudaFunction,
 
     /// Paged KV cache manager (pool + prefix cache + COW).
     paged_kv_manager: Option<PagedKvManager>,
@@ -134,6 +139,7 @@ impl ForwardEngine {
         // Resolve quantization kernel handles
         let fp8_quantize_kernel = kernels.get_function("infers_fp8_quantize_bf16")?;
         let fp8_dequantize_kernel = kernels.get_function("infers_fp8_dequantize_bf16")?;
+        let int4_gemm_kernel = kernels.get_function("int4_gemm_kernel")?;
 
         // Create GEMM engine using the first stream
         let default_stream = streams.get(0)
@@ -180,6 +186,7 @@ impl ForwardEngine {
             paged_attention_decode_kernel,
             fp8_quantize_kernel,
             fp8_dequantize_kernel,
+            int4_gemm_kernel,
             paged_kv_manager: None,
             gemm,
             nccl,
@@ -362,6 +369,33 @@ impl ForwardEngine {
             page_size,
             kv_dim,
             dtype,
+        )
+    }
+
+    /// Execute INT4 GEMM with on-the-fly dequantization.
+    ///
+    /// Weights stay in INT4-packed format in GPU memory — no dequantized copy exists.
+    /// Dequantization happens in registers during the inner loop.
+    /// See [`infers_cuda::gemm::matmul_int4`] for details.
+    pub fn matmul_int4(
+        &self,
+        stream: &Arc<CudaStream>,
+        config: &Int4GemmConfig,
+        output: &mut CudaSlice<half::bf16>,
+        weight: &CudaSlice<u32>,
+        scales: &CudaSlice<half::bf16>,
+        zeros: &CudaSlice<u32>,
+        input: &CudaSlice<half::bf16>,
+    ) -> Result<()> {
+        infers_cuda::gemm::matmul_int4(
+            stream,
+            &self.int4_gemm_kernel,
+            config,
+            output,
+            weight,
+            scales,
+            zeros,
+            input,
         )
     }
 
