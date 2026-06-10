@@ -150,15 +150,47 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 # Phase 4.6 Deliverables
 Phase 4.6 (PagedAttention + Prefix Caching) replaces the flat contiguous KV cache with a paged block-pool allocator supporting prefix caching and copy-on-write page sharing. See `plan/phase-4.6-pagedattention.md` for the full design document.
 
-- Paged KV allocator: PhysicalPage, PagePool, SequencePageTable, O(1) alloc/free
-- Prefix cache: Blake3 content hashing, page chain storage, LRU eviction, memory budgeting
+## Paged KV Types
+
+Core data structures in `infers-kv` crate for paged attention.
+
+### PhysicalPage
+
+CPU-side metadata for a single paged KV block.
+
+`PhysicalPage` tracks `page_id`, `refcount` (`AtomicU32` for copy-on-write sharing), `state` (`Mutable` or `Sealed`), `location` (`Gpu` or `Cpu`), and device pointers `k_ptr`/`v_ptr`. Pages become `Sealed` when full, enabling prefix caching. See [[crates/kv/src/page.rs#PhysicalPage]].
+
+### PageId and PageSentinel
+
+`u32` alias for identifying physical pages in the pool.
+
+`PageId` is a `u32` alias. `INVALID_PAGE_ID` (`u32::MAX`) serves as a sentinel for unallocated slots. See [[crates/kv/src/page.rs#PageId]].
+
+### SequencePageTable
+
+Maps logical token positions to physical page IDs for kernel dispatch.
+
+`SequencePageTable` does not own pages — it holds a `Vec<PageId>` pointing into the shared `PagePool`. Methods: `push_page()`, `add_token()`, `remove_last_page()`, `is_tail_page_full()`, `tail_page_id()`, `block_table()`. See [[crates/kv/src/table.rs#SequencePageTable]].
+
+## Completed
+
+Types and tests shipped for Phase 4.6 paged KV foundations.
+
+- `infers-kv` crate: `PhysicalPage`, `PageId`, `SequencePageTable` types with 11 unit tests
+- `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
+
+## Remaining
+
+Future deliverables for Phase 4.6 completion.
+
+- PagePool with O(1) alloc/free and free list
+- Prefix cache: Blake3 content hashing, page chain storage, LRU eviction
 - Copy-on-write: refcount-based page sharing, GPU-side memcpy for COW copies
 - Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
 - attention.rs rewrite: paged decode with zero CPU round-trips
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
 - engine.rs integration: PagedKvManager with pool + cache orchestration
-- Unit + stress tests: page lifecycle, prefix cache hits/misses, COW correctness, sequence deletion
-- Benchmark suite: prefill throughput, decode latency, cache hit rate, memory usage across 4k–128k contexts
+- Stress tests and benchmark suite
 
 # Phase 4 Deliverables
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
