@@ -147,6 +147,19 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 - Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
 - `lat check` passes
 
+# Phase 4.6 Deliverables
+Phase 4.6 (PagedAttention + Prefix Caching) replaces the flat contiguous KV cache with a paged block-pool allocator supporting prefix caching and copy-on-write page sharing. See `plan/phase-4.6-pagedattention.md` for the full design document.
+
+- Paged KV allocator: PhysicalPage, PagePool, SequencePageTable, O(1) alloc/free
+- Prefix cache: Blake3 content hashing, page chain storage, LRU eviction, memory budgeting
+- Copy-on-write: refcount-based page sharing, GPU-side memcpy for COW copies
+- Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
+- attention.rs rewrite: paged decode with zero CPU round-trips
+- MemoryBudget update: block-aware KV estimation vs flat-buffer model
+- engine.rs integration: PagedKvManager with pool + cache orchestration
+- Unit + stress tests: page lifecycle, prefix cache hits/misses, COW correctness, sequence deletion
+- Benchmark suite: prefill throughput, decode latency, cache hit rate, memory usage across 4k–128k contexts
+
 # Phase 4 Deliverables
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
 
