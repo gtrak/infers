@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use infers_api::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    Choice, ChunkChoice, Delta, MessageContent, Usage, SSE_DONE,
+    Choice, ChunkChoice, Delta, FunctionCall, FunctionCallDelta, MessageContent,
+    ToolCall, ToolCallDelta, Usage, SSE_DONE,
 };
 use crate::state::SharedState;
 
@@ -23,38 +24,268 @@ pub async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
 
+    // Extract tool name from request (if tools provided) before req is consumed
+    let tool_name = req
+        .tools
+        .as_ref()
+        .and_then(|t| t.first())
+        .map(|t| t.function.name.clone());
+
     if req.stream {
-        let stream = create_mock_stream(state.model_name.clone(), now);
-        let sse = Sse::new(stream).keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(std::time::Duration::from_secs(5)),
-        );
-        Ok(sse.into_response())
+        if let Some(name) = tool_name.clone() {
+            let stream = create_mock_tool_call_stream(state.model_name.clone(), now, name);
+            let sse = Sse::new(stream).keep_alive(
+                axum::response::sse::KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(5)),
+            );
+            Ok(sse.into_response())
+        } else {
+            let stream = create_mock_stream(state.model_name.clone(), now);
+            let sse = Sse::new(stream).keep_alive(
+                axum::response::sse::KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(5)),
+            );
+            Ok(sse.into_response())
+        }
     } else {
-        let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{}", generate_id()),
-            object: "chat.completion".to_string(),
-            created: now as i64,
-            model: state.model_name.clone(),
-            choices: vec![Choice {
-                index: 0,
-                message: MessageContent {
-                    role: "assistant".to_string(),
-                    content: Some("Hello! I am a mock response from infers.".to_string()),
-                    tool_calls: None,
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-            usage: Some(Usage {
-                prompt_tokens: 10,
-                completion_tokens: 10,
-                total_tokens: 20,
-            }),
-        };
-        Ok(Json(response).into_response())
+        if let Some(name) = tool_name.clone() {
+            let response = create_mock_tool_call_response(&state.model_name, now, &name);
+            Ok(Json(response).into_response())
+        } else {
+            let response = ChatCompletionResponse {
+                id: format!("chatcmpl-{}", generate_id()),
+                object: "chat.completion".to_string(),
+                created: now as i64,
+                model: state.model_name.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: MessageContent {
+                        role: "assistant".to_string(),
+                        content: Some("Hello! I am a mock response from infers.".to_string()),
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 10,
+                    total_tokens: 20,
+                }),
+            };
+            Ok(Json(response).into_response())
+        }
     }
 }
 
+/// Create a mock non-streaming response with tool calls.
+fn create_mock_tool_call_response(
+    model: &str,
+    created: u64,
+    tool_name: &str,
+) -> ChatCompletionResponse {
+    let tool_call = ToolCall {
+        id: format!("call_{}", generate_id()),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: tool_name.to_string(),
+            arguments: r#"{"location":"Paris","unit":"celsius"}"#.to_string(),
+        },
+    };
+
+    ChatCompletionResponse {
+        id: format!("chatcmpl-{}", generate_id()),
+        object: "chat.completion".to_string(),
+        created: created as i64,
+        model: model.to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: MessageContent {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![tool_call]),
+                reasoning_content: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        }],
+        usage: Some(Usage {
+            prompt_tokens: 15,
+            completion_tokens: 20,
+            total_tokens: 35,
+        }),
+    }
+}
+
+/// Create a mock SSE stream with tool call deltas.
+fn create_mock_tool_call_stream(
+    model: String,
+    created: u64,
+    tool_name: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let id = format!("chatcmpl-{}", generate_id());
+    let call_id = format!("call_{}", generate_id());
+
+    // Simulated incremental arguments to stream
+    let arg_chunks = vec![
+        "{\"",
+        "location",
+        "\":\"",
+        "Paris",
+        "\",\"",
+        "unit",
+        "\":\"",
+        "celsius",
+        "\"}",
+    ];
+
+    let model_c = model.clone();
+    let created_c = created;
+
+    // 1. Role delta: set role to "assistant"
+    let role_chunk = {
+        let id_c = id.clone();
+        let model_c = model_c.clone();
+        stream::once(async move {
+            Ok(Event::default().data(
+                serde_json::to_string(&ChatCompletionChunk {
+                    id: id_c,
+                    object: "chat.completion.chunk".to_string(),
+                    created: created_c as i64,
+                    model: model_c,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                })
+                .unwrap_or_default(),
+            ))
+        })
+    };
+
+    // 2. Tool call name chunk: emit id + type + function name
+    let name_chunk = {
+        let id_c = id.clone();
+        let model_c = model_c.clone();
+        let tool_name_c = tool_name.clone();
+        let call_id_c = call_id.clone();
+        stream::once(async move {
+            Ok(Event::default().data(
+                serde_json::to_string(&ChatCompletionChunk {
+                    id: id_c,
+                    object: "chat.completion.chunk".to_string(),
+                    created: created_c as i64,
+                    model: model_c,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: 0,
+                                id: Some(call_id_c),
+                                tool_type: Some("function".to_string()),
+                                function: Some(FunctionCallDelta {
+                                    name: Some(tool_name_c),
+                                    arguments: None,
+                                }),
+                            }]),
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                })
+                .unwrap_or_default(),
+            ))
+        })
+    };
+
+    // Pre-clone for closures
+    let id_for_args = id.clone();
+    let model_for_args = model_c.clone();
+
+    // 3. Argument chunks: stream incremental arguments
+    let arg_stream = stream::iter(arg_chunks.into_iter().map(move |arg| {
+        let id_c = id_for_args.clone();
+        let model_c = model_for_args.clone();
+        Ok(Event::default().data(
+            serde_json::to_string(&ChatCompletionChunk {
+                id: id_c,
+                object: "chat.completion.chunk".to_string(),
+                created: created_c as i64,
+                model: model_c,
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![ToolCallDelta {
+                            index: 0,
+                            id: None,
+                            tool_type: None,
+                            function: Some(FunctionCallDelta {
+                                name: None,
+                                arguments: Some(arg.to_string()),
+                            }),
+                        }]),
+                        reasoning_content: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .unwrap_or_default(),
+        ))
+    }));
+
+    // 4. Finish chunk: empty delta with finish_reason "tool_calls"
+    let finish_chunk = {
+        let id_c = id.clone();
+        let model_c = model_c.clone();
+        stream::once(async move {
+            Ok(Event::default().data(
+                serde_json::to_string(&ChatCompletionChunk {
+                    id: id_c,
+                    object: "chat.completion.chunk".to_string(),
+                    created: created_c as i64,
+                    model: model_c,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: Some("tool_calls".to_string()),
+                    }],
+                    usage: None,
+                })
+                .unwrap_or_default(),
+            ))
+        })
+    };
+
+    // 5. [DONE] event
+    let end_stream = stream::once(async move {
+        Ok(Event::default().data(SSE_DONE))
+    });
+
+    role_chunk
+        .chain(name_chunk)
+        .chain(arg_stream)
+        .chain(finish_chunk)
+        .chain(end_stream)
+}
+
+/// Create a mock regular text SSE stream.
 fn create_mock_stream(
     model: String,
     created: u64,
@@ -78,6 +309,7 @@ fn create_mock_stream(
                         role: Some("assistant".to_string()),
                         content: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: None,
                 }],
@@ -106,6 +338,7 @@ fn create_mock_stream(
                             role: None,
                             content: Some(token.to_string()),
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason: None,
                     }],
@@ -132,6 +365,7 @@ fn create_mock_stream(
                         role: None,
                         content: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: Some("stop".to_string()),
                 }],

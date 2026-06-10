@@ -40,6 +40,8 @@ pub struct Delta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallDelta {
     pub index: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

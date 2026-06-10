@@ -43,6 +43,8 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default)]
     pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub enable_auto_tool_choice: bool,
     #[serde(default = "default_presence_penalty")]
     pub presence_penalty: f32,
     #[serde(default = "default_frequency_penalty")]
