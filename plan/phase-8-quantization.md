@@ -17,9 +17,9 @@
 
 ### AutoRound INT4 End-to-End
 
-**Not yet implemented.** The format detection exists (`QuantizationFormat::detect`
-returns `AutoRound` for `quantization_config.json`), but the weight loading and
-custom INT4 GEMM are not yet implemented.
+**In progress.** The format detection exists (`QuantizationFormat::detect`
+returns `AutoRound` for `quantization_config.json`), and the custom INT4 GEMM kernel
+is being implemented.
 
 AutoRound weights are in packed INT4 format. The planned approach:
 
@@ -189,7 +189,7 @@ the native backend. The `infers-backend-gguf` crate is already set up
 with the correct dependency structure.
 
 ```rust
-// Conceptual approach (not yet implemented):
+// Conceptual approach (deferred to later phase):
 pub struct LlamaCppBackend {
     pub ctx: *mut llama_context,
     pub model: *mut llama_model,
@@ -373,9 +373,11 @@ crates/backends/
 
 crates/cuda/
   src/
-    gemm.rs               # UPDATE: Add INT4 GEMM engine
+    gemm.rs               # UPDATE: Add INT4 GEMM engine + FP8 quantize dispatch
   kernels/infers/
-    int4_gemm.cu          # NEW: Custom INT4 GEMM kernel (future)
+    int4_gemm.cu          # NEW: Custom INT4 GEMM kernel
+    fp8_quantize.cu        # NEW: BF16→FP8 quantize kernel (E4M3/E5M2)
+    fp8_dequantize.cu      # NEW: FP8→BF16 dequantize kernel
 
 crates/kv/
   src/
@@ -427,6 +429,16 @@ fn test_quantized_kv_cache_alloc() {
 ```rust
 // GGUF parsing and llama.cpp backend tests will be added once
 // crates/backends/gguf/ is implemented. See that crate for details.
+```
+
+### FP8 Quantize/Dequantize Kernels
+
+```rust
+#[test]
+fn test_fp8_quantize_roundtrip() {
+    // Verify that quantize(bf16) → dequantize(u8) round-trips within FP8 precision
+    // This tests the CUDA kernel dispatch through the Rust wrapper.
+}
 ```
 
 ## Dependencies

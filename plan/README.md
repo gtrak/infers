@@ -50,7 +50,7 @@ CUDA Kernels
 | [Phase 5](phase-5-pp-microbatching.md) | 3 weeks | Pipeline parallelism with microbatching | PP=2 producing correct results |
 | [Phase 6](phase-6-continuous-batching.md) | 3 weeks | Continuous batching, hybrid KV, session lifecycle | 3+ concurrent sessions |
 | [Phase 7](phase-7-mtp.md) | 2 weeks | Multi-Token Prediction speculative decoding | >1.2x speedup with MTP |
-| [Phase 8](phase-8-quantization.md) | 3 weeks | AutoRound, GGUF, KV cache quantization | All formats working end-to-end |
+| [Phase 8](phase-8-quantization.md) | 3 weeks | AutoRound, GGUF, KV cache quantization, FP8/INT4 CUDA kernels | All formats working end-to-end |
 | [Phase 9](phase-9-tool-calls.md) | 2 weeks | Tool calls, benchmarking, stability | Production-ready server |
 
 **Total: ~24 weeks (6 months)**
