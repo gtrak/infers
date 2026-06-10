@@ -70,7 +70,9 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 | `compiled/` | Compiled .cubin output from nvcc |
 
 ### Kernel Source Files
-Eleven kernel implementations for transformer forward-pass operations using BF16 data.
+All kernels use `extern "C" __global__` so function names are directly loadable from cubin files. Launch configuration is determined by Rust dispatch code, not kernel wrappers.
+
+Eleven kernel implementations across 10 files for transformer forward-pass operations using BF16 data.
 
 | File | Kernels | Description |
 |------|---------|-------------|

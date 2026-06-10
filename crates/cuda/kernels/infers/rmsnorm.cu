@@ -8,12 +8,18 @@
 
 #include "common.cuh"
 
-/// RMSNorm kernel.
+/// RMSNorm kernel — one block per row, shared-memory reduction.
 ///
 /// Each block handles one row. Threads collaboratively compute sum of squares
 /// via shared memory reduction, then broadcast the scaling factor.
+///
+/// # Launch configuration
+/// * grid: `rows` blocks
+/// * block: `min(hidden, INFERS_BLOCK_SIZE)` threads
+/// * shared: `block_size * sizeof(float)` bytes
+extern "C" {
 __launch_bounds__(INFERS_BLOCK_SIZE)
-__global__ void rmsnorm_kernel(
+__global__ void infers_rmsnorm_bf16(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ output,
@@ -55,38 +61,6 @@ __global__ void rmsnorm_kernel(
         float w_val = __bfloat162float(weight[i]);
         output[row * hidden + i] = __float2bfloat16(x_val * scale * w_val);
     }
-}
-
-extern "C" {
-
-/// Launch RMSNorm for BF16 tensors.
-///
-/// # Arguments
-/// * `x` — Input [rows × hidden] in BF16
-/// * `weight` — Weights [hidden] in BF16
-/// * `output` — Output [rows × hidden] in BF16
-/// * `hidden` — Hidden dimension
-/// * `rows` — Number of rows (batch × seq)
-/// * `eps` — Epsilon (typically 1e-5)
-void infers_rmsnorm_bf16(
-    const __nv_bfloat16* x,
-    const __nv_bfloat16* weight,
-    __nv_bfloat16* output,
-    int hidden,
-    int rows,
-    float eps
-) {
-    int block_size;
-    if (hidden <= INFERS_BLOCK_SIZE) {
-        block_size = hidden;
-    } else {
-        block_size = INFERS_BLOCK_SIZE;
-    }
-
-    int shared_bytes = block_size * sizeof(float);
-    rmsnorm_kernel<<<rows, block_size, shared_bytes>>>(
-        x, weight, output, hidden, eps
-    );
 }
 
 } // extern "C"

@@ -12,10 +12,16 @@
 /// Each block processes one row of the seq_len × seq_len score matrix.
 /// Three-phase parallel reduction using shared memory:
 ///   Phase 1 — find row maximum (for numerical stability)
-///   Phase 2 — compute sum of exp(x_i - max)
-///   Phase 3 — write normalized output: exp(x_i - max) / sum
+///   Phase 2 — compute sum of exp(x - max)
+///   Phase 3 — write normalized output: exp(x - max) / sum
+///
+/// # Launch configuration
+/// * grid: `seq_len`
+/// * block: next power of 2 up to `min(seq_len, INFERS_BLOCK_SIZE)`
+/// * shared: `block_size * sizeof(float)`
+extern "C" {
 __launch_bounds__(INFERS_BLOCK_SIZE)
-__global__ void softmax_kernel(
+__global__ void infers_softmax_bf16(
     const __nv_bfloat16* __restrict__ scores,
     __nv_bfloat16* __restrict__ output,
     int seq_len,
@@ -87,32 +93,6 @@ __global__ void softmax_kernel(
             output[row * seq_len + col] = __float2bfloat16(expf(val - max_val) * inv_sum);
         }
     }
-}
-
-extern "C" {
-
-/// Launch online softmax for BF16 attention score matrix.
-///
-/// # Arguments
-/// * `scores` — Input Q×K^T matrix [seq_len × seq_len] row-major
-/// * `output` — Softmax result [seq_len × seq_len] row-major
-/// * `seq_len` — Sequence length (both dimensions)
-/// * `use_causal` — 1 for causal mask (upper triangle = 0), 0 for full softmax
-void infers_softmax_bf16(
-    const __nv_bfloat16* scores,
-    __nv_bfloat16* output,
-    int seq_len,
-    int use_causal
-) {
-    // Round up to next power of 2 for reduction correctness
-    int block_size = 1;
-    while (block_size < seq_len && block_size < INFERS_BLOCK_SIZE) {
-        block_size *= 2;
-    }
-    int shared_bytes = block_size * sizeof(float);
-    softmax_kernel<<<seq_len, block_size, shared_bytes>>>(
-        scores, output, seq_len, use_causal
-    );
 }
 
 } // extern "C"

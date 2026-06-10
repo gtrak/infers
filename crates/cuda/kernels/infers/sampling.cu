@@ -6,8 +6,14 @@
 #include "common.cuh"
 
 /// Argmax kernel — each block finds the max index for one logit row.
+///
+/// # Launch configuration
+/// * grid: `batch_size`
+/// * block: `min(vocab_size, INFERS_BLOCK_SIZE)`
+/// * shared: `block_size * 2 * sizeof(float)`
+extern "C" {
 __launch_bounds__(INFERS_BLOCK_SIZE)
-__global__ void argmax_kernel(
+__global__ void infers_argmax_f32(
     const float* __restrict__ logits,
     int* __restrict__ output,
     int batch_size,
@@ -56,29 +62,6 @@ __global__ void argmax_kernel(
     if (tid == 0) {
         output[row] = (int)s_idxs[0];
     }
-}
-
-extern "C" {
-
-/// Launch argmax sampling for FP32 logits.
-///
-/// # Arguments
-/// * `logits` — Logit tensor [batch_size × vocab_size] in FP32
-/// * `output` — Output token IDs [batch_size] as int32
-/// * `batch_size` — Number of independent logit vectors
-/// * `vocab_size` — Vocabulary size
-void infers_argmax_f32(
-    const float* logits,
-    int* output,
-    int batch_size,
-    int vocab_size
-) {
-    int block_size = (vocab_size <= INFERS_BLOCK_SIZE) ? vocab_size : INFERS_BLOCK_SIZE;
-    int shared_bytes = block_size * 2 * sizeof(float);
-
-    argmax_kernel<<<batch_size, block_size, shared_bytes>>>(
-        logits, output, batch_size, vocab_size
-    );
 }
 
 } // extern "C"

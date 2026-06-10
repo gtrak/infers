@@ -44,11 +44,12 @@ pub fn rms_norm(
     let hidden_size_i32 = hidden_size as i32;
     let num_rows = (elem_count / hidden_size) as i32;
 
-    // Launch config: one block per row, 256 threads per block
+    // Launch config: one block per row, INFERS_BLOCK_SIZE threads per block
+    let block_size = if hidden_size <= 256 { hidden_size } else { 256 };
     let config = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: (256 * std::mem::size_of::<f32>()) as u32,
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: (block_size * std::mem::size_of::<f32>()) as u32,
     };
 
     unsafe {
@@ -58,7 +59,6 @@ pub fn rms_norm(
             .arg(weight)
             .arg(&mut output)
             .arg(&hidden_size_i32)
-            .arg(&num_rows)
             .arg(&eps)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("RMSNorm kernel launch failed: {e}"))?;
