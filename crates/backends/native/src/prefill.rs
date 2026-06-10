@@ -48,6 +48,9 @@ pub struct PrefillKernels {
 /// 3. Final RMSNorm
 /// 4. LM head projection
 /// 5. Sample first token
+///
+/// # Arguments
+/// * `_nccl` — NCCL communicator (reserved for future TP=2 multi-GPU all-reduce)
 pub fn prefill(
     gemm: &mut GemmEngine,
     stream: &Arc<CudaStream>,

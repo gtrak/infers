@@ -8,7 +8,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+/// Reserved for future sampling strategies
 /// Sampling strategy selection for token generation.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SamplingStrategy {
     /// Pure greedy: always pick the token with highest logit.
@@ -22,6 +24,9 @@ pub enum SamplingStrategy {
 }
 
 /// Sampling configuration for the inference engine.
+///
+/// Reserved for future sampling strategies
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SamplingConfig {
     /// Strategy for selecting the next token.
@@ -93,7 +98,7 @@ pub fn temperature_sample(
     _logits: &CudaSlice<f32>,
     _temp: f32,
 ) -> Result<u32> {
-    todo!("temperature_sample: scale logits by 1/temp, softmax, sample from distribution")
+    anyhow::bail!("not yet implemented: temperature_sample")
 }
 
 /// Top-k sampling.
@@ -105,7 +110,7 @@ pub fn top_k_sample(
     _k: usize,
     _temp: f32,
 ) -> Result<u32> {
-    todo!("top_k_sample: find top-k logits, renormalize, sample")
+    anyhow::bail!("not yet implemented: top_k_sample")
 }
 
 /// Top-p (nucleus) sampling.
@@ -117,5 +122,5 @@ pub fn top_p_sample(
     _p: f64,
     _temp: f32,
 ) -> Result<u32> {
-    todo!("top_p_sample: find smallest set of tokens with cumulative probability >= p, sample")
+    anyhow::bail!("not yet implemented: top_p_sample")
 }

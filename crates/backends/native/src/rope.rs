@@ -83,6 +83,7 @@ pub fn apply_rope(
 
     let max_position = *positions.iter().max().unwrap();
 
+    // TODO: Cache RoPE tables in ForwardEngine at init time instead of recomputing per call
     // Precompute sin/cos tables on host — indexed by position value, not sequential index
     let (cos_table, sin_table) = precompute_rope_tables(max_position, head_dim, rope_theta, partial_rotary_factor);
 

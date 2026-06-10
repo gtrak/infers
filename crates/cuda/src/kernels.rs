@@ -60,7 +60,6 @@ impl KernelRegistry {
     /// Paths point to .cubin files in the kernels/compiled/ directory.
     pub fn register_infers_kernels(&mut self) {
         self.register("infers_rmsnorm_bf16", "kernels/compiled/rmsnorm.cubin");
-        self.register("infers_silu_bf16", "kernels/compiled/silu.cubin");
         self.register("infers_silu_glu_bf16", "kernels/compiled/silu.cubin");
         self.register("infers_rope_bf16", "kernels/compiled/rope.cubin");
         self.register("infers_embedding_gather_bf16", "kernels/compiled/embedding.cubin");

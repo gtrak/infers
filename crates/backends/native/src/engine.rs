@@ -29,6 +29,8 @@ pub struct ForwardEngine {
     weights: Vec<WeightRegistry>,
 
     /// Loaded CUDA kernel functions (cubin-based).
+    /// Retained for future multi-kernel lookup
+    #[allow(dead_code)]
     kernels: LoadedKernelRegistry,
 
     /// Cached kernel function handles (resolved from LoadedKernelRegistry at init time).
@@ -50,6 +52,8 @@ pub struct ForwardEngine {
     nccl: NcclCommunicator,
 
     /// Async CUDA streams for parallel execution.
+    /// Retained for future multi-stream execution
+    #[allow(dead_code)]
     streams: StreamPool,
 
     /// Per-layer KV caches for full-attention layers.

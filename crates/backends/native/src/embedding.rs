@@ -47,7 +47,8 @@ pub fn embed_tokens(
 
     let seq_len_i32 = seq_len as i32;
     let hidden_size_i32 = hidden_size as i32;
-    let _vocab_size = vocab_size;
+    // vocab_size is not used by the kernel but validates caller invariants
+    let _ = vocab_size;
 
     let config = LaunchConfig {
         grid_dim: (((seq_len as u32) + 15) / 16, 1, 1), // 16 tokens per block

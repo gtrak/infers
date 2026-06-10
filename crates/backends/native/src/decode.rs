@@ -51,7 +51,7 @@ pub struct DecodeKernels {
 /// * `gemm` — cuBLASLt engine
 /// * `stream` — CUDA stream
 /// * `kernels` — Loaded CUDA kernels
-/// * `nccl` — NCCL communicator (unused for single GPU)
+/// * `_nccl` — NCCL communicator (reserved for future TP=2 multi-GPU all-reduce)
 /// * `config` — Model configuration
 /// * `weights` — Weight registry
 /// * `token_id` — Current token to process
