@@ -98,7 +98,7 @@ pub fn mlp_forward(
 
     let elem_count_i32 = gate_buf_size as i32;
     let config = LaunchConfig {
-        grid_dim: (((gate_buf_size as u32) + 255) / 256, 1, 1),
+        grid_dim: ((gate_buf_size as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };

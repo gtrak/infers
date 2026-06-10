@@ -32,6 +32,12 @@ pub struct KvCache {
     kv_dim: usize,
 }
 
+impl Default for KvCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvCache {
     /// Create an empty (unallocated) KV cache.
     pub fn new() -> Self {
@@ -73,6 +79,7 @@ impl KvCache {
 /// - Zero CPU round-trips during decode
 /// - Prefix sharing across sequences
 /// - Copy-on-write page sharing
+///
 /// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#PagedKvCache]]
 #[derive(Debug)]
 pub struct PagedKvCache {
@@ -216,19 +223,20 @@ pub fn paged_kv_write(
     block_table_gpu: &CudaSlice<i32>,
     positions_gpu: &CudaSlice<i32>,
     seq_len: usize,
+    head_dim: usize,
     kv_dim: usize,
     page_size: usize,
 ) -> Result<()> {
     let total_elements = seq_len * kv_dim;
-    let grid = ((total_elements as u32 + 255) / 256, 1, 1);
+    let grid = (total_elements as u32).div_ceil(256);
     let config = LaunchConfig {
-        grid_dim: grid,
+        grid_dim: (grid, 1, 1),
         block_dim: (BLOCK_SIZE as u32, 1, 1),
         shared_mem_bytes: 0,
     };
 
     let seq_len_i32 = seq_len as i32;
-    let head_dim_i32: i32 = 0; // Not used by kernel — passed for layout
+    let head_dim_i32 = head_dim as i32;
     let kv_dim_i32 = kv_dim as i32;
     let page_size_i32 = page_size as i32;
 
@@ -273,6 +281,7 @@ pub fn paged_kv_read(
     block_table_gpu: &CudaSlice<i32>,
     num_pages: usize,
     num_cached_tokens: usize,
+    head_dim: usize,
     kv_dim: usize,
     page_size: usize,
 ) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>)> {
@@ -286,16 +295,16 @@ pub fn paged_kv_read(
         .map_err(|e| anyhow::anyhow!("Failed to allocate V gather buffer: {e}"))?;
 
     let total_elements = num_cached_tokens * kv_dim;
-    let grid = ((total_elements as u32 + 255) / 256, 1, 1);
+    let grid = (total_elements as u32).div_ceil(256);
     let config = LaunchConfig {
-        grid_dim: grid,
+        grid_dim: (grid, 1, 1),
         block_dim: (BLOCK_SIZE as u32, 1, 1),
         shared_mem_bytes: 0,
     };
 
     let num_pages_i32 = num_pages as i32;
     let num_cached_tokens_i32 = num_cached_tokens as i32;
-    let head_dim_i32: i32 = 0; // Not used by kernel — passed for layout
+    let head_dim_i32 = head_dim as i32;
     let kv_dim_i32 = kv_dim as i32;
     let page_size_i32 = page_size as i32;
 
@@ -534,7 +543,7 @@ pub fn forward(
         .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
 
     let kv_total = seq_len * kv_dim;
-    let kv_grid = ((kv_total as u32) + 255) / 256;
+    let kv_grid = (kv_total as u32).div_ceil(256);
     let kv_config = LaunchConfig {
         grid_dim: (kv_grid, 1, 1),
         block_dim: (256, 1, 1),
@@ -777,7 +786,7 @@ pub fn forward(
     }
 
     // Final result: accum_a if num_heads is even (last head odd → wrote accum_a), accum_b if odd (last head even → wrote accum_b)
-    let output = if num_heads % 2 == 0 { accum_a } else { accum_b };
+    let output = if num_heads.is_multiple_of(2) { accum_a } else { accum_b };
     Ok(output)
 }
 
@@ -917,7 +926,7 @@ pub fn decode_forward(
         .clone_htod(&[position])
         .map_err(|e| anyhow::anyhow!("Failed to copy position to device: {e}"))?;
 
-    let kv_grid = ((kv_dim as u32) + 255) / 256;
+    let kv_grid = (kv_dim as u32).div_ceil(256);
     let kv_config = LaunchConfig {
         grid_dim: (kv_grid, 1, 1),
         block_dim: (256, 1, 1),
@@ -1136,7 +1145,7 @@ pub fn decode_forward(
         }
     }
 
-    let output = if num_heads % 2 == 0 { accum_a } else { accum_b };
+    let output = if num_heads.is_multiple_of(2) { accum_a } else { accum_b };
     Ok(output)
 }
 
@@ -1267,6 +1276,7 @@ pub fn forward_paged(
         block_table_gpu,
         positions_gpu,
         seq_len,
+        head_dim,
         kv_dim,
         page_size,
     )?;
@@ -1487,7 +1497,7 @@ pub fn forward_paged(
         }
     }
 
-    let output = if num_heads % 2 == 0 { accum_a } else { accum_b };
+    let output = if num_heads.is_multiple_of(2) { accum_a } else { accum_b };
     Ok(output)
 }
 
@@ -1615,6 +1625,7 @@ pub fn decode_forward_paged(
         block_table_gpu,
         positions_gpu,
         1, // seq_len = 1 for decode
+        head_dim,
         kv_dim,
         page_size,
     )?;

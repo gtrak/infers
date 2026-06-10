@@ -23,6 +23,12 @@ pub struct GdnState {
     pub hidden_size: usize,
 }
 
+impl Default for GdnState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GdnState {
     /// Create an empty GDN state.
     pub fn new() -> Self {

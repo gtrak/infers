@@ -51,7 +51,7 @@ pub fn embed_tokens(
     let _ = vocab_size;
 
     let config = LaunchConfig {
-        grid_dim: (((seq_len as u32) + 15) / 16, 1, 1), // 16 tokens per block
+        grid_dim: ((seq_len as u32).div_ceil(16), 1, 1), // 16 tokens per block
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };

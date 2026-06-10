@@ -49,7 +49,7 @@ impl SequencePageTable {
         if self.num_tokens == 0 {
             return true;
         }
-        self.num_tokens % self.page_size == 0
+        self.num_tokens.is_multiple_of(self.page_size)
     }
 
     /// Append a new page to the sequence's page table.

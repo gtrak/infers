@@ -194,7 +194,7 @@ impl MemoryBudget {
         // Pages needed per session for average context
         // Each session needs ceil(avg_context / page_size) pages per attention layer
         // Max concurrent = total_pages / (pages_per_session * num_attn_layers)
-        let pages_per_session_per_layer = (config.max_position_embeddings + page_size - 1) / page_size;
+        let pages_per_session_per_layer = config.max_position_embeddings.div_ceil(page_size);
         let max_concurrent_sessions = if pages_per_session_per_layer > 0 && num_attn_layers > 0 {
             total_pages_per_gpu / (pages_per_session_per_layer * num_attn_layers)
         } else {

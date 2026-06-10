@@ -91,7 +91,7 @@ impl PagedKvManager {
         let seq_id = self
             .free_sequence_ids
             .pop()
-            .unwrap_or_else(|| self.sequences.len());
+            .unwrap_or(self.sequences.len());
 
         let table = SequencePageTable::new(self.page_size);
         if seq_id < self.sequences.len() {
@@ -193,10 +193,11 @@ impl PagedKvManager {
 
         table.num_tokens += 1;
 
-        if table.num_tokens > 0 && table.num_tokens % self.page_size == 0 {
-            if let Some(tail_page_id) = table.tail_page_id() {
-                pool.seal(tail_page_id);
-            }
+        if table.num_tokens > 0
+            && table.num_tokens.is_multiple_of(self.page_size)
+            && let Some(tail_page_id) = table.tail_page_id()
+        {
+            pool.seal(tail_page_id);
         }
 
         Ok(())
@@ -309,6 +310,21 @@ impl PagedKvManager {
     /// Get the page size (tokens per page).
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    /// Get the number of KV heads.
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    /// Get the head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Get the KV dimension (num_kv_heads * head_dim).
+    pub fn kv_dim(&self) -> usize {
+        self.num_kv_heads * self.head_dim
     }
 
 }

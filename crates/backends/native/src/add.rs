@@ -36,7 +36,7 @@ pub fn add(
 
     let elem_count_i32 = elem_count as i32;
     let config = LaunchConfig {
-        grid_dim: (((elem_count as u32) + 255) / 256, 1, 1),
+        grid_dim: ((elem_count as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };

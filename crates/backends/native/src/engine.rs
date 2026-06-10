@@ -48,18 +48,14 @@ pub struct ForwardEngine {
     gdn_update_kernel: CudaFunction,
 
 
-    /// Paged attention kernels (resolved for future paged pipeline integration).
-    #[allow(dead_code)]
-    /// Paged KV cache write kernel.
-    #[allow(dead_code)]
+    /// Paged KV cache write kernel. Used by paged pipeline (wiring in progress).
+    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
     paged_kv_write_kernel: CudaFunction,
-    #[allow(dead_code)]
-    /// Paged KV cache read kernel.
-    #[allow(dead_code)]
+    /// Paged KV cache read kernel. Used by paged pipeline (wiring in progress).
+    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
     paged_kv_read_kernel: CudaFunction,
-    #[allow(dead_code)]
-    /// Paged attention decode kernel.
-    #[allow(dead_code)]
+    /// Paged attention decode kernel. Used by paged pipeline (wiring in progress).
+    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
     paged_attention_decode_kernel: CudaFunction,
 
     /// Paged KV cache manager (pool + prefix cache + COW).

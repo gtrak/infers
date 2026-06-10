@@ -79,7 +79,7 @@ pub fn apply_rope(
     partial_rotary_factor: f32,
 ) -> Result<()> {
     anyhow::ensure!(!positions.is_empty(), "Positions must not be empty");
-    anyhow::ensure!(head_dim % 2 == 0, "head_dim must be even, got {}", head_dim);
+    anyhow::ensure!(head_dim.is_multiple_of(2), "head_dim must be even, got {}", head_dim);
 
     let max_position = *positions.iter().max().unwrap();
 
@@ -106,7 +106,7 @@ pub fn apply_rope(
     let half_dim = rotary_dim / 2;
     let total_pairs = positions.len() * num_heads as usize * half_dim;
     let config = LaunchConfig {
-        grid_dim: (((total_pairs as u32) + 255) / 256, 1, 1),
+        grid_dim: ((total_pairs as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
