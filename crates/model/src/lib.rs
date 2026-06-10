@@ -13,6 +13,6 @@ pub mod budget;
 pub use config::*;
 pub use formats::*;
 pub use weights::*;
-pub use loader::{load_model, load_safetensors, LoadedModel, ShardIndex};
+pub use loader::{build_mtp_weights, load_model, load_safetensors, LoadedModel, ShardIndex};
 pub use sharding::*;
 pub use budget::*;

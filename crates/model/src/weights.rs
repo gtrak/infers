@@ -112,12 +112,34 @@ pub struct LayerWeights {
 }
 
 /// Multi-Token Prediction head weights.
+///
+/// MTP adds one or more full transformer layers that predict future tokens
+/// from the main model's hidden state. The MTP head:
+/// 1. Normalizes the input embedding and the main model's hidden state
+/// 2. Concatenates and projects them through an FC layer
+/// 3. Passes through full transformer decoder layers (attention + MLP)
+/// 4. Applies final norm
+/// 5. Projects to logits via the shared LM head
+///
+/// When `mtp_use_dedicated_embeddings: false` (typical), the MTP head reuses
+/// the main model's embedding table. When true, it has its own `embed_tokens`.
+// @lat: [[lat#Weight Registry and Tensors#MtpWeights]]
 #[derive(Debug, Clone)]
 pub struct MtpWeights {
-    /// MTP embedding norm.
-    pub norm: WeightData,
-    /// MTP FC projection.
+    /// Norm applied to the input token embedding before FC projection.
+    pub pre_fc_norm_embedding: WeightData,
+    /// Norm applied to the main model's hidden state before FC projection.
+    pub pre_fc_norm_hidden: WeightData,
+    /// FC projection: concatenates [embed, hidden] → hidden_size.
     pub fc: WeightData,
+    /// The MTP transformer layer(s). Each is a full decoder layer with
+    /// attention + MLP, identical in structure to main model layers.
+    pub layers: Vec<LayerWeights>,
+    /// Final post-layer norm.
+    pub norm: WeightData,
+    /// Dedicated MTP embeddings (only present if
+    /// `mtp_use_dedicated_embeddings: true`).
+    pub embed_tokens: Option<WeightData>,
 }
 
 /// Complete model weight registry.

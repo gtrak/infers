@@ -604,6 +604,10 @@ Enumeration of weight data types: BF16, FP16, FP32, INT4 packed, NVFP4, and Othe
 
 Typed weight structures for GDN layers (`GdnWeights`), attention layers (`AttentionWeights`), and MLP layers (`MlpWeights`). Each contains named `WeightData` fields matching safetensors tensor names. See [[crates/model/src/weights.rs#GdnWeights]], [[crates/model/src/weights.rs#AttentionWeights]], [[crates/model/src/weights.rs#MlpWeights]].
 
+## MtpWeights
+
+MTP head weights with pre-FC norms, FC projection, full transformer layers, final norm, and optional dedicated embeddings. See [[crates/model/src/weights.rs#MtpWeights]].
+
 ## WeightRegistry
 
 Complete model weight registry with embedding, layers, optional MTP head, LM head, norm, and a `HashMap<String, WeightData>` for name-based lookup and sharding. See [[crates/model/src/weights.rs#WeightRegistry]].
@@ -614,11 +618,15 @@ Multi-format model loader with safetensors file reading and auto-detection of si
 
 ## Loading Pipeline
 
-The `load_model()` function is the main entry point: it reads `config.json`, detects quantization format, loads safetensors files, and constructs a `WeightRegistry`. See [[crates/model/src/loader.rs#load_model]].
+`load_model()` reads config, detects format, loads safetensors, then calls `build_mtp_weights()` if MTP is enabled. See [[crates/model/src/loader.rs#load_model]].
 
 ## Single vs Sharded
 
 `load_safetensors()` auto-detects whether a model uses a single `model.safetensors` file or a sharded index (`model.safetensors.index.json` with multiple shard files). Memory maps files for efficient loading. See [[crates/model/src/loader.rs#load_safetensors]].
+
+## MTP Weight Loading
+
+`build_mtp_weights()` extracts MTP tensors from `registry.tensors` and populates `registry.mtp`. Supports GDN and full attention layers. See [[crates/model/src/loader.rs#build_mtp_weights]].
 
 # Weight Sharding
 
