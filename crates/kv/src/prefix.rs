@@ -32,6 +32,7 @@ pub struct CacheEntry {
 ///
 /// The cache has a memory budget. When the budget is exceeded, the least recently
 /// used entries are evicted.
+#[derive(Debug)]
 pub struct PrefixCache {
     /// Map from content hash → cache entry.
     map: HashMap<PageHash, CacheEntry>,

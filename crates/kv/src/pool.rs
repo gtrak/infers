@@ -27,6 +27,7 @@ pub enum PagePoolError {
 ///
 /// This is CPU-side bookkeeping only — actual GPU buffer management lives
 /// at the integration layer (attention.rs / ForwardEngine).
+#[derive(Debug)]
 pub struct PagePool {
     /// Pre-allocated physical pages.
     pages: Vec<PhysicalPage>,
