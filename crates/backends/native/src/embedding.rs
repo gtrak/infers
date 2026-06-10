@@ -47,7 +47,7 @@ pub fn embed_tokens(
 
     let seq_len_i32 = seq_len as i32;
     let hidden_size_i32 = hidden_size as i32;
-    let vocab_size_i32 = vocab_size as i32;
+    let _vocab_size = vocab_size;
 
     let config = LaunchConfig {
         grid_dim: (((seq_len as u32) + 15) / 16, 1, 1), // 16 tokens per block
@@ -58,12 +58,11 @@ pub fn embed_tokens(
     unsafe {
         stream
             .launch_builder(kernel)
-            .arg(&token_ids_gpu)
             .arg(embedding_table)
+            .arg(&token_ids_gpu)
             .arg(&mut output)
             .arg(&seq_len_i32)
             .arg(&hidden_size_i32)
-            .arg(&vocab_size_i32)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("Embedding kernel launch failed: {e}"))?;
     }

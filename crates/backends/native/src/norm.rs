@@ -48,7 +48,7 @@ pub fn rms_norm(
     let config = LaunchConfig {
         grid_dim: (num_rows as u32, 1, 1),
         block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: (256 * std::mem::size_of::<f32>()) as u32,
     };
 
     unsafe {

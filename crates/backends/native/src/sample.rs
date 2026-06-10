@@ -58,6 +58,7 @@ pub fn greedy_sample(
         .map_err(|e| anyhow::anyhow!("Failed to allocate argmax result: {e}"))?;
 
     let vocab_size_i32 = vocab_size as i32;
+    let batch_size_i32 = 1i32;
 
     let config = LaunchConfig {
         grid_dim: (1, 1, 1), // single block for argmax
@@ -70,6 +71,7 @@ pub fn greedy_sample(
             .launch_builder(kernel)
             .arg(logits)
             .arg(&mut result_gpu)
+            .arg(&batch_size_i32)
             .arg(&vocab_size_i32)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("Argmax kernel launch failed: {e}"))?;

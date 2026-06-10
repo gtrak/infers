@@ -402,6 +402,26 @@ Chat handler uses `SSE_DONE` constant from `infers_api` instead of hardcoded `"[
 
 `LoadedKernelRegistry` documents its role in GPU kernel execution, loading pre-compiled .cubin files via cudarc.
 
+## Kernel Dispatch Fixes
+
+Four critical kernel dispatch bugs were fixed to align Rust dispatch code with CUDA kernel signatures.
+
+### RMSNorm Shared Memory
+
+`infers_rmsnorm_bf16` uses `extern __shared__ float shared_mem[]` for a block-wide reduction with 256 threads. Shared memory was set to 0, causing undefined behavior. Fixed to `256 * sizeof(f32) = 1024` bytes. See [[crates/backends/native/src/norm.rs#rms_norm]].
+
+### Embedding Argument Order
+
+Kernel dispatch passed arguments in wrong order and included an extra parameter. Fixed to match CUDA signature `infers_embedding_gather_bf16(weight, token_ids, output, seq_len, hidden_size)`. See [[crates/backends/native/src/embedding.rs#embed_tokens]].
+
+### Argmax Missing Batch Size
+
+`infers_argmax_f32` expects `(logits, output, batch_size, vocab_size)` but the dispatch code only passed 3 args, leaving `batch_size` unfilled (vocab_size was passed into the batch_size slot). Added `batch_size_i32 = 1` argument. See [[crates/backends/native/src/sample.rs#greedy_sample]].
+
+### GEMM Transpose Flags
+
+GEMM transpose flags were inverted for row-major weight storage. All three `matmul_bf16` calls in `mlp_forward` changed from `transa: false, transb: true` to `transa: true, transb: false` so cuBLASLt correctly interprets row-major inputs. See [[crates/backends/native/src/mlp.rs#mlp_forward]].
+
 # Memory Budget
 
 Memory budget calculator for estimating VRAM requirements across different quantization formats and parallelism configurations.
