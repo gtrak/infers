@@ -1,4 +1,4 @@
-This directory defines the high-level concepts, business logic, and architecture of this project using markdown. It is managed by [lat.md](https://www.npmjs.com/package/lat.md) — a tool that anchors source code to these definitions. Install the `lat` command with `npm i -g lat.md` and run `lat --help`.
+This directory defines the high-level concepts, business logic, and architecture of this project. It is managed by [lat.md](https://www.npmjs.com/package/lat.md) — a tool that anchors source code to these definitions.
 
 # Workspace Architecture
 Rust workspace for infers, a Qwen3.6-27B inference server using nightly toolchain with cuda-oxide orchestration.
@@ -207,6 +207,35 @@ Entry in the prefix cache mapping a content hash to a physical page.
 Pure function that computes a Blake3 content hash for a sealed page.
 
 `hash_page(k_data, v_data, model_id, layer_idx)` derives a 32-byte key from `model_id` using `blake3::hash`, then uses `blake3::Hasher::new_keyed` to hash `k_data || v_data || layer_idx.to_le_bytes()`. CPU-side operation — caller copies page data from GPU to host before hashing. See [[crates/kv/src/prefix.rs#hash_page]].
+### CowResult
+
+Copy-on-write result enum distinguishing in-place writes from COW operations.
+
+`CowResult` has two variants: `NoCowNeeded { page_id }` when the tail page is exclusively owned and mutable, and `CowPerformed { new_page_id, original_page_id }` when COW allocated a new page and decremented the original refcount. See [[crates/kv/src/cow.rs#CowResult]].
+
+### CowError
+
+Custom error type for COW operations using thiserror.
+
+`CowError` has two variants: `PoolExhausted` when the pool has no free pages, and `InvalidPageId` when a page lookup targets an out-of-range page ID. See [[crates/kv/src/cow.rs#CowError]].
+
+### ensure_mutable_page
+
+Main COW entry point that ensures a sequence's tail page is exclusively owned and mutable.
+
+`ensure_mutable_page(pool, table)` returns `NoCowNeeded` if the tail page is exclusively owned and mutable. Returns `CowPerformed` if the tail page is shared or sealed. See [[crates/kv/src/cow.rs#ensure_mutable_page]].
+
+### decrement_page_refcount
+
+Helper that decrements a page's refcount and returns the previous value.
+
+`decrement_page_refcount(pool, page_id)` calls `fetch_sub(1, SeqCst)` on the page's refcount. Returns the previous refcount before decrement. See [[crates/kv/src/cow.rs#decrement_page_refcount]].
+
+### try_share_from_prefix_cache
+
+Attempts to share an existing page from the prefix cache.
+
+`try_share_from_prefix_cache(cache, hash, pool, table)` looks up `hash` in the prefix cache. If found, increments the cached page's refcount and appends the page ID to the sequence table, returning `true`. If not found, returns `false`. See [[crates/kv/src/cow.rs#try_share_from_prefix_cache]].
 
 ## Completed
 
@@ -216,11 +245,12 @@ Types and tests shipped for Phase 4.6 paged KV foundations.
 - `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
 - `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
 - `PrefixCache` with Blake3 content hashing, LRU eviction, `CacheEntry`, `PageHash`, 12 unit tests
+- `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 11 unit tests
 
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
-- Copy-on-write: refcount-based page sharing, GPU-side memcpy for COW copies
+- GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
 - Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
 - attention.rs rewrite: paged decode with zero CPU round-trips
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
