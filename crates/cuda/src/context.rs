@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-pub use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaStream};
 
 /// Runtime managing CUDA device contexts and streams.
 ///
@@ -18,12 +18,14 @@ pub struct CudaRuntime {
 impl CudaRuntime {
     /// Create a new runtime, enumerating all available GPU devices.
     pub fn new() -> anyhow::Result<Self> {
-        let num_devices = CudaContext::device_count()? as usize;
+        let num_devices = CudaContext::device_count()
+            .map_err(|e| anyhow::anyhow!("Failed to count CUDA devices: {:?}", e))? as usize;
         anyhow::ensure!(num_devices >= 1, "No CUDA devices found");
 
         let mut devices = Vec::with_capacity(num_devices);
         for ordinal in 0..num_devices {
-            let ctx = CudaContext::new(ordinal)?;
+            let ctx = CudaContext::new(ordinal)
+                .map_err(|e| anyhow::anyhow!("Failed to create context for device {ordinal}: {:?}", e))?;
             devices.push(ctx);
         }
 
@@ -35,5 +37,18 @@ impl CudaRuntime {
     pub fn device(&self, ordinal: usize) -> anyhow::Result<&Arc<CudaContext>> {
         self.devices.get(ordinal)
             .ok_or_else(|| anyhow::anyhow!("Device ordinal {} out of range", ordinal))
+    }
+
+    /// Get the default stream for a given device ordinal.
+    pub fn default_stream(&self, ordinal: usize) -> anyhow::Result<Arc<CudaStream>> {
+        let ctx = self.device(ordinal)?;
+        Ok(ctx.default_stream())
+    }
+
+    /// Get a new async stream for a given device ordinal.
+    pub fn new_stream(&self, ordinal: usize) -> anyhow::Result<Arc<CudaStream>> {
+        let ctx = self.device(ordinal)?;
+        ctx.new_stream()
+            .map_err(|e| anyhow::anyhow!("Failed to create stream for device {ordinal}: {:?}", e))
     }
 }

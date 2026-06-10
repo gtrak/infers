@@ -7,3 +7,14 @@ pub mod memory;
 pub mod kernels;
 pub mod gemm;
 pub mod nccl;
+
+// Re-export key cudarc types so consumers don't need `cudarc` directly.
+pub use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, DeviceRepr,
+};
+pub use cudarc::cublaslt::safe::{
+    Activation, CudaBlasLT, MatmulConfig as CublasMatmulConfig,
+};
+pub use cudarc::nccl::safe::{
+    Comm as NcclComm, ReduceOp as NcclReduceOp, NcclType,
+};

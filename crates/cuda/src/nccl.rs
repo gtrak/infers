@@ -1,58 +1,130 @@
 //! NCCL communicator for multi-GPU collective operations.
 //!
-//! Provides all-reduce (TP) and send/recv (PP) primitives
-//! across 2× RTX 5060 Ti GPUs.
+//! Provides all-reduce, broadcast, reduce, and all-gather primitives
+//! across multiple GPUs via cudarc's safe NCCL bindings.
 
-/// Rank of this process in the NCCL communicator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NcclRank(pub usize);
-
-/// World size (total number of processes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NcclWorldSize(pub usize);
-
-/// NCCL collective operation type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReduceOp {
-    /// Element-wise sum.
-    Sum,
-    /// Element-wise product.
-    Prod,
-    /// Element-wise maximum.
-    Max,
-    /// Element-wise minimum.
-    Min,
-}
-
-use cudarc::nccl;
+use cudarc::driver::CudaSlice;
+use cudarc::nccl::safe::{Comm, NcclType, ReduceOp};
 use std::sync::Arc;
-use cudarc::driver::CudaStream;
 
 /// NCCL communicator managing collective operations across GPUs.
+///
+/// Created via `NcclCommunicator::new()` using `Comm::from_devices()`,
+/// which returns one `Comm` per GPU stream.
 pub struct NcclCommunicator {
-    /// The NCCL communicator handles (one per GPU stream).
-    pub comms: Vec<nccl::safe::Comm>,
-    /// Rank of this process.
-    pub rank: NcclRank,
-    /// Total number of processes.
-    pub world_size: NcclWorldSize,
+    /// One NCCL communicator per GPU stream.
+    comms: Vec<Comm>,
+    /// Rank of this process (always 0 for single-process multi-GPU).
+    rank: usize,
+    /// Total number of GPUs in the communicator.
+    world_size: usize,
 }
 
 impl NcclCommunicator {
     /// Create a new NCCL communicator using the provided streams.
-    /// All ranks must coordinate to create communicators from the same unique ID.
-    pub fn new(
-        rank: NcclRank,
-        world_size: NcclWorldSize,
-        streams: Vec<Arc<CudaStream>>,
-    ) -> anyhow::Result<Self> {
-        let comms = nccl::safe::Comm::from_devices(streams)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    ///
+    /// All streams must be on different GPUs and belong to contexts
+    /// that are bound to the correct CUDA devices.
+    pub fn new(streams: Vec<Arc<cudarc::driver::CudaStream>>) -> anyhow::Result<Self> {
+        let comms =
+            Comm::from_devices(streams).map_err(|e| anyhow::anyhow!("NCCL init failed: {:?}", e))?;
+        let world_size = comms.len();
+        let rank = 0;
+
         tracing::info!(
-            "NCCL communicator created: rank {}/{}",
-            rank.0,
-            world_size.0
+            "NCCL communicator created: rank {}/{}, {} devices",
+            rank,
+            world_size,
+            world_size
         );
         Ok(Self { comms, rank, world_size })
+    }
+
+    /// Get the rank of this communicator.
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// Get the world size (total GPUs).
+    pub fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    /// Get the comm for a specific rank/GPU.
+    pub fn comm(&self, rank: usize) -> Option<&Comm> {
+        self.comms.get(rank)
+    }
+
+    /// Get all comms.
+    pub fn comms(&self) -> &[Comm] {
+        &self.comms
+    }
+
+    /// All-reduce across all ranks for a specific GPU's comm.
+    pub fn all_reduce<T: NcclType>(
+        &self,
+        rank: usize,
+        send: &CudaSlice<T>,
+        recv: &mut CudaSlice<T>,
+        op: ReduceOp,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range (world_size={})", rank, self.world_size))?;
+        comm.all_reduce(send, recv, &op)
+            .map_err(|e| anyhow::anyhow!("NCCL all_reduce failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Broadcast from a root rank to all other ranks for a specific GPU's comm.
+    pub fn broadcast<T: NcclType>(
+        &self,
+        rank: usize,
+        send: Option<&CudaSlice<T>>,
+        recv: &mut CudaSlice<T>,
+        root: i32,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
+        comm.broadcast(send, recv, root)
+            .map_err(|e| anyhow::anyhow!("NCCL broadcast failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Reduce to a single root rank.
+    pub fn reduce<T: NcclType>(
+        &self,
+        rank: usize,
+        send: &CudaSlice<T>,
+        recv: Option<&mut CudaSlice<T>>,
+        op: ReduceOp,
+        root: i32,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
+        comm.reduce(send, recv, &op, root)
+            .map_err(|e| anyhow::anyhow!("NCCL reduce failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// All-gather: gather data from all ranks into recv buffer.
+    pub fn all_gather<T: NcclType>(
+        &self,
+        rank: usize,
+        send: &CudaSlice<T>,
+        recv: &mut CudaSlice<T>,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
+        comm.all_gather(send, recv)
+            .map_err(|e| anyhow::anyhow!("NCCL all_gather failed: {:?}", e))?;
+        Ok(())
     }
 }

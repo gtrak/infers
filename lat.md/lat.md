@@ -37,11 +37,11 @@ Nightly toolchain configuration, Rust edition, and cargo-oxide requirements for 
 
 ## Dependencies
 
-Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, serde 1.0.228, clap 4.6.1, prometheus 0.14.0, thiserror 2.0.18. cudarc 0.19.7 with cublaslt, nccl, cuda-13020 features. cuda-oxide crates deferred to future phase.
+Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, serde 1.0.228, clap 4.6.1, prometheus 0.14.0, thiserror 2.0.18. cudarc 0.19.7 with cublaslt, nccl, cuda-13020, f16 features. half 2.6.0 for FP16/BF16. cuda-oxide deferred.
 
 ## CUDA Crate
 
-CUDA runtime crate for GPU inference. cudarc is always present — no feature gating, stub types, or optional dependencies. GPU hardware is assumed available for all builds.
+CUDA runtime crate for GPU inference. cudarc is always present with no feature gating or optional deps. Re-exports key cudarc types for consumer convenience.
 
 ### Module Structure
 
@@ -53,7 +53,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | stream | CUDA stream pool for async execution |
 | memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
-| gemm | cuBLASLt GEMM engine with `matmul()` method for matrix multiplication |
+| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication |
 | nccl | Multi-GPU collective operations for TP/PP |
 
 # Kernel Extraction and Build System
@@ -98,8 +98,8 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
 - KernelRegistry for .cubin loading (5 kernels: gdn_prefill, gdn_decode, batch_prefill, batch_decode, sampling) and LoadedKernelRegistry for GPU-loaded kernels
-- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support; `new()` requires no stream, `matmul()` accepts `GemmConfig` and `&Arc<CudaStream>` (placeholder implementation)
-- NcclCommunicator for TP all-reduce and PP send/recv operations
+- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
+- NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_100a, configurable via INFERS_CUDA_ARCH env var)
 - scripts/extract-kernels.sh for pulling FlashInfer kernels from vLLM
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)

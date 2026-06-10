@@ -1,80 +1,140 @@
 //! cuBLASLt GEMM engine for matrix multiplication.
 //!
 //! Provides a wrapper around NVIDIA's cuBLASLt library for efficient
-//! batched GEMM operations supporting FP16, BF16, and NVFP4 formats.
+//! batched GEMM operations supporting FP16, BF16, and FP32 formats.
+
+use cudarc::cublaslt::safe::{Activation, CudaBlasLT, Matmul, MatmulConfig};
+use cudarc::driver::{CudaSlice, CudaStream};
+use std::sync::Arc;
 
 /// Configuration for a GEMM operation.
 #[derive(Debug, Clone)]
 pub struct GemmConfig {
-    /// M dimension (rows of A).
+    /// M dimension (rows of output C = A @ B).
     pub m: usize,
-    /// N dimension (columns of B / rows of A).
+    /// N dimension (columns of output C = A @ B).
     pub n: usize,
-    /// K dimension (columns of A / columns of B).
+    /// K dimension (inner dimension).
     pub k: usize,
     /// Whether A is transposed.
     pub transa: bool,
     /// Whether B is transposed.
     pub transb: bool,
-    /// Data type for the operation.
-    pub dtype: GemmDtype,
-}
-
-/// Supported GEMM data types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmDtype {
-    /// FP16 (half precision).
-    Fp16,
-    /// BF16 (bfloat16).
-    Bf16,
-    /// FP32 (single precision).
-    Fp32,
-    /// NVFP4 (Blackwell 4-bit floating point).
-    Nvfp4,
+    /// Alpha scalar (multiply A@B before adding to C).
+    pub alpha: f32,
+    /// Beta scalar (multiply C before adding).
+    pub beta: f32,
+    /// Leading dimension of A (row stride in memory). Default: inferred.
+    pub lda: Option<i64>,
+    /// Leading dimension of B. Default: inferred.
+    pub ldb: Option<i64>,
+    /// Leading dimension of C. Default: inferred.
+    pub ldc: Option<i64>,
+    /// Optional activation to fuse after matmul.
+    pub activation: Option<Activation>,
 }
 
 /// cuBLASLt GEMM engine.
 ///
 /// Wraps NVIDIA's cuBLASLt library for high-performance matrix multiplication.
+/// The handle is created eagerly upon construction.
 pub struct GemmEngine {
-    /// Lazily created cuBLASLt handle.
-    handle: Option<cudarc::cublaslt::safe::CudaBlasLT>,
+    handle: CudaBlasLT,
 }
 
 impl GemmEngine {
-    /// Create a new GEMM engine.
+    /// Create a new GEMM engine with a cuBLASLt handle.
     ///
-    /// The underlying cuBLASLt handle is created lazily on the first
-    /// `matmul` call.
-    pub fn new() -> Self {
-        Self { handle: None }
+    /// Requires an active CUDA stream — the handle is tied to the stream's device.
+    pub fn new(stream: Arc<CudaStream>) -> anyhow::Result<Self> {
+        let handle = CudaBlasLT::new(stream)
+            .map_err(|e| anyhow::anyhow!("Failed to create CudaBlasLT handle: {:?}", e))?;
+        Ok(Self { handle })
     }
 
-    /// Execute a GEMM operation with the given configuration.
-    ///
-    /// The stream is passed to cuBLASLt so the kernel is enqueued on the
-    /// correct async execution context.  The first call lazily creates
-    /// the `CudaBlasLT` handle; subsequent calls reuse the cached handle.
-    pub fn matmul(
-        &mut self,
-        _config: &GemmConfig,
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Execute an FP32 GEMM: C = alpha * op(A) * op(B) + beta * C.
+    pub fn matmul_f32(
+        &self,
+        config: &GemmConfig,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
     ) -> anyhow::Result<()> {
-        if self.handle.is_none() {
-            self.handle = Some(
-                cudarc::cublaslt::safe::CudaBlasLT::new(std::sync::Arc::clone(stream))
-                    .map_err(|e| anyhow::anyhow!("Failed to create CudaBlasLT: {:?}", e))?,
-            );
-        }
-        let handle = self.handle.as_ref().unwrap();
-        // TODO: actual matmul call using `handle`
-        let _ = handle;
-        anyhow::bail!("GemmEngine::matmul not yet implemented")
+        gemm_impl(&self.handle, config, a, b, c)
+    }
+
+    /// Execute a BF16 GEMM: C = alpha * op(A) * op(B) + beta * C.
+    pub fn matmul_bf16(
+        &self,
+        config: &GemmConfig,
+        a: &CudaSlice<half::bf16>,
+        b: &CudaSlice<half::bf16>,
+        c: &mut CudaSlice<half::bf16>,
+    ) -> anyhow::Result<()> {
+        gemm_impl(&self.handle, config, a, b, c)
+    }
+
+    /// Execute an FP16 GEMM: C = alpha * op(A) * op(B) + beta * C.
+    pub fn matmul_fp16(
+        &self,
+        config: &GemmConfig,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        c: &mut CudaSlice<half::f16>,
+    ) -> anyhow::Result<()> {
+        gemm_impl(&self.handle, config, a, b, c)
     }
 }
 
-impl Default for GemmEngine {
-    fn default() -> Self {
-        Self::new()
+/// Internal helper that builds a `MatmulConfig` from `GemmConfig` and
+/// calls the unsafe cuBLASLt `matmul`. Validates dimensions first.
+fn gemm_impl<T>(
+    handle: &CudaBlasLT,
+    config: &GemmConfig,
+    a: &CudaSlice<T>,
+    b: &CudaSlice<T>,
+    c: &mut CudaSlice<T>,
+) -> anyhow::Result<()>
+where
+    CudaBlasLT: Matmul<T>,
+{
+    anyhow::ensure!(
+        config.m > 0 && config.n > 0 && config.k > 0,
+        "GEMM dimensions must all be positive"
+    );
+
+    let lda = config.lda.unwrap_or({
+        if config.transa { config.m as i64 } else { config.k as i64 }
+    });
+    let ldb = config.ldb.unwrap_or({
+        if config.transb { config.n as i64 } else { config.k as i64 }
+    });
+    let ldc = config.ldc.unwrap_or(config.n as i64);
+
+    let matmul_config = MatmulConfig {
+        transa: config.transa,
+        transb: config.transb,
+        transc: false,
+        m: config.m as u64,
+        n: config.n as u64,
+        k: config.k as u64,
+        alpha: config.alpha,
+        beta: config.beta,
+        lda,
+        ldb,
+        ldc,
+        stride_a: None,
+        stride_b: None,
+        stride_c: None,
+        stride_bias: None,
+        batch_size: None,
+    };
+
+    unsafe {
+        handle
+            .matmul(matmul_config, a, b, c, None::<&CudaSlice<T>>, config.activation.as_ref())
+            .map_err(|e| anyhow::anyhow!("cuBLASLt matmul failed: {:?}", e))?;
     }
+
+    Ok(())
 }
