@@ -184,6 +184,30 @@ Custom error type for page pool operations using thiserror.
 
 `PagePoolError` has two variants: `PoolExhausted` when no free pages remain, and `InvalidPageId` when a lookup targets an out-of-range page ID. See [[crates/kv/src/pool.rs#PagePoolError]].
 
+### PrefixCache
+
+LRU-based prefix cache for sharing sealed KV cache pages across sequences.
+
+`PrefixCache` maps content hashes (`[[PageHash]]`) to physical pages, enabling multiple sequences to share the same sealed pages when they have identical prompt prefixes. Memory is tracked against a configurable budget. When the budget is exceeded, `evict_if_needed()` evicts the least recently used entries with refcount = 0. `insert()` creates or increments entries, `lookup()` returns page IDs, `touch()` updates LRU order, and `release()` decrements refcounts. See [[crates/kv/src/prefix.rs#PrefixCache]].
+
+### PageHash
+
+256-bit Blake3 content hash identifying sealed page contents.
+
+`PageHash` is a `[u8; 32]` type alias uniquely identifying page content across models and layers. See [[crates/kv/src/prefix.rs#PageHash]].
+
+### CacheEntry
+
+Entry in the prefix cache mapping a content hash to a physical page.
+
+`CacheEntry` holds `page_id` (the physical page ID) and `refcount` (number of sequences currently referencing this cached entry). See [[crates/kv/src/prefix.rs#CacheEntry]].
+
+### hash_page
+
+Pure function that computes a Blake3 content hash for a sealed page.
+
+`hash_page(k_data, v_data, model_id, layer_idx)` derives a 32-byte key from `model_id` using `blake3::hash`, then uses `blake3::Hasher::new_keyed` to hash `k_data || v_data || layer_idx.to_le_bytes()`. CPU-side operation — caller copies page data from GPU to host before hashing. See [[crates/kv/src/prefix.rs#hash_page]].
+
 ## Completed
 
 Types and tests shipped for Phase 4.6 paged KV foundations.
@@ -191,12 +215,11 @@ Types and tests shipped for Phase 4.6 paged KV foundations.
 - `infers-kv` crate: `PhysicalPage`, `PageId`, `SequencePageTable` types with 11 unit tests
 - `PageState` enum (`Mutable`, `Sealed`), `PageLocation` enum (`Gpu`, `Cpu`)
 - `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
+- `PrefixCache` with Blake3 content hashing, LRU eviction, `CacheEntry`, `PageHash`, 12 unit tests
 
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
-
-- Prefix cache: Blake3 content hashing, page chain storage, LRU eviction
 - Copy-on-write: refcount-based page sharing, GPU-side memcpy for COW copies
 - Three new CUDA kernels: `paged_kv_write.cu`, `paged_kv_read.cu`, `paged_attention_decode.cu`
 - attention.rs rewrite: paged decode with zero CPU round-trips

@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+blake3 = "1"
 thiserror = { workspace = true }
