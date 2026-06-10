@@ -11,8 +11,9 @@
 
 /// RoPE kernel applying rotary position embeddings.
 ///
-/// For each position `pos` and head `h`, each pair of dimensions
-/// (2k, 2k+1) within the head is rotated by angle `pos * freq[k]`.
+/// For each position `pos`, head `h`, and dimension pair `(2k, 2k+1)`,
+/// rotates the pair by angle `pos * freq[k]` using precomputed sin/cos.
+/// Operates on tensors of shape [total_tokens × num_heads × head_dim].
 __launch_bounds__(INFERS_BLOCK_SIZE)
 __global__ void rope_kernel(
     __nv_bfloat16* __restrict__ q,
@@ -21,23 +22,27 @@ __global__ void rope_kernel(
     const float* __restrict__ sin,
     const int* __restrict__ positions,
     int total_tokens,
+    int num_heads,
     int head_dim
 ) {
     int idx = INFERS_THREAD_IDX;
     int stride = blockDim.x * gridDim.x;
     int half_dim = head_dim / 2;
+    int pairs_per_token = num_heads * half_dim;
 
-    for (int t = idx; t < total_tokens * half_dim; t += stride) {
-        int token_idx = t / half_dim;
-        int dim_pair = t % half_dim;
+    for (int t = idx; t < total_tokens * pairs_per_token; t += stride) {
+        int token_idx = t / pairs_per_token;
+        int remainder = t % pairs_per_token;
+        int head_idx = remainder / half_dim;
+        int dim_pair = remainder % half_dim;
         int pos = positions[token_idx];
 
         int cos_idx = pos * half_dim + dim_pair;
         float cos_val = cos[cos_idx];
         float sin_val = sin[cos_idx];
 
-        // Index into the paired dimensions
-        int i0 = token_idx * head_dim + dim_pair * 2;
+        // Index into [total_tokens × num_heads × head_dim]
+        int i0 = token_idx * num_heads * head_dim + head_idx * head_dim + dim_pair * 2;
         int i1 = i0 + 1;
 
         float q0 = __bfloat162float(q[i0]);
@@ -58,12 +63,13 @@ extern "C" {
 /// Launch RoPE for BF16 query and key tensors.
 ///
 /// # Arguments
-/// * `q` — Query tensor [total_tokens × head_dim], modified in-place
-/// * `k` — Key tensor [total_tokens × head_dim], modified in-place
-/// * `cos` — Cosine embedding table (FP32) [max_seq_len × head_dim/2]
-/// * `sin` — Sine embedding table (FP32) [max_seq_len × head_dim/2]
+/// * `q` — Query tensor [total_tokens × num_heads × head_dim], modified in-place
+/// * `k` — Key tensor [total_tokens × num_heads × head_dim], modified in-place
+/// * `cos` — Cosine embedding table (FP32) [max_pos × head_dim/2]
+/// * `sin` — Sine embedding table (FP32) [max_pos × head_dim/2]
 /// * `positions` — Position IDs [total_tokens]
 /// * `total_tokens` — Total number of tokens (batch × seq)
+/// * `num_heads` — Number of attention heads
 /// * `head_dim` — Head dimension (must be even)
 void infers_rope_bf16(
     __nv_bfloat16* q,
@@ -72,15 +78,17 @@ void infers_rope_bf16(
     const float* sin,
     const int* positions,
     int total_tokens,
+    int num_heads,
     int head_dim
 ) {
     int half_dim = head_dim / 2;
-    int total_pairs = total_tokens * half_dim;
+    int pairs_per_token = num_heads * half_dim;
+    int total_pairs = total_tokens * pairs_per_token;
     int block_size = INFERS_BLOCK_SIZE;
     int grid_size = (total_pairs + block_size - 1) / block_size;
 
     rope_kernel<<<grid_size, block_size>>>(
-        q, k, cos, sin, positions, total_tokens, head_dim
+        q, k, cos, sin, positions, total_tokens, num_heads, head_dim
     );
 }
 

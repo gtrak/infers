@@ -405,7 +405,7 @@ Chat handler uses `SSE_DONE` constant from `infers_api` instead of hardcoded `"[
 
 ## Kernel Dispatch Fixes
 
-Four critical kernel dispatch bugs were fixed to align Rust dispatch code with CUDA kernel signatures.
+Six critical kernel dispatch bugs were fixed to align Rust dispatch code with CUDA kernel signatures.
 
 ### RMSNorm Shared Memory
 
@@ -422,6 +422,14 @@ Kernel dispatch passed arguments in wrong order and included an extra parameter.
 ### GEMM Transpose Flags
 
 GEMM transpose flags were inverted for row-major weight storage. All three `matmul_bf16` calls in `mlp_forward` changed from `transa: false, transb: true` to `transa: true, transb: false` so cuBLASLt correctly interprets row-major inputs. See [[crates/backends/native/src/mlp.rs#mlp_forward]].
+
+### RoPE Table Indexing
+
+`precompute_rope_tables` allocated a compact table indexed by token index, but the CUDA kernel indexed by position value. Fixed to size table by max position and index by position. See [[crates/backends/native/src/rope.rs#precompute_rope_tables]].
+
+### RoPE Multi-Head Rotation
+
+RoPE kernel only rotated the first head, ignoring the `num_heads` dimension in tensor layout. Fixed by adding `num_heads` parameter and iterating all head-dimension pairs. See [[crates/backends/native/src/rope.rs#apply_rope]].
 
 # Memory Budget
 
