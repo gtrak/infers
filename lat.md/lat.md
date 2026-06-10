@@ -238,3 +238,71 @@ Auto-detects quantization format from model directory contents.
 ## QuantizationConfig
 
 Parsed from quantization config JSON with arbitrary format-specific fields.
+
+# Weight Registry and Tensors
+
+Weight storage structures for model weights as raw byte data with shape metadata, ready for GPU upload.
+
+## WeightData
+
+Raw tensor storage holding `Vec<u8>` bytes, shape dimensions, dtype, and tensor name. Weights stay as bytes until CUDA upload time to avoid requiring GPU hardware at load time. See [[crates/model/src/weights.rs#WeightData]].
+
+## WeightDtype
+
+Enumeration of weight data types: BF16, FP16, FP32, INT4 packed, NVFP4, and Other. Provides `bytes_per_element()` for contiguous formats and `None` for packed layouts. See [[crates/model/src/weights.rs#WeightDtype]].
+
+## Layer Weight Structures
+
+Typed weight structures for GDN layers (`GdnWeights`), attention layers (`AttentionWeights`), and MLP layers (`MlpWeights`). Each contains named `WeightData` fields matching safetensors tensor names. See [[crates/model/src/weights.rs#GdnWeights]], [[crates/model/src/weights.rs#AttentionWeights]], [[crates/model/src/weights.rs#MlpWeights]].
+
+## WeightRegistry
+
+Complete model weight registry with embedding, layers, optional MTP head, LM head, norm, and a `HashMap<String, WeightData>` for name-based lookup and sharding. See [[crates/model/src/weights.rs#WeightRegistry]].
+
+# Safetensors Loader
+
+Multi-format model loader with safetensors file reading and auto-detection of single vs sharded model files.
+
+## Loading Pipeline
+
+The `load_model()` function is the main entry point: it reads `config.json`, detects quantization format, loads safetensors files, and constructs a `WeightRegistry`. See [[crates/model/src/loader.rs#load_model]].
+
+## Single vs Sharded
+
+`load_safetensors()` auto-detects whether a model uses a single `model.safetensors` file or a sharded index (`model.safetensors.index.json` with multiple shard files). Memory maps files for efficient loading. See [[crates/model/src/loader.rs#load_safetensors]].
+
+# Weight Sharding
+
+Weight sharding for tensor parallelism (TP=2) and pipeline parallelism (PP=2).
+
+## Tensor Parallelism Sharding
+
+`shard_weights_tp()` splits weights across GPUs. Column-parallel tensors are sliced along dim 0, row-parallel along last dim. Norms and embeddings are replicated. See [[crates/model/src/sharding.rs#shard_weights_tp]].
+
+## Shard Type Detection
+
+Tensor names determine sharding type. Projections like Q/K/V/gate/up are column-parallel; O/down are row-parallel. All others are replicated. See [[crates/model/src/sharding.rs#determine_shard_type]].
+
+## Pipeline Parallelism Split
+
+`split_layers_pp()` divides layers evenly across pipeline stages. For 64 layers and 2 stages: stage 0 gets layers 0-31, stage 1 gets layers 32-63. See [[crates/model/src/sharding.rs#split_layers_pp]].
+
+# Memory Budget
+
+Memory budget calculator for estimating VRAM requirements across different quantization formats and parallelism configurations.
+
+## Budget Calculation
+
+`MemoryBudget::calculate()` estimates weight bytes, KV cache bytes, workspace bytes, and available memory per GPU. Accounts for quantization format (BF16, PrismaSCOUT, AutoRound, GGUF), GPU count, VRAM per GPU, and utilization factor. See [[crates/model/src/budget.rs#MemoryBudget#calculate]].
+
+## Weight Size Estimation
+
+`estimate_weight_bytes()` computes parameter count from model config (embedding, attention, MLP, norms, LM head) multiplied by bytes per element for the quantization format. See [[crates/model/src/budget.rs#MemoryBudget#estimate_weight_bytes]].
+
+## KV Cache Estimation
+
+`estimate_kv_cache_bytes()` calculates KV cache per GPU based on full attention layers, KV heads, head dimension, and max position embeddings. Only full attention layers use paged KV cache. See [[crates/model/src/budget.rs#MemoryBudget#estimate_kv_cache_bytes]].
+
+## Concurrent Session Planning
+
+`max_concurrent_sessions()` estimates how many sessions fit in available KV memory given an average context length. Scales linearly with context tokens. See [[crates/model/src/budget.rs#MemoryBudget#max_concurrent_sessions]].
