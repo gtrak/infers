@@ -70,7 +70,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 | `compiled/` | Compiled .cubin output from nvcc |
 
 ### Kernel Source Files
-Nine kernel implementations for transformer forward-pass operations using BF16 data.
+Eleven kernel implementations for transformer forward-pass operations using BF16 data.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -83,6 +83,8 @@ Nine kernel implementations for transformer forward-pass operations using BF16 d
 | `sampling.cu` | `infers_argmax_f32` | Greedy argmax sampling from FP32 logits |
 | `softmax.cu` | `infers_softmax_bf16` | Online softmax for attention scores with optional causal masking, using three-phase parallel reduction (max, sum, normalize) in shared memory |
 | `kv_cache.cu` | `infers_kv_cache_write_bf16` | Scattered KV cache write using position IDs: writes K and V rows into cache at arbitrary positions via strided thread loops |
+| `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
+| `gdn_prefill.cu` | `infers_gdn_prefill_bf16` | Gated DeltaNet prefill kernel: processes all tokens in a sequence sequentially within each block, updating state and writing per-token output via shared memory reduction |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -108,11 +110,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (7 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (11 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, gdn_update, gdn_prefill) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, gdn_update.cu, gdn_prefill.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for future integration
 
 # Phase 3 Deliverables
@@ -440,6 +442,13 @@ Three bugs fixed in `crates/cuda/kernels/infers/softmax.cu`:
 1. **Max value overwritten by sum** (CRITICAL): Phase 2's sum reduction overwrote `sdata[0]`, causing Phase 3 normalization to subtract the sum instead of the max. Fixed by saving `sdata[0]` to a `max_val` register after Phase 1, then using `max_val` in Phase 2 (exp computation) and Phase 3 (normalization).
 2. **Race condition** (implicit in bug 1): Reading `sdata[0]` for the max during Phase 2 created a race with concurrent sum reduction writes. Resolved by using the `max_val` register instead of shared memory.
 3. **Non-power-of-2 reduction** (MINOR): Tree reduction with `stride >>= 1` silently drops tail elements for non-power-of-2 block sizes. Fixed by rounding `block_size` up to the next power of 2 and adding `tid + stride < blockDim.x` bounds checks in both reduction loops.
+
+### GDN Kernel Fixes
+
+Two bugs fixed in both `gdn_update.cu` and `gdn_prefill.cu`:
+
+1. **Non-power-of-2 reduction** (MINOR): Host wrappers used `hidden_size` directly as block size, causing tree reduction to silently drop tail elements for non-power-of-2 hidden sizes. Fixed by restructuring kernels: `__global__` kernels are now placed inside `extern "C"` with names matching the registry (`infers_gdn_update_bf16`, `infers_gdn_prefill_bf16`), eliminating host wrappers. Rust-side launch configuration computes power-of-2 block sizes. Reduction loops use `tid + stride < blockDim.x` bounds checks.
+2. **Kernel name mismatch** (CRITICAL): `LoadedKernelRegistry` registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
 
 # Memory Budget
 

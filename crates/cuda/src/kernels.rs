@@ -68,6 +68,8 @@ impl KernelRegistry {
         self.register("infers_argmax_f32", "kernels/compiled/sampling.cubin");
         self.register("infers_softmax_bf16", "kernels/compiled/softmax.cubin");
         self.register("infers_kv_cache_write_bf16", "kernels/compiled/kv_cache.cubin");
+        self.register("infers_gdn_update_bf16", "kernels/compiled/gdn_update.cubin");
+        self.register("infers_gdn_prefill_bf16", "kernels/compiled/gdn_prefill.cubin");
     }
 }
 
