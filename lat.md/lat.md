@@ -273,6 +273,8 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension
 - `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection), `forward_paged` (paged KV write + per-head GEMM attention)
 - `infers-backend-native` now depends on `infers-kv` crate
+- `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
+- Engine integration: `ForwardEngine` has 14 kernel handles, `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`
 
 ## Paged Attention Implementation
 
@@ -310,7 +312,6 @@ Same K/V computation and RoPE as original `forward`, but writes to paged cache v
 
 Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
-- MemoryBudget update: block-aware KV estimation vs flat-buffer model
 - Full paged pipeline: complete `prefill_paged` and `decode_paged` with layer-by-layer dispatch (embedding, projections, RoPE, paged attention, MLP, sampling)
 - Stress tests and benchmark suite
 
