@@ -647,26 +647,36 @@ impl ForwardEngine {
         let mut current_token = token_id;
         let current_pos = Cell::new(position);
 
-        // Wrap references as raw pointers inside Arc for Fn closures.
-        // This is safe because:
-        // 1. The &mut borrow of self is held for the entire duration
-        // 2. Closures are called sequentially (never concurrently)
-        // 3. References are valid as long as self lives
+        // SAFETY: raw pointer workaround for Fn closures that need &mut access.
+        // The pointers are valid because:
+        //   1. self is borrowed mutably for the entire duration of decode_with_mtp
+        //   2. Closures are called sequentially (never concurrently)
+        //   3. References remain valid as long as self is alive
+        // keep the kv_caches and gdn_states pointers for mutable access in full_forward_fn
         let kv_caches_ptr: Arc<*mut Vec<KvCache>> =
             Arc::new(&mut self.kv_caches as *mut Vec<KvCache>);
         let gdn_states_ptr: Arc<*mut Vec<GdnState>> =
             Arc::new(&mut self.gdn_states as *mut Vec<GdnState>);
-        let config_ptr: Arc<*const ModelConfig> =
-            Arc::new(self.config.as_ref() as *const ModelConfig);
+
+        // Read-only references captured via Arc<*const _> for use in Fn closures
+        // alongside the mutable-access raw pointers above
+        let weights_ref: &infers_model::WeightRegistry = &self.weights[0];
         let weights_ptr: Arc<*const infers_model::WeightRegistry> =
-            Arc::new(&self.weights[0] as *const infers_model::WeightRegistry);
+            Arc::new(weights_ref as *const infers_model::WeightRegistry);
+        let nccl_ref: &NcclCommunicator = &self.nccl;
         let nccl_ptr: Arc<*const NcclCommunicator> =
-            Arc::new(&self.nccl as *const NcclCommunicator);
+            Arc::new(nccl_ref as *const NcclCommunicator);
+
+        // Clone config Arc for use in closures (no raw pointer needed)
+        let config = self.config.clone();
+
+        // --- Draft position counter for verification ---
+        // Tracks which draft index we're on so each draft gets the correct position
+        let verify_pos = Cell::new(current_pos.get());
 
         // Build embed callback for MTP operations
         let embed_fn = |token: u32, s: &Arc<CudaStream>| -> Result<CudaSlice<bf16>> {
             let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
-            let config: &ModelConfig = unsafe { &**config_ptr };
             let embed_weight = weights.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
             let embed_table = crate::upload::upload_weight(s, embed_weight)?;
@@ -690,20 +700,22 @@ impl ForwardEngine {
             crate::norm::rms_norm(s, &kernels.rmsnorm, input, weight, eps, hidden_size)
         };
 
-        // Build forward_layer callback
+        // Build forward_layer callback (uses EPHEMERAL local state,
+        // NOT the main model's kv_caches/gdn_states — MTP layers are speculative
+        // and must not corrupt the main model's state)
         let forward_layer_fn =
             |layer: &infers_model::LayerWeights,
              input: &CudaSlice<bf16>,
              s: &Arc<CudaStream>,
              g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
-                let kv_caches: &mut [KvCache] = unsafe { &mut **kv_caches_ptr };
-                let gdn_states: &mut [GdnState] = unsafe { &mut **gdn_states_ptr };
-                let config: &ModelConfig = unsafe { &**config_ptr };
-                let layer_idx = 0;
+                // Local ephemeral state for the MTP head's decoder layer
+                let mut mtp_kv = vec![crate::attention::KvCache::new()];
+                let mut mtp_gdn = vec![crate::gdn::GdnState::new()];
+                let config: &ModelConfig = config.as_ref();
                 crate::mtp::forward_layer_pass(
                     layer, input, g, s, &kernels, config,
-                    kv_caches, gdn_states,
-                    current_pos.get(), layer_idx,
+                    &mut mtp_kv, &mut mtp_gdn,
+                    current_pos.get(), 0,
                 )
             };
 
@@ -712,7 +724,6 @@ impl ForwardEngine {
                           s: &Arc<CudaStream>,
                           g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
             let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
-            let config: &ModelConfig = unsafe { &**config_ptr };
             let lm_head_weight = weights.lm_head.as_ref()
                 .or_else(|| weights.embedding.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
@@ -754,21 +765,23 @@ impl ForwardEngine {
             crate::sample::greedy_sample(s, &kernels.argmax, &logits_f32_gpu)
         };
 
-        // Build full_forward callback
+        // Build full_forward callback (for draft verification)
+        // NOTE: position advances with each call via verify_pos counter
         let full_forward_fn =
             |token: u32,
              s: &Arc<CudaStream>,
              g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
                 let kv_caches: &mut [KvCache] = unsafe { &mut **kv_caches_ptr };
                 let gdn_states: &mut [GdnState] = unsafe { &mut **gdn_states_ptr };
-                let config: &ModelConfig = unsafe { &**config_ptr };
                 let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
                 let nccl: &NcclCommunicator = unsafe { &**nccl_ptr };
+                let pos = verify_pos.get();
+                verify_pos.set(pos + 1);
                 crate::mtp::full_forward_logits(
                     token, g, s, &kernels, nccl,
-                    config, weights,
+                    config.as_ref(), weights,
                     kv_caches, gdn_states,
-                    current_pos.get(),
+                    pos, // each draft gets incrementing position
                 )
             };
 
@@ -804,6 +817,8 @@ impl ForwardEngine {
             )?;
 
             // Step 4: Verify drafts
+            // Reset position counter before each verification batch
+            verify_pos.set(current_pos.get());
             let verification =
                 mtp.verify_drafts(&drafts, stream, &mut self.gemm, &ops)?;
 
