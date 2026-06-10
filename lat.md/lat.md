@@ -1138,3 +1138,35 @@ See [[crates/kv/src/quant.rs#quantize_fp8_e4m3]], [[crates/kv/src/quant.rs#dequa
 ## Delegation Pattern
 
 FP8 helpers live in `infers-kv::quant` and are re-exported by `infers-backend-native::quant` to eliminate duplication. `KvCacheDtype` and `QuantizedKvCache` are additionally re-exported from the `infers-kv` crate root. See [[crates/kv/src/lib.rs]], [[crates/backends/native/src/quant.rs]].
+
+# Phase 9 Deliverables
+
+Phase 9 (Tool Calls + Final Polish) adds Qwen3.6 chat template formatting, tool call parsing, tool call streaming in SSE format, and the `enable_auto_tool_choice` API parameter.
+
+## Chat Template
+
+Qwen3.6 chat template for formatting messages with thinking tokens and tool calls using `<|im_start|>` / `<|im_end|>` tokens.
+
+`QwenChatTemplate` holds `enable_thinking` and `preserve_thinking` flags. `apply()` formats system, user, assistant, and tool messages into a prompt string. Tools are formatted as `<tools>` XML blocks in a prepended system message. Assistant reasoning content is wrapped in `<thinking>` tags. Tool calls use `<tool_call>` XML blocks. Tool responses use `<tool_response>` wrappers. See [[crates/api/src/template.rs#QwenChatTemplate]].
+
+**`Message` reasoning_content**: The `request::Message` type now supports `reasoning_content` for assistant messages containing thinking/reasoning tokens. `response::MessageContent` and `streaming::Delta` also carry `reasoning_content` for output. See [[crates/api/src/request.rs#Message]], [[crates/api/src/response.rs#MessageContent]], [[crates/api/src/streaming.rs#Delta]].
+
+## Tool Call Parser
+
+Parser for Qwen3.6 XML-format tool calls (`<tool_call>...</tool_call>` blocks) supporting both streaming and complete text modes.
+
+`ToolCallParser` provides `parse_streaming_delta()` for incremental text accumulation with `PartialToolCall` state tracking, and `parse_complete()` for processing full response text. Handles multiple JSON shapes: full `ToolCall` JSON, function-only `{"name", "arguments"}`, and fallback wrappers. See [[crates/api/src/tool_parser.rs#ToolCallParser]].
+
+## Tool Call Streaming
+
+The chat handler now produces OpenAI-compatible tool call responses when `tools` are provided in the request.
+
+`create_mock_tool_call_response()` returns a non-streaming response with `tool_calls` in the message and `finish_reason: "tool_calls"`. `create_mock_tool_call_stream()` emits SSE deltas following the OpenAI protocol: role delta, tool call name/ID, incremental argument chunks, finish reason, and `[DONE]`. See [[crates/server/src/handlers/chat.rs#chat_completions]].
+
+## API Parameters
+
+`ChatCompletionRequest` gained `enable_auto_tool_choice` (boolean, default `false`) for automatic tool choice when tools are present. `streaming::ToolCallDelta` gained `id` field for the OpenAI streaming tool call identifier. See [[crates/api/src/request.rs#ChatCompletionRequest]], [[crates/api/src/streaming.rs#ToolCallDelta]].
+
+## Tool Call Response Schema
+
+Non-streaming tool responses set `content` null and populate `tool_calls`. Streaming emits deltas with `index`, `id`, `type`, and partial `function` arguments. See `plan/research/api.md#Tool Calls` for the full schema.
