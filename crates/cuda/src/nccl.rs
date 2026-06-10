@@ -112,6 +112,22 @@ impl NcclCommunicator {
         Ok(())
     }
 
+    /// All-reduce in-place across all ranks for a specific GPU's comm.
+    pub fn all_reduce_in_place<T: NcclType>(
+        &self,
+        rank: usize,
+        buffer: &mut CudaSlice<T>,
+        op: ReduceOp,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range (world_size={})", rank, self.world_size))?;
+        comm.all_reduce_in_place(buffer, &op)
+            .map_err(|e| anyhow::anyhow!("NCCL all_reduce_in_place failed: {:?}", e))?;
+        Ok(())
+    }
+
     /// All-gather: gather data from all ranks into recv buffer.
     pub fn all_gather<T: NcclType>(
         &self,

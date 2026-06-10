@@ -108,7 +108,7 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
 - KernelRegistry for .cubin loading (7 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
-- NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
+- NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
 - CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for future integration
@@ -156,7 +156,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `sample` | Greedy argmax (`infers_argmax_f32`) + strategy enum |
 | `attention` | Full attention with KV cache (FlashInfer placeholder) |
 | `gdn` | Gated DeltaNet recurrent state update (FlashInfer placeholder) |
-| `sync` | NCCL all-reduce for TP collectives |
+| `sync` | NCCL all-reduce for TP collectives (`all_reduce_attention`, `all_reduce_mlp`) |
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 
 ### Sampling
