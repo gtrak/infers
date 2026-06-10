@@ -20,6 +20,10 @@ use crate::gdn::GdnState;
 
 use infers_kv::PagedKvManager;
 
+use half::bf16;
+use infers_cuda::CudaSlice;
+use infers_model::MtpWeights;
+
 /// Central engine for forward-pass inference.
 ///
 /// Owns all GPU resources: CUDA contexts, streams, loaded kernels, cuBLASLt handles,
@@ -537,5 +541,293 @@ impl ForwardEngine {
         );
 
         Ok(new_seq_id)
+    }
+
+    /// Initialize the MTP speculative decoding engine.
+    ///
+    /// Creates an `MtpEngine` from MTP weights, uploading weight data to GPU.
+    ///
+    /// # Arguments
+    /// * `mtp_weights` — MTP weights from model loading
+    /// * `num_draft_tokens` — Number of draft tokens per speculative step (1-4, 2 recommended)
+    /// * `stream` — CUDA stream for weight uploads
+    ///
+    /// # Returns
+    /// A new `MtpEngine` ready for draft generation and verification.
+    pub fn init_mtp(
+        &self,
+        mtp_weights: &MtpWeights,
+        num_draft_tokens: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<infers_mtp::MtpEngine> {
+        infers_mtp::MtpEngine::new(mtp_weights, &self.config, num_draft_tokens, stream)
+    }
+
+    /// Decode a single token and return both the sampled token and the
+    /// final hidden state (pre-LM-head) for MTP speculative decoding.
+    ///
+    /// # Arguments
+    /// * `stream` — CUDA stream for kernel launches
+    /// * `token_id` — Previous token ID to continue generation
+    /// * `position` — Current position in the sequence (for RoPE)
+    ///
+    /// # Returns
+    /// `(sampled_token, hidden_state)` where `hidden_state` is the output
+    /// of the final RMSNorm, preserved before LM head projection.
+    pub fn decode_with_hidden(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+    ) -> Result<(u32, CudaSlice<bf16>)> {
+        let gpu_id = 0;
+        let weights = &self.weights[gpu_id];
+
+        let kernels = crate::decode::DecodeKernels {
+            rmsnorm: self.rmsnorm_kernel.clone(),
+            silu_glu: self.silu_glu_kernel.clone(),
+            rope: self.rope_kernel.clone(),
+            embedding: self.embedding_kernel.clone(),
+            add: self.add_kernel.clone(),
+            argmax: self.argmax_kernel.clone(),
+            softmax: self.softmax_kernel.clone(),
+            kv_cache_write: self.kv_cache_write_kernel.clone(),
+            gdn_update: self.gdn_update_kernel.clone(),
+        };
+
+        crate::decode::decode_with_hidden(
+            &mut self.gemm, stream, &kernels, &self.nccl,
+            &self.config, weights, token_id, position,
+            &mut self.kv_caches, &mut self.gdn_states,
+        )
+    }
+
+    /// Run the MTP speculative decoding loop.
+    ///
+    /// For each step:
+    /// 1. Get the main model's hidden state via `decode_with_hidden`
+    /// 2. Generate draft tokens from the MTP head
+    /// 3. Verify drafts against the main model
+    /// 4. Accept/reject drafts and extend output
+    ///
+    /// # Arguments
+    /// * `stream` — CUDA stream for kernel launches
+    /// * `token_id` — Initial token ID to start generation
+    /// * `position` — Starting position in the sequence
+    /// * `mtp` — MTP engine (created via `init_mtp`)
+    /// * `max_tokens` — Maximum number of tokens to generate
+    /// * `mtp_metrics` — Optional metrics tracker (can be `&mut MtpMetrics::new()`)
+    ///
+    /// # Returns
+    /// All generated tokens including the initial decode step
+    pub fn decode_with_mtp(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        mtp: &mut infers_mtp::MtpEngine,
+        max_tokens: usize,
+        mtp_metrics: &mut infers_mtp::MtpMetrics,
+    ) -> Result<Vec<u32>> {
+        let kernels = crate::decode::DecodeKernels {
+            rmsnorm: self.rmsnorm_kernel.clone(),
+            silu_glu: self.silu_glu_kernel.clone(),
+            rope: self.rope_kernel.clone(),
+            embedding: self.embedding_kernel.clone(),
+            add: self.add_kernel.clone(),
+            argmax: self.argmax_kernel.clone(),
+            softmax: self.softmax_kernel.clone(),
+            kv_cache_write: self.kv_cache_write_kernel.clone(),
+            gdn_update: self.gdn_update_kernel.clone(),
+        };
+
+        use std::cell::Cell;
+
+        let mut output_tokens = Vec::new();
+        let mut current_token = token_id;
+        let current_pos = Cell::new(position);
+
+        // Wrap references as raw pointers inside Arc for Fn closures.
+        // This is safe because:
+        // 1. The &mut borrow of self is held for the entire duration
+        // 2. Closures are called sequentially (never concurrently)
+        // 3. References are valid as long as self lives
+        let kv_caches_ptr: Arc<*mut Vec<KvCache>> =
+            Arc::new(&mut self.kv_caches as *mut Vec<KvCache>);
+        let gdn_states_ptr: Arc<*mut Vec<GdnState>> =
+            Arc::new(&mut self.gdn_states as *mut Vec<GdnState>);
+        let config_ptr: Arc<*const ModelConfig> =
+            Arc::new(self.config.as_ref() as *const ModelConfig);
+        let weights_ptr: Arc<*const infers_model::WeightRegistry> =
+            Arc::new(&self.weights[0] as *const infers_model::WeightRegistry);
+        let nccl_ptr: Arc<*const NcclCommunicator> =
+            Arc::new(&self.nccl as *const NcclCommunicator);
+
+        // Build embed callback for MTP operations
+        let embed_fn = |token: u32, s: &Arc<CudaStream>| -> Result<CudaSlice<bf16>> {
+            let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
+            let config: &ModelConfig = unsafe { &**config_ptr };
+            let embed_weight = weights.embedding.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+            let embed_table = crate::upload::upload_weight(s, embed_weight)?;
+            crate::embedding::embed_tokens(
+                s,
+                &kernels.embedding,
+                &[token],
+                &embed_table,
+                config.hidden_size,
+                config.vocab_size,
+            )
+        };
+
+        // Build RMS norm callback
+        let rms_norm_fn = |s: &Arc<CudaStream>,
+                           input: &CudaSlice<bf16>,
+                           weight: &CudaSlice<bf16>,
+                           eps: f32,
+                           hidden_size: usize|
+         -> Result<CudaSlice<bf16>> {
+            crate::norm::rms_norm(s, &kernels.rmsnorm, input, weight, eps, hidden_size)
+        };
+
+        // Build forward_layer callback
+        let forward_layer_fn =
+            |layer: &infers_model::LayerWeights,
+             input: &CudaSlice<bf16>,
+             s: &Arc<CudaStream>,
+             g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
+                let kv_caches: &mut [KvCache] = unsafe { &mut **kv_caches_ptr };
+                let gdn_states: &mut [GdnState] = unsafe { &mut **gdn_states_ptr };
+                let config: &ModelConfig = unsafe { &**config_ptr };
+                let layer_idx = 0;
+                crate::mtp::forward_layer_pass(
+                    layer, input, g, s, &kernels, config,
+                    kv_caches, gdn_states,
+                    current_pos.get(), layer_idx,
+                )
+            };
+
+        // Build LM head callback
+        let lm_head_fn = |hidden: &CudaSlice<bf16>,
+                          s: &Arc<CudaStream>,
+                          g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
+            let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
+            let config: &ModelConfig = unsafe { &**config_ptr };
+            let lm_head_weight = weights.lm_head.as_ref()
+                .or_else(|| weights.embedding.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
+            let lm_head_gpu = crate::upload::upload_weight(s, lm_head_weight)?;
+            let mut logits = s
+                .alloc_zeros::<bf16>(config.vocab_size)
+                .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
+            g.matmul_bf16(
+                &infers_cuda::gemm::GemmConfig {
+                    m: 1,
+                    n: config.vocab_size,
+                    k: config.hidden_size,
+                    transa: true,
+                    transb: false,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    lda: None,
+                    ldb: None,
+                    ldc: None,
+                    activation: None,
+                },
+                hidden,
+                &lm_head_gpu,
+                &mut logits,
+            )?;
+            Ok(logits)
+        };
+
+        // Build sample callback
+        let sample_fn = |logits: &CudaSlice<bf16>,
+                         s: &Arc<CudaStream>| -> Result<u32> {
+            let logits_bf16: Vec<bf16> = s
+                .clone_dtoh(logits)
+                .map_err(|e| anyhow::anyhow!("Failed to download logits: {e}"))?;
+            let logits_f32: Vec<f32> = logits_bf16.iter().map(|v| v.to_f32()).collect();
+            let logits_f32_gpu = s
+                .clone_htod(&logits_f32)
+                .map_err(|e| anyhow::anyhow!("Failed to upload f32 logits: {e}"))?;
+            crate::sample::greedy_sample(s, &kernels.argmax, &logits_f32_gpu)
+        };
+
+        // Build full_forward callback
+        let full_forward_fn =
+            |token: u32,
+             s: &Arc<CudaStream>,
+             g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
+                let kv_caches: &mut [KvCache] = unsafe { &mut **kv_caches_ptr };
+                let gdn_states: &mut [GdnState] = unsafe { &mut **gdn_states_ptr };
+                let config: &ModelConfig = unsafe { &**config_ptr };
+                let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
+                let nccl: &NcclCommunicator = unsafe { &**nccl_ptr };
+                crate::mtp::full_forward_logits(
+                    token, g, s, &kernels, nccl,
+                    config, weights,
+                    kv_caches, gdn_states,
+                    current_pos.get(),
+                )
+            };
+
+        // Create MtpOperations from callbacks
+        let ops = infers_mtp::MtpOperations::new(
+            &embed_fn,
+            &rms_norm_fn,
+            &forward_layer_fn,
+            &lm_head_fn,
+            &sample_fn,
+            &full_forward_fn,
+        );
+
+        while output_tokens.len() < max_tokens {
+            // Step 1: Decode with hidden state
+            let (sampled_token, hidden_state) =
+                self.decode_with_hidden(stream, current_token, current_pos.get())?;
+            output_tokens.push(sampled_token);
+            current_pos.set(current_pos.get() + 1);
+
+            // Step 2: Check for EOS
+            // (EOS check placeholder — tokenizer not available at this level)
+
+            // Step 3: Generate draft tokens from MTP head
+            let num_drafts = mtp.adaptive_num_drafts();
+            let drafts = mtp.generate_drafts(
+                &hidden_state,
+                sampled_token,
+                num_drafts,
+                stream,
+                &mut self.gemm,
+                &ops,
+            )?;
+
+            // Step 4: Verify drafts
+            let verification =
+                mtp.verify_drafts(&drafts, stream, &mut self.gemm, &ops)?;
+
+            // Step 5: Record metrics
+            mtp_metrics.record_step(verification.num_accepted(), verification.num_drafts());
+
+            // Step 6: Accept longest valid prefix
+            let accepted = mtp.accept_prefix(&verification);
+            let accepted_len = accepted.len();
+
+            output_tokens.extend(accepted);
+            current_pos.set(current_pos.get() + accepted_len as u32);
+
+            // Update current_token for next iteration
+            if let Some(&last_accepted) = output_tokens.last() {
+                current_token = last_accepted;
+            }
+
+            // Stop if we've hit max_tokens
+            if output_tokens.len() >= max_tokens {
+                break;
+            }
+        }
+
+        Ok(output_tokens)
     }
 }

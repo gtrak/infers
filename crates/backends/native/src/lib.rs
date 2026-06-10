@@ -13,6 +13,7 @@ pub mod decode;
 pub mod gdn;
 pub mod attention;
 pub mod mlp;
+pub mod mtp;
 pub mod norm;
 pub mod rope;
 pub mod sample;

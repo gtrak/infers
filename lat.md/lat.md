@@ -401,6 +401,43 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 
 See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
+### Decode with Hidden State
+Variant of `decode` that also returns the pre-LM-head hidden state for MTP speculative decoding.
+
+Identical to `decode` except after the final RMSNorm it clones the hidden state tensor (`mtp_hidden`) before LM head projection. Returns `(sampled_token, mtp_hidden)` where `mtp_hidden` is `[hidden_size]` BF16 output of the final RMSNorm. Used by MTP draft heads that need the last layer's hidden state as input rather than token IDs.
+
+See [[crates/backends/native/src/decode.rs#decode_with_hidden]].
+
+### MTP Integration Methods
+
+Three `ForwardEngine` methods provide MTP speculative decoding support.
+
+#### init_mtp
+
+Creates an `MtpEngine` from `MtpWeights`, uploading weight data to GPU. Takes `num_draft_tokens` (1-4, 2 recommended) and a CUDA stream for weight uploads. Returns a new `MtpEngine` ready for draft generation and verification.
+
+See [[crates/backends/native/src/engine.rs#ForwardEngine#init_mtp]].
+
+#### decode_with_hidden
+
+Returns the sampled token and pre-LM-head hidden state. Clones the hidden tensor after final RMSNorm before LM head projection, yielding `(sampled_token, hidden_state)`.
+
+See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_hidden]].
+
+#### decode_with_mtp
+
+Full MTP speculative decoding loop. For each iteration:
+
+1. Calls `decode_with_hidden` to get the main model's hidden state and sampled token
+2. Generates draft tokens via `mtp.generate_drafts` using the MTP head
+3. Verifies drafts against the main model via `mtp.verify_drafts`
+4. Records metrics and accepts the longest valid prefix
+5. Extends output tokens and updates position tracking
+
+Uses `MtpOperations` callbacks (embed, rms_norm, forward_layer, lm_head, sample, full_forward) wrapped with raw pointers inside `Arc` to satisfy `Fn` trait requirements while accessing mutable engine state (`kv_caches`, `gdn_states`). Position tracking uses `Cell<u32>` for interior mutability across closure boundaries.
+
+See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_mtp]].
+
 ## Module Structure
 Fourteen modules cover forward-pass operations, including eviction for memory pressure handling: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction.
 
