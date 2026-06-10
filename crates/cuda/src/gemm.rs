@@ -4,7 +4,7 @@
 //! batched GEMM operations supporting FP16, BF16, and FP32 formats.
 
 use cudarc::cublaslt::safe::{Activation, CudaBlasLT, Matmul, MatmulConfig};
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 /// Configuration for a GEMM operation.
@@ -134,6 +134,88 @@ where
         handle
             .matmul(matmul_config, a, b, c, None::<&CudaSlice<T>>, config.activation.as_ref())
             .map_err(|e| anyhow::anyhow!("cuBLASLt matmul failed: {:?}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Configuration for INT4 GEMM with per-group dequantization.
+///
+/// Weights are stored in INT4-packed format with per-group scale
+/// and zero-point. Dequantization happens on-the-fly in registers.
+#[derive(Debug, Clone)]
+pub struct Int4GemmConfig {
+    /// M dimension (rows of output from input).
+    pub m: usize,
+    /// N dimension (columns of output, rows of weight).
+    pub n: usize,
+    /// K dimension (inner dimension, columns of input).
+    pub k: usize,
+    /// Quantization group size (typically 128).
+    pub group_size: usize,
+}
+
+/// Execute INT4 GEMM with on-the-fly dequantization.
+///
+/// Computes: output[M][N] = dequant(weight[N][K]) @ input[M][K]
+///
+/// Weights stay in INT4-packed format — no dequantized copy exists.
+/// Dequantization happens in registers during the inner loop.
+///
+/// # Arguments
+/// * `stream` — CUDA stream to launch on
+/// * `kernel` — The `int4_gemm_kernel` CudaFunction handle
+/// * `config` — M, N, K, group_size dimensions
+/// * `output` — [M, N] BF16 output buffer
+/// * `weight` — [N, K/8] packed INT4 weights
+/// * `scales` — [N, K/group_size] BF16 group scales
+/// * `zeros`  — [N, K/group_size/8] packed INT4 zero points
+/// * `input`  — [M, K] BF16 input activations
+pub fn matmul_int4(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    config: &Int4GemmConfig,
+    output: &mut CudaSlice<half::bf16>,
+    weight: &CudaSlice<u32>,
+    scales: &CudaSlice<half::bf16>,
+    zeros: &CudaSlice<u32>,
+    input: &CudaSlice<half::bf16>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.m > 0 && config.n > 0 && config.k > 0,
+        "INT4 GEMM dimensions must all be positive"
+    );
+    anyhow::ensure!(
+        config.group_size > 0 && config.k % config.group_size == 0,
+        "K must be divisible by group_size"
+    );
+
+    // Launch config: 16x16 threads per block
+    let block = (16, 16, 1);
+    let launch_config = LaunchConfig {
+        grid_dim: (
+            (config.n as u32 + block.0 - 1) / block.0,
+            (config.m as u32 + block.1 - 1) / block.1,
+            1,
+        ),
+        block_dim: block,
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        let _ = stream
+            .launch_builder(kernel)
+            .arg(output)
+            .arg(weight)
+            .arg(scales)
+            .arg(zeros)
+            .arg(input)
+            .arg(&(config.m as i32))
+            .arg(&(config.n as i32))
+            .arg(&(config.k as i32))
+            .arg(&(config.group_size as i32))
+            .launch(launch_config)
+            .map_err(|e| anyhow::anyhow!("int4_gemm_kernel launch failed: {:?}", e))?;
     }
 
     Ok(())

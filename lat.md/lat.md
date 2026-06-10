@@ -53,7 +53,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | stream | CUDA stream pool for async execution |
 | memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
-| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication |
+| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization |
 | nccl | Multi-GPU collective operations for TP/PP |
 
 # Kernel Extraction and Build System
@@ -72,7 +72,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 ### Kernel Source Files
 All kernels use `extern "C" __global__` so function names are directly loadable from cubin files. Launch configuration is determined by Rust dispatch code, not kernel wrappers.
 
-Sixteen kernel implementations across 14 files for transformer forward-pass operations using BF16 data.
+Seventeen kernel implementations across 15 files for transformer forward-pass operations using BF16 data, plus INT4 GEMM for AutoRound quantization.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -91,6 +91,7 @@ Sixteen kernel implementations across 14 files for transformer forward-pass oper
 | `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 | `paged_attention_decode.cu` | `infers_paged_attention_decode_bf16` | Paged attention decode: computes single-token attention over paged KV cache using two-pass online softmax and weighted V accumulation, one block per KV head — Phase 1 uses strided dot-product computation, Phase 2 loops over all tokens per thread |
 | `fp8_quantize.cu` | `infers_fp8_quantize_bf16`, `infers_fp8_dequantize_bf16` | FP8 quantize (BF16→FP8) and dequantize (FP8→BF16) for KV cache quantization, supporting both E4M3 (mode=0) and E5M2 (mode=1) formats — one thread per element, 256 threads per block |
+| `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - zero) * scale` on-the-fly during inner loop, accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -116,11 +117,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (16 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, paged_attention_decode, fp8_quantize, fp8_dequantize) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
-- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
+- KernelRegistry for .cubin loading (17 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, paged_attention_decode.cu, fp8_quantize.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 
 # Phase 3 Deliverables

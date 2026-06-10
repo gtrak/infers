@@ -74,6 +74,7 @@ impl KernelRegistry {
         self.register("infers_paged_attention_decode_bf16", "kernels/compiled/paged_attention_decode.cubin");
         self.register("infers_fp8_quantize_bf16", "kernels/compiled/fp8_quantize.cubin");
         self.register("infers_fp8_dequantize_bf16", "kernels/compiled/fp8_quantize.cubin");
+        self.register("int4_gemm_kernel", "kernels/compiled/int4_gemm.cubin");
     }
 }
 
