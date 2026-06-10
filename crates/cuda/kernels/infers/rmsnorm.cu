@@ -20,34 +20,34 @@ __global__ void rmsnorm_kernel(
     int hidden,
     float eps
 ) {
-    extern __shared__ __nv_bfloat16 shared_mem[];
+    extern __shared__ float shared_mem[];
 
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int total_threads = blockDim.x;
 
-    // --- Phase 1: Compute sum of squares ---
+    // --- Phase 1: Compute sum of squares (accumulated in float for precision) ---
     float sum_sq = 0.0f;
     for (int i = tid; i < hidden; i += total_threads) {
         float val = __bfloat162float(x[row * hidden + i]);
         sum_sq += val * val;
     }
 
-    // Reduce within block via shared memory
-    __nv_bfloat16* sdata = shared_mem;
-    sdata[tid] = __float2bfloat16(sum_sq);
+    // Reduce within block via shared memory — use float throughout for precision
+    float* sdata = shared_mem;
+    sdata[tid] = sum_sq;
     __syncthreads();
 
     for (int stride = total_threads / 2; stride > 0; stride >>= 1) {
         __syncthreads();
         if (tid < stride) {
-            sdata[tid] = sdata[tid] + sdata[tid + stride];
+            sdata[tid] += sdata[tid + stride];
         }
     }
     __syncthreads();
 
     // --- Phase 2: Broadcast scaling factor and apply ---
-    float rms = __bfloat162float(sdata[0]);
+    float rms = sdata[0];
     float scale = rsqrtf(rms / hidden + eps);
 
     for (int i = tid; i < hidden; i += total_threads) {
@@ -83,7 +83,7 @@ void infers_rmsnorm_bf16(
         block_size = INFERS_BLOCK_SIZE;
     }
 
-    int shared_bytes = block_size * sizeof(__nv_bfloat16);
+    int shared_bytes = block_size * sizeof(float);
     rmsnorm_kernel<<<rows, block_size, shared_bytes>>>(
         x, weight, output, hidden, eps
     );

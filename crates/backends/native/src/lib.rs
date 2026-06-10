@@ -1,6 +1,21 @@
-//! Native inference backend using FlashInfer + cuBLASLt.
+//! Native inference backend using custom CUDA kernels + cuBLASLt.
 //!
-//! This backend implements the Qwen3.6-27B forward pass using:
-//! - FlashInfer GDN kernels for the 48 Gated DeltaNet layers
-//! - FlashInfer PagedAttention for the 16 full-attention layers
+//! Implements the Qwen3.6-27B forward pass with:
+//! - Custom BF16 kernels for RMSNorm, RoPE, SiLU, embedding
 //! - cuBLASLt GEMM for linear projections
+//! - NCCL all-reduce for tensor parallelism
+//! - Hybrid GDN/FullAttention layer dispatch
+
+pub mod engine;
+pub mod prefill;
+pub mod decode;
+pub mod gdn;
+pub mod attention;
+pub mod mlp;
+pub mod norm;
+pub mod rope;
+pub mod sample;
+pub mod embedding;
+pub mod sync;
+
+pub use engine::ForwardEngine;

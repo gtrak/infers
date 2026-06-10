@@ -28,8 +28,8 @@ impl NcclCommunicator {
     pub fn new(streams: Vec<Arc<cudarc::driver::CudaStream>>) -> anyhow::Result<Self> {
         let comms =
             Comm::from_devices(streams).map_err(|e| anyhow::anyhow!("NCCL init failed: {:?}", e))?;
-        let world_size = comms.len();
-        let rank = 0;
+        let world_size = if comms.is_empty() { 0 } else { comms[0].world_size() };
+        let rank = if comms.is_empty() { 0 } else { comms[0].rank() };
 
         tracing::info!(
             "NCCL communicator created: rank {}/{}, {} devices",

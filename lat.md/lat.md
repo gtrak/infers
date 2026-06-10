@@ -75,7 +75,7 @@ Seven kernel implementations for transformer forward-pass operations using BF16 
 | File | Kernels | Description |
 |------|---------|-------------|
 | `common.cuh` | — | Shared utilities: `__nv_bfloat16` conversion helpers, `INFERS_BLOCK_SIZE` (256), thread indexing macros |
-| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * weight |
+| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * weight, using float shared memory for precision-preserving reduction |
 | `silu.cu` | `infers_silu_bf16`, `infers_silu_glu_bf16` | SiLU activation and SwiGLU gating: output = x * sigmoid(gate) |
 | `rope.cu` | `infers_rope_bf16` | Rotary Position Embedding applied to query and key tensors |
 | `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |
@@ -106,7 +106,7 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (7 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax) and LoadedKernelRegistry for GPU-loaded kernels
+- KernelRegistry for .cubin loading (7 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
@@ -125,6 +125,41 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 - MemoryBudget calculator for VRAM estimation across quantization formats
 - LayerType enum with default pattern (every 4th layer full attention, rest GDN)
 - QuantizationConfig parsing from `quantization_config.json` or embedded config
+
+# Phase 4 Deliverables
+Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
+
+## Forward Engine
+Central `ForwardEngine` struct owns all GPU state: CUDA contexts, streams, loaded kernels, cuBLASLt handles, and NCCL communicators. Provides `prefill()` for prompt processing and `decode()` for single-token generation.
+
+### Engine Structure
+`ForwardEngine` holds: `config: Arc<ModelConfig>`, `weights: Vec<WeightRegistry>`, `kernels: LoadedKernelRegistry`, `gemm: GemmEngine`, `nccl: NcclCommunicator`, `streams: StreamPool`. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+
+### Prefill Path
+Embeds prompt tokens, loops through layers dispatching GDN or full attention based on `LayerType`, applies final norm + LM head, samples first token via greedy argmax. See [[crates/backends/native/src/prefill.rs#prefill]].
+
+### Decode Path
+Embeds single token, loops through layers with KV cache (full attention) or recurrent state (GDN), applies final norm + LM head, samples next token. See [[crates/backends/native/src/decode.rs#decode]].
+
+## Module Structure
+Eleven modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync.
+
+### Layer Operations
+Per-layer CUDA kernel dispatch for transformer operations.
+
+| Module | Purpose |
+|--------|---------|
+| `norm` | RMSNorm kernel dispatch (`infers_rmsnorm_bf16`) |
+| `rope` | Rotary position embedding (`infers_rope_bf16`) |
+| `embedding` | Token embedding gather (`infers_embedding_gather_bf16`) |
+| `mlp` | SwiGLU forward via cuBLASLt GEMM + SiLU kernel |
+| `sample` | Greedy argmax (`infers_argmax_f32`) + strategy enum |
+| `attention` | Full attention with KV cache (FlashInfer placeholder) |
+| `gdn` | Gated DeltaNet recurrent state update (FlashInfer placeholder) |
+| `sync` | NCCL all-reduce for TP collectives |
+
+### Sampling
+`SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
 
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
@@ -351,6 +386,10 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 ## Build Script Safety
 
 `build.rs` uses `parent().unwrap_or(Path::new("."))` instead of `parent().unwrap()` for output path directory creation. See [[crates/cuda/build.rs]].
+
+## GEMM Leading Dimension Fix
+
+`GemmConfig` to `MatmulConfig` conversion in `gemm_impl` had incorrect column-major leading dimension defaults. Fixed `lda` branches (transa=true→k, transa=false→m) and `ldc` default (m, not n) to match cuBLASLt column-major convention. See [[crates/cuda/src/gemm.rs#gemm_impl]].
 
 ## SSE Constant Usage
 

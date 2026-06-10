@@ -104,12 +104,12 @@ where
     );
 
     let lda = config.lda.unwrap_or({
-        if config.transa { config.m as i64 } else { config.k as i64 }
+        if config.transa { config.k as i64 } else { config.m as i64 }
     });
     let ldb = config.ldb.unwrap_or({
         if config.transb { config.n as i64 } else { config.k as i64 }
     });
-    let ldc = config.ldc.unwrap_or(config.n as i64);
+    let ldc = config.ldc.unwrap_or(config.m as i64);
 
     let matmul_config = MatmulConfig {
         transa: config.transa,

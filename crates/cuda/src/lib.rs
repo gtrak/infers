@@ -12,6 +12,7 @@ pub mod nccl;
 pub use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, DeviceRepr,
 };
+pub use cudarc::driver::safe::PushKernelArg;
 pub use cudarc::cublaslt::safe::{
     Activation, CudaBlasLT, MatmulConfig as CublasMatmulConfig,
 };

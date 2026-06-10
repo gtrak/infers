@@ -583,7 +583,10 @@ name = "infers-backend-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "infers-cuda",
+ "infers-model",
+ "tracing",
 ]
 
 [[package]]

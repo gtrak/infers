@@ -77,9 +77,12 @@ impl Default for KernelRegistry {
 
 /// GPU-loaded kernel registry that holds actual CUDA module and function handles.
 ///
-/// Used by the forward pass to launch loaded kernels via `CudaModule::load_function()`.
+/// Deduplicates module loading so that the same .cubin file is loaded only once,
+/// even when multiple kernel functions reference it.
 pub struct LoadedKernelRegistry {
-    /// Map from kernel name to loaded CUDA module.
+    /// Map from kernel name to (cubin_path, function_name).
+    kernels: HashMap<String, (String, String)>,
+    /// Map from cubin path to loaded module — deduplicated so same .cubin is loaded once.
     modules: HashMap<String, Arc<CudaModule>>,
     /// The CUDA context these kernels are loaded into.
     _ctx: Arc<CudaContext>,
@@ -87,30 +90,39 @@ pub struct LoadedKernelRegistry {
 
 impl LoadedKernelRegistry {
     /// Load all kernels from a KernelRegistry into GPU memory.
+    ///
+    /// Deduplicates by cubin path so that the same .cubin file is loaded only once.
     pub fn load_all(
         ctx: Arc<CudaContext>,
         registry: &KernelRegistry,
     ) -> anyhow::Result<Self> {
+        let mut kernels = HashMap::new();
         let mut modules = HashMap::new();
         for (name, handle) in &registry.kernels {
-            let cubin_bytes = std::fs::read(&handle.cubin_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read {}: {:?}", handle.cubin_path, e))?;
-            let ptx = Ptx::from_binary(cubin_bytes);
-            let module = ctx.load_module(ptx)
-                .map_err(|e| anyhow::anyhow!("Failed to load module '{}': {:?}", name, e))?;
-            modules.insert(name.clone(), module);
+            // Deduplicate: load module only once per cubin path
+            if !modules.contains_key(&handle.cubin_path) {
+                let cubin_bytes = std::fs::read(&handle.cubin_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {:?}", handle.cubin_path, e))?;
+                let ptx = Ptx::from_binary(cubin_bytes);
+                let module = ctx.load_module(ptx)
+                    .map_err(|e| anyhow::anyhow!("Failed to load module '{}': {:?}", handle.cubin_path, e))?;
+                modules.insert(handle.cubin_path.clone(), module);
+            }
+            kernels.insert(name.clone(), (handle.cubin_path.clone(), handle.name.clone()));
         }
-        Ok(Self { modules, _ctx: ctx })
+        Ok(Self { kernels, modules, _ctx: ctx })
     }
 
     /// Get a `CudaFunction` for a kernel by name.
     ///
-    /// Loads the function on demand from the pre-loaded module.
+    /// Looks up the deduplicated module by cubin path and loads the function from it.
     pub fn get_function(&self, name: &str) -> anyhow::Result<CudaFunction> {
-        let module = self.modules.get(name)
+        let (cubin_path, function_name) = self.kernels.get(name)
             .ok_or_else(|| anyhow::anyhow!("Kernel '{}' not found", name))?;
-        module.load_function(name)
-            .map_err(|e| anyhow::anyhow!("Failed to load function '{}': {:?}", name, e))
+        let module = self.modules.get(cubin_path)
+            .ok_or_else(|| anyhow::anyhow!("Module '{}' not loaded", cubin_path))?;
+        module.load_function(function_name)
+            .map_err(|e| anyhow::anyhow!("Failed to load function '{}': {:?}", function_name, e))
     }
 
     /// Launch a kernel with the given config and arguments.
