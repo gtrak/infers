@@ -2,3 +2,5 @@
 //!
 //! TP=2: NCCL all-reduce after attention and MLP layers.
 //! PP=2: P2P send/recv between pipeline stages with microbatching.
+
+pub mod comm;

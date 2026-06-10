@@ -143,4 +143,35 @@ impl NcclCommunicator {
             .map_err(|e| anyhow::anyhow!("NCCL all_gather failed: {:?}", e))?;
         Ok(())
     }
+
+    /// Send data to a peer rank via NCCL P2P.
+    pub fn send<T: NcclType>(
+        &self,
+        rank: usize,
+        data: &CudaSlice<T>,
+        peer: i32,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {rank} out of range (world_size={})", self.world_size))?;
+        comm.send(data, peer)
+            .map_err(|e| anyhow::anyhow!("NCCL send failed: {:?}", e))
+    }
+
+    /// Receive data from a peer rank via NCCL P2P.
+    pub fn recv<T: NcclType>(
+        &self,
+        rank: usize,
+        data: &mut CudaSlice<T>,
+        peer: i32,
+    ) -> anyhow::Result<()> {
+        let comm = self
+            .comms
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("Rank {rank} out of range (world_size={})", self.world_size))?;
+        comm.recv(data, peer)
+            .map_err(|e| anyhow::anyhow!("NCCL recv failed: {:?}", e))?;
+        Ok(())
+    }
 }
