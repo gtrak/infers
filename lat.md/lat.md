@@ -242,21 +242,46 @@ Attempts to share an existing page from the prefix cache.
 
 ### PagedKvManager
 
-Orchestrator that ties together the page pool, prefix cache, and copy-on-write logic for multi-sequence management.
+Orchestrator that ties together the page pool, prefix cache, copy-on-write, and eviction logic for multi-sequence management.
 
-`PagedKvManager` holds shared pool and cache via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, and prefix caching. Methods: `new()` initializes pool and cache, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`, `page_size()`, `num_sequences()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
+`PagedKvManager` holds shared pool, cache, and CPU eviction pool via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, prefix caching, and eviction/restore. Methods: `new()` initializes pool, cache, and CPU eviction pool, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`, `page_size()`, `num_sequences()`, `page_bytes()`, `num_evicted_pages()`, `eviction_utilization()`, `is_sequence_evicted()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
+
+#### Eviction
+
+Eviction and restore of sequence page data between GPU and CPU.
+
+`evict_sequence(seq_id, page_data)` takes ownership of a sequence's page table, stores each page's data in `CpuPagePool`, frees the GPU pages back to the page pool, and deletes the sequence. Returns an `EvictedSequence` snapshot. `restore_sequence(evicted)` creates a new sequence, allocates pages, retrieves data from `CpuPagePool` using the original page IDs, and returns `(new_seq_id, page_data)` for the backend to copy back to GPU.
 
 ### ManagerError
 
 Custom error type for manager operations using thiserror.
 
-`ManagerError` has two variants: `InvalidSequence(seq_id)` when a sequence is not found or already deleted, and `PoolExhausted` when the page pool has no free pages. See [[crates/kv/src/manager.rs#ManagerError]].
+`ManagerError` has three variants: `InvalidSequence(seq_id)` when a sequence is not found or already deleted, `PoolExhausted` when the page pool has no free pages, and `Eviction(EvictionError)` when an eviction-related error occurs. See [[crates/kv/src/manager.rs#ManagerError]].
 
 ### SequenceId
 
 `usize` alias for identifying sequences in the manager.
 
 `SequenceId` is a `usize` used as the index into `PagedKvManager.sequences`. Deleted IDs are recycled via a free list. See [[crates/kv/src/manager.rs#SequenceId]].
+:
+### CpuPagePool
+
+CPU-side storage for evicted KV cache page data.
+
+Stores page data as `Vec<u8>` blobs indexed by `PageId`. The backend performs GPU→CPU copy; this pool handles CPU storage and memory tracking. See [[crates/kv/src/eviction.rs#CpuPagePool]].
+
+### EvictedSequence
+
+Eviction-time snapshot of a sequence page table.
+
+Holds `seq_id`, ordered `page_ids`, `num_tokens`, `page_size`, and `last_access` for LRU ordering. See [[crates/kv/src/eviction.rs#EvictedSequence]].
+
+### EvictionError
+
+Error type for eviction pool operations.
+
+`EvictionError` has five variants: `AlreadyEvicted(PageId)`, `NotEvicted(PageId)`, `BudgetExceeded`, `SizeMismatch`, and `EmptySequence`. See [[crates/kv/src/eviction.rs#EvictionError]].
+
 
 ## Completed
 
@@ -267,7 +292,8 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `PagePool` with O(1) stack-based free list, `PagePoolError` (thiserror), 5 unit tests
 - `PrefixCache` with Blake3 content hashing, LRU eviction, `CacheEntry`, `PageHash`, 12 unit tests
 - `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 12 unit tests
-- `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 11 unit tests
+- `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 11 unit tests + 4 eviction/restore tests
+- `eviction` module: `CpuPagePool`, `EvictedSequence`, `EvictionError`, 9 unit tests
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension
@@ -942,26 +968,32 @@ Valid state transition rules for session lifecycle management.
 
 `TransitionError` holds `from` and `to` states when an invalid transition is attempted. `transition()` validates the `(from, to)` pair against eight allowed transitions: Created→Prefilling, Prefilling→Decoding, Decoding→Completed, Decoding→Paused, Paused→Decoding, Prefilling→Completed, Decoding→Evicted, Evicted→Prefilling. Convenience wrappers: `start_prefill()`, `finish_prefill()`, `complete_session()`, `pause_session()`, `resume_session()`. See [[crates/scheduler/src/lifecycle.rs#transition]].
 
+## Memory Pressure
+
+Memory pressure monitoring and LRU eviction policy for KV page pool management.
+
+`PressureConfig` holds `eviction_threshold` (default 0.90) — when pool utilization exceeds this value, eviction candidates are sought. `PressureAction` enum: `None` (no action needed) or `SuggestEvict` (session ID and utilization). `is_under_pressure()` checks pool utilization against threshold. `select_lru_eviction_candidate()` finds the oldest evictable session (idle >30s) using LRU ordering. The scheduler calls `handle_memory_pressure()` between cleanup and batch building to evict idle sessions when the pool is near capacity. See [[crates/scheduler/src/pressure.rs#PressureConfig]].
+
 ## ScheduledWork
 
 Output of a single scheduling iteration containing decode and optional prefill batches.
 
-`ScheduledWork` holds `decode_batch` (`DecodeBatch` of active sessions for single-token generation) and `prefill_batch` (`Option<DecodeBatch>` for a new session being prefilled). Produced by `RoundRobinScheduler::schedule()`. See [[crates/scheduler/src/scheduler.rs#ScheduledWork]].
+`ScheduledWork` holds `decode_batch` (`DecodeBatch` of active sessions for single-token generation), `prefill_batch` (`Option<DecodeBatch>` for a new session being prefilled), and `evicted_session` (`Option<usize>` — session ID evicted due to memory pressure, if any). Produced by `RoundRobinScheduler::schedule()`. See [[crates/scheduler/src/scheduler.rs#ScheduledWork]].
 
 ## RoundRobinScheduler
 
 Round-robin scheduler for continuous batching that manages session lifecycle and batch construction.
 
-`RoundRobinScheduler` holds `request_queue`, `active_sessions`, `max_concurrent_sessions`, `batch_builder`, and `kv_manager`. `schedule()` runs one iteration: (1) admits new requests up to capacity, (2) removes completed sessions and frees KV resources, (3) builds a decode batch, (4) builds a prefill batch if the decode batch is under half capacity. `create_session()` allocates KV pages for a request's prompt tokens. Helper methods: `enqueue_request()`, `active_count()`, `pending_count()`, `is_busy()`. See [[crates/scheduler/src/scheduler.rs#RoundRobinScheduler]].
+`RoundRobinScheduler` holds `request_queue`, `active_sessions`, `max_concurrent_sessions`, `batch_builder`, `kv_manager`, and `pressure_config` (`PressureConfig` for eviction thresholds). `schedule()` runs one iteration: (1) admits new requests up to capacity, (2) removes completed sessions and frees KV resources, (3) handles memory pressure by evicting idle sessions if pool utilization exceeds threshold, (4) builds a decode batch, (5) builds a prefill batch if under half capacity. `handle_memory_pressure()` checks pool utilization and evicts LRU idle session. `select_and_evict_idle_session()` finds and transitions the oldest evictable session to Evicted. Helper methods: `enqueue_request()`, `active_count()`, `pending_count()`, `is_busy()`. See [[crates/scheduler/src/scheduler.rs#RoundRobinScheduler]].
 
 # Re-exports
 
 Convenience re-exports from `infers_scheduler` crate root for ergonomic downstream usage.
 
-The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Request`, `RequestQueue`, `SamplingConfig`, `SamplingStrategy`, `RoundRobinScheduler`, `ScheduledWork`, `Session`, and `SessionState` so consumers can import directly from `infers_scheduler::` without nested module paths. See [[crates/scheduler/src/lib.rs]].
+The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Request`, `RequestQueue`, `SamplingConfig`, `SamplingStrategy`, `RoundRobinScheduler`, `ScheduledWork`, `Session`, `SessionState`, `PressureConfig`, `PressureAction`, `is_under_pressure`, and `select_lru_eviction_candidate` so consumers can import directly from `infers_scheduler::` without nested module paths. See [[crates/scheduler/src/lib.rs]].
 
 ## Integration Tests
 
 End-to-end integration tests verifying full scheduling flows across module boundaries.
 
-The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable. See [[crates/scheduler/tests/integration.rs]].
+The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable; (8) `test_memory_pressure_triggers_eviction` — end-to-end memory pressure detection when pool is full; (9) `test_evict_restore_round_trip_integration` — evict and restore a sequence through `PagedKvManager` with data integrity verification; (10) `test_lru_eviction_candidate_selection` — LRU eviction selection picks the oldest evictable session; (11) `test_cpu_page_pool_budget_integration` — `CpuPagePool` budget enforcement across store/retrieve cycles. See [[crates/scheduler/tests/integration.rs]].

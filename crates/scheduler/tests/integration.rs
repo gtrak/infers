@@ -13,7 +13,7 @@ use infers_scheduler::{
 };
 
 fn make_kv() -> PagedKvManager {
-    PagedKvManager::new(200, 16, 4, 256, 1024 * 1024)
+    PagedKvManager::new(200, 16, 4, 256, 1024 * 1024, 1024 * 1024)
 }
 
 fn make_request(id: usize, tokens: Vec<u32>) -> Request {
@@ -142,11 +142,12 @@ fn test_batch_builder_with_real_kv_manager() {
 #[test]
 fn test_page_lifecycle_with_sessions() {
     let mut kv = PagedKvManager::new(
-        100,    // total_pages
-        16,     // page_size
-        4,      // num_kv_heads
-        256,    // head_dim
+        100,                // total_pages
+        16,                 // page_size
+        4,                  // num_kv_heads
+        256,                // head_dim
         1024 * 1024 * 1024, // max_cache_bytes
+        1024 * 1024,        // eviction_max_bytes
     );
 
     // Create 3 sequences
@@ -274,4 +275,132 @@ fn test_sampling_config_reexport() {
     assert!(matches!(config.strategy, SamplingStrategy::Temperature { .. }));
     assert_eq!(config.max_tokens, 256);
     assert_eq!(config.stop_sequences.len(), 1);
+}
+
+/// Verify that memory pressure detection works end-to-end with a full pool.
+#[test]
+fn test_memory_pressure_triggers_eviction() {
+    use infers_scheduler::pressure::{is_under_pressure, PressureConfig};
+
+    // Create a tiny pool (4 pages) so we can fill it easily
+    let mut kv = infers_kv::PagedKvManager::new(4, 16, 4, 256, 1024, 65536);
+    let config = PressureConfig::default();
+
+    // Fill the pool completely
+    let seq = kv.create_sequence();
+    for _ in 0..4 {
+        kv.append_page(seq).unwrap();
+    }
+    assert_eq!(kv.pool_utilization(), 1.0);
+
+    // Should be under pressure
+    assert!(is_under_pressure(&kv, &config));
+}
+
+/// Verify evict→restore round-trip through PagedKvManager with data integrity.
+#[test]
+fn test_evict_restore_round_trip_integration() {
+    use infers_kv::PagedKvManager;
+
+    let page_size = 16;
+    let num_kv_heads = 4;
+    let head_dim = 256;
+    let page_bytes = page_size * num_kv_heads * head_dim * 2; // 32768
+
+    let mut kv = PagedKvManager::new(10, page_size, num_kv_heads, head_dim, 1024, 65536);
+
+    // Create sequence and allocate pages
+    let seq1 = kv.create_sequence();
+    kv.append_page(seq1).unwrap();
+    kv.append_page(seq1).unwrap();
+
+    // Create distinguishable page data
+    let page_data = vec![
+        vec![0xABu8; page_bytes], // page 0
+        vec![0xCDu8; page_bytes], // page 1
+    ];
+
+    let free_before = kv.num_free_pages();
+
+    // Evict
+    let evicted = kv.evict_sequence(seq1, page_data).unwrap();
+    assert_eq!(evicted.page_ids.len(), 2);
+
+    // Pages returned to pool
+    assert_eq!(kv.num_free_pages(), free_before + 2);
+    assert_eq!(kv.num_evicted_pages(), 2);
+
+    // Verify sequence is gone
+    assert!(kv.get_page_table(seq1).is_err());
+
+    // Restore
+    let (new_seq, restored_data) = kv.restore_sequence(evicted).unwrap();
+    assert_eq!(restored_data.len(), 2);
+    assert_eq!(restored_data[0][0], 0xAB);
+    assert_eq!(restored_data[1][0], 0xCD);
+    assert_eq!(kv.num_pages(new_seq).unwrap(), 2);
+    assert_eq!(kv.num_evicted_pages(), 0);
+}
+
+/// Verify that LRU eviction selection works with scheduler sessions.
+#[test]
+fn test_lru_eviction_candidate_selection() {
+    use std::time::{Duration, Instant};
+    use infers_scheduler::session::{Session, SessionState};
+    use infers_scheduler::pressure::select_lru_eviction_candidate;
+    use infers_kv::SequencePageTable;
+
+    let now = Instant::now();
+
+    let sessions = vec![
+        Session {
+            id: 0, state: SessionState::Decoding, tokens: vec![1],
+            num_prompt_tokens: 1, num_generated_tokens: 5, max_tokens: 100,
+            page_table: SequencePageTable::new(16),
+            created_at: now, last_activity: now - Duration::from_secs(100),
+            priority: 0,
+        },
+        Session {
+            id: 1, state: SessionState::Decoding, tokens: vec![2],
+            num_prompt_tokens: 1, num_generated_tokens: 5, max_tokens: 100,
+            page_table: SequencePageTable::new(16),
+            created_at: now, last_activity: now - Duration::from_secs(200),
+            priority: 0,
+        },
+        Session {
+            id: 2, state: SessionState::Prefilling, tokens: vec![3],
+            num_prompt_tokens: 1, num_generated_tokens: 0, max_tokens: 100,
+            page_table: SequencePageTable::new(16),
+            created_at: now, last_activity: now, // too recent
+            priority: 0,
+        },
+    ];
+
+    // Session 1 has oldest last_activity (200s ago) — should be selected
+    let candidate = select_lru_eviction_candidate(&sessions);
+    assert_eq!(candidate, Some(1));
+}
+
+/// Verify CpuPagePool budget enforcement across multiple stores.
+#[test]
+fn test_cpu_page_pool_budget_integration() {
+    use infers_kv::CpuPagePool;
+
+    // Budget: 2 pages worth
+    let page_bytes = 1024;
+    let mut pool = CpuPagePool::new(10, page_bytes, 2 * page_bytes);
+
+    pool.store(0, vec![0u8; page_bytes]).unwrap();
+    pool.store(1, vec![0u8; page_bytes]).unwrap();
+    assert!(pool.is_full());
+    assert_eq!(pool.used_bytes(), 2 * page_bytes);
+
+    // Retrieve one page — budget freed
+    let _ = pool.retrieve(0).unwrap();
+    assert_eq!(pool.used_bytes(), page_bytes);
+    assert!(!pool.is_full());
+
+    // Can store again
+    pool.store(5, vec![0u8; page_bytes]).unwrap();
+    assert!(pool.is_full());
 }

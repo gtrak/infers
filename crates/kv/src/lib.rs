@@ -7,6 +7,7 @@
 //! - Copy-on-write page sharing for branching prompts
 
 pub mod cow;
+pub mod eviction;
 pub mod manager;
 pub mod page;
 pub mod pool;
@@ -18,4 +19,5 @@ pub use manager::{ManagerError, PagedKvManager, SequenceId};
 pub use page::{INVALID_PAGE_ID, PageId, PageLocation, PageState, PhysicalPage};
 pub use pool::{PagePool, PagePoolError};
 pub use prefix::{CacheEntry, PageHash, PrefixCache};
+pub use eviction::{CpuPagePool, EvictedSequence, EvictionError};
 pub use table::SequencePageTable;

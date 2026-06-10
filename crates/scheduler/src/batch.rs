@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_decode_batch_empty_for_inactive_sessions() {
-        let kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let builder = BatchBuilder::new(4, 128);
         let sessions = vec![make_session(0, SessionState::Created, vec![1], 1, 0, 100)];
         let batch = builder.build_decode_batch(&sessions, &kv).unwrap();
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_decode_batch_collects_active_sessions() {
-        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let seq1 = kv.create_sequence();
         let seq2 = kv.create_sequence();
         kv.append_page(seq1).unwrap();
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_decode_batch_respects_max_batch_size() {
-        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let ids: Vec<_> = (0..5).map(|_| kv.create_sequence()).collect();
         for &id in &ids {
             kv.append_page(id).unwrap();
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_build_prefill_batch() {
-        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let seq_id = kv.create_sequence();
         for _ in 0..2 {
             kv.append_page(seq_id).unwrap();
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_build_prefill_batch_no_pending() {
-        let kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let builder = BatchBuilder::new(4, 128);
         let mut sessions = vec![];
         let result = builder.build_prefill_batch(&mut sessions, &kv);
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_build_prefill_batch_skips_non_created() {
-        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024);
+        let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let seq_id = kv.create_sequence();
         let builder = BatchBuilder::new(4, 128);
         let mut sessions = vec![make_session(seq_id, SessionState::Decoding, vec![1], 1, 1, 100)];

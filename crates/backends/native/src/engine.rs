@@ -259,12 +259,14 @@ impl ForwardEngine {
         let kv_dim = num_kv_heads * head_dim;
 
         // Create the paged KV manager
+        let eviction_max_bytes = total_pages * page_size * num_kv_heads * head_dim * 2;
         let manager = PagedKvManager::new(
             total_pages,
             page_size,
             num_kv_heads,
             head_dim,
             max_cache_bytes,
+            eviction_max_bytes,
         );
 
         // Create per-layer paged KV caches for all layers

@@ -9,6 +9,8 @@ use anyhow::{anyhow, Result};
 use infers_kv::{PagedKvManager, SequencePageTable};
 
 use crate::batch::{BatchBuilder, DecodeBatch};
+use crate::lifecycle;
+use crate::pressure::{self, PressureConfig};
 use crate::queue::{Request, RequestQueue};
 use crate::session::{Session, SessionState};
 
@@ -19,6 +21,9 @@ pub struct ScheduledWork {
     pub decode_batch: DecodeBatch,
     /// Optional prefill batch: a new session being prefilled.
     pub prefill_batch: Option<DecodeBatch>,
+    /// Session evicted due to memory pressure (if any). The backend
+    /// should copy its GPU page data and call `kv_manager.evict_sequence()`.
+    pub evicted_session: Option<usize>,
 }
 
 /// Round-robin scheduler for continuous batching.
@@ -40,6 +45,8 @@ pub struct RoundRobinScheduler {
     pub batch_builder: BatchBuilder,
     /// Paged KV manager for block allocation and page table access.
     pub kv_manager: PagedKvManager,
+    /// Memory pressure configuration for eviction policy.
+    pub pressure_config: PressureConfig,
 }
 
 impl RoundRobinScheduler {
@@ -56,6 +63,7 @@ impl RoundRobinScheduler {
             max_concurrent_sessions,
             batch_builder: BatchBuilder::new(max_batch_size, max_tokens_per_batch),
             kv_manager,
+            pressure_config: PressureConfig::default(),
         }
     }
 
@@ -68,14 +76,18 @@ impl RoundRobinScheduler {
     ///
     /// 1. Admit new requests from the queue up to `max_concurrent_sessions`.
     /// 2. Remove completed sessions and free their KV resources.
-    /// 3. Build a decode batch from active sessions.
-    /// 4. If the decode batch is small, try to prefill a new session.
+    /// 3. Handle memory pressure — evict idle sessions if pool utilization is high.
+    /// 4. Build a decode batch from active sessions.
+    /// 5. If the decode batch is small, try to prefill a new session.
     pub fn schedule(&mut self) -> Result<ScheduledWork> {
         // Step 1: Admit new requests from the queue
         self.admit_new_requests();
 
         // Step 2: Remove completed sessions
         self.cleanup_completed_sessions();
+
+        // Step 3: Handle memory pressure — evict idle sessions if pool utilization is high
+        let evicted_session = self.handle_memory_pressure()?;
 
         // Step 3: Build decode batch
         let decode_batch = self
@@ -94,7 +106,53 @@ impl RoundRobinScheduler {
         Ok(ScheduledWork {
             decode_batch,
             prefill_batch,
+            evicted_session,
         })
+    }
+
+    /// Handle memory pressure by evicting the oldest idle session if needed.
+    ///
+    /// Checks if the KV page pool utilization exceeds the configured threshold.
+    /// If so, selects the LRU evictable session and transitions it to Evicted.
+    /// Returns the evicted session ID if one was evicted.
+    pub fn handle_memory_pressure(&mut self) -> Result<Option<usize>> {
+        if !pressure::is_under_pressure(&self.kv_manager, &self.pressure_config) {
+            return Ok(None);
+        }
+
+        let candidate_idx =
+            pressure::select_lru_eviction_candidate(&self.active_sessions);
+
+        match candidate_idx {
+            Some(idx) => self.evict_session_at(idx),
+            None => Ok(None),
+        }
+    }
+
+    /// Find and evict an idle session using LRU policy.
+    ///
+    /// Selects the evictable session with the oldest `last_activity` and
+    /// transitions it to `Evicted` state.
+    pub fn select_and_evict_idle_session(&mut self) -> Result<Option<usize>> {
+        let candidate_idx =
+            pressure::select_lru_eviction_candidate(&self.active_sessions);
+
+        match candidate_idx {
+            Some(idx) => self.evict_session_at(idx),
+            None => Ok(None),
+        }
+    }
+
+    /// Evict the session at the given index.
+    ///
+    /// Transitions the session to `Evicted` state and removes it from
+    /// the active sessions list. Returns the session ID.
+    fn evict_session_at(&mut self, idx: usize) -> Result<Option<usize>> {
+        let session_id = self.active_sessions[idx].id;
+        lifecycle::transition(&mut self.active_sessions[idx], SessionState::Evicted)
+            .map_err(|e| anyhow!("Failed to evict session {}: {:?}", session_id, e))?;
+        self.active_sessions.remove(idx);
+        Ok(Some(session_id))
     }
 
     /// Admit new requests from the queue up to capacity.
@@ -188,7 +246,7 @@ mod tests {
     use crate::queue::SamplingConfig;
 
     fn make_kv_manager() -> PagedKvManager {
-        PagedKvManager::new(200, 16, 4, 256, 1024 * 1024)
+        PagedKvManager::new(200, 16, 4, 256, 1024 * 1024, 1024 * 1024)
     }
 
     fn make_request(id: usize, tokens: Vec<u32>) -> Request {
@@ -304,5 +362,32 @@ mod tests {
         assert!(!sched.is_busy());
         sched.enqueue_request(make_request(0, vec![1]));
         assert!(sched.is_busy());
+    }
+
+    #[test]
+    fn test_scheduler_evicts_idle_session() {
+        let kv = make_kv_manager();
+        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        sched.enqueue_request(make_request(0, vec![1, 2]));
+        let _ = sched.schedule().unwrap();
+
+        // Session was created — recently, so not evictable
+        let evicted = sched.select_and_evict_idle_session().unwrap();
+        assert!(evicted.is_none());
+
+        // Simulate the session being idle for a while
+        if let Some(session) = sched.active_sessions.first_mut() {
+            // Transition to Decoding first (needed for evict transition)
+            let _ = crate::lifecycle::start_prefill(session);
+            let _ = crate::lifecycle::finish_prefill(session);
+            // Manually set last_activity to be old enough to be evictable
+            session.last_activity = Instant::now() - std::time::Duration::from_secs(60);
+        }
+
+        // Now the session is evictable
+        let evicted = sched.select_and_evict_idle_session().unwrap();
+        assert!(evicted.is_some());
+        // Session should be removed from active_sessions
+        assert_eq!(sched.active_count(), 0);
     }
 }

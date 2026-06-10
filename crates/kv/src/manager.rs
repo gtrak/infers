@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::cow::{ensure_mutable_page, CowResult};
+use super::eviction::{CpuPagePool, EvictedSequence, EvictionError};
 use super::page::PageId;
 use super::pool::PagePool;
 use super::prefix::{hash_page, PrefixCache};
@@ -27,26 +28,33 @@ pub enum ManagerError {
     /// The page pool has no free pages remaining.
     #[error("Page pool exhausted")]
     PoolExhausted,
+    /// An eviction-related error occurred.
+    #[error("Eviction error: {0}")]
+    Eviction(#[from] super::eviction::EvictionError),
 }
 
 // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
 /// Orchestrates paged KV cache management.
 ///
-/// Manages sequences, page allocation, prefix caching, and copy-on-write
-/// logic. The pool and cache are shared via `Arc<Mutex<>>` to allow
-/// safe access from multiple contexts.
+/// Manages sequences, page allocation, prefix caching, copy-on-write,
+/// and eviction logic. The pool and cache are shared via `Arc<Mutex<>>`
+/// to allow safe access from multiple contexts.
 #[derive(Debug)]
 pub struct PagedKvManager {
     /// Shared page pool for allocation and deallocation.
     page_pool: Arc<Mutex<PagePool>>,
     /// Shared prefix cache for page content hashing and sharing.
     prefix_cache: Arc<Mutex<PrefixCache>>,
+    /// CPU-side storage for evicted page data.
+    cpu_page_pool: Arc<Mutex<CpuPagePool>>,
     /// Number of tokens per page.
     page_size: usize,
     /// Number of KV heads in the model.
     num_kv_heads: usize,
     /// Dimension of each head.
     head_dim: usize,
+    /// Size of a single page in bytes.
+    page_bytes: usize,
     /// Sequence page tables indexed by sequence ID.
     sequences: Vec<Option<SequencePageTable>>,
     /// Pool of free sequence IDs for reuse.
@@ -62,23 +70,28 @@ impl PagedKvManager {
     /// * `num_kv_heads` — Number of KV heads in the model.
     /// * `head_dim` — Dimension of each head.
     /// * `max_cache_bytes` — Memory budget for the prefix cache.
+    /// * `eviction_max_bytes` — Memory budget for the CPU eviction pool.
     pub fn new(
         total_pages: usize,
         page_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
         max_cache_bytes: usize,
+        eviction_max_bytes: usize,
     ) -> Self {
         let page_pool = PagePool::new(total_pages, page_size, num_kv_heads, head_dim);
         let page_bytes = page_size * num_kv_heads * head_dim * 2;
         let prefix_cache = PrefixCache::new(max_cache_bytes, page_bytes);
+        let cpu_page_pool = CpuPagePool::new(total_pages, page_bytes, eviction_max_bytes);
 
         Self {
             page_pool: Arc::new(Mutex::new(page_pool)),
             prefix_cache: Arc::new(Mutex::new(prefix_cache)),
+            cpu_page_pool: Arc::new(Mutex::new(cpu_page_pool)),
             page_size,
             num_kv_heads,
             head_dim,
+            page_bytes,
             sequences: Vec::new(),
             free_sequence_ids: Vec::new(),
         }
@@ -333,6 +346,170 @@ impl PagedKvManager {
         self.sequences.iter().filter(|s| s.is_some()).count()
     }
 
+    /// Get the size of a single page in bytes.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
+    pub fn page_bytes(&self) -> usize {
+        self.page_bytes
+    }
+
+    /// Evict a sequence's pages from GPU to CPU storage.
+    ///
+    /// Takes ownership of the sequence's page table, frees the GPU pages
+    /// back to the pool, and stores the page data in the CPU eviction pool.
+    /// The sequence is then deleted from the manager.
+    ///
+    /// # Arguments
+    /// * `seq_id` — The sequence to evict.
+    /// * `page_data` — The raw page data for each page in the sequence's
+    ///   page table, in order. Each entry must be `page_bytes` bytes.
+    ///
+    /// # Returns
+    /// An `EvictedSequence` snapshot that can be used for restoration.
+    ///
+    /// # Errors
+    /// Returns `InvalidSequence` if the sequence doesn't exist.
+    /// Returns `Eviction` if the CPU pool is full or data sizes mismatch.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    pub fn evict_sequence(
+        &mut self,
+        seq_id: SequenceId,
+        page_data: Vec<Vec<u8>>,
+    ) -> Result<EvictedSequence, ManagerError> {
+        let table = self
+            .sequences
+            .get_mut(seq_id)
+            .and_then(|opt| opt.take())
+            .ok_or(ManagerError::InvalidSequence(seq_id))?;
+
+        let page_ids = table.page_ids.clone();
+
+        if page_ids.is_empty() {
+            return Err(EvictionError::EmptySequence.into());
+        }
+
+        if page_data.len() != page_ids.len() {
+            return Err(EvictionError::SizeMismatch {
+                expected: page_ids.len(),
+                actual: page_data.len(),
+            }
+            .into());
+        }
+
+        // Store page data in CPU eviction pool
+        {
+            let mut cpu_pool = self.cpu_page_pool.lock().unwrap();
+            for (page_id, data) in page_ids.iter().zip(page_data) {
+                cpu_pool.store(*page_id, data)?;
+            }
+        }
+
+        // Free GPU pages back to the page pool
+        {
+            let mut pool = self.page_pool.lock().unwrap();
+            for page_id in &page_ids {
+                pool.free(*page_id);
+            }
+        }
+
+        // Recycle sequence ID
+        self.free_sequence_ids.push(seq_id);
+
+        Ok(EvictedSequence {
+            seq_id,
+            page_ids,
+            num_tokens: table.num_tokens,
+            page_size: table.page_size,
+            last_access: std::time::Instant::now(),
+        })
+    }
+
+    /// Restore a previously evicted sequence back to GPU.
+    ///
+    /// Creates a new sequence, re-allocates pages from the pool, retrieves
+    /// the page data from the CPU eviction pool, and returns both the new
+    /// `SequenceId` and the page data for the backend to copy back to GPU.
+    ///
+    /// # Arguments
+    /// * `evicted` — The `EvictedSequence` returned by `evict_sequence()`.
+    ///
+    /// # Returns
+    /// A tuple of `(new SequenceId, page data Vec<Vec<u8>>)`.
+    ///
+    /// # Errors
+    /// Returns `PoolExhausted` if not enough pages are available.
+    /// Returns `Eviction` if page data is missing from the CPU pool.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    pub fn restore_sequence(
+        &mut self,
+        evicted: EvictedSequence,
+    ) -> Result<(SequenceId, Vec<Vec<u8>>), ManagerError> {
+        let new_seq_id = self.create_sequence();
+
+        let mut page_data = Vec::with_capacity(evicted.page_ids.len());
+
+        for old_page_id in &evicted.page_ids {
+            let data = {
+                let mut cpu_pool = self.cpu_page_pool.lock().unwrap();
+                cpu_pool.retrieve(*old_page_id)?
+            };
+            page_data.push(data);
+        }
+
+        {
+            let table = self
+                .sequences
+                .get_mut(new_seq_id)
+                .and_then(|opt| opt.as_mut())
+                .expect("sequence was just created");
+            for _ in &evicted.page_ids {
+                let page_id = {
+                    let mut pool = self.page_pool.lock().unwrap();
+                    pool.allocate().map_err(|_| ManagerError::PoolExhausted)?
+                };
+                table.push_page(page_id);
+            }
+            table.num_tokens = evicted.num_tokens;
+        }
+
+        Ok((new_seq_id, page_data))
+    }
+
+    /// Number of pages currently evicted to CPU.
+    pub fn num_evicted_pages(&self) -> usize {
+        let cpu_pool = self.cpu_page_pool.lock().unwrap();
+        cpu_pool.num_evicted()
+    }
+
+    /// Eviction pool utilization (0.0 to 1.0).
+    pub fn eviction_utilization(&self) -> f64 {
+        let cpu_pool = self.cpu_page_pool.lock().unwrap();
+        if cpu_pool.max_bytes() == 0 {
+            return 0.0;
+        }
+        cpu_pool.used_bytes() as f64 / cpu_pool.max_bytes() as f64
+    }
+
+    /// Whether a sequence's pages have been evicted to the CPU pool.
+    ///
+    /// Returns `true` if any page from the sequence is currently
+    /// stored in the CPU eviction pool.
+    pub fn is_sequence_evicted(&self, seq_id: SequenceId) -> bool {
+        match self.get_page_table(seq_id) {
+            Ok(table) => {
+                let cpu_pool = self.cpu_page_pool.lock().unwrap();
+                table
+                    .page_ids
+                    .iter()
+                    .any(|&pid| cpu_pool.is_evicted(pid))
+            }
+            Err(_) => {
+                // Sequence doesn't exist — check if any pages are evicted
+                // under a previously-deleted sequence. This is a no-op check.
+                false
+            }
+        }
+    }
+
 }
 #[cfg(test)]
 mod tests {
@@ -341,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_create_delete_sequence() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
 
         // Create a sequence
         let seq_id = manager.create_sequence();
@@ -358,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_append_page() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
         let seq_id = manager.create_sequence();
 
         // Append a page
@@ -376,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_add_token_seals_page() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
         let seq_id = manager.create_sequence();
 
         // Append a page
@@ -399,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_multiple_sequences() {
-        let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024, 65536);
 
         // Create two sequences
         let seq1 = manager.create_sequence();
@@ -420,7 +597,7 @@ mod tests {
 
     #[test]
     fn test_delete_frees_pages() {
-        let mut manager = PagedKvManager::new(4, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(4, 16, 8, 128, 1024, 65536);
 
         // Create a sequence and allocate pages
         let seq_id = manager.create_sequence();
@@ -441,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_ensure_writable_cow() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
 
         // Create two sequences and allocate pages
         let seq1 = manager.create_sequence();
@@ -474,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_block_table_for_kernel() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
         let seq_id = manager.create_sequence();
 
         // Append multiple pages
@@ -495,7 +672,7 @@ mod tests {
     #[test]
     fn test_block_table_mapping() {
         let page_size = 16;
-        let mut manager = PagedKvManager::new(8, page_size, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, page_size, 8, 128, 1024, 65536);
         let seq_id = manager.create_sequence();
 
         // Append 3 pages
@@ -545,7 +722,7 @@ mod tests {
     #[test]
     fn test_page_reclamation() {
         let page_size = 16;
-        let mut manager = PagedKvManager::new(4, page_size, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(4, page_size, 8, 128, 1024, 65536);
 
         // Create sequence, allocate all 4 pages
         let seq_id = manager.create_sequence();
@@ -585,7 +762,7 @@ mod tests {
     // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PrefixCache]]
     #[test]
     fn test_prefix_cache_hit_integration() {
-        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
 
         // Create two sequences
         let seq1 = manager.create_sequence();
@@ -632,7 +809,7 @@ mod tests {
     // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
     #[test]
     fn test_deep_branching() {
-        let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024);
+        let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024, 65536);
 
         // Create root sequence with 3 pages
         let root = manager.create_sequence();
@@ -701,5 +878,86 @@ mod tests {
             branch_bt[1], root_bt_before[1],
             "Branch tail page should differ from root after COW"
         );
+    }
+
+    /// End-to-end eviction and restoration of a sequence with two pages.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    #[test]
+    fn test_evict_and_restore_sequence() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+
+        // Create sequence with 2 pages
+        let seq_id = manager.create_sequence();
+        manager.append_page(seq_id).unwrap();
+        manager.append_page(seq_id).unwrap();
+        assert_eq!(manager.num_pages(seq_id).unwrap(), 2);
+
+        let free_before = manager.num_free_pages();
+
+        // Create fake page data (page_bytes = 16 * 8 * 128 * 2 = 32768)
+        let page_bytes = 16 * 8 * 128 * 2;
+        let page_data = vec![vec![0u8; page_bytes], vec![1u8; page_bytes]];
+
+        // Evict
+        let evicted = manager.evict_sequence(seq_id, page_data).unwrap();
+        assert_eq!(evicted.page_ids.len(), 2);
+        assert!(manager.get_page_table(seq_id).is_err()); // sequence deleted
+
+        // Pages should be freed back to pool
+        assert_eq!(manager.num_free_pages(), free_before + 2);
+
+        // Restore
+        let (new_id, restored_data) = manager.restore_sequence(evicted).unwrap();
+        assert_eq!(restored_data.len(), 2);
+        assert_eq!(restored_data[0][0], 0);
+        assert_eq!(restored_data[1][0], 1);
+        assert_eq!(manager.num_pages(new_id).unwrap(), 2);
+    }
+
+    /// Evicting an empty sequence fails.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    #[test]
+    fn test_evict_empty_sequence_fails() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let seq_id = manager.create_sequence();
+
+        let result = manager.evict_sequence(seq_id, vec![]);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ManagerError::Eviction(EvictionError::EmptySequence)));
+    }
+
+    /// Restoration allocates new pages and retrieves data from CPU pool.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    #[test]
+    fn test_restore_reuses_pages() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let page_bytes = 16 * 8 * 128 * 2;
+
+        let seq1 = manager.create_sequence();
+        manager.append_page(seq1).unwrap();
+
+        let evicted =
+            manager.evict_sequence(seq1, vec![vec![42u8; page_bytes]]).unwrap();
+
+        // Restore should allocate new pages
+        let (seq2, data) = manager.restore_sequence(evicted).unwrap();
+        assert_eq!(data[0][0], 42);
+        assert!(manager.get_page_table(seq2).is_ok());
+    }
+
+    /// Eviction tracking methods report correct utilization.
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    #[test]
+    fn test_eviction_utilization() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        assert_eq!(manager.eviction_utilization(), 0.0);
+
+        let page_bytes = 16 * 8 * 128 * 2;
+        let seq = manager.create_sequence();
+        manager.append_page(seq).unwrap();
+
+        let _ = manager.evict_sequence(seq, vec![vec![0u8; page_bytes]]).unwrap();
+        assert!(manager.eviction_utilization() > 0.0);
+        assert!(manager.num_evicted_pages() > 0);
     }
 }

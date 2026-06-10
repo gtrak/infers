@@ -139,6 +139,7 @@ impl StageState {
                 num_kv_heads,
                 head_dim,
                 max_cache_bytes,
+                num_pages * page_size * num_kv_heads * head_dim * 2,
             ),
             gdn_states: HashMap::new(),
         }
