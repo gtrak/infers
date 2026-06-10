@@ -140,7 +140,20 @@ Central `ForwardEngine` struct owns all GPU state: CUDA contexts, streams, loade
 `ForwardEngine` holds: `config: Arc<ModelConfig>`, `weights: Vec<WeightRegistry>`, `kernels: LoadedKernelRegistry`, `gemm: GemmEngine`, `nccl: NcclCommunicator`, `streams: StreamPool`. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Prefill Path
-Embeds prompt tokens, loops through layers dispatching GDN or full attention based on `LayerType`, applies final norm + LM head, samples first token via greedy argmax. See [[crates/backends/native/src/prefill.rs#prefill]].
+
+Embeds prompt tokens, loops through layers dispatching GDN or full attention based on `LayerType`, applies final norm + LM head, samples first token via greedy argmax.
+
+The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel handles (`rmsnorm`, `silu_glu`, `rope`, `embedding`, `add`, `argmax`, `softmax`, `kv_cache_write`, `gdn_prefill`), a `GemmEngine`, CUDA stream, `NcclCommunicator`, `ModelConfig`, `WeightRegistry`, token IDs, and mutable vectors of `KvCache` and `GdnState` for each layer.
+
+**Phase 1 — Embedding**: Uploads embedding weights via `upload_weight()` (converts `WeightData` bytes to BF16 Vec and copies to GPU), then dispatches the embedding gather kernel.
+
+**Phase 2 — Layer Loop**: For each layer, dispatches `norm::rms_norm` (norm1), then either `gdn::forward` or `attention::forward` depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), `mlp::mlp_forward`, and another residual add. NCCL all-reduce calls are reserved for multi-GPU paths.
+
+**Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[seq_len × vocab_size]` BF16 matrix.
+
+**Phase 4 — Sampling**: Downloads BF16 logits to host, extracts last token's row, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel.
+
+See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/prefill.rs#upload_weight]].
 
 ### Decode Path
 Embeds single token, loops through layers with KV cache (full attention) or recurrent state (GDN), applies final norm + LM head, samples next token. See [[crates/backends/native/src/decode.rs#decode]].
