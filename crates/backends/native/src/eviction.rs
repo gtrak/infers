@@ -20,9 +20,6 @@ use infers_kv::PageId;
 pub struct BackendEvictionStore {
     /// One map per layer: PageId → raw page data bytes.
     layers: Vec<HashMap<PageId, Vec<u8>>>,
-    /// Per-page byte size for one layer (page_size * kv_dim * 2 * 2).
-    #[allow(dead_code)]
-    page_bytes: usize,
 }
 
 impl BackendEvictionStore {
@@ -30,16 +27,15 @@ impl BackendEvictionStore {
     ///
     /// # Arguments
     /// * `num_layers` — Number of full-attention layers (NOT total hidden layers).
-    /// * `page_bytes` — Size of one page's data in bytes for one layer.
-    pub fn new(num_layers: usize, page_bytes: usize) -> Self {
+    pub fn new(num_layers: usize) -> Self {
         Self {
             layers: (0..num_layers).map(|_| HashMap::new()).collect(),
-            page_bytes,
         }
     }
 
     /// Store page data for a specific layer.
     pub fn store(&mut self, layer: usize, page_id: PageId, data: Vec<u8>) {
+        debug_assert!(layer < self.layers.len(), "Layer {layer} out of range (max {})", self.layers.len());
         if let Some(map) = self.layers.get_mut(layer) {
             map.insert(page_id, data);
         }
@@ -101,7 +97,7 @@ mod tests {
     use super::*;
 
     fn make_store() -> BackendEvictionStore {
-        BackendEvictionStore::new(3, 1024) // 3 layers, 1024 bytes per page per layer
+        BackendEvictionStore::new(3) // 3 layers
     }
 
     #[test]
@@ -199,11 +195,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_store_out_of_range_layer_silent() {
-        let mut store = make_store(); // 3 layers
-        store.store(5, 1, vec![0u8; 1024]); // layer 5 doesn't exist
-        assert_eq!(store.total_pages(), 0);
-        assert!(!store.contains(5, 1));
-    }
+
 }

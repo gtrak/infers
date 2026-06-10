@@ -303,7 +303,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `infers-backend-native` now depends on `infers-kv` crate
 - `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
 - Engine integration: `ForwardEngine` has 14 kernel handles, `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`
-- `eviction.rs` (backend-native): `BackendEvictionStore` with 9 unit tests — empty store, store/retrieve, per-layer isolation, nonexistent retrieval, overwrite, remove_page, clear, bf16 round-trip, out-of-range layer
+- `eviction.rs` (backend-native): `BackendEvictionStore` with 8 unit tests — empty store, store/retrieve, per-layer isolation, nonexistent retrieval, overwrite, remove_page, clear, bf16 round-trip
 
 ## Paged Attention Implementation
 
@@ -319,7 +319,7 @@ Unlike `KvCache` which allocates `[2 * max_seq_len * kv_dim]` for a flat buffer,
 
 Per-layer CPU storage for evicted KV page data. See [[crates/backends/native/src/eviction.rs#BackendEvictionStore]].
 
-The `CpuPagePool` in `infers-kv` stores one blob per `PageId`, but each page's data is actually per-layer (each full-attention layer has its own K/V values for the same page). `BackendEvictionStore` manages this multi-layer aspect using `Vec<HashMap<PageId, Vec<u8>>>` — one map per layer. `store()` inserts page data, `retrieve()` removes and returns it, `contains()` checks existence, `remove_page()` cleans up across all layers, `clear()` resets everything. Helper methods `bf16_slice_to_bytes()` and `bytes_to_bf16_slice()` convert between bf16 GPU data and raw bytes.
+The `CpuPagePool` in `infers-kv` stores one blob per `PageId`, but each page's data is actually per-layer (each full-attention layer has its own K/V values for the same page). `BackendEvictionStore` manages this multi-layer aspect using `Vec<HashMap<PageId, Vec<u8>>>` — one map per layer. `new(num_layers)` creates the store. `store()` inserts page data with a `debug_assert!` guard against out-of-range layers, `retrieve()` removes and returns it, `contains()` checks existence, `remove_page()` cleans up across all layers, `clear()` resets everything. Helper methods `bf16_slice_to_bytes()` and `bytes_to_bf16_slice()` convert between bf16 GPU data and raw bytes.
 
 ### Paged Kernel Dispatch
 
