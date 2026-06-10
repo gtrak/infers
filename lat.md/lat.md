@@ -72,7 +72,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 ### Kernel Source Files
 All kernels use `extern "C" __global__` so function names are directly loadable from cubin files. Launch configuration is determined by Rust dispatch code, not kernel wrappers.
 
-Twelve kernel implementations across 11 files for transformer forward-pass operations using BF16 data.
+Thirteen kernel implementations across 12 files for transformer forward-pass operations using BF16 data.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -88,6 +88,7 @@ Twelve kernel implementations across 11 files for transformer forward-pass opera
 | `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
 | `gdn_prefill.cu` | `infers_gdn_prefill_bf16` | Gated DeltaNet prefill kernel: processes all tokens in a sequence sequentially within each block, updating state and writing per-token output via shared memory reduction |
 | `paged_kv_write.cu` | `infers_paged_kv_write_bf16` | Paged KV cache write using block-table address translation: writes K and V into interleaved per-page layout via strided thread loops, eliminating CPU round-trips during prefill |
+| `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -113,11 +114,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (12 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, paged_kv_write, gdn_update, gdn_prefill) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (13 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()` methods for TP/PP collectives across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, gdn_update.cu, gdn_prefill.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 
 # Phase 3 Deliverables
@@ -267,12 +268,13 @@ Types and tests shipped for Phase 4.6 paged KV foundations.
 - `cow` module: `CowResult`, `CowError`, `ensure_mutable_page`, `decrement_page_refcount`, `try_share_from_prefix_cache`, 11 unit tests
 - `manager` module: `PagedKvManager`, `ManagerError`, `SequenceId`, 7 unit tests
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
+- `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
-- Two new CUDA kernels remaining: `paged_kv_read.cu`, `paged_attention_decode.cu`
+- One new CUDA kernel remaining: `paged_attention_decode.cu`
 - attention.rs rewrite: paged decode with zero CPU round-trips
 - MemoryBudget update: block-aware KV estimation vs flat-buffer model
 - engine.rs integration: wire `PagedKvManager` into ForwardEngine dispatch loop
