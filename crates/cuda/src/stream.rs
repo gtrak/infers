@@ -1,18 +1,13 @@
 //! CUDA stream management.
 
-#[cfg(feature = "cuda")]
 pub use cudarc::driver::CudaStream;
-
-#[cfg(feature = "cuda")]
 use cudarc::driver::CudaContext;
 
 /// A pool of CUDA streams for async execution.
-#[cfg(feature = "cuda")]
 pub struct StreamPool {
     streams: Vec<std::sync::Arc<CudaStream>>,
 }
 
-#[cfg(feature = "cuda")]
 impl StreamPool {
     /// Create a stream pool with one stream per context.
     pub fn new(contexts: &[std::sync::Arc<CudaContext>]) -> anyhow::Result<Self> {
@@ -37,16 +32,5 @@ impl StreamPool {
     /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-/// Stub: StreamPool requires the `cuda` feature.
-pub struct StreamPool;
-
-#[cfg(not(feature = "cuda"))]
-impl StreamPool {
-    pub fn new(_count: usize) -> anyhow::Result<Self> {
-        anyhow::bail!("StreamPool requires the 'cuda' feature")
     }
 }

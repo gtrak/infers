@@ -24,56 +24,35 @@ pub enum ReduceOp {
     Min,
 }
 
-#[cfg(feature = "cuda")]
-mod cuda_impl {
-    use super::*;
-    use cudarc::nccl;
-    use std::sync::Arc;
-    use cudarc::driver::CudaStream;
+use cudarc::nccl;
+use std::sync::Arc;
+use cudarc::driver::CudaStream;
 
-    /// NCCL communicator managing collective operations across GPUs.
-    pub struct NcclCommunicator {
-        /// The NCCL communicator handles (one per GPU stream).
-        pub comms: Vec<nccl::safe::Comm>,
-        /// Rank of this process.
-        pub rank: NcclRank,
-        /// Total number of processes.
-        pub world_size: NcclWorldSize,
-    }
-
-    impl NcclCommunicator {
-        /// Create a new NCCL communicator using the provided streams.
-        /// All ranks must coordinate to create communicators from the same unique ID.
-        pub fn new(
-            rank: NcclRank,
-            world_size: NcclWorldSize,
-            streams: Vec<Arc<CudaStream>>,
-        ) -> anyhow::Result<Self> {
-            let comms = nccl::safe::Comm::from_devices(streams)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            tracing::info!(
-                "NCCL communicator created: rank {}/{}",
-                rank.0,
-                world_size.0
-            );
-            Ok(Self { comms, rank, world_size })
-        }
-    }
+/// NCCL communicator managing collective operations across GPUs.
+pub struct NcclCommunicator {
+    /// The NCCL communicator handles (one per GPU stream).
+    pub comms: Vec<nccl::safe::Comm>,
+    /// Rank of this process.
+    pub rank: NcclRank,
+    /// Total number of processes.
+    pub world_size: NcclWorldSize,
 }
 
-#[cfg(feature = "cuda")]
-pub use cuda_impl::NcclCommunicator;
-
-#[cfg(not(feature = "cuda"))]
-/// Stub: NcclCommunicator requires the `cuda` feature.
-pub struct NcclCommunicator;
-
-#[cfg(not(feature = "cuda"))]
 impl NcclCommunicator {
+    /// Create a new NCCL communicator using the provided streams.
+    /// All ranks must coordinate to create communicators from the same unique ID.
     pub fn new(
-        _rank: NcclRank,
-        _world_size: NcclWorldSize,
+        rank: NcclRank,
+        world_size: NcclWorldSize,
+        streams: Vec<Arc<CudaStream>>,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!("NcclCommunicator requires the 'cuda' feature")
+        let comms = nccl::safe::Comm::from_devices(streams)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        tracing::info!(
+            "NCCL communicator created: rank {}/{}",
+            rank.0,
+            world_size.0
+        );
+        Ok(Self { comms, rank, world_size })
     }
 }

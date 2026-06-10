@@ -33,45 +33,48 @@ pub enum GemmDtype {
     Nvfp4,
 }
 
-#[cfg(feature = "cuda")]
-mod cuda_impl {
-    use super::*;
-    /// cuBLASLt GEMM engine.
+/// cuBLASLt GEMM engine.
+///
+/// Wraps NVIDIA's cuBLASLt library for high-performance matrix multiplication.
+pub struct GemmEngine {
+    /// Lazily created cuBLASLt handle.
+    handle: Option<cudarc::cublaslt::safe::CudaBlasLT>,
+}
+
+impl GemmEngine {
+    /// Create a new GEMM engine.
     ///
-    /// Wraps NVIDIA's cuBLASLt library for high-performance matrix multiplication.
-    pub struct GemmEngine {
-        _handle: cudarc::cublaslt::safe::CudaBlasLT,
+    /// The underlying cuBLASLt handle is created lazily on the first
+    /// `matmul` call.
+    pub fn new() -> Self {
+        Self { handle: None }
     }
 
-    impl GemmEngine {
-        /// Create a new GEMM engine. Requires a CUDA stream.
-        pub fn new(stream: std::sync::Arc<cudarc::driver::CudaStream>) -> anyhow::Result<Self> {
-            let handle = cudarc::cublaslt::safe::CudaBlasLT::new(stream)?;
-            Ok(Self { _handle: handle })
+    /// Execute a GEMM operation with the given configuration.
+    ///
+    /// The stream is passed to cuBLASLt so the kernel is enqueued on the
+    /// correct async execution context.  The first call lazily creates
+    /// the `CudaBlasLT` handle; subsequent calls reuse the cached handle.
+    pub fn matmul(
+        &mut self,
+        _config: &GemmConfig,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> anyhow::Result<()> {
+        if self.handle.is_none() {
+            self.handle = Some(
+                cudarc::cublaslt::safe::CudaBlasLT::new(std::sync::Arc::clone(stream))
+                    .map_err(|e| anyhow::anyhow!("Failed to create CudaBlasLT: {:?}", e))?,
+            );
         }
-
-        /// Execute a GEMM operation with the given configuration.
-        /// TODO: Implement actual cuBLASLt matmul call.
-        pub fn matmul(&self, _config: &GemmConfig) -> anyhow::Result<()> {
-            anyhow::bail!("GemmEngine::matmul not yet implemented")
-        }
+        let handle = self.handle.as_ref().unwrap();
+        // TODO: actual matmul call using `handle`
+        let _ = handle;
+        anyhow::bail!("GemmEngine::matmul not yet implemented")
     }
 }
 
-#[cfg(feature = "cuda")]
-pub use cuda_impl::GemmEngine;
-
-#[cfg(not(feature = "cuda"))]
-/// Stub: GemmEngine requires the `cuda` feature.
-pub struct GemmEngine;
-
-#[cfg(not(feature = "cuda"))]
-impl GemmEngine {
-    pub fn new() -> anyhow::Result<Self> {
-        anyhow::bail!("GemmEngine requires the 'cuda' feature")
-    }
-
-    pub fn matmul(&self, _config: &GemmConfig) -> anyhow::Result<()> {
-        anyhow::bail!("GemmEngine requires the 'cuda' feature")
+impl Default for GemmEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }

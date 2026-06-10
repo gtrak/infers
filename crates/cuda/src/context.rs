@@ -1,21 +1,20 @@
 //! CUDA device context management.
 
-#[cfg(feature = "cuda")]
+use std::sync::Arc;
+
 pub use cudarc::driver::CudaContext;
 
 /// Runtime managing CUDA device contexts and streams.
 ///
 /// Holds the primary cudarc context for each GPU and provides
 /// a shared interface for context management.
-#[cfg(feature = "cuda")]
 pub struct CudaRuntime {
     /// cudarc contexts for each GPU device.
-    pub devices: Vec<std::sync::Arc<CudaContext>>,
+    pub devices: Vec<Arc<CudaContext>>,
     /// Number of available GPU devices.
     pub num_devices: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl CudaRuntime {
     /// Create a new runtime, enumerating all available GPU devices.
     pub fn new() -> anyhow::Result<Self> {
@@ -33,19 +32,8 @@ impl CudaRuntime {
     }
 
     /// Get the primary context for device `ordinal`.
-    pub fn device(&self, ordinal: usize) -> anyhow::Result<&std::sync::Arc<CudaContext>> {
+    pub fn device(&self, ordinal: usize) -> anyhow::Result<&Arc<CudaContext>> {
         self.devices.get(ordinal)
             .ok_or_else(|| anyhow::anyhow!("Device ordinal {} out of range", ordinal))
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-/// Stub: CudaRuntime requires the `cuda` feature.
-pub struct CudaRuntime;
-
-#[cfg(not(feature = "cuda"))]
-impl CudaRuntime {
-    pub fn new() -> anyhow::Result<Self> {
-        anyhow::bail!("CudaRuntime requires the 'cuda' feature to be enabled")
     }
 }

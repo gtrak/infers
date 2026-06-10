@@ -6,17 +6,12 @@ authors.workspace = true
 license.workspace = true
 build = "build.rs"
 
-[features]
-default = []
-cuda = ["cudarc"]
-
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-# CUDA runtime (cudarc) — feature-gated so the crate compiles without CUDA toolkit
-cudarc = { workspace = true, optional = true }
+cudarc = { workspace = true }
 
 # CUDA (cuda-oxide) — deferred to future phase; requires cargo-oxide toolchain
 # cuda-core = { workspace = true }

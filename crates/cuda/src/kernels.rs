@@ -2,10 +2,14 @@
 //!
 //! Loads pre-compiled `.cubin` files and extracts kernel function handles.
 
+use cudarc::driver::{CudaContext, CudaModule};
+use cudarc::nvrtc::Ptx;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 /// A handle to a loaded CUDA kernel function.
 ///
 /// Stores the module name and function name for identification.
-/// Actual GPU function handle requires the `cuda` feature.
 #[derive(Debug, Clone)]
 pub struct KernelHandle {
     /// Name of the kernel function (e.g., "chunk_gated_delta_rule").
@@ -33,7 +37,6 @@ impl KernelRegistry {
     }
 
     /// Register a kernel by name and cubin path.
-    /// Actual GPU loading requires the `cuda` feature.
     pub fn register(&mut self, name: impl Into<String>, cubin_path: impl Into<String>) {
         let name = name.into();
         let cubin_path = cubin_path.into();
@@ -72,45 +75,30 @@ impl Default for KernelRegistry {
     }
 }
 
-#[cfg(feature = "cuda")]
-mod cuda_impl {
-    use super::*;
-    use cudarc::driver::{CudaContext, CudaModule};
-    use cudarc::nvrtc::Ptx;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    /// GPU-loaded kernel registry that holds actual CUDA module and function handles.
-    ///
-    /// This type is only available with the `cuda` feature. It will be used by
-    /// the model forward pass in Phase 4 to execute loaded kernels.
-    #[allow(dead_code)]
-    // dead_code is expected: LoadedKernelRegistry requires the `cuda` feature
-    // which pulls in cudarc types. Without the feature, the struct is unused.
-    pub struct LoadedKernelRegistry {
-        /// Map from kernel name to (module, function_name).
-        modules: HashMap<String, (Arc<CudaModule>, String)>,
-        /// The CUDA context these kernels are loaded into.
-        _ctx: Arc<CudaContext>,
-    }
-
-    impl LoadedKernelRegistry {
-        /// Load all kernels from a KernelRegistry into GPU memory.
-        pub fn load_all(
-            ctx: Arc<CudaContext>,
-            registry: &KernelRegistry,
-        ) -> anyhow::Result<Self> {
-            let mut modules = HashMap::new();
-            for (name, handle) in &registry.kernels {
-                let cubin_bytes = std::fs::read(&handle.cubin_path)?;
-                let ptx = Ptx::from_binary(cubin_bytes);
-                let module = ctx.load_module(ptx)?;
-                modules.insert(name.clone(), (module, handle.name.clone()));
-            }
-            Ok(Self { modules, _ctx: ctx })
-        }
-    }
+/// GPU-loaded kernel registry that holds actual CUDA module and function handles.
+///
+/// Used by the forward pass (Phase 4) to launch loaded kernels via `CudaModule::load_function()`.
+#[allow(dead_code)] // modules will be read when kernel launch is implemented in Phase 4
+pub struct LoadedKernelRegistry {
+    /// Map from kernel name to (module, function_name).
+    modules: HashMap<String, (Arc<CudaModule>, String)>,
+    /// The CUDA context these kernels are loaded into.
+    _ctx: Arc<CudaContext>,
 }
 
-#[cfg(feature = "cuda")]
-pub use cuda_impl::LoadedKernelRegistry;
+impl LoadedKernelRegistry {
+    /// Load all kernels from a KernelRegistry into GPU memory.
+    pub fn load_all(
+        ctx: Arc<CudaContext>,
+        registry: &KernelRegistry,
+    ) -> anyhow::Result<Self> {
+        let mut modules = HashMap::new();
+        for (name, handle) in &registry.kernels {
+            let cubin_bytes = std::fs::read(&handle.cubin_path)?;
+            let ptx = Ptx::from_binary(cubin_bytes);
+            let module = ctx.load_module(ptx)?;
+            modules.insert(name.clone(), (module, handle.name.clone()));
+        }
+        Ok(Self { modules, _ctx: ctx })
+    }
+}

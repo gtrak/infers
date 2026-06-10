@@ -26,7 +26,7 @@ Workspace contains 12 crates across server, API, inference backend, and utility 
 ## Dependency Graph
 Crate dependency relationships and feature propagation between workspace members.
 
-infers-backend-native and infers-parallelism both depend on infers-cuda for GPU kernel loading and NCCL communication respectively. The `cuda` feature propagates through: `infers-backend-native/cuda` -> `infers-cuda/cuda` -> `cudarc`. Same propagation applies to `infers-parallelism/cuda`.
+infers-backend-native and infers-parallelism both depend on infers-cuda for GPU kernel loading and NCCL communication respectively. cudarc is always present — no feature gating.
 
 ## Toolchain
 Nightly toolchain configuration, Rust edition, and cargo-oxide requirements for CUDA support.
@@ -41,11 +41,7 @@ Key workspace dependencies pinned to exact versions: tokio 1.52.3, axum 0.8.9, s
 
 ## CUDA Crate
 
-Feature-gated CUDA runtime crate for GPU inference. The `cuda` feature gates cudarc so the crate compiles on non-CUDA machines, providing stub types that panic at runtime when the feature is disabled.
-
-### Feature Gate Pattern
-
-The `cuda` feature enables cudarc. Without it, all GPU types are stubs that bail on construction with a descriptive error.
+CUDA runtime crate for GPU inference. cudarc is always present — no feature gating, stub types, or optional dependencies. GPU hardware is assumed available for all builds.
 
 ### Module Structure
 
@@ -55,7 +51,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 |--------|---------|
 | context | CUDA device context management, CudaRuntime |
 | stream | CUDA stream pool for async execution |
-| memory | Block pool GPU memory allocator (pure Rust, no cfg) |
+| memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
 | gemm | cuBLASLt GEMM engine with `matmul()` method for matrix multiplication |
 | nccl | Multi-GPU collective operations for TP/PP |
@@ -97,17 +93,16 @@ Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding 
 # Phase 2 Deliverables
 Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline, and multi-GPU communication primitives.
 
-- Feature-gated CUDA crate (`infers-cuda`) that compiles with and without cudarc
+- CUDA crate (`infers-cuda`) with cudarc always present — no feature gating
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
 - KernelRegistry for .cubin loading (5 kernels: gdn_prefill, gdn_decode, batch_prefill, batch_decode, sampling) and LoadedKernelRegistry for GPU-loaded kernels
-- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support; `matmul()` method accepts `GemmConfig` (placeholder implementation)
+- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support; `new()` requires no stream, `matmul()` accepts `GemmConfig` and `&Arc<CudaStream>` (placeholder implementation)
 - NcclCommunicator for TP all-reduce and PP send/recv operations
 - build.rs for nvcc kernel compilation (default sm_100a, configurable via INFERS_CUDA_ARCH env var)
 - scripts/extract-kernels.sh for pulling FlashInfer kernels from vLLM
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)
-- Feature propagation: backends/native and parallelism crates forward `cuda` feature to infers-cuda
 
 # Phase 3 Deliverables
 Phase 3 (Model Loading) implements multi-format model loading with auto-detection, weight registry, TP sharding, and memory budgeting.
@@ -354,7 +349,7 @@ Chat handler uses `SSE_DONE` constant from `infers_api` instead of hardcoded `"[
 
 ## Kernel Registry Documentation
 
-`LoadedKernelRegistry` has documentation explaining its use with the `cuda` feature for GPU kernel execution.
+`LoadedKernelRegistry` documents its role in GPU kernel execution, loading pre-compiled .cubin files via cudarc.
 
 # Memory Budget
 

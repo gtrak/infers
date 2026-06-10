@@ -15,7 +15,6 @@ use std::process::Command;
 use std::path::Path;
 
 fn main() {
-    // Only compile kernels if the cuda feature is enabled and source files exist
     println!("cargo:rerun-if-changed=kernels/");
 
     let arch_str = std::env::var("INFERS_CUDA_ARCH")
