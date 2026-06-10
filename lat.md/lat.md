@@ -134,10 +134,10 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
 
 ## Forward Engine
-Central `ForwardEngine` struct owns all GPU state: CUDA contexts, streams, loaded kernels, cuBLASLt handles, and NCCL communicators. Provides `prefill()` for prompt processing and `decode()` for single-token generation.
+Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode inference. `prefill()` and `decode()` delegate to module-level functions with cached kernel handles and per-layer KV/GDN state vectors.
 
 ### Engine Structure
-`ForwardEngine` holds: `config: Arc<ModelConfig>`, `weights: Vec<WeightRegistry>`, `kernels: LoadedKernelRegistry`, `gemm: GemmEngine`, `nccl: NcclCommunicator`, `streams: StreamPool`. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+`ForwardEngine` holds config, weights, 11 cached `CudaFunction` handles, GemmEngine, NcclCommunicator, StreamPool, and per-layer `kv_caches` and `gdn_states` vectors. Kernel handles are resolved from `LoadedKernelRegistry` at init time. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Prefill Path
 
