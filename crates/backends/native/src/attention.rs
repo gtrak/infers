@@ -63,23 +63,6 @@ impl KvCache {
     }
 }
 
-/// Convert [WeightData] bytes to [Vec<bf16>] and upload to GPU.
-fn upload_weight(
-    stream: &Arc<CudaStream>,
-    weight: &WeightData,
-) -> Result<CudaSlice<bf16>> {
-    let bf16_vec: Vec<bf16> = {
-        let count = weight.data.len() / 2;
-        let mut v = Vec::with_capacity(count);
-        for chunk in weight.data.chunks_exact(2) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            v.push(bf16::from_bits(bits));
-        }
-        v
-    };
-    upload_bf16_slice(stream, &bf16_vec)
-}
-
 /// Upload a [&[bf16]] slice to GPU memory.
 fn upload_bf16_slice(
     stream: &Arc<CudaStream>,
@@ -213,8 +196,8 @@ pub fn forward(
     // =========================================================================
 
     // Upload full K and V projection weights
-    let k_proj_full = upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = upload_weight(stream, &weights.v_proj)?;
+    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
+    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
 
     // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim]
     let mut k_full = stream
@@ -598,8 +581,8 @@ pub fn decode_forward(
     // Phase 1: Full K, V computation + RoPE + KV cache write
     // =========================================================================
 
-    let k_proj_full = upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = upload_weight(stream, &weights.v_proj)?;
+    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
+    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
 
     // k_single = GEMM(input, k_proj^T)  [1 × kv_dim]
     let mut k_single = stream

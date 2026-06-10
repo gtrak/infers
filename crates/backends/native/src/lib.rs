@@ -18,5 +18,6 @@ pub mod rope;
 pub mod sample;
 pub mod embedding;
 pub mod sync;
+pub mod upload;
 
 pub use engine::ForwardEngine;

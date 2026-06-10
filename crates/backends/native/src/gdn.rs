@@ -9,7 +9,7 @@ use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
-use infers_model::{GdnWeights, WeightData};
+use infers_model::GdnWeights;
 
 /// GDN recurrent state, maintained across decode steps.
 ///
@@ -46,21 +46,6 @@ impl GdnState {
         }
         Ok(())
     }
-}
-
-/// Convert [WeightData] bytes to [Vec<bf16>] and upload to GPU.
-fn upload_weight(
-    stream: &Arc<CudaStream>,
-    weight: &WeightData,
-) -> Result<CudaSlice<bf16>> {
-    let bf16_vec: Vec<bf16> = weight
-        .data
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-        .collect();
-    stream
-        .clone_htod(&bf16_vec)
-        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))
 }
 
 /// Prefill-time GDN forward pass.
@@ -101,11 +86,11 @@ pub fn forward(
     // =========================================================================
 
     // Upload projection weights
-    let in_proj_a = upload_weight(stream, &weights.in_proj_a)?;
-    let in_proj_b = upload_weight(stream, &weights.in_proj_b)?;
-    let x_proj = upload_weight(stream, &weights.x_proj_weight)?;
-    let dt_proj = upload_weight(stream, &weights.dt_proj_weight)?;
-    let out_proj = upload_weight(stream, &weights.out_proj_weight)?;
+    let in_proj_a = crate::upload::upload_weight(stream, &weights.in_proj_a)?;
+    let in_proj_b = crate::upload::upload_weight(stream, &weights.in_proj_b)?;
+    let x_proj = crate::upload::upload_weight(stream, &weights.x_proj_weight)?;
+    let dt_proj = crate::upload::upload_weight(stream, &weights.dt_proj_weight)?;
+    let out_proj = crate::upload::upload_weight(stream, &weights.out_proj_weight)?;
 
     // TODO: conv1d_weight is skipped — not critical for Phase 4.5
 
@@ -320,11 +305,11 @@ pub fn decode_forward(
     // =========================================================================
 
     // Upload projection weights
-    let in_proj_a = upload_weight(stream, &weights.in_proj_a)?;
-    let in_proj_b = upload_weight(stream, &weights.in_proj_b)?;
-    let x_proj = upload_weight(stream, &weights.x_proj_weight)?;
-    let dt_proj = upload_weight(stream, &weights.dt_proj_weight)?;
-    let out_proj = upload_weight(stream, &weights.out_proj_weight)?;
+    let in_proj_a = crate::upload::upload_weight(stream, &weights.in_proj_a)?;
+    let in_proj_b = crate::upload::upload_weight(stream, &weights.in_proj_b)?;
+    let x_proj = crate::upload::upload_weight(stream, &weights.x_proj_weight)?;
+    let dt_proj = crate::upload::upload_weight(stream, &weights.dt_proj_weight)?;
+    let out_proj = crate::upload::upload_weight(stream, &weights.out_proj_weight)?;
 
     // a = GEMM(input, in_proj_a^T)  [1 × hidden_size]
     let mut a = stream

@@ -168,7 +168,7 @@ The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel
 
 **Phase 4 — Sampling**: Downloads BF16 logits to host, extracts last token's row, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel.
 
-See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/prefill.rs#upload_weight]].
+See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
 ### Decode Path
 
@@ -184,10 +184,10 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 
 **Phase 4 — Sampling**: Downloads BF16 logits to host, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
 
-See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/decode.rs#upload_weight]].
+See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
 ## Module Structure
-Twelve modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add.
+Thirteen modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload.
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -203,6 +203,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `gdn` | Gated DeltaNet: projection GEMMs, `infers_gdn_prefill_bf16` kernel, output projection |
 | `sync` | NCCL all-reduce for TP collectives (`all_reduce_attention`, `all_reduce_mlp`) |
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
+| `upload` | Shared weight upload utility: converts `WeightData` bytes to GPU-resident BF16 buffers (`upload_weight`) |
 
 
 ### Attention Forward Pass

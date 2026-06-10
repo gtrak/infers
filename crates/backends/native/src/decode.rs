@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
+use infers_cuda::{CudaFunction, CudaStream};
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
 use infers_cuda::nccl::NcclCommunicator;
-use infers_model::{LayerType, ModelConfig, WeightData, WeightRegistry};
+use infers_model::{LayerType, ModelConfig, WeightRegistry};
 
 use crate::add;
 use crate::attention::{self, KvCache};
@@ -18,25 +18,6 @@ use crate::gdn::{self, GdnState};
 use crate::mlp;
 use crate::norm;
 use crate::sample;
-
-/// Convert [WeightData] bytes to [Vec<bf16>] and upload to GPU.
-fn upload_weight(
-    stream: &Arc<CudaStream>,
-    weight: &WeightData,
-) -> Result<CudaSlice<bf16>> {
-    let bf16_vec: Vec<bf16> = {
-        let count = weight.data.len() / 2;
-        let mut v = Vec::with_capacity(count);
-        for chunk in weight.data.chunks_exact(2) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            v.push(bf16::from_bits(bits));
-        }
-        v
-    };
-    stream
-        .clone_htod(&bf16_vec)
-        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))
-}
 
 /// Kernel handles needed for the decode pass.
 pub struct DecodeKernels {
@@ -117,7 +98,7 @@ pub fn decode(
 
     let embed_weight = weights.embedding.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-    let embed_table = upload_weight(stream, embed_weight)?;
+    let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
 
     let mut hidden = embedding::embed_tokens(
         stream,
@@ -137,7 +118,7 @@ pub fn decode(
         let layer_type = config.get_layer_type(layer_idx);
 
         // --- Norm1 (pre-attention/GDN) ---
-        let norm1_weight = upload_weight(stream, &layer.norm1)?;
+        let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
         let norm1_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -190,7 +171,7 @@ pub fn decode(
         hidden = add::add(stream, &kernels.add, &hidden, &attn_or_gdn_out)?;
 
         // --- Norm2 (pre-MLP) ---
-        let norm2_weight = upload_weight(stream, &layer.norm2)?;
+        let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
         let norm2_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -202,9 +183,9 @@ pub fn decode(
 
         // --- MLP ---
         let mlp_weights = &layer.mlp;
-        let gate_proj = upload_weight(stream, &mlp_weights.gate_proj)?;
-        let up_proj = upload_weight(stream, &mlp_weights.up_proj)?;
-        let down_proj = upload_weight(stream, &mlp_weights.down_proj)?;
+        let gate_proj = crate::upload::upload_weight(stream, &mlp_weights.gate_proj)?;
+        let up_proj = crate::upload::upload_weight(stream, &mlp_weights.up_proj)?;
+        let down_proj = crate::upload::upload_weight(stream, &mlp_weights.down_proj)?;
         let mlp_out = mlp::mlp_forward(
             gemm,
             stream,
@@ -227,7 +208,7 @@ pub fn decode(
 
     let final_norm_weight = weights.norm.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-    let final_norm_gpu = upload_weight(stream, final_norm_weight)?;
+    let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
     let hidden = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -239,7 +220,7 @@ pub fn decode(
 
     let lm_head_weight = weights.lm_head.as_ref()
         .ok_or_else(|| anyhow::anyhow!("LM head weights not found"))?;
-    let lm_head_gpu = upload_weight(stream, lm_head_weight)?;
+    let lm_head_gpu = crate::upload::upload_weight(stream, lm_head_weight)?;
 
     // LM head: logits = hidden @ lm_head^T → [1 × vocab_size]
     let mut logits = stream
