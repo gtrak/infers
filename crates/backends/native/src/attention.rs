@@ -528,8 +528,8 @@ pub fn forward(
         }
     }
 
-    // Final result: accum_a if num_heads is odd, accum_b if even
-    let output = if num_heads % 2 == 1 { accum_a } else { accum_b };
+    // Final result: accum_a if num_heads is even (last head odd → wrote accum_a), accum_b if odd (last head even → wrote accum_b)
+    let output = if num_heads % 2 == 0 { accum_a } else { accum_b };
     Ok(output)
 }
 
@@ -538,32 +538,356 @@ pub fn forward(
 /// Projects a single token into Q/K/V, applies RoPE, appends to KV cache,
 /// and computes attention against all previously cached tokens.
 ///
+/// Uses per-head weight slicing like [[forward]], with per-head KV cache
+/// extraction from the flat buffer on the CPU.
+///
+/// # Steps
+/// 1. Compute full K and V for single token, apply RoPE, write to KV cache
+/// 2. Download full KV cache to CPU, extract per-head K and V buffers
+/// 3. Per-head: Q projection → RoPE → attention scores → softmax → attn out → partial O-proj
+/// 4. Accumulate partial results into final output
+///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
 /// * `stream` — CUDA stream
+/// * `softmax_kernel` — CUDA kernel for softmax
+/// * `kv_cache_write_kernel` — CUDA kernel for KV cache write
+/// * `rope_kernel` — CUDA kernel for RoPE
+/// * `add_kernel` — CUDA kernel for element-wise addition
 /// * `weights` — Attention weights for this layer
 /// * `input` — Single-token input `[1 × hidden_size]`
 /// * `kv_cache` — KV cache state (pre-populated from prefill)
-/// * `position` — Current decode position for RoPE
+/// * `position` — Current decode position for RoPE (0-based)
 /// * `head_dim` — Per-head dimension
 /// * `num_heads` — Number of attention heads
+/// * `num_kv_heads` — Number of KV heads (must equal num_heads for now)
+/// * `max_seq_len` — Maximum sequence length for cache allocation
+/// * `rope_theta` — RoPE base frequency
+/// * `partial_rotary_factor` — Fraction of head_dim to apply RoPE to
 ///
 /// # Returns
 /// Attention output `[1 × hidden_size]`
 pub fn decode_forward(
-    _gemm: &mut GemmEngine,
-    _stream: &Arc<CudaStream>,
-    _weights: &AttentionWeights,
-    _input: &CudaSlice<bf16>,
-    _kv_cache: &mut KvCache,
-    _position: u32,
-    _head_dim: usize,
-    _num_heads: usize,
+    gemm: &mut GemmEngine,
+    stream: &Arc<CudaStream>,
+    softmax_kernel: &CudaFunction,
+    kv_cache_write_kernel: &CudaFunction,
+    rope_kernel: &CudaFunction,
+    add_kernel: &CudaFunction,
+    weights: &AttentionWeights,
+    input: &CudaSlice<bf16>,
+    kv_cache: &mut KvCache,
+    position: u32,
+    head_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_seq_len: usize,
+    rope_theta: f64,
+    partial_rotary_factor: f32,
 ) -> Result<CudaSlice<bf16>> {
-    // Step 1: Q, K, V projection (single token)
-    // Step 2: RoPE(q, k, [position], head_dim, num_heads)
-    // Step 3: Append K, V to KV cache
-    // Step 4: o = FlashInferAttentionSingleToken(q, k, v, kv_cache)
-    // Step 5: output = GEMM(o, o_proj)
-    todo!("attention decode: QKV projection → RoPE → KV cache append → single-token attention → O projection")
+    let hidden_size = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let num_cached = (position + 1) as usize;
+
+    anyhow::ensure!(
+        num_heads == num_kv_heads,
+        "GQA (num_heads != num_kv_heads) not yet supported"
+    );
+
+    // =========================================================================
+    // Phase 1: Full K, V computation + RoPE + KV cache write
+    // =========================================================================
+
+    let k_proj_full = upload_weight(stream, &weights.k_proj)?;
+    let v_proj_full = upload_weight(stream, &weights.v_proj)?;
+
+    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim]
+    let mut k_single = stream
+        .alloc_zeros::<bf16>(kv_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: kv_dim,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &k_proj_full,
+        &mut k_single,
+    )?;
+
+    // v_single = GEMM(input, v_proj^T)  [1 × kv_dim]
+    let mut v_single = stream
+        .alloc_zeros::<bf16>(kv_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: kv_dim,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &v_proj_full,
+        &mut v_single,
+    )?;
+
+    // Apply RoPE to K_single
+    let mut q_dummy = stream
+        .alloc_zeros::<bf16>(kv_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
+    rope::apply_rope(
+        stream,
+        rope_kernel,
+        &mut q_dummy,
+        &mut k_single,
+        &[position],
+        num_kv_heads as i32,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor,
+    )?;
+
+    // Write K and V to KV cache at position
+    let kv_buf = kv_cache.ensure_allocated(stream, max_seq_len, kv_dim)?;
+    let positions_gpu = stream
+        .clone_htod(&[position])
+        .map_err(|e| anyhow::anyhow!("Failed to copy position to device: {e}"))?;
+
+    let kv_grid = ((kv_dim as u32) + 255) / 256;
+    let kv_config = LaunchConfig {
+        grid_dim: (kv_grid, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let kv_seq_len_i32: i32 = 1;
+    let kv_head_dim_i32 = kv_dim as i32;
+    let kv_max_seq_len_i32 = max_seq_len as i32;
+
+    unsafe {
+        stream
+            .launch_builder(kv_cache_write_kernel)
+            .arg(&k_single)
+            .arg(&v_single)
+            .arg(kv_buf)
+            .arg(&positions_gpu)
+            .arg(&kv_seq_len_i32)
+            .arg(&kv_head_dim_i32)
+            .arg(&kv_max_seq_len_i32)
+            .launch(kv_config)
+            .map_err(|e| anyhow::anyhow!("KV cache write kernel launch failed: {e}"))?;
+    }
+
+    // =========================================================================
+    // Phase 2: Download full KV cache to CPU, extract per-head data
+    // =========================================================================
+
+    let kv_cache_data: Vec<bf16> = stream
+        .clone_dtoh(kv_buf)
+        .map_err(|e| anyhow::anyhow!("Failed to download KV cache to host: {e}"))?;
+
+    let k_cache_host = &kv_cache_data[..max_seq_len * kv_dim];
+    let v_cache_host = &kv_cache_data[max_seq_len * kv_dim..];
+
+    // =========================================================================
+    // Phase 3: Per-head attention with alternating accumulation
+    // =========================================================================
+
+    let buf_size = hidden_size;
+    let mut accum_a = stream
+        .alloc_zeros::<bf16>(buf_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_a buffer: {e}"))?;
+    let mut accum_b = stream
+        .alloc_zeros::<bf16>(buf_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
+
+    for head_idx in 0..num_heads {
+        // --- Extract and upload per-head weight slices ---
+        let q_proj_h = extract_head_weight_slice(&weights.q_proj, head_idx, head_dim)?;
+        let o_proj_h = extract_o_proj_head_slice(&weights.o_proj, head_idx, head_dim)?;
+
+        let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
+        let o_proj_h_gpu = upload_bf16_slice(stream, &o_proj_h)?;
+
+        // --- Extract per-head KV cache on CPU ---
+        let mut k_h_cache = Vec::with_capacity(num_cached * head_dim);
+        let mut v_h_cache = Vec::with_capacity(num_cached * head_dim);
+        for pos in 0..num_cached {
+            for d in 0..head_dim {
+                k_h_cache.push(k_cache_host[pos * kv_dim + head_idx * head_dim + d]);
+                v_h_cache.push(v_cache_host[pos * kv_dim + head_idx * head_dim + d]);
+            }
+        }
+
+        let k_h_cache_gpu = upload_bf16_slice(stream, &k_h_cache)?;
+        let v_h_cache_gpu = upload_bf16_slice(stream, &v_h_cache)?;
+
+        // --- Q projection (per-head) ---
+        let mut q_h = stream
+            .alloc_zeros::<bf16>(head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
+        gemm.matmul_bf16(
+            &GemmConfig {
+                m: 1,
+                n: head_dim,
+                k: hidden_size,
+                transa: true,
+                transb: false,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: None,
+                ldb: None,
+                ldc: None,
+                activation: None,
+            },
+            input,
+            &q_proj_h_gpu,
+            &mut q_h,
+        )?;
+
+        // --- RoPE (per-head, num_heads=1) ---
+        let mut k_rope_dummy = stream
+            .alloc_zeros::<bf16>(head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
+        rope::apply_rope(
+            stream,
+            rope_kernel,
+            &mut q_h,
+            &mut k_rope_dummy,
+            &[position],
+            1,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+        )?;
+
+        // --- Attention scores: Q_h @ K_h_cache^T → [1 × num_cached] ---
+        let mut scores_h = stream
+            .alloc_zeros::<bf16>(num_cached)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate scores buffer: {e}"))?;
+        gemm.matmul_bf16(
+            &GemmConfig {
+                m: 1,
+                n: num_cached,
+                k: head_dim,
+                transa: true,
+                transb: false,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: None,
+                ldb: None,
+                ldc: None,
+                activation: None,
+            },
+            &q_h,
+            &k_h_cache_gpu,
+            &mut scores_h,
+        )?;
+
+        // --- Softmax (no causal mask for decode) ---
+        let mut softmax_out_h = stream
+            .alloc_zeros::<bf16>(num_cached)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
+
+        let block_size = {
+            let mut sz = 1usize;
+            while sz < num_cached && sz < 256 {
+                sz *= 2;
+            }
+            sz
+        };
+        let shared_mem_bytes = block_size * std::mem::size_of::<f32>();
+
+        let softmax_config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+
+        let num_cached_i32 = num_cached as i32;
+        let use_causal = 0i32;
+
+        unsafe {
+            stream
+                .launch_builder(softmax_kernel)
+                .arg(&scores_h)
+                .arg(&mut softmax_out_h)
+                .arg(&num_cached_i32)
+                .arg(&use_causal)
+                .launch(softmax_config)
+                .map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
+        }
+
+        // --- Attention output: softmax_out_h @ V_h_cache → [1 × head_dim] ---
+        let mut attn_out_h = stream
+            .alloc_zeros::<bf16>(head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
+        gemm.matmul_bf16(
+            &GemmConfig {
+                m: 1,
+                n: head_dim,
+                k: num_cached,
+                transa: true,
+                transb: true,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: None,
+                ldb: None,
+                ldc: None,
+                activation: None,
+            },
+            &softmax_out_h,
+            &v_h_cache_gpu,
+            &mut attn_out_h,
+        )?;
+
+        // --- Partial O-projection: attn_out_h @ o_proj_h^T → [1 × hidden_size] ---
+        let mut partial_out = stream
+            .alloc_zeros::<bf16>(buf_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate partial_out buffer: {e}"))?;
+        gemm.matmul_bf16(
+            &GemmConfig {
+                m: 1,
+                n: hidden_size,
+                k: head_dim,
+                transa: true,
+                transb: false,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: None,
+                ldb: None,
+                ldc: None,
+                activation: None,
+            },
+            &attn_out_h,
+            &o_proj_h_gpu,
+            &mut partial_out,
+        )?;
+
+        // --- Accumulate into alternating buffers ---
+        if head_idx % 2 == 0 {
+            accum_b = add::add(stream, add_kernel, &accum_a, &partial_out)?;
+        } else {
+            accum_a = add::add(stream, add_kernel, &accum_b, &partial_out)?;
+        }
+    }
+
+    let output = if num_heads % 2 == 0 { accum_a } else { accum_b };
+    Ok(output)
 }

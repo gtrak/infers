@@ -179,11 +179,30 @@ Full-attention prefill implementation using per-head weight slicing. Extracts ea
 Odd number of heads leaves result in `accum_a`, even in `accum_b`.
 
 See [[crates/backends/native/src/attention.rs#forward]].
+
+### Decode Attention Forward Pass
+
+Single-token attention for decode-time generation. Projects a single input token into Q/K/V, applies RoPE, appends to KV cache, then computes attention over all cached tokens.
+
+#### Architecture
+
+**Phase 1 — Full K/V for cache**: Computes full K and V via GEMM from single-token input, applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache at current position.
+
+**Phase 2 — Per-head cache extraction**: Downloads full KV cache from GPU to CPU, extracts per-head K and V buffers by striding through the flat `[max_seq_len × kv_dim]` layout.
+
+**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection.
+
+Same alternating accumulation pattern as prefill: even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
+
+Unlike prefill, the softmax uses `use_causal=0` because a single query token can attend to all previously cached positions.
+
+See [[crates/backends/native/src/attention.rs#decode_forward]].
+
 ### Sampling
 `SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
 
 ### Kernel Dispatch
-Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]].
+Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]].
 
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
