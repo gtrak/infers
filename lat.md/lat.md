@@ -214,11 +214,27 @@ Tensor-parallel all-reduce is handled by the caller in `prefill.rs`.
 
 See [[crates/backends/native/src/gdn.rs#forward]].
 
+### GDN Decode Forward Pass
+
+Gated DeltaNet decode: recurrent single-token state update using `infers_gdn_update_bf16` kernel.
+
+#### Architecture
+
+**Phase 1 — Projections**: Four projection weights are uploaded from CPU bytes to GPU BF16 buffers. Four GEMMs (m=1) compute `a`, `b`, `x`, and `dt` projections from a single-token input `[1 × hidden_size]`. 1D convolution is skipped, same as prefill.
+
+**Phase 2 — State Update**: GDN state is allocated lazily via `ensure_allocated()`. The `infers_gdn_update_bf16` kernel runs with `hidden_size` blocks (one per state row) and power-of-2 block size up to 256. Unlike prefill, it processes only a single token and takes 7 arguments (no `seq_len`).
+
+**Phase 3 — Output Projection**: Final GEMM (m=1) multiplies `[hidden_size]` kernel output by `out_proj_weight`.
+
+Tensor-parallel all-reduce is handled by the caller in `decode.rs`.
+
+See [[crates/backends/native/src/gdn.rs#decode_forward]].
+
 ### Sampling
 `SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
 
 ### Kernel Dispatch
-Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]], [[crates/backends/native/src/gdn.rs#forward]].
+Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.

@@ -280,10 +280,25 @@ pub fn forward(
 }
 
 /// Decode-time GDN: recurrent step with updated hidden state.
+/// @lat: [[lat.md/lat#Phase 4 Deliverables#Module Structure#GDN Decode Forward Pass]]
+///
+/// For a single token:
+/// 1. a = GEMM(input, in_proj_a^T) → [1 × hidden_size]
+/// 2. b = GEMM(input, in_proj_b^T) → [1 × hidden_size]
+/// 3. x = GEMM(input, x_proj^T) → [1 × hidden_size]
+/// 4. dt = GEMM(input, dt_proj^T) → [1 × hidden_size]
+/// 5. Ensure GDN state is allocated
+/// 6. Allocate output buffer [hidden_size]
+/// 7. Launch infers_gdn_update_bf16 kernel
+/// 8. output_proj = GEMM(gdn_output, out_proj^T) → [1 × hidden_size]
+///
+/// conv1d is skipped (same as forward).
+/// TP all-reduce is handled by the caller.
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
 /// * `stream` — CUDA stream
+/// * `gdn_update_kernel` — Loaded CUDA function for `infers_gdn_update_bf16`
 /// * `weights` — GDN layer weights
 /// * `input` — Single-token input `[1 × hidden_size]`
 /// * `gdn_state` — Mutable recurrent state (updated in-place)
@@ -292,21 +307,189 @@ pub fn forward(
 /// # Returns
 /// GDN output `[1 × hidden_size]`
 pub fn decode_forward(
-    _gemm: &mut GemmEngine,
-    _stream: &Arc<CudaStream>,
-    _weights: &GdnWeights,
-    _input: &CudaSlice<bf16>,
-    _gdn_state: &mut GdnState,
-    _hidden_size: usize,
+    gemm: &mut GemmEngine,
+    stream: &Arc<CudaStream>,
+    gdn_update_kernel: &CudaFunction,
+    weights: &GdnWeights,
+    input: &CudaSlice<bf16>,
+    gdn_state: &mut GdnState,
+    hidden_size: usize,
 ) -> Result<CudaSlice<bf16>> {
-    // Phase 1: Project single token
-    // a = GEMM(input, in_proj_a)
-    // b = GEMM(input, in_proj_b)
+    // =========================================================================
+    // Phase 1: Projection GEMMs (single token, m=1)
+    // =========================================================================
 
-    // Phase 2: Recurrent state update
-    // state = gated_delta_rule(state, a, b, dt, x)
+    // Upload projection weights
+    let in_proj_a = upload_weight(stream, &weights.in_proj_a)?;
+    let in_proj_b = upload_weight(stream, &weights.in_proj_b)?;
+    let x_proj = upload_weight(stream, &weights.x_proj_weight)?;
+    let dt_proj = upload_weight(stream, &weights.dt_proj_weight)?;
+    let out_proj = upload_weight(stream, &weights.out_proj_weight)?;
 
+    // a = GEMM(input, in_proj_a^T)  [1 × hidden_size]
+    let mut a = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate a buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: hidden_size,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &in_proj_a,
+        &mut a,
+    )?;
+
+    // b = GEMM(input, in_proj_b^T)  [1 × hidden_size]
+    let mut b = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate b buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: hidden_size,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &in_proj_b,
+        &mut b,
+    )?;
+
+    // x = GEMM(input, x_proj^T)  [1 × hidden_size]
+    let mut x = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate x buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: hidden_size,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &x_proj,
+        &mut x,
+    )?;
+
+    // dt = GEMM(input, dt_proj^T)  [1 × hidden_size]
+    let mut dt = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate dt buffer: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: hidden_size,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        input,
+        &dt_proj,
+        &mut dt,
+    )?;
+
+    // =========================================================================
+    // Phase 2: GDN update kernel (recurrent state update)
+    // =========================================================================
+
+    // Ensure GDN state is allocated
+    gdn_state.ensure_allocated(stream, hidden_size)?;
+
+    // Allocate GDN kernel output buffer [hidden_size]
+    let mut gdn_output = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate GDN output buffer: {e}"))?;
+
+    // Grid: hidden_size blocks (one per state row), block_size power of 2 up to 256
+    let mut block_size: usize = 1;
+    while block_size < hidden_size && block_size < 256 {
+        block_size *= 2;
+    }
+    let shared_mem = block_size * std::mem::size_of::<f32>();
+
+    let hidden_size_i32 = hidden_size as i32;
+
+    let config = LaunchConfig {
+        grid_dim: (hidden_size as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: shared_mem as u32,
+    };
+
+    // Kernel requires mutable state pointer (IN/OUT).
+    let state_ref = gdn_state.state.as_mut()
+        .expect("GDN state should be allocated");
+
+    unsafe {
+        stream
+            .launch_builder(gdn_update_kernel)
+            .arg(state_ref)       // state (IN/OUT) H×H
+            .arg(&mut gdn_output) // output (OUT) [hidden_size]
+            .arg(&a)              // a [hidden_size]
+            .arg(&b)              // b [hidden_size]
+            .arg(&dt)             // dt [hidden_size]
+            .arg(&x)              // x [hidden_size]
+            .arg(&hidden_size_i32)
+            .launch(config)
+            .map_err(|e| anyhow::anyhow!("GDN update kernel launch failed: {e}"))?;
+    }
+
+    // =========================================================================
     // Phase 3: Output projection
-    // output = GEMM(state, out_proj_weight)
-    todo!("GDN decode: single-token x_proj → dt_proj → in_proj → recurrent state update → out_proj → TP all-reduce")
+    // =========================================================================
+
+    // output = GEMM(gdn_output, out_proj^T)  [1 × hidden_size]
+    // gdn_output is [hidden_size], treated as [1 × hidden_size]
+    let mut output = stream
+        .alloc_zeros::<bf16>(hidden_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate GDN final output: {e}"))?;
+    gemm.matmul_bf16(
+        &GemmConfig {
+            m: 1,
+            n: hidden_size,
+            k: hidden_size,
+            transa: true,
+            transb: false,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: None,
+            ldb: None,
+            ldc: None,
+            activation: None,
+        },
+        &gdn_output,
+        &out_proj,
+        &mut output,
+    )?;
+
+    Ok(output)
 }
