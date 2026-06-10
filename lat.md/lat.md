@@ -1023,3 +1023,21 @@ Result types for verifying MTP speculative decoding drafts against the main mode
 Describes which draft tokens were accepted and which (if any) should be regenerated after MTP speculative decoding verification.
 
 The verification process compares each draft token against the main model's greedy prediction at the same position. The longest prefix of matching tokens is accepted; the first mismatch (if any) produces a corrected token from the main model. See [[crates/mtp/src/verify.rs#VerificationResult]].
+
+# MTP Engine
+MTP speculative decoding engine coordinating draft generation, verification, and adaptive token counts.
+
+## MtpEngine
+Orchestrates the full MTP speculative decoding lifecycle: draft generation, verification, acceptance, and adaptive draft count.
+
+`MtpEngine` wraps an `MtpHead` and manages the speculative decoding flow. It tracks acceptance history for adaptive draft count management. Fields: `mtp_head` (MTP prediction head), `num_draft_tokens` (1-4), `acceptance_history` (recent results), `rms_norm_eps`, `hidden_size`. Methods: `new()` constructs from weights/config, `generate_drafts()` iteratively runs MTP head forward + LM head + sampling, `verify_drafts()` runs full model forward for each draft and compares predictions, `accept_prefix()` returns accepted tokens plus correction, `adaptive_num_drafts()` adjusts count based on rolling 10-step acceptance rate (>80% increase, <30% decrease). See [[crates/mtp/src/engine.rs#MtpEngine]].
+
+## MtpOperations
+Callback bundle for GPU operations required by the MTP engine.
+
+`MtpOperations` bundles callbacks for embedding lookup, RMSNorm, layer forward, LM head projection, greedy sampling, and full model forward. By passing callbacks instead of direct dependencies, the MTP crate avoids coupling to the backend crate's kernel dispatch and CUDA resource management. See [[crates/mtp/src/engine.rs#MtpOperations]].
+
+## MtpHead
+Single-layer transformer head that predicts the next token from the main model's hidden state.
+
+`MtpHead` stores GPU-resident weight buffers for the MTP prediction head (norms, FC projections, decoder layer, final norm). The `forward()` method takes callbacks for embedding lookup, RMSNorm, and decoder layer execution. Architecture: normalize embedding and hidden state, project via FC layers, add element-wise, run decoder layer, final norm. See [[crates/mtp/src/head.rs#MtpHead]].
