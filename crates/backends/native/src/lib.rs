@@ -19,5 +19,7 @@ pub mod sample;
 pub mod embedding;
 pub mod sync;
 pub mod upload;
+pub mod eviction;
 
 pub use engine::ForwardEngine;
+pub use eviction::BackendEvictionStore;

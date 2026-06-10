@@ -15,6 +15,7 @@ use infers_cuda::{CudaContext, CudaFunction, CudaStream};
 use infers_model::{ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
+use crate::eviction::BackendEvictionStore;
 use crate::gdn::GdnState;
 
 use infers_kv::PagedKvManager;
@@ -394,5 +395,147 @@ impl ForwardEngine {
 
         // Placeholder: return the input token_id until full pipeline is wired.
         Ok(token_id)
+    }
+
+    /// Evict a sequence's pages from GPU to the backend eviction store.
+    ///
+    /// Copies page data from all layers' `PagedKvCache` GPU buffers to CPU,
+    /// stores it in the backend eviction store, then marks the sequence as
+    /// evicted in the KV manager.
+    ///
+    /// # Arguments
+    /// * `seq_id` — The sequence to evict.
+    /// * `stream` — CUDA stream for GPU→CPU data copies.
+    /// * `store` — Backend eviction store to receive the page data.
+    /// * `kv_manager` — Paged KV manager for metadata tracking.
+    ///
+    /// # Returns
+    /// The `EvictedSequence` snapshot for later restoration.
+    pub fn evict_session(
+        &mut self,
+        seq_id: infers_kv::SequenceId,
+        stream: &Arc<CudaStream>,
+        store: &mut BackendEvictionStore,
+        kv_manager: &mut infers_kv::PagedKvManager,
+    ) -> Result<infers_kv::EvictedSequence> {
+        // Get block table (page IDs for this sequence)
+        let block_table = kv_manager
+            .block_table(seq_id)
+            .map_err(|e| anyhow::anyhow!("Failed to get block table: {e:?}"))?
+            .to_vec();
+
+        if block_table.is_empty() {
+            anyhow::bail!("Sequence {seq_id} has no pages to evict");
+        }
+
+        // For each page, copy data from all layers' GPU buffers
+        for &page_id in &block_table {
+            for (layer_idx, cache) in self.paged_kv_caches.iter().enumerate() {
+                let page_pool = cache.page_pool()
+                    .ok_or_else(|| anyhow::anyhow!("PagedKvCache not allocated for layer {layer_idx}"))?;
+
+                let page_elements = 2 * cache.page_size() * cache.kv_dim();
+                let offset = (page_id as usize) * page_elements;
+
+                // Extract sub-slice of GPU buffer for this page
+                let sub_slice = page_pool.slice(offset..offset + page_elements);
+
+                // Copy from GPU to CPU
+                let page_data_bf16: Vec<half::bf16> = stream
+                    .clone_dtoh(&sub_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to copy page from GPU: {e}"))?;
+
+                // Convert bf16 to bytes and store
+                let page_bytes = BackendEvictionStore::bf16_slice_to_bytes(&page_data_bf16);
+                store.store(layer_idx, page_id, page_bytes);
+            }
+        }
+
+        // Mark the sequence as evicted in the KV manager (metadata only)
+        let evicted = kv_manager.mark_evicted(seq_id)
+            .map_err(|e| anyhow::anyhow!("Failed to mark sequence evicted: {e:?}"))?;
+
+        tracing::info!(
+            "Evicted sequence {}: {} pages, {} tokens",
+            seq_id,
+            block_table.len(),
+            evicted.num_tokens,
+        );
+
+        Ok(evicted)
+    }
+
+    /// Restore a previously evicted sequence back to GPU.
+    ///
+    /// Allocates new pages via the KV manager, retrieves page data from the
+    /// backend eviction store, and copies it back to all layers' `PagedKvCache`
+    /// GPU buffers.
+    ///
+    /// # Arguments
+    /// * `evicted` — The `EvictedSequence` from a prior `evict_session()` call.
+    /// * `stream` — CUDA stream for CPU→GPU data copies.
+    /// * `store` — Backend eviction store containing the page data.
+    /// * `kv_manager` — Paged KV manager for metadata tracking.
+    ///
+    /// # Returns
+    /// The new `SequenceId` assigned to the restored sequence.
+    pub fn restore_session(
+        &mut self,
+        evicted: infers_kv::EvictedSequence,
+        stream: &Arc<CudaStream>,
+        store: &mut BackendEvictionStore,
+        kv_manager: &mut infers_kv::PagedKvManager,
+    ) -> Result<infers_kv::SequenceId> {
+        // Allocate new pages
+        let new_seq_id = kv_manager.allocate_for_restore(&evicted)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate for restore: {e:?}"))?;
+
+        // Get new block table (maps logical pages → new physical page IDs)
+        let new_block_table = kv_manager
+            .block_table(new_seq_id)
+            .map_err(|e| anyhow::anyhow!("Failed to get new block table: {e:?}"))?
+            .to_vec();
+
+        // For each page, copy data from store back to all layers' GPU buffers
+        for (i, &old_page_id) in evicted.page_ids.iter().enumerate() {
+            let new_page_id = new_block_table[i];
+
+            for layer_idx in 0..self.paged_kv_caches.len() {
+                // Retrieve data from store
+                let page_bytes = store
+                    .retrieve(layer_idx, old_page_id)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "No evicted data for sequence {} page {} layer {}",
+                        evicted.seq_id, old_page_id, layer_idx,
+                    ))?;
+
+                // Convert bytes back to bf16
+                let page_data_bf16 = BackendEvictionStore::bytes_to_bf16_slice(&page_bytes);
+
+                // Get mutable slice of GPU buffer for this page
+                let cache = &mut self.paged_kv_caches[layer_idx];
+                let page_elements = 2 * cache.page_size() * cache.kv_dim();
+                let offset = (new_page_id as usize) * page_elements;
+                let page_pool = cache.page_pool_mut()
+                    .ok_or_else(|| anyhow::anyhow!("PagedKvCache not allocated for layer {layer_idx}"))?;
+
+                let mut sub_slice = page_pool.slice_mut(offset..offset + page_elements);
+
+                // Copy from CPU to GPU
+                stream
+                    .memcpy_htod(&page_data_bf16, &mut sub_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to copy page to GPU: {e}"))?;
+            }
+        }
+
+        tracing::info!(
+            "Restored sequence {} (was {}): {} pages, {} tokens",
+            new_seq_id,
+            evicted.seq_id,
+            new_block_table.len(),
+            evicted.num_tokens,
+        );
+
+        Ok(new_seq_id)
     }
 }

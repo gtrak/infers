@@ -474,6 +474,100 @@ impl PagedKvManager {
         Ok((new_seq_id, page_data))
     }
 
+    /// Mark a sequence as evicted without storing page data.
+    ///
+    /// Frees the GPU pages back to the pool and recycles the sequence ID,
+    /// but does NOT store any page data in the CPU eviction pool. The
+    /// caller (backend) is responsible for saving the GPU buffer data
+    /// before calling this.
+    ///
+    /// This is a lightweight alternative to `evict_sequence()` for the
+    /// case where the caller manages its own data storage (e.g., the
+    /// backend stores per-layer page data separately).
+    ///
+    /// # Arguments
+    /// * `seq_id` — The sequence to mark as evicted.
+    ///
+    /// # Returns
+    /// An `EvictedSequence` snapshot for later restoration.
+    ///
+    /// # Errors
+    /// Returns `InvalidSequence` if the sequence doesn't exist.
+    /// Returns `Eviction(EvictionError::EmptySequence)` if the sequence has no pages.
+    pub fn mark_evicted(&mut self, seq_id: SequenceId) -> Result<EvictedSequence, ManagerError> {
+        let table = self
+            .sequences
+            .get_mut(seq_id)
+            .and_then(|opt| opt.take())
+            .ok_or(ManagerError::InvalidSequence(seq_id))?;
+
+        let page_ids = table.page_ids.clone();
+
+        if page_ids.is_empty() {
+            return Err(EvictionError::EmptySequence.into());
+        }
+
+        // Free GPU pages back to the page pool
+        {
+            let mut pool = self.page_pool.lock().unwrap();
+            for page_id in &page_ids {
+                pool.free(*page_id);
+            }
+        }
+
+        // Recycle sequence ID
+        self.free_sequence_ids.push(seq_id);
+
+        Ok(EvictedSequence {
+            seq_id,
+            page_ids,
+            num_tokens: table.num_tokens,
+            page_size: table.page_size,
+            last_access: std::time::Instant::now(),
+        })
+    }
+
+    /// Allocate pages for restoring a previously evicted sequence.
+    ///
+    /// Creates a new sequence with the same number of pages as the
+    /// evicted sequence had. Does NOT retrieve any data from the CPU
+    /// eviction pool — the caller (backend) is responsible for copying
+    /// data back to the GPU buffers.
+    ///
+    /// This is a lightweight alternative to `restore_sequence()` for the
+    /// case where the caller manages its own data storage.
+    ///
+    /// # Arguments
+    /// * `evicted` — The `EvictedSequence` returned by `mark_evicted()`.
+    ///
+    /// # Returns
+    /// The new `SequenceId` with allocated pages.
+    ///
+    /// # Errors
+    /// Returns `PoolExhausted` if not enough free pages are available.
+    pub fn allocate_for_restore(&mut self, evicted: &EvictedSequence) -> Result<SequenceId, ManagerError> {
+        let new_seq_id = self.create_sequence();
+
+        {
+            let table = self
+                .sequences
+                .get_mut(new_seq_id)
+                .and_then(|opt| opt.as_mut())
+                .expect("sequence was just created");
+
+            for _ in &evicted.page_ids {
+                let page_id = {
+                    let mut pool = self.page_pool.lock().unwrap();
+                    pool.allocate().map_err(|_| ManagerError::PoolExhausted)?
+                };
+                table.push_page(page_id);
+            }
+            table.num_tokens = evicted.num_tokens;
+        }
+
+        Ok(new_seq_id)
+    }
+
     /// Number of pages currently evicted to CPU.
     pub fn num_evicted_pages(&self) -> usize {
         let cpu_pool = self.cpu_page_pool.lock().unwrap();
@@ -959,5 +1053,78 @@ mod tests {
         let _ = manager.evict_sequence(seq, vec![vec![0u8; page_bytes]]).unwrap();
         assert!(manager.eviction_utilization() > 0.0);
         assert!(manager.num_evicted_pages() > 0);
+    }
+
+    #[test]
+    fn test_mark_evicted_frees_pages() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let seq_id = manager.create_sequence();
+        manager.append_page(seq_id).unwrap();
+        manager.append_page(seq_id).unwrap();
+
+        let free_before = manager.num_free_pages();
+        let evicted = manager.mark_evicted(seq_id).unwrap();
+
+        assert_eq!(evicted.page_ids.len(), 2);
+        assert_eq!(manager.num_free_pages(), free_before + 2);
+        assert!(manager.get_page_table(seq_id).is_err());
+    }
+
+    #[test]
+    fn test_mark_evicted_empty_sequence_fails() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let seq_id = manager.create_sequence();
+        let result = manager.mark_evicted(seq_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_allocate_for_restore() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let seq_id = manager.create_sequence();
+        manager.append_page(seq_id).unwrap();
+        manager.append_page(seq_id).unwrap();
+
+        let evicted = manager.mark_evicted(seq_id).unwrap();
+        let new_id = manager.allocate_for_restore(&evicted).unwrap();
+
+        assert_eq!(manager.num_pages(new_id).unwrap(), 2);
+        assert_eq!(manager.num_tokens(new_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_allocate_for_restore_preserves_token_count() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+        let seq_id = manager.create_sequence();
+        manager.append_page(seq_id).unwrap();
+        for _ in 0..10 {
+            manager.add_token(seq_id).unwrap();
+        }
+
+        let evicted = manager.mark_evicted(seq_id).unwrap();
+        assert_eq!(evicted.num_tokens, 10);
+
+        let new_id = manager.allocate_for_restore(&evicted).unwrap();
+        assert_eq!(manager.num_tokens(new_id).unwrap(), 10);
+    }
+
+    #[test]
+    fn test_mark_evicted_then_allocate_for_restore_round_trip() {
+        let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
+
+        let seq = manager.create_sequence();
+        manager.append_page(seq).unwrap();
+        manager.append_page(seq).unwrap();
+        for _ in 0..20 {
+            manager.add_token(seq).unwrap();
+        }
+
+        let evicted = manager.mark_evicted(seq).unwrap();
+        assert_eq!(evicted.num_tokens, 20);
+
+        let new_seq = manager.allocate_for_restore(&evicted).unwrap();
+        // seq ID may be recycled to same value — verify state instead
+        assert_eq!(manager.num_pages(new_seq).unwrap(), 2);
+        assert_eq!(manager.num_tokens(new_seq).unwrap(), 20);
     }
 }

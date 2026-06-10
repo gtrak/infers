@@ -125,6 +125,31 @@ impl PagedKvCache {
         }
         Ok(self.page_pool.as_ref().expect("page pool should be allocated"))
     }
+
+    /// Get a reference to the GPU page pool buffer.
+    pub fn page_pool(&self) -> Option<&CudaSlice<bf16>> {
+        self.page_pool.as_ref()
+    }
+
+    /// Get a mutable reference to the GPU page pool buffer.
+    pub fn page_pool_mut(&mut self) -> Option<&mut CudaSlice<bf16>> {
+        self.page_pool.as_mut()
+    }
+
+    /// Number of pages in the pool.
+    pub fn num_pages(&self) -> usize {
+        self.num_pages
+    }
+
+    /// Page size (tokens per page).
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// KV dimension (num_kv_heads * head_dim).
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
 }
 
 /// Upload a [&[bf16]] slice to GPU memory.

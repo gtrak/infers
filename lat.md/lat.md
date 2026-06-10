@@ -244,13 +244,15 @@ Attempts to share an existing page from the prefix cache.
 
 Orchestrator that ties together the page pool, prefix cache, copy-on-write, and eviction logic for multi-sequence management.
 
-`PagedKvManager` holds shared pool, cache, and CPU eviction pool via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, prefix caching, and eviction/restore. Methods: `new()` initializes pool, cache, and CPU eviction pool, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`, `page_size()`, `num_sequences()`, `page_bytes()`, `num_evicted_pages()`, `eviction_utilization()`, `is_sequence_evicted()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
+`PagedKvManager` holds shared pool, cache, and CPU eviction pool via `Arc<Mutex<>>`, manages sequences as a `Vec<Option<SequencePageTable>>` with free-ID reuse, and coordinates page allocation, token counting, page sealing, prefix caching, and eviction/restore. Methods: `new()` initializes pool, cache, and CPU eviction pool, `create_sequence()` allocates a unique `SequenceId`, `delete_sequence()` frees all pages back to the pool, `append_page()` allocates a page and pushes to the table, `ensure_writable()` delegates to COW, `add_token()` increments token count and seals pages at boundaries, `seal_and_cache()` seals and inserts into prefix cache, `block_table()` returns `&[PageId]` for kernel consumption, `num_pages()`, `num_tokens()`, `num_free_pages()`, `pool_utilization()`, `page_size()`, `num_sequences()`, `page_bytes()`, `num_evicted_pages()`, `eviction_utilization()`, `is_sequence_evicted()`, `mark_evicted()`, `allocate_for_restore()`. See [[crates/kv/src/manager.rs#PagedKvManager]].
 
 #### Eviction
 
 Eviction and restore of sequence page data between GPU and CPU.
 
 `evict_sequence(seq_id, page_data)` takes ownership of a sequence's page table, stores each page's data in `CpuPagePool`, frees the GPU pages back to the page pool, and deletes the sequence. Returns an `EvictedSequence` snapshot. `restore_sequence(evicted)` creates a new sequence, allocates pages, retrieves data from `CpuPagePool` using the original page IDs, and returns `(new_seq_id, page_data)` for the backend to copy back to GPU.
+
+`mark_evicted(seq_id)` is a metadata-only eviction that frees GPU pages and recycles the sequence ID without storing page data in `CpuPagePool`. The caller (backend) saves GPU buffer data before calling this. Returns an `EvictedSequence` snapshot. `allocate_for_restore(evicted)` is a metadata-only restoration that creates a new sequence and allocates pages without retrieving data from `CpuPagePool`. The caller copies data back to GPU buffers. Returns a new `SequenceId`. Both methods enable the backend to manage its own multi-layer data storage.
 
 ### ManagerError
 
@@ -301,6 +303,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `infers-backend-native` now depends on `infers-kv` crate
 - `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
 - Engine integration: `ForwardEngine` has 14 kernel handles, `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`
+- `eviction.rs` (backend-native): `BackendEvictionStore` with 9 unit tests — empty store, store/retrieve, per-layer isolation, nonexistent retrieval, overwrite, remove_page, clear, bf16 round-trip, out-of-range layer
 
 ## Paged Attention Implementation
 
@@ -310,7 +313,13 @@ Paged attention functions and types in `attention.rs` for zero CPU round-trip de
 
 GPU-side paged KV cache replacing flat contiguous buffers. See [[crates/backends/native/src/attention.rs#PagedKvCache]].
 
-Unlike `KvCache` which allocates `[2 * max_seq_len * kv_dim]` for a flat buffer, `PagedKvCache` allocates `[num_pages * 2 * page_size * kv_dim]` for the interleaved page layout. Per-page layout: `[K tokens | V tokens]`, each side = `page_size * kv_dim` elements. Uses lazy allocation via `ensure_allocated()`.
+Unlike `KvCache` which allocates `[2 * max_seq_len * kv_dim]` for a flat buffer, `PagedKvCache` allocates `[num_pages * 2 * page_size * kv_dim]` for the interleaved page layout. Per-page layout: `[K tokens | V tokens]`, each side = `page_size * kv_dim` elements. Uses lazy allocation via `ensure_allocated()`. Accessors: `page_pool()` / `page_pool_mut()` for buffer references, `num_pages()`, `page_size()`, `kv_dim()`.
+
+### Backend Eviction Store
+
+Per-layer CPU storage for evicted KV page data. See [[crates/backends/native/src/eviction.rs#BackendEvictionStore]].
+
+The `CpuPagePool` in `infers-kv` stores one blob per `PageId`, but each page's data is actually per-layer (each full-attention layer has its own K/V values for the same page). `BackendEvictionStore` manages this multi-layer aspect using `Vec<HashMap<PageId, Vec<u8>>>` — one map per layer. `store()` inserts page data, `retrieve()` removes and returns it, `contains()` checks existence, `remove_page()` cleans up across all layers, `clear()` resets everything. Helper methods `bf16_slice_to_bytes()` and `bytes_to_bf16_slice()` convert between bf16 GPU data and raw bytes.
 
 ### Paged Kernel Dispatch
 
@@ -352,6 +361,14 @@ Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode
 
 The struct owns `Option<PagedKvManager>` for the paged system, plus `paged_kv_caches` for per-layer paged caches alongside legacy `kv_caches`. Three paged kernel handles (`paged_kv_write_kernel`, `paged_kv_read_kernel`, `paged_attention_decode_kernel`) are resolved from `LoadedKernelRegistry` at init. `init_paged()` creates the manager and caches. `prefill_paged()` and `decode_paged()` provide paged entry points. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
+### Eviction Integration
+
+GPU-to-CPU data movement for session eviction during memory pressure. See [[crates/backends/native/src/engine.rs#ForwardEngine#evict_session]], [[crates/backends/native/src/engine.rs#ForwardEngine#restore_session]].
+
+`evict_session()` copies page data from all layers' `PagedKvCache` GPU buffers to CPU using `stream.clone_dtoh()`, converts bf16 data to raw bytes via `BackendEvictionStore::bf16_slice_to_bytes()`, and stores it in the eviction store keyed by (layer, page_id). After copying all pages across all layers, it calls `PagedKvManager::mark_evicted()` for metadata-only eviction (frees GPU pages, recycles sequence ID). Returns `EvictedSequence` snapshot.
+
+`restore_session()` calls `PagedKvManager::allocate_for_restore()` to allocate new pages and get a new sequence ID. For each page, it retrieves per-layer data from the eviction store (using old page IDs as keys), converts bytes back to bf16 via `bytes_to_bf16_slice()`, and copies to the new GPU buffers using `stream.memcpy_htod()` with `slice_mut()` sub-slices keyed by new page IDs.
+
 ### Prefill Path
 
 Embeds prompt tokens, loops through layers dispatching GDN or full attention based on `LayerType`, applies final norm + LM head, samples first token via greedy argmax.
@@ -385,7 +402,7 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
 ## Module Structure
-Thirteen modules cover forward-pass operations: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload.
+Fourteen modules cover forward-pass operations, including eviction for memory pressure handling: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction.
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -402,6 +419,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `sync` | NCCL all-reduce for TP collectives (`all_reduce_attention`, `all_reduce_mlp`) |
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 | `upload` | Shared weight upload utility: converts `WeightData` bytes to GPU-resident BF16 buffers (`upload_weight`) |
+| `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
 
 
 ### Attention Forward Pass
