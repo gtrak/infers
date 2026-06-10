@@ -70,7 +70,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 | `compiled/` | Compiled .cubin output from nvcc |
 
 ### Kernel Source Files
-Seven kernel implementations for transformer forward-pass operations using BF16 data.
+Nine kernel implementations for transformer forward-pass operations using BF16 data.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -81,6 +81,8 @@ Seven kernel implementations for transformer forward-pass operations using BF16 
 | `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |
 | `elementwise.cu` | `infers_add_bf16` | Element-wise addition for residual connections |
 | `sampling.cu` | `infers_argmax_f32` | Greedy argmax sampling from FP32 logits |
+| `softmax.cu` | `infers_softmax_bf16` | Online softmax for attention scores with optional causal masking, using three-phase parallel reduction (max, sum, normalize) in shared memory |
+| `kv_cache.cu` | `infers_kv_cache_write_bf16` | Scattered KV cache write using position IDs: writes K and V rows into cache at arbitrary positions via strided thread loops |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -430,6 +432,14 @@ GEMM transpose flags were inverted for row-major weight storage. All three `matm
 ### RoPE Multi-Head Rotation
 
 RoPE kernel only rotated the first head, ignoring the `num_heads` dimension in tensor layout. Fixed by adding `num_heads` parameter and iterating all head-dimension pairs. See [[crates/backends/native/src/rope.rs#apply_rope]].
+
+### Softmax Kernel Fixes
+
+Three bugs fixed in `crates/cuda/kernels/infers/softmax.cu`:
+
+1. **Max value overwritten by sum** (CRITICAL): Phase 2's sum reduction overwrote `sdata[0]`, causing Phase 3 normalization to subtract the sum instead of the max. Fixed by saving `sdata[0]` to a `max_val` register after Phase 1, then using `max_val` in Phase 2 (exp computation) and Phase 3 (normalization).
+2. **Race condition** (implicit in bug 1): Reading `sdata[0]` for the max during Phase 2 created a race with concurrent sum reduction writes. Resolved by using the `max_val` register instead of shared memory.
+3. **Non-power-of-2 reduction** (MINOR): Tree reduction with `stride >>= 1` silently drops tail elements for non-power-of-2 block sizes. Fixed by rounding `block_size` up to the next power of 2 and adding `tid + stride < blockDim.x` bounds checks in both reduction loops.
 
 # Memory Budget
 
