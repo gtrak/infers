@@ -21,6 +21,7 @@ pub mod embedding;
 pub mod sync;
 pub mod upload;
 pub mod eviction;
+pub mod quant;
 
 pub use engine::ForwardEngine;
 pub use eviction::BackendEvictionStore;

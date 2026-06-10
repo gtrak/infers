@@ -1101,3 +1101,34 @@ Lightweight metrics collection for tracking MTP speculative decoding performance
 Collects running statistics on draft token acceptance rate, tokens saved, and provides helpers for speedup estimation.
 
 `MtpMetrics` tracks `total_drafts`, `total_accepted`, `verification_steps`, and `rate_sum` (for rolling average). `record_step()` updates counters per verification step. `acceptance_rate()` returns overall acceptance (accepted/drafts), `average_step_rate()` returns rolling mean of per-step rates. `estimated_speedup()` computes rough speedup factor: `1 / (1 - r + r/k)` where `r` is acceptance rate and `k` is draft count. `tokens_saved()` returns total accepted tokens. `reset()` zeroes all counters. See [[crates/mtp/src/metrics.rs#MtpMetrics]].
+
+# FP8 Quantization
+
+CPU reference implementations for FP8 (E4M3 and E5M2) quantization and dequantization of BF16 data.
+
+The `quant` module provides CPU-based reference implementations for converting between `half::bf16` slices and `u8` slices (raw FP8 bytes). E4M3 uses 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits with range ±240. E5M2 uses 1 sign bit, 5 exponent bits (bias 15), 2 mantissa bits with range ±57344. Overflow clamps to max finite; underflow maps to zero. Production paths will use CUDA kernel implementations.
+
+## E4M3 Format
+
+FP8 E4M3 encoding: 1 sign, 4 exponent (bias 7), 3 mantissa bits.
+
+Max finite value is exp=14, mant=7 → 240.0. Values beyond this range are clamped to the max finite (0x77 positive, 0xF7 negative). NaN is encoded as exp=0xF with non-zero mantissa (0x7F positive). See [[crates/backends/native/src/quant.rs#f32_to_fp8_e4m3]], [[crates/backends/native/src/quant.rs#fp8_e4m3_to_f32]].
+
+## E5M2 Format
+
+FP8 E5M2 encoding: 1 sign, 5 exponent (bias 15), 2 mantissa bits.
+
+Max finite value is exp=30, mant=3 → 57344.0. Overflow clamps to 0x6F (positive) or 0xEF (negative). NaN encodes as exp=0x1F with non-zero mantissa (0x7F positive, 0xFF negative). See [[crates/backends/native/src/quant.rs#f32_to_fp8_e5m2]], [[crates/backends/native/src/quant.rs#fp8_e5m2_to_f32]].
+
+## Public API
+
+Four public functions provide quantize/dequantize pairs for both formats.
+
+| Function | Description |
+|----------|-------------|
+| `quantize_fp8_e4m3` | Convert `&[bf16]` to `Vec<u8>` (E4M3 bytes) |
+| `dequantize_fp8_e4m3` | Convert `&[u8]` (E4M3) back to `Vec<bf16>` |
+| `quantize_fp8_e5m2` | Convert `&[bf16]` to `Vec<u8>` (E5M2 bytes) |
+| `dequantize_fp8_e5m2` | Convert `&[u8]` (E5M2) back to `Vec<bf16>` |
+
+See [[crates/backends/native/src/quant.rs#quantize_fp8_e4m3]], [[crates/backends/native/src/quant.rs#dequantize_fp8_e4m3]], [[crates/backends/native/src/quant.rs#quantize_fp8_e5m2]], [[crates/backends/native/src/quant.rs#dequantize_fp8_e5m2]].
