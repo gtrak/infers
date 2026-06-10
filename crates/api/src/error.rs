@@ -2,6 +2,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+/// Errors returned by the inference API.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("Bad request: {0}")]
@@ -18,11 +19,13 @@ pub enum ApiError {
     Overloaded,
 }
 
+/// JSON error response body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
+/// Detailed error information in API responses.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorDetail {
     pub message: String,

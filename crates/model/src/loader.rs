@@ -90,6 +90,8 @@ pub fn load_safetensors(model_dir: &Path) -> Result<WeightRegistry> {
 fn load_single(path: &Path) -> Result<WeightRegistry> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open safetensors file: {:?}", path))?;
+    // SAFETY: The file is opened read-only (std::fs::File::open), the file handle
+    // is verified to exist before mapping, and the mapping is read-only weight data.
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
 
@@ -130,6 +132,8 @@ fn load_sharded(model_dir: &Path, index_path: &Path) -> Result<WeightRegistry> {
 
         let file = std::fs::File::open(&shard_path)
             .with_context(|| format!("Failed to open shard: {:?}", shard_path))?;
+        // SAFETY: The shard file is opened read-only, verified to exist before mapping,
+        // and the mapping is read-only weight data.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let st = SafeTensors::deserialize(&mmap)?;
 

@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use infers_api::{
     ApiError, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    Choice, ChunkChoice, Delta, MessageContent, Usage,
+    Choice, ChunkChoice, Delta, MessageContent, Usage, SSE_DONE,
 };
 use crate::state::SharedState;
 
@@ -143,7 +143,7 @@ fn create_mock_stream(
 
     // 4. [DONE] event
     let end_stream = stream::once(async move {
-        Ok(Event::default().data("[DONE]"))
+        Ok(Event::default().data(SSE_DONE))
     });
 
     intro_stream

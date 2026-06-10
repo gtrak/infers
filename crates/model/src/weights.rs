@@ -125,15 +125,15 @@ pub struct MtpWeights {
 #[derive(Debug, Clone)]
 pub struct WeightRegistry {
     /// Token embedding weights.
-    pub embedding: WeightData,
+    pub embedding: Option<WeightData>,
     /// Per-layer weights.
     pub layers: Vec<LayerWeights>,
     /// MTP head weights (present if model has MTP).
     pub mtp: Option<MtpWeights>,
     /// LM head (output projection).
-    pub lm_head: WeightData,
+    pub lm_head: Option<WeightData>,
     /// Final layer norm.
-    pub norm: WeightData,
+    pub norm: Option<WeightData>,
     /// All tensors by name, for lookup and sharding.
     pub tensors: HashMap<String, WeightData>,
 }
@@ -142,26 +142,11 @@ impl WeightRegistry {
     /// Create a new empty weight registry.
     pub fn new() -> Self {
         Self {
-            embedding: WeightData {
-                data: Vec::new(),
-                shape: Vec::new(),
-                dtype: WeightDtype::Bf16,
-                name: String::new(),
-            },
+            embedding: None,
             layers: Vec::new(),
             mtp: None,
-            lm_head: WeightData {
-                data: Vec::new(),
-                shape: Vec::new(),
-                dtype: WeightDtype::Bf16,
-                name: String::new(),
-            },
-            norm: WeightData {
-                data: Vec::new(),
-                shape: Vec::new(),
-                dtype: WeightDtype::Bf16,
-                name: String::new(),
-            },
+            lm_head: None,
+            norm: None,
             tensors: HashMap::new(),
         }
     }

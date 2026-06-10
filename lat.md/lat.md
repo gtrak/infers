@@ -308,6 +308,54 @@ Tensor names determine sharding type. Projections like Q/K/V/gate/up are column-
 
 `split_layers_pp()` divides layers evenly across pipeline stages. For 64 layers and 2 stages: stage 0 gets layers 0-31, stage 1 gets layers 32-63. See [[crates/model/src/sharding.rs#split_layers_pp]].
 
+# Tech Debt Fixes
+
+Production hardening changes applied to improve error handling, safety, and code quality.
+
+## Error Handling
+
+Critical `.unwrap()` calls in `main.rs` replaced with `?` propagation. The `run()` function returns `anyhow::Result<()>` with proper context on bind and serve failures.
+
+## Metrics Handler
+
+`metrics_handler()` now returns `Result<impl IntoResponse, StatusCode>` instead of `impl IntoResponse`. Encoding errors and UTF-8 conversion errors return `INTERNAL_SERVER_ERROR` instead of panicking. See [[crates/metrics/src/lib.rs#metrics_handler]].
+
+## Metrics Registry
+
+Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error messages. This makes it clear that metric creation failures indicate duplicate metric names or registry errors, not normal failures. See [[crates/metrics/src/registry.rs]].
+
+## Safety Comments
+
+`memmap2::Mmap::map()` calls have `// SAFETY:` comments explaining that the file is opened read-only, the file handle is verified to exist before mapping, and the mapping is read-only weight data. See [[crates/model/src/loader.rs#load_single]], [[crates/model/src/loader.rs#load_sharded]].
+
+## Memory Budget Improvements
+
+`MemoryBudget` now includes `max_position_embeddings` from the model config instead of hardcoding `262144`. The workspace size is defined as `DEFAULT_WORKSPACE_BYTES` constant. The `max_position_tokens()` helper method was removed. See [[crates/model/src/budget.rs#MemoryBudget]].
+
+## Config Constants
+
+`FULL_ATTENTION_INTERVAL` constant replaces the hardcoded `4` in `default_layer_type()`. See [[crates/model/src/config.rs#ModelConfig#default_layer_type]].
+
+## Weight Registry Safety
+
+`WeightRegistry` now uses `Option<WeightData>` for `embedding`, `lm_head`, and `norm` fields instead of empty placeholder `WeightData` structs. See [[crates/model/src/weights.rs#WeightRegistry]].
+
+## GpuAllocator Encapsulation
+
+`GpuAllocator` fields are now private with accessor methods. The `free()` method has overflow protection and derives `Debug` and `Clone`.
+
+## Build Script Safety
+
+`build.rs` uses `parent().unwrap_or(Path::new("."))` instead of `parent().unwrap()` for output path directory creation. See [[crates/cuda/build.rs]].
+
+## SSE Constant Usage
+
+Chat handler uses `SSE_DONE` constant from `infers_api` instead of hardcoded `"[DONE]"` string. See [[crates/server/src/handlers/chat.rs]].
+
+## Kernel Registry Documentation
+
+`LoadedKernelRegistry` has documentation explaining its use with the `cuda` feature for GPU kernel execution.
+
 # Memory Budget
 
 Memory budget calculator for estimating VRAM requirements across different quantization formats and parallelism configurations.

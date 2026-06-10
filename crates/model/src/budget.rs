@@ -3,6 +3,9 @@
 use super::config::ModelConfig;
 use super::formats::QuantizationFormat;
 
+/// Default workspace size (4 GB) for activation and temporary buffers.
+const DEFAULT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 /// Memory budget estimate for a model configuration.
 #[derive(Debug, Clone)]
 pub struct MemoryBudget {
@@ -16,6 +19,8 @@ pub struct MemoryBudget {
     pub workspace_bytes_per_gpu: usize,
     /// Available memory for KV cache per GPU (bytes).
     pub available_for_kv: usize,
+    /// Maximum position embeddings from model config.
+    pub max_position_embeddings: usize,
 }
 
 impl MemoryBudget {
@@ -38,7 +43,7 @@ impl MemoryBudget {
         let kv_cache_bytes_per_gpu = Self::estimate_kv_cache_bytes(config, quant_format, num_gpus);
 
         // Workspace (activations, temp buffers)
-        let workspace_bytes_per_gpu = 4 * 1024 * 1024 * 1024; // 4 GB
+        let workspace_bytes_per_gpu = DEFAULT_WORKSPACE_BYTES;
 
         let available_for_kv = total_vram_per_gpu
             .saturating_sub(weight_bytes_per_gpu)
@@ -50,6 +55,7 @@ impl MemoryBudget {
             kv_cache_bytes_per_gpu,
             workspace_bytes_per_gpu,
             available_for_kv,
+            max_position_embeddings: config.max_position_embeddings,
         }
     }
 
@@ -131,14 +137,8 @@ impl MemoryBudget {
             return 0;
         }
         // KV cache scales linearly with context length
-        let kv_per_session = self.kv_cache_bytes_per_gpu * avg_context_len / self.max_position_tokens();
+        let kv_per_session = self.kv_cache_bytes_per_gpu * avg_context_len / self.max_position_embeddings;
         self.available_for_kv / kv_per_session.max(1)
-    }
-
-    /// Maximum position tokens (from config).
-    fn max_position_tokens(&self) -> usize {
-        // This should come from config, but for budget estimation we use a default
-        262144
     }
 }
 

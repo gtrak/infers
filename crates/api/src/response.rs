@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+/// Non-streaming chat completion response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -11,6 +12,7 @@ pub struct ChatCompletionResponse {
     pub usage: Option<Usage>,
 }
 
+/// Individual choice in a chat completion response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Choice {
     pub index: i32,
@@ -18,6 +20,7 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
+/// Assistant message content in a chat completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageContent {
     pub role: String,
@@ -27,6 +30,7 @@ pub struct MessageContent {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Tool call made by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -35,12 +39,14 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// Function call within a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
 }
 
+/// Token usage statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: i32,
@@ -48,12 +54,14 @@ pub struct Usage {
     pub total_tokens: i32,
 }
 
+/// List of available models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelList {
     pub object: String,
     pub data: Vec<Model>,
 }
 
+/// Model metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -62,6 +70,7 @@ pub struct Model {
     pub owned_by: String,
 }
 
+/// Health check response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,

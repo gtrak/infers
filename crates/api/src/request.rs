@@ -18,6 +18,7 @@ fn default_frequency_penalty() -> f32 {
     0.0
 }
 
+/// Request body for the chat completions endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -60,6 +61,7 @@ pub struct ChatCompletionRequest {
     pub speculative_config: Option<SpeculativeConfig>,
 }
 
+/// Conversation message in a chat completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
@@ -73,6 +75,7 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+/// Stop token configuration for chat completions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopConfig {
@@ -80,6 +83,7 @@ pub enum StopConfig {
     Array(Vec<String>),
 }
 
+/// Tool definition for function calling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     #[serde(rename = "type")]
@@ -87,6 +91,7 @@ pub struct Tool {
     pub function: Function,
 }
 
+/// Function definition within a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
@@ -95,6 +100,7 @@ pub struct Function {
     pub parameters: serde_json::Value,
 }
 
+/// Tool choice strategy for chat completions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
@@ -106,23 +112,27 @@ pub enum ToolChoice {
     },
 }
 
+/// Explicit function selection for tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionChoice {
     pub name: String,
 }
 
+/// Output format specification for chat completions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFormat {
     #[serde(rename = "type")]
     pub format_type: String,
 }
 
+/// Streaming options for chat completions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
 }
 
+/// Configuration for speculative decoding (MTP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeculativeConfig {
     pub method: String,

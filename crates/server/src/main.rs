@@ -2,6 +2,7 @@ mod handlers;
 mod server;
 mod state;
 
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -72,6 +73,13 @@ pub enum KvCacheDtype {
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Server failed: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Initialize tracing
@@ -92,8 +100,13 @@ async fn main() {
 
     let app = server::build_router(state);
     let addr = format!("{}:{}", args.host, args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {}", addr))?;
     tracing::info!("Listening on {}", addr);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .with_context(|| "Server shutdown unexpectedly")?;
+    Ok(())
 }

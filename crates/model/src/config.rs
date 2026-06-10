@@ -96,6 +96,10 @@ pub struct ModelConfig {
     pub layer_types: Option<Vec<String>>,
 }
 
+/// Default interval for full-attention layers in the hybrid attention pattern.
+/// Every Nth layer (0-indexed, 1-based modulo) is full attention.
+const FULL_ATTENTION_INTERVAL: usize = 4;
+
 impl ModelConfig {
     /// Load model config from `config.json` in the given directory.
     pub fn load(model_dir: &Path) -> anyhow::Result<Self> {
@@ -108,7 +112,7 @@ impl ModelConfig {
     /// Return the layer type for a given layer index.
     ///
     /// If `layer_types` is set explicitly, uses that. Otherwise falls back
-    /// to the default pattern: every 4th layer (0, 4, 8, …) is full attention,
+    /// to the default pattern: every Nth layer (0, 4, 8, …) is full attention,
     /// all others are GDN.
     pub fn get_layer_type(&self, layer_idx: usize) -> LayerType {
         if let Some(ref types) = self.layer_types {
@@ -133,9 +137,9 @@ impl ModelConfig {
         }
     }
 
-    /// Default layer type pattern: every 4th layer (0-indexed) is full attention.
+    /// Default layer type pattern: every Nth layer (0-indexed) is full attention.
     fn default_layer_type(&self, layer_idx: usize) -> LayerType {
-        if (layer_idx + 1).is_multiple_of(4) {
+        if (layer_idx + 1).is_multiple_of(FULL_ATTENTION_INTERVAL) {
             LayerType::FullAttention
         } else {
             LayerType::GatedDeltaNet

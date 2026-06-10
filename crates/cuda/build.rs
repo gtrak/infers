@@ -76,7 +76,7 @@ fn compile_kernel_if_exists(src: &str, output: &str, arch: &str) {
     }
 
     let output_path = format!("kernels/compiled/{}", output);
-    let output_parent = Path::new(&output_path).parent().unwrap();
+    let output_parent = Path::new(&output_path).parent().unwrap_or(Path::new("."));
     if !output_parent.exists() {
         let _ = std::fs::create_dir_all(output_parent);
     }

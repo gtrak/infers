@@ -4,15 +4,16 @@
 ///
 /// Pre-allocates GPU memory in fixed-size blocks and recycles them
 /// to avoid repeated allocation/deallocation overhead.
+#[derive(Debug, Clone)]
 pub struct GpuAllocator {
     /// Size of each block in bytes.
-    pub block_size: usize,
+    block_size: usize,
     /// Total bytes allocated so far.
-    pub total_allocated: usize,
+    total_allocated: usize,
     /// Maximum bytes allowed.
-    pub max_bytes: usize,
+    max_bytes: usize,
     /// Number of free blocks available for reuse.
-    pub free_count: usize,
+    free_count: usize,
 }
 
 impl GpuAllocator {
@@ -58,7 +59,33 @@ impl GpuAllocator {
 
     /// Return a block to the pool.
     pub fn free(&mut self) {
-        self.free_count += 1;
+        // Guard against free_count overflow: if free_count exceeds total_blocks,
+        // something is wrong (e.g., freeing without allocating). Cap it to prevent
+        // silent integer overflow in 32/64-bit usize arithmetic.
+        let total_blocks = (self.total_allocated / self.block_size) + self.free_count;
+        if self.free_count < total_blocks {
+            self.free_count += 1;
+        }
+    }
+
+    /// Size of each block in bytes.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Total bytes allocated so far.
+    pub fn total_allocated(&self) -> usize {
+        self.total_allocated
+    }
+
+    /// Maximum bytes allowed.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Number of free blocks available for reuse.
+    pub fn free_count(&self) -> usize {
+        self.free_count
     }
 
     /// Total number of blocks (allocated + free).
@@ -88,10 +115,10 @@ mod tests {
     #[test]
     fn test_allocator_new() {
         let alloc = GpuAllocator::new(16 * 1024 * 1024, 1024 * 1024 * 1024);
-        assert_eq!(alloc.block_size, 16 * 1024 * 1024);
-        assert_eq!(alloc.total_allocated, 0);
-        assert_eq!(alloc.free_count, 0);
-        assert_eq!(alloc.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(alloc.block_size(), 16 * 1024 * 1024);
+        assert_eq!(alloc.total_allocated(), 0);
+        assert_eq!(alloc.free_count(), 0);
+        assert_eq!(alloc.max_bytes(), 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -102,7 +129,7 @@ mod tests {
         let info = alloc.allocate().unwrap();
         assert_eq!(info.size, 1024);
         assert!(!info.reused);
-        assert_eq!(alloc.total_allocated, 1024);
+        assert_eq!(alloc.total_allocated(), 1024);
     }
 
     #[test]
@@ -113,7 +140,7 @@ mod tests {
         assert!(!info1.reused);
 
         alloc.free();
-        assert_eq!(alloc.free_count, 1);
+        assert_eq!(alloc.free_count(), 1);
 
         let info2 = alloc.allocate().unwrap();
         assert!(info2.reused);

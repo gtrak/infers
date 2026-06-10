@@ -81,7 +81,12 @@ mod cuda_impl {
     use std::sync::Arc;
 
     /// GPU-loaded kernel registry that holds actual CUDA module and function handles.
+    ///
+    /// This type is only available with the `cuda` feature. It will be used by
+    /// the model forward pass in Phase 4 to execute loaded kernels.
     #[allow(dead_code)]
+    // dead_code is expected: LoadedKernelRegistry requires the `cuda` feature
+    // which pulls in cudarc types. Without the feature, the struct is unused.
     pub struct LoadedKernelRegistry {
         /// Map from kernel name to (module, function_name).
         modules: HashMap<String, (Arc<CudaModule>, String)>,
