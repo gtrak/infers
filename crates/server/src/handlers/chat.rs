@@ -143,7 +143,7 @@ fn create_mock_stream(
 
     // 4. [DONE] event
     let end_stream = stream::once(async move {
-        Ok(Event::default().data("[DONE]".to_string()))
+        Ok(Event::default().data("[DONE]"))
     });
 
     intro_stream

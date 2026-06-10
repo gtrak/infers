@@ -1,2 +1,1 @@
-/// Inference scheduler crate.
-pub mod scheduler {}
+//! Session lifecycle management and batch construction for inference scheduling.

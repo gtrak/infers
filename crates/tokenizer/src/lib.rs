@@ -1,2 +1,1 @@
-/// Tokenizer crate.
-pub mod tokenizer {}
+//! Tokenizer for model input/output.

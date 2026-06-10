@@ -62,8 +62,7 @@ impl KernelRegistry {
         self.register("gdn_decode", "kernels/compiled/gdn_decode.cubin");
         self.register("batch_prefill", "kernels/compiled/batch_prefill.cubin");
         self.register("batch_decode", "kernels/compiled/batch_decode.cubin");
-        self.register("sampling_topk", "kernels/compiled/sampling_topk.cubin");
-        self.register("sampling_topp", "kernels/compiled/sampling_topp.cubin");
+        self.register("sampling", "kernels/compiled/sampling.cubin");
     }
 }
 

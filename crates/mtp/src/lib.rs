@@ -1,2 +1,1 @@
-/// Multi-token prediction crate.
-pub mod mtp {}
+//! Multi-token prediction for speculative decoding.

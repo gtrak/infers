@@ -1,2 +1,1 @@
-/// Key-value cache crate.
-pub mod kv {}
+//! Key-value cache for attention computation.

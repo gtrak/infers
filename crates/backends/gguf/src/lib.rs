@@ -1,2 +1,1 @@
-/// GGUF model backend crate.
-pub mod gguf {}
+//! GGUF model backend for CPU inference.

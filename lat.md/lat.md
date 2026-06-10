@@ -57,7 +57,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | stream | CUDA stream pool for async execution |
 | memory | Block pool GPU memory allocator (pure Rust, no cfg) |
 | kernels | Kernel registry for pre-compiled .cubin loading |
-| gemm | cuBLASLt GEMM engine for matrix multiplication |
+| gemm | cuBLASLt GEMM engine with `matmul()` method for matrix multiplication |
 | nccl | Multi-GPU collective operations for TP/PP |
 
 # Kernel Extraction and Build System
@@ -80,7 +80,7 @@ Handles three sources: GDN kernels, standard attention kernels, and FlashInfer s
 ### Build Script
 Compiles kernel source files to .cubin binaries using nvcc.
 
-Targets `sm_100a` (Blackwell) with `-O3 --use_fast_math`. The `which_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). nvcc args include `-I` flags for `kernels/flashinfer-gdn` and `kernels/flashinfer-attn` include paths. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
+Targets `sm_100a` (Blackwell) by default, configurable via the `INFERS_CUDA_ARCH` environment variable. With `-O3 --use_fast_math`. The `which_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). nvcc args include `-I` flags for `kernels/flashinfer-gdn` and `kernels/flashinfer-attn` include paths. Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` and loaded at runtime by the KernelRegistry.
 
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.
@@ -101,10 +101,10 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading and LoadedKernelRegistry for GPU-loaded kernels
-- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support
+- KernelRegistry for .cubin loading (5 kernels: gdn_prefill, gdn_decode, batch_prefill, batch_decode, sampling) and LoadedKernelRegistry for GPU-loaded kernels
+- GemmEngine wrapping cuBLASLt with FP16/BF16/FP32/NVFP4 support; `matmul()` method accepts `GemmConfig` (placeholder implementation)
 - NcclCommunicator for TP all-reduce and PP send/recv operations
-- build.rs for nvcc kernel compilation targeting sm_100a (Blackwell)
+- build.rs for nvcc kernel compilation (default sm_100a, configurable via INFERS_CUDA_ARCH env var)
 - scripts/extract-kernels.sh for pulling FlashInfer kernels from vLLM
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled)
 - Feature propagation: backends/native and parallelism crates forward `cuda` feature to infers-cuda
@@ -132,7 +132,7 @@ Prometheus-based metrics collection and exposure for inference server monitoring
 
 ## Registry and Metric Definitions
 
-All metrics are registered in a single lazy_static Prometheus Registry. Seven metrics track inference workload and system resources.
+All metrics use `std::sync::LazyLock` (Rust 1.80+) for lazy initialization instead of `lazy_static`. Seven metrics track inference workload and system resources.
 
 ### Counters
 Metrics that track monotonically increasing values over the lifetime of the server.

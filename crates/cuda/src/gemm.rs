@@ -35,7 +35,7 @@ pub enum GemmDtype {
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-
+    use super::*;
     /// cuBLASLt GEMM engine.
     ///
     /// Wraps NVIDIA's cuBLASLt library for high-performance matrix multiplication.
@@ -48,6 +48,12 @@ mod cuda_impl {
         pub fn new(stream: std::sync::Arc<cudarc::driver::CudaStream>) -> anyhow::Result<Self> {
             let handle = cudarc::cublaslt::safe::CudaBlasLT::new(stream)?;
             Ok(Self { _handle: handle })
+        }
+
+        /// Execute a GEMM operation with the given configuration.
+        /// TODO: Implement actual cuBLASLt matmul call.
+        pub fn matmul(&self, _config: &GemmConfig) -> anyhow::Result<()> {
+            anyhow::bail!("GemmEngine::matmul not yet implemented")
         }
     }
 }
@@ -62,6 +68,10 @@ pub struct GemmEngine;
 #[cfg(not(feature = "cuda"))]
 impl GemmEngine {
     pub fn new() -> anyhow::Result<Self> {
+        anyhow::bail!("GemmEngine requires the 'cuda' feature")
+    }
+
+    pub fn matmul(&self, _config: &GemmConfig) -> anyhow::Result<()> {
         anyhow::bail!("GemmEngine requires the 'cuda' feature")
     }
 }

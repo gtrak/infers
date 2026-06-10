@@ -18,7 +18,9 @@ fn main() {
     // Only compile kernels if the cuda feature is enabled and source files exist
     println!("cargo:rerun-if-changed=kernels/");
 
-    let gpu_arch = "sm_100a"; // Blackwell (RTX 5060 Ti)
+    let arch_str = std::env::var("INFERS_CUDA_ARCH")
+        .unwrap_or_else(|_| "sm_100a".to_string()); // Blackwell (RTX 5060 Ti)
+    let gpu_arch = arch_str.as_str();
 
     // Check if nvcc is available
     if which_nvcc().is_none() {
@@ -110,12 +112,12 @@ fn compile_kernel(src: &str, output: &str, arch: &str) -> Result<(), String> {
 
 fn which_nvcc() -> Option<String> {
     // Check PATH first
-    if let Ok(output) = Command::new("which").arg("nvcc").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
+    if let Ok(output) = Command::new("which").arg("nvcc").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
         }
     }
     
