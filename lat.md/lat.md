@@ -699,6 +699,10 @@ Fields include `num_hidden_layers`, `hidden_size`, `intermediate_size`, `vocab_s
 
 Default pattern: every 4th layer (1-indexed) is full attention, others use GDN linear attention.
 
+### Text Config Merging
+
+Multimodal model configs wrap architecture parameters inside a `text_config` object. `[[crates/model/src/config.rs#merge_text_config]]` performs a shallow merge: `text_config` fields are promoted to the root level, but root-level keys take priority. See [[crates/model/src/config.rs#ModelConfig#load]].
+
 ## Quantization Format Detection
 
 `QuantizationFormat` enum with `Bf16`, `PrismaScout`, `AutoRound`, and `Gguf` variants. Auto-detection checks for `.gguf` files, `quantization_config.json`, and embedded config. See [[crates/model/src/formats.rs#QuantizationFormat]].
