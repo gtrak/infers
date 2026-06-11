@@ -7,6 +7,7 @@
 //! - ~30s to load model and run inference
 //!
 //! Run with: cargo test --package infers-backend-native --test smoke_test smoke_test_real_model -- --ignored --nocapture
+use std::time::Instant;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
 use infers_model::sharding::shard_weights_tp;
-use infers_model::{load_safetensors, strip_language_model_prefix, build_main_layers, load_model};
+use infers_model::{load_safetensors, strip_language_model_prefix, build_main_layers};
 
 /// Default path for the Qwen3.6-27B AutoRound INT4 model.
 const DEFAULT_MODEL_DIR: &str = "~/opt/vllm/models/qwen3.6-27b-autoround-int4/";
@@ -100,6 +101,7 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     config.max_position_embeddings = test_max_seq_len;
     let config = Arc::new(config);
     let group_size = 128; // Standard for AutoRound INT4
+    let engine_start = Instant::now();
     let mut engine = ForwardEngine::new(
         config.clone(),
         weight_registries,
@@ -108,8 +110,8 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
         stream_pool,
         group_size,
     )?;
-
-    eprintln!("Engine initialized successfully with 2 GPU shards");
+    let engine_elapsed = engine_start.elapsed();
+    eprintln!("Engine init (including weight cache upload): {:.2}s", engine_elapsed.as_secs_f64());
 
     // 9. Initialize paged KV cache
     let page_size = 16; // tokens per page
@@ -127,15 +129,21 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
 
     // 12. Run prefill with BOS token
     let token_ids = vec![151644u32]; // BOS/im_start token for Qwen3.5
+    let prefill_start = Instant::now();
     let pages_used = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
-    eprintln!("Prefill completed: {} pages used", pages_used);
+    let prefill_elapsed = prefill_start.elapsed();
+    eprintln!("Prefill completed: {} pages used, {:.3}s", pages_used, prefill_elapsed.as_secs_f64());
 
     // 13. Run decode for 10 steps
     let mut token = token_ids[0];
+    let mut total_decode_time = std::time::Duration::ZERO;
     for step in 0..10 {
+        let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
         token = engine.decode_paged(&external_stream, token, pos, seq_id)?;
-        eprintln!("Decode step {}: token={}", step, token);
+        let decode_elapsed = decode_start.elapsed();
+        total_decode_time += decode_elapsed;
+        eprintln!("Decode step {}: token={}, {:.3}s", step, token, decode_elapsed.as_secs_f64());
         assert!(
             token < config.vocab_size as u32,
             "Decode token {} >= vocab_size {} at step {}",
@@ -144,7 +152,18 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
             step
         );
     }
+    eprintln!(
+        "Total decode time: {:.3}s, avg per step: {:.3}s",
+        total_decode_time.as_secs_f64(),
+        total_decode_time.as_secs_f64() / 10.0,
+    );
 
-    eprintln!("Smoke test PASSED: {} tokens generated", 1 + 10);
+    eprintln!(
+        "Smoke test PASSED: {} tokens generated | Engine: {:.2}s | Prefill: {:.3}s | Decode avg: {:.3}s/step",
+        1 + 10,
+        engine_elapsed.as_secs_f64(),
+        prefill_elapsed.as_secs_f64(),
+        total_decode_time.as_secs_f64() / 10.0,
+    );
     Ok(())
 }
