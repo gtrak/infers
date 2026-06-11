@@ -52,6 +52,18 @@ pub struct Args {
     #[arg(long, default_value = "0.85")]
     pub gpu_memory_utilization: f32,
 
+    /// Tensor parallelism degree (number of GPUs)
+    #[arg(long, default_value = "1")]
+    pub tensor_parallel_size: usize,
+
+    /// Number of KV cache pages in the pool
+    #[arg(long, default_value = "2048")]
+    pub num_pages: usize,
+
+    /// Number of tokens per KV cache page
+    #[arg(long, default_value = "16")]
+    pub page_size: usize,
+
     /// Enable speculative decoding (MTP)
     #[arg(long, default_value = "false")]
     pub enable_mtp: bool,
@@ -86,6 +98,16 @@ pub enum KvCacheDtype {
     Nvfp4,
 }
 
+impl From<KvCacheDtype> for infers_kv::KvCacheDtype {
+    fn from(dtype: KvCacheDtype) -> Self {
+        match dtype {
+            KvCacheDtype::Bf16 => infers_kv::KvCacheDtype::Bf16,
+            KvCacheDtype::Fp8 => infers_kv::KvCacheDtype::Fp8E4M3,
+            KvCacheDtype::Nvfp4 => infers_kv::KvCacheDtype::Nvfp4,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -108,6 +130,10 @@ async fn run() -> Result<()> {
     tracing::info!("Starting infers server");
     tracing::info!("Model: {}", args.model);
     tracing::info!("Parallelism: {:?}", args.parallelism);
+    tracing::info!("Tensor parallel size: {}", args.tensor_parallel_size);
+    tracing::info!("KV cache dtype: {:?}", args.kv_cache_dtype);
+    tracing::info!("Num pages: {}", args.num_pages);
+    tracing::info!("Page size: {}", args.page_size);
 
     // Step 1: Initialize CUDA runtime
     let cuda_runtime = CudaRuntime::new()
@@ -176,10 +202,15 @@ async fn run() -> Result<()> {
     ).context("Failed to create ForwardEngine")?;
 
     // Step 6: Create PagedKvManager for the scheduler
-    let page_size: usize = 16;
+    let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
+    // TODO: Wire kv_cache_dtype to PagedKvManager when quantized KV cache support is ready.
+    // The dtype determines bytes-per-element for buffer sizing (bf16=2, fp8=1, nvfp4=1).
+    let _kv_cache_dtype = kv_cache_dtype;
+
+    let page_size = args.page_size;
     let num_kv_heads = model_config.num_key_value_heads;
     let head_dim = model_config.head_dim;
-    let total_pages = 1024; // Small pool for testing
+    let total_pages = args.num_pages;
     let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
     let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
 

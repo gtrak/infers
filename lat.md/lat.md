@@ -638,7 +638,9 @@ Main binary crate for the inference server. Provides CLI argument parsing, Axum-
 
 ## CLI Arguments
 
-Uses `clap` derive API. Key arguments include model name, parallelism, KV cache dtype, context length, GPU utilization, speculative decoding, and bind address. All support environment variable override and defaults.
+Uses `clap` derive API. Key arguments include model name, parallelism, KV cache dtype, context length, GPU utilization, speculative decoding, and bind address.
+
+**Phase 11 additions**: `--tensor-parallel-size` (default 1), `--num-pages` (default 2048), `--page-size` (default 16). KV cache dtype converts via `From` impl: CLI `Fp8` → `infers_kv::KvCacheDtype::Fp8E4M3`. The `--model` arg also supports `INFERS_MODEL` env var override.
 
 ## AppState
 
