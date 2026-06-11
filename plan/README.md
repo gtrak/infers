@@ -52,8 +52,10 @@ CUDA Kernels
 | [Phase 7](phase-7-mtp.md) | 2 weeks | Multi-Token Prediction speculative decoding | >1.2x speedup with MTP |
 | [Phase 8](phase-8-quantization.md) | 3 weeks | AutoRound, GGUF, KV cache quantization, FP8/INT4 CUDA kernels | All formats working end-to-end |
 | [Phase 9](phase-9-tool-calls.md) | 2 weeks | Tool calls, benchmarking, stability | Production-ready server |
+| [Phase 10](phase-10-server-orchestration.md) | 1.5 weeks | Server orchestration — wire everything together | End-to-end pipeline (mock model) |
+| [Phase 11](phase-11-model-integration.md) | 3–4 weeks | Model integration — real model loading and inference | Working inference with real Qwen3.6-27B |
 
-**Total: ~24 weeks (6 months)**
+**Total: ~29 weeks (7 months)**
 
 ## Research Documents
 
