@@ -96,7 +96,6 @@ pub fn upload_int4_weight(
     qweight: &WeightData,
     scales: &WeightData,
     qzeros: &WeightData,
-    _group_size: usize,
 ) -> Result<(CudaSlice<u32>, CudaSlice<bf16>, CudaSlice<u32>)> {
     // qweight: packed INT4 as u32 — upload as-is
     let qweight_u32: Vec<u32> = qweight

@@ -199,13 +199,15 @@ async fn run() -> Result<()> {
         ctx.clone(),
         kernel_registry,
         streams,
+        128, // group_size (default AutoRound)
     ).context("Failed to create ForwardEngine")?;
 
     // Step 6: Create PagedKvManager for the scheduler
     let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-    // TODO: Wire kv_cache_dtype to PagedKvManager when quantized KV cache support is ready.
+    // TODO: Wire kv_cache_dtype ({:?}) to PagedKvManager when quantized KV cache support is ready.
     // The dtype determines bytes-per-element for buffer sizing (bf16=2, fp8=1, nvfp4=1).
-    let _kv_cache_dtype = kv_cache_dtype;
+    // For now, dtype conversion validates the CLI value is recognized.
+    let _ = &kv_cache_dtype;
 
     let page_size = args.page_size;
     let num_kv_heads = model_config.num_key_value_heads;

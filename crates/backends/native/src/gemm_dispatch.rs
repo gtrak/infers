@@ -79,7 +79,7 @@ pub fn gemm_projection(
                 .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", weight.name))?;
 
             let (qweight_gpu, scales_gpu, qzeros_gpu) = crate::upload::upload_int4_weight(
-                stream, &weight, &companions.scales, &companions.qzeros, group_size,
+                stream, &weight, &companions.scales, &companions.qzeros,
             )?;
 
             infers_cuda::gemm::matmul_int4(

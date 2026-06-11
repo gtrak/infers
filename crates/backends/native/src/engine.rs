@@ -97,6 +97,9 @@ pub struct ForwardEngine {
 
     /// Per-layer GDN recurrent states.
     gdn_states: Vec<GdnState>,
+
+    /// INT4 quantization group size for on-the-fly dequantization.
+    group_size: usize,
 }
 
 impl ForwardEngine {
@@ -115,6 +118,7 @@ impl ForwardEngine {
         ctx: Arc<CudaContext>,
         kernel_registry: KernelRegistry,
         streams: StreamPool,
+        group_size: usize,
     ) -> Result<Self> {
         let kernels = LoadedKernelRegistry::load_all(ctx, &kernel_registry)
             .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels: {e}"))?;
@@ -194,6 +198,7 @@ impl ForwardEngine {
             kv_caches,
             paged_kv_caches,
             gdn_states,
+            group_size,
         })
     }
 
@@ -230,7 +235,7 @@ impl ForwardEngine {
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_ids,
             &mut self.kv_caches, &mut self.gdn_states,
-            128, // group_size (default AutoRound)
+            self.group_size,
         )
     }
 
@@ -266,7 +271,7 @@ impl ForwardEngine {
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
             &mut self.kv_caches, &mut self.gdn_states,
-            128, // group_size (default AutoRound)
+            self.group_size,
         )
     }
 
@@ -711,7 +716,7 @@ impl ForwardEngine {
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
             &mut self.kv_caches, &mut self.gdn_states,
-            128, // group_size (default AutoRound)
+            self.group_size,
         )
     }
 

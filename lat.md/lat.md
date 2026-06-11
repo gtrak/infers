@@ -534,7 +534,9 @@ Gated DeltaNet prefill: projection GEMMs via INT4-aware `gemm_projection` dispat
 
 #### Architecture
 
-**Phase 1 — Projections**: Five projection weights are dispatched via `gemm_projection`. BF16 weights route to cuBLASLt; INT4 weights use `infers_int4_gemm` for on-the-fly dequantization. Four GEMMs compute `a`, `b`, `x`, and `dt` projections from input. 1D convolution (`conv1d_weight`) is skipped for Phase 4.5.
+Five projection weights dispatch via `gemm_projection` for GDN prefill, routing BF16 to cuBLASLt and INT4 to `infers_int4_gemm`. Four GEMMs compute `a`, `b`, `x`, `dt` projections from input.
+
+1D convolution (`conv1d_weight`) is skipped for Phase 4.5.
 
 **Phase 2 — State Update**: GDN state (H×H matrix) is allocated lazily on first call. The `infers_gdn_prefill_bf16` kernel runs with `hidden_size` blocks (one per state row), each block processing all `seq_len` tokens sequentially via shared memory reduction.
 
@@ -550,7 +552,9 @@ Gated DeltaNet decode: recurrent single-token state update using `infers_gdn_upd
 
 #### Architecture
 
-**Phase 1 — Projections**: Four projection weights are dispatched via `gemm_projection` (BF16 weights route to cuBLASLt, INT4 weights route to `infers_int4_gemm` kernel). Four GEMMs (m=1) compute `a`, `b`, `x`, and `dt` projections from a single-token input `[1 × hidden_size]`. 1D convolution is skipped, same as prefill.
+Four projection weights dispatch via `gemm_projection` for GDN decode, routing BF16 to cuBLASLt and INT4 to `infers_int4_gemm`. Four GEMMs (m=1) compute `a`, `b`, `x`, `dt` from single-token input.
+
+1D convolution is skipped, same as prefill.
 
 **Phase 2 — State Update**: GDN state is allocated lazily via `ensure_allocated()`. The `infers_gdn_update_bf16` kernel runs with `hidden_size` blocks (one per state row) and power-of-2 block size up to 256. Unlike prefill, it processes only a single token and takes 7 arguments (no `seq_len`).
 
