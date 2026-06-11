@@ -431,7 +431,7 @@ See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/sr
 
 Full prefill pipeline using paged KV cache instead of flat buffers. See [[crates/backends/native/src/engine.rs#ForwardEngine#prefill_paged]].
 
-`prefill_paged()` allocates pages via `PagedKvManager`, uploads block table and positions to GPU, then runs the complete layer loop: embedding, norm1, layer dispatch (GDN via `gdn::forward` or full attention via `attention::forward_paged`), residual add, norm2, MLP (gate/up/silu/down_proj), residual add, final norm, LM head projection, and greedy sampling. Returns the number of pages allocated.
+`prefill_paged()` allocates pages via `PagedKvManager`, uploads block table and positions to GPU, then runs the complete layer loop: embedding (cache lookup via `weight_caches[gpu_idx].get_bf16()`), norm1 (cache lookup), layer dispatch (GDN via `gdn::forward` or full attention via `attention::forward_paged`), residual add, norm2 (cache lookup), MLP gate/up/down projections (via `gemm_projection_cached` using the per-GPU weight cache, no `int4_companions` argument needed since INT4 metadata is in the cache), residual add, final norm (cache lookup on GPU 0), LM head projection (via `gemm_projection_cached` on GPU 0), and greedy sampling. Returns the number of pages allocated.
 
 Key differences from flat `prefill()`: uses `attention::forward_paged` which writes K/V to paged cache via `paged_kv_write` kernel, passes block table GPU pointer and positions GPU pointer to the attention function.
 
@@ -439,7 +439,7 @@ Key differences from flat `prefill()`: uses `attention::forward_paged` which wri
 
 Full decode pipeline using paged KV cache with zero CPU round-trips and TP support. See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_paged]].
 
-`decode_paged()` uploads block table and position to ALL GPUs via per-GPU streams. Embeds the single token independently on each GPU. Per-GPU sharded head counts are computed as `num_kv_heads / num_gpus`, `num_attention_heads / num_gpus`, and `intermediate_size / num_gpus`. The layer loop runs in phases: (A) attention/GDN per GPU with NCCL all-reduce of outputs, (B) residual add per GPU, (C) MLP with column-parallel gate/up projections and row-parallel down projection, NCCL all-reduce of MLP outputs, (D) residual add per GPU. Final norm + LM head + greedy sampling occur on GPU 0 only.
+`decode_paged()` uploads block table and position to ALL GPUs via per-GPU streams. Embeds the single token independently on each GPU (cache lookup). Per-GPU sharded head counts are computed as `num_kv_heads / num_gpus`, `num_attention_heads / num_gpus`, and `intermediate_size / num_gpus`. The layer loop runs in phases: (A) attention/GDN per GPU with norm1 cache lookup and NCCL all-reduce of outputs, (B) residual add per GPU, (C) MLP with column-parallel gate/up projections and row-parallel down projection via `gemm_projection_cached` (using per-GPU weight cache), norm2 cache lookup, NCCL all-reduce of MLP outputs, (D) residual add per GPU. Final norm (cache lookup) + LM head (`gemm_projection_cached`) + greedy sampling occur on GPU 0 only.
 
 ### NCCL All-Reduce Grouping
 

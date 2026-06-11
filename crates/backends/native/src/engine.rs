@@ -480,7 +480,8 @@ impl ForwardEngine {
             let w = &self.weights[gpu_idx];
             let embed_weight = w.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-            let embed_table = crate::upload::upload_weight(&gpu_stream, embed_weight)?;
+            let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
+                .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
             let h = crate::embedding::embed_tokens(
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, token_ids, &embed_table,
                 config.hidden_size, config.vocab_size,
@@ -509,7 +510,8 @@ impl ForwardEngine {
                 let layer_type = config.get_layer_type(layer_idx);
 
                 // Norm1
-                let norm1_weight = crate::upload::upload_weight(&gpu_stream, &layer.norm1)?;
+                let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
+                    .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
                 let norm1_out = crate::norm::rms_norm(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
@@ -583,7 +585,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let mlp_weights = &w.layers[layer_idx].mlp;
 
                 // Norm2
-                let norm2_weight = crate::upload::upload_weight(&gpu_stream, &w.layers[layer_idx].norm2)?;
+                let norm2_weight = self.weight_caches[gpu_idx].get_bf16(&w.layers[layer_idx].norm2.name)
+                    .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", w.layers[layer_idx].norm2.name))?;
                 let norm2_out = crate::norm::rms_norm(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
@@ -591,20 +594,24 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.gate_proj.name,
+                    &norm2_out, &mut gate,
                     seq_len, sharded_intermediate, config.hidden_size,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.up_proj, &norm2_out, &mut up,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.up_proj.name,
+                    &norm2_out, &mut up,
                     seq_len, sharded_intermediate, config.hidden_size,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
@@ -622,11 +629,13 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
                 // Down projection (row-parallel: full hidden_size output, sharded_intermediate inner dim)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.down_proj.name,
+                    &silu_out, &mut mlp_out,
                     seq_len, config.hidden_size, sharded_intermediate,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 mlp_outputs.push(mlp_out);
@@ -664,7 +673,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // Final norm
         let final_norm_weight = final_weights.norm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-        let final_norm_gpu = crate::upload::upload_weight(&final_stream, final_norm_weight)?;
+        let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
+            .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
         final_hidden = crate::norm::rms_norm(
             &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
@@ -675,12 +685,14 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         let mut logits = final_stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
-            lm_head_weight, &final_hidden, &mut logits,
+            &self.weight_caches[0],
+            &lm_head_weight.name,
+            &final_hidden, &mut logits,
             seq_len, config.vocab_size, config.hidden_size,
-            self.group_size, &final_weights.int4_companions,
-)?;
+            self.group_size,
+        )?;
 
         // Sample: last row argmax
         let last_row_start = (seq_len - 1) * config.vocab_size;
@@ -751,7 +763,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             let w = &self.weights[gpu_idx];
             let embed_weight = w.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-            let embed_table = crate::upload::upload_weight(&gpu_stream, embed_weight)?;
+            let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
+                .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
             let h = crate::embedding::embed_tokens(
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, &[token_id], &embed_table,
                 config.hidden_size, config.vocab_size,
@@ -779,7 +792,8 @@ for layer_idx in 0..config.num_hidden_layers {
                 let layer_type = config.get_layer_type(layer_idx);
 
                 // Norm1
-                let norm1_weight = crate::upload::upload_weight(&gpu_stream, &layer.norm1)?;
+                let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
+                    .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
                 let norm1_out = crate::norm::rms_norm(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
@@ -854,7 +868,8 @@ for layer_idx in 0..config.num_hidden_layers {
                 let mlp_weights = &w.layers[layer_idx].mlp;
 
                 // Norm2
-                let norm2_weight = crate::upload::upload_weight(&gpu_stream, &w.layers[layer_idx].norm2)?;
+                let norm2_weight = self.weight_caches[gpu_idx].get_bf16(&w.layers[layer_idx].norm2.name)
+                    .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", w.layers[layer_idx].norm2.name))?;
                 let norm2_out = crate::norm::rms_norm(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
@@ -862,20 +877,24 @@ for layer_idx in 0..config.num_hidden_layers {
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.gate_proj.name,
+                    &norm2_out, &mut gate,
                     1, sharded_intermediate, config.hidden_size,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.up_proj, &norm2_out, &mut up,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.up_proj.name,
+                    &norm2_out, &mut up,
                     1, sharded_intermediate, config.hidden_size,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
@@ -893,11 +912,13 @@ for layer_idx in 0..config.num_hidden_layers {
 
                 // Down projection (row-parallel: full hidden_size output)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
-                crate::gemm_dispatch::gemm_projection(
+                crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                    &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                    &self.weight_caches[gpu_idx],
+                    &mlp_weights.down_proj.name,
+                    &silu_out, &mut mlp_out,
                     1, config.hidden_size, sharded_intermediate,
-                    self.group_size, &w.int4_companions,
+                    self.group_size,
                 )?;
 
                 mlp_outputs.push(mlp_out);
@@ -935,7 +956,8 @@ for layer_idx in 0..config.num_hidden_layers {
         // Final norm
         let final_norm_weight = final_weights.norm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-        let final_norm_gpu = crate::upload::upload_weight(&final_stream, final_norm_weight)?;
+        let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
+            .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
         final_hidden = crate::norm::rms_norm(
             &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
@@ -946,12 +968,14 @@ for layer_idx in 0..config.num_hidden_layers {
             .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         let mut logits = final_stream.alloc_zeros::<bf16>(config.vocab_size)?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
-            lm_head_weight, &final_hidden, &mut logits,
+            &self.weight_caches[0],
+            &lm_head_weight.name,
+            &final_hidden, &mut logits,
             1, config.vocab_size, config.hidden_size,
-            self.group_size, &final_weights.int4_companions,
-)?;
+            self.group_size,
+        )?;
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::greedy_sample_bf16(
