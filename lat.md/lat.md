@@ -435,15 +435,15 @@ Embeds prompt tokens, loops through layers dispatching GDN or full attention bas
 
 The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel handles (`rmsnorm`, `silu_glu`, `rope`, `embedding`, `add`, `argmax`, `softmax`, `kv_cache_write`, `gdn_prefill`), a `GemmEngine`, CUDA stream, `NcclCommunicator`, `ModelConfig`, `WeightRegistry`, token IDs, and mutable vectors of `KvCache` and `GdnState` for each layer.
 
-**Phase 1 — Embedding**: Uploads embedding weights via `upload_weight()` (converts `WeightData` bytes to BF16 Vec and copies to GPU), then dispatches the embedding gather kernel.
+**Phase 1 — Embedding**: Looks up embedding weights in GpuWeightCache via `cache.get_bf16()`, then dispatches the embedding gather kernel.
 
-**Phase 2 — Layer Loop**: For each layer, dispatches `norm::rms_norm` (norm1), then either `gdn::forward` or `attention::forward` depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), `mlp::mlp_forward`, and another residual add. NCCL all-reduce calls are reserved for multi-GPU paths.
+**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::forward` or `attention::forward` depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), and another residual add. NCCL all-reduce calls are reserved for multi-GPU paths.
 
-**Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[seq_len × vocab_size]` BF16 matrix.
+**Phase 3 — Final Norm + LM Head**: Looks up final norm weight from cache, applies RMSNorm, then computes logits via `gemm_projection_cached` using cache (no `int4_companions` needed), producing `[seq_len × vocab_size]` BF16 matrix.
 
 **Phase 4 — Sampling**: Extracts last row of BF16 logits via `CudaSlice::slice()` to get a `CudaView`, then dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel — zero CPU round-trip.
 
-See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
+See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]].
 
 ### Decode Path
 
@@ -451,15 +451,15 @@ Embeds a single token, loops through layers dispatching GDN recurrent steps or s
 
 The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel handles (`rmsnorm`, `silu_glu`, `rope`, `embedding`, `add`, `argmax`, `softmax`, `kv_cache_write`, `gdn_update`), a `GemmEngine`, CUDA stream, `NcclCommunicator`, `ModelConfig`, `WeightRegistry`, a single `token_id`, `position`, and mutable vectors of `KvCache` and `GdnState` for each layer.
 
-**Phase 1 — Embedding**: Uploads embedding weights via `upload_weight()` (converts `WeightData` bytes to BF16 Vec and copies to GPU), then dispatches the embedding gather kernel for a single token.
+**Phase 1 — Embedding**: Looks up embedding weights in GpuWeightCache via `cache.get_bf16()`, then dispatches the embedding gather kernel for a single token.
 
-**Phase 2 — Layer Loop**: For each layer, dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), `mlp::mlp_forward`, and another residual add. All GEMMs use m=1 (single token).
+**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), and another residual add. All GEMMs use m=1 (single token).
 
-**Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[1 × vocab_size]` BF16 vector.
+**Phase 3 — Final Norm + LM Head**: Looks up final norm weight from cache, applies RMSNorm, then computes logits via `gemm_projection_cached` using cache (no `int4_companions` needed), producing `[1 × vocab_size]` BF16 vector.
 
 **Phase 4 — Sampling**: Dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel directly on BF16 logits via `CudaSlice::as_view()` — zero CPU round-trip. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
 
-See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
+See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]].
 
 ### Paged Prefill Path
 

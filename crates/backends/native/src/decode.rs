@@ -103,7 +103,8 @@ pub fn decode(
 
     let embed_weight = weights.embedding.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-    let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
+    let embed_table = cache.get_bf16(&embed_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
 
     let mut hidden = embedding::embed_tokens(
         stream,
@@ -123,7 +124,8 @@ pub fn decode(
         let layer_type = config.get_layer_type(layer_idx);
 
         // --- Norm1 (pre-attention/GDN) ---
-        let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
+        let norm1_weight = cache.get_bf16(&layer.norm1.name)
+            .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
         let norm1_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -184,7 +186,8 @@ pub fn decode(
         hidden = add::add(stream, &kernels.add, &hidden, &attn_or_gdn_out)?;
 
         // --- Norm2 (pre-MLP) ---
-        let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
+        let norm2_weight = cache.get_bf16(&layer.norm2.name)
+            .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", layer.norm2.name))?;
         let norm2_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -202,22 +205,20 @@ pub fn decode(
         let mut gate = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.gate_proj, &norm2_out, &mut gate,
+            cache, &mlp_weights.gate_proj.name, &norm2_out, &mut gate,
             1, intermediate_size, hidden_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // up = GEMM(norm2_out, up_proj)  [1 × intermediate_size]
         let mut up = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate up buffer: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.up_proj, &norm2_out, &mut up,
+            cache, &mlp_weights.up_proj.name, &norm2_out, &mut up,
             1, intermediate_size, hidden_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // silu_out = SiLU(gate) ⊗ up
@@ -247,11 +248,10 @@ pub fn decode(
         let mut mlp_out = stream
             .alloc_zeros::<bf16>(hidden_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate MLP output: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+            cache, &mlp_weights.down_proj.name, &silu_out, &mut mlp_out,
             1, hidden_size, intermediate_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // --- Residual add (MLP output + hidden) ---
@@ -264,7 +264,8 @@ pub fn decode(
 
     let final_norm_weight = weights.norm.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-    let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
+    let final_norm_gpu = cache.get_bf16(&final_norm_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
     let hidden = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -282,11 +283,10 @@ pub fn decode(
     let mut logits = stream
         .alloc_zeros::<bf16>(config.vocab_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, &kernels.int4_gemm, stream,
-        lm_head_weight, &hidden, &mut logits,
+        cache, &lm_head_weight.name, &hidden, &mut logits,
         1, config.vocab_size, hidden_size, group_size,
-        &weights.int4_companions,
     )?;
 
     // =========================================================================
@@ -346,7 +346,8 @@ pub fn decode_with_hidden(
 
     let embed_weight = weights.embedding.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-    let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
+    let embed_table = cache.get_bf16(&embed_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
 
     let mut hidden = embedding::embed_tokens(
         stream,
@@ -366,7 +367,8 @@ pub fn decode_with_hidden(
         let layer_type = config.get_layer_type(layer_idx);
 
         // --- Norm1 (pre-attention/GDN) ---
-        let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
+        let norm1_weight = cache.get_bf16(&layer.norm1.name)
+            .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
         let norm1_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -427,7 +429,8 @@ pub fn decode_with_hidden(
         hidden = add::add(stream, &kernels.add, &hidden, &attn_or_gdn_out)?;
 
         // --- Norm2 (pre-MLP) ---
-        let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
+        let norm2_weight = cache.get_bf16(&layer.norm2.name)
+            .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", layer.norm2.name))?;
         let norm2_out = norm::rms_norm(
             stream,
             &kernels.rmsnorm,
@@ -445,22 +448,20 @@ pub fn decode_with_hidden(
         let mut gate = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.gate_proj, &norm2_out, &mut gate,
+            cache, &mlp_weights.gate_proj.name, &norm2_out, &mut gate,
             1, intermediate_size, hidden_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // up = GEMM(norm2_out, up_proj)  [1 × intermediate_size]
         let mut up = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate up buffer: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.up_proj, &norm2_out, &mut up,
+            cache, &mlp_weights.up_proj.name, &norm2_out, &mut up,
             1, intermediate_size, hidden_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // silu_out = SiLU(gate) ⊗ up
@@ -490,11 +491,10 @@ pub fn decode_with_hidden(
         let mut mlp_out = stream
             .alloc_zeros::<bf16>(hidden_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate MLP output: {e}"))?;
-        crate::gemm_dispatch::gemm_projection(
+        crate::gemm_dispatch::gemm_projection_cached(
             gemm, &kernels.int4_gemm, stream,
-            &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+            cache, &mlp_weights.down_proj.name, &silu_out, &mut mlp_out,
             1, hidden_size, intermediate_size, group_size,
-            &weights.int4_companions,
         )?;
 
         // --- Residual add (MLP output + hidden) ---
@@ -507,7 +507,8 @@ pub fn decode_with_hidden(
 
     let final_norm_weight = weights.norm.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-    let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
+    let final_norm_gpu = cache.get_bf16(&final_norm_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
     let hidden = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -528,11 +529,10 @@ pub fn decode_with_hidden(
     let mut logits = stream
         .alloc_zeros::<bf16>(config.vocab_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, &kernels.int4_gemm, stream,
-        lm_head_weight, &hidden, &mut logits,
+        cache, &lm_head_weight.name, &hidden, &mut logits,
         1, config.vocab_size, hidden_size, group_size,
-        &weights.int4_companions,
     )?;
 
     // =========================================================================
