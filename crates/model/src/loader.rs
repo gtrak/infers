@@ -51,10 +51,12 @@ pub fn load_model(model_dir: &Path) -> Result<LoadedModel> {
     let config = ModelConfig::load(model_dir)?;
     let format = QuantizationFormat::detect(model_dir)?;
     let mut weights = load_safetensors(model_dir)?;
-
+    // Strip `model.language_model.` prefix and remove vision tensors
+    strip_language_model_prefix(&mut weights);
+    // Build structured main layers (embedding, per-layer, norm, lm_head)
+    build_main_layers(&mut weights, &config)?;
     // Build structured MTP weights if the model has MTP
     build_mtp_weights(&mut weights, &config)?;
-
     tracing::info!(
         "Loaded model: {} layers, format: {:?}, {} tensors, {:.2} GB{}",
         config.num_hidden_layers,
@@ -175,6 +177,113 @@ fn load_sharded(model_dir: &Path, index_path: &Path) -> Result<WeightRegistry> {
     registry.tensors = all_tensors;
     Ok(registry)
 }
+/// Strip `model.language_model.` prefix from tensor names and remove vision tensors.
+///
+/// Tensors starting with `model.language_model.` get that prefix stripped, so
+/// `model.language_model.layers.0.input_layernorm.weight` becomes
+/// `layers.0.input_layernorm.weight`. Tensors starting with `model.visual.`
+/// are removed entirely. Tensors starting with `mtp.` and all other tensors
+/// are kept as-is.
+pub fn strip_language_model_prefix(registry: &mut WeightRegistry) {
+    let lang_prefix = "model.language_model.";
+    let vis_prefix = "model.visual.";
+    let mut to_remove = Vec::new();
+    let mut to_rename = Vec::new();
+    for key in registry.tensors.keys() {
+        if key.starts_with(vis_prefix) {
+            to_remove.push(key.clone());
+        } else if key.starts_with(lang_prefix) {
+            let new_key = key.strip_prefix(lang_prefix).unwrap().to_string();
+            if new_key != *key {
+                to_rename.push((key.clone(), new_key));
+            }
+        }
+    }
+    for key in to_remove {
+        registry.tensors.remove(&key);
+    }
+    for (old_key, new_key) in to_rename {
+        if let Some(weight) = registry.tensors.remove(&old_key) {
+            registry.tensors.insert(new_key, weight);
+        }
+    }
+}
+
+/// Build main model layers from the flat tensor map.
+///
+/// Populates `registry.layers`, `registry.embedding`, `registry.norm`, and
+/// `registry.lm_head` from tensors in `registry.tensors`. Tensors are removed
+/// from the flat map during extraction to halve memory usage.
+pub fn build_main_layers(registry: &mut WeightRegistry, config: &ModelConfig) -> Result<()> {
+    // Extract scalar weights: embedding, norm, lm_head
+    registry.embedding = get_weight(registry, "embed_tokens.weight").ok();
+    registry.norm = get_weight(registry, "norm.weight").ok();
+    registry.lm_head = get_weight(registry, "lm_head.weight").ok();
+    // Build per-layer weights
+    let num_layers = config.num_hidden_layers;
+    let mut layers = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let layer = build_main_layer(registry, config, i)?;
+        layers.push(layer);
+    }
+    registry.layers = layers;
+    Ok(())
+}
+
+/// Build a single main model layer from the flat tensor map.
+fn build_main_layer(
+    registry: &mut WeightRegistry,
+    config: &ModelConfig,
+    layer_idx: usize,
+) -> Result<LayerWeights> {
+    let prefix = format!("layers.{}", layer_idx);
+    let norm1 = get_weight(registry, &format!("{}.input_layernorm.weight", prefix))?;
+    let norm2 = get_weight(registry, &format!("{}.post_attention_layernorm.weight", prefix))?;
+    let layer_type = config.get_layer_type(layer_idx);
+    // Determine GDN sub-prefix: check if linear_attn. exists, fall back to gdn.
+    let gdn_sub = if registry.tensors.contains_key(&format!("{}.linear_attn.in_proj_a.weight", prefix)) {
+        "linear_attn"
+    } else {
+        "gdn"
+    };
+    let (gdn, attn) = match layer_type {
+        super::config::LayerType::GatedDeltaNet => {
+            let gdn = GdnWeights {
+                in_proj_a: get_weight(registry, &format!("{}.{}.in_proj_a.weight", prefix, gdn_sub))?,
+                in_proj_b: get_weight(registry, &format!("{}.{}.in_proj_b.weight", prefix, gdn_sub))?,
+                conv1d_weight: get_weight(registry, &format!("{}.{}.conv1d.weight", prefix, gdn_sub))?,
+                x_proj_weight: get_weight(registry, &format!("{}.{}.x_proj_weight.weight", prefix, gdn_sub))?,
+                dt_proj_weight: get_weight(registry, &format!("{}.{}.dt_proj_weight.weight", prefix, gdn_sub))?,
+                out_proj_weight: get_weight(registry, &format!("{}.{}.out_proj_weight.weight", prefix, gdn_sub))?,
+            };
+            (Some(gdn), None)
+        }
+        super::config::LayerType::FullAttention => {
+            let attn = AttentionWeights {
+                q_proj: get_weight(registry, &format!("{}.self_attn.q_proj.weight", prefix))?,
+                k_proj: get_weight(registry, &format!("{}.self_attn.k_proj.weight", prefix))?,
+                v_proj: get_weight(registry, &format!("{}.self_attn.v_proj.weight", prefix))?,
+                o_proj: get_weight(registry, &format!("{}.self_attn.o_proj.weight", prefix))?,
+            };
+            (None, Some(attn))
+        }
+    };
+    let mlp = MlpWeights {
+        gate_proj: get_weight(registry, &format!("{}.mlp.gate_proj.weight", prefix))?,
+        up_proj: get_weight(registry, &format!("{}.mlp.up_proj.weight", prefix))?,
+        down_proj: get_weight(registry, &format!("{}.mlp.down_proj.weight", prefix))?,
+    };
+    Ok(LayerWeights {
+        layer_type,
+        layer_idx,
+        gdn,
+        attn,
+        mlp,
+        norm1,
+        norm2,
+    })
+}
+
 
 /// Build MTP weights from the flat tensor map.
 ///
@@ -224,7 +333,7 @@ pub fn build_mtp_weights(registry: &mut WeightRegistry, config: &ModelConfig) ->
 
 /// Build a single MTP layer from the flat tensor map.
 fn build_mtp_layer(
-    registry: &WeightRegistry,
+    registry: &mut WeightRegistry,
     config: &ModelConfig,
     layer_idx: usize,
 ) -> Result<LayerWeights> {
@@ -275,13 +384,13 @@ fn build_mtp_layer(
     })
 }
 
-/// Get a weight tensor from the registry by name.
-fn get_weight(registry: &WeightRegistry, name: &str) -> Result<WeightData> {
+/// Get a weight tensor from the registry by name. Removes the tensor from the flat map.
+/// Returns ownership of the weight data to halve memory usage during model loading.
+fn get_weight(registry: &mut WeightRegistry, name: &str) -> Result<WeightData> {
     registry
         .tensors
-        .get(name)
-        .cloned()
-        .with_context(|| format!("MTP tensor not found: {}", name))
+        .remove(name)
+        .with_context(|| format!("tensor not found: {}", name))
 }
 
 /// Map safetensors dtype to our WeightDtype.
@@ -564,5 +673,203 @@ mod tests {
         };
         assert!(mtp.layers.is_empty());
         assert!(mtp.embed_tokens.is_none());
+    }
+
+    fn dummy_weight(name: &str) -> WeightData {
+        WeightData { data: vec![0u8; 32], shape: vec![2, 16], dtype: WeightDtype::Bf16, name: name.to_string() }
+    }
+
+    #[test]
+    fn strip_language_model_prefix_removes_prefix() {
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert(
+            "model.language_model.layers.0.input_layernorm.weight".to_string(),
+            WeightData { data: vec![1; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+        );
+        registry.tensors.insert(
+            "model.language_model.norm.weight".to_string(),
+            WeightData { data: vec![2; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+        );
+        strip_language_model_prefix(&mut registry);
+        assert!(registry.tensors.contains_key("layers.0.input_layernorm.weight"));
+        assert!(registry.tensors.contains_key("norm.weight"));
+        assert!(!registry.tensors.contains_key("model.language_model.layers.0.input_layernorm.weight"));
+        assert!(!registry.tensors.contains_key("model.language_model.norm.weight"));
+    }
+
+    #[test]
+    fn strip_language_model_prefix_filters_visual() {
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert(
+            "model.visual.patch_embed.proj.weight".to_string(),
+            WeightData { data: vec![3; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+        );
+        registry.tensors.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            WeightData { data: vec![4; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+        );
+        strip_language_model_prefix(&mut registry);
+        assert!(!registry.tensors.contains_key("model.visual.patch_embed.proj.weight"));
+        assert!(registry.tensors.contains_key("layers.0.input_layernorm.weight"));
+        assert_eq!(registry.tensors.len(), 1);
+    }
+
+    #[test]
+    fn strip_language_model_prefix_keeps_mtp() {
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert(
+            "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+            WeightData { data: vec![5; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+        );
+        strip_language_model_prefix(&mut registry);
+        assert!(registry.tensors.contains_key("mtp.layers.0.self_attn.q_proj.weight"));
+        assert_eq!(registry.tensors.len(), 1);
+    }
+
+    #[test]
+    fn build_main_layers_basic() {
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":4,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert("embed_tokens.weight".to_string(), dummy_weight("embed_tokens.weight"));
+        registry.tensors.insert("norm.weight".to_string(), dummy_weight("norm.weight"));
+        registry.tensors.insert("lm_head.weight".to_string(), dummy_weight("lm_head.weight"));
+        for i in 0..4 {
+            let prefix = format!("layers.{}", i);
+            registry.tensors.insert(format!("{}.input_layernorm.weight", prefix), dummy_weight(&format!("{}.input_layernorm.weight", prefix)));
+            registry.tensors.insert(format!("{}.post_attention_layernorm.weight", prefix), dummy_weight(&format!("{}.post_attention_layernorm.weight", prefix)));
+            if i < 3 {
+                for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.x_proj_weight.weight", "gdn.dt_proj_weight.weight", "gdn.out_proj_weight.weight"] {
+                    registry.tensors.insert(format!("{}.{}", prefix, sub), dummy_weight(&format!("{}.{}", prefix, sub)));
+                }
+            } else {
+                for sub in ["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight"] {
+                    registry.tensors.insert(format!("{}.{}", prefix, sub), dummy_weight(&format!("{}.{}", prefix, sub)));
+                }
+            }
+            for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
+                registry.tensors.insert(format!("{}.{}", prefix, sub), dummy_weight(&format!("{}.{}", prefix, sub)));
+            }
+        }
+        let result = build_main_layers(&mut registry, &config);
+        assert!(result.is_ok());
+        assert_eq!(registry.layers.len(), 4);
+        for i in 0..3 {
+            assert_eq!(registry.layers[i].layer_type, crate::config::LayerType::GatedDeltaNet);
+            assert!(registry.layers[i].gdn.is_some(), "layer {} should have GDN", i);
+            assert!(registry.layers[i].attn.is_none(), "layer {} should not have attention", i);
+        }
+        assert_eq!(registry.layers[3].layer_type, crate::config::LayerType::FullAttention);
+        assert!(registry.layers[3].attn.is_some());
+        assert!(registry.layers[3].gdn.is_none());
+        assert!(registry.embedding.is_some());
+        assert!(registry.norm.is_some());
+        assert!(registry.lm_head.is_some());
+        assert_eq!(registry.embedding.as_ref().unwrap().name, "embed_tokens.weight");
+        assert_eq!(registry.norm.as_ref().unwrap().name, "norm.weight");
+        assert_eq!(registry.lm_head.as_ref().unwrap().name, "lm_head.weight");
+    }
+
+    #[test]
+    fn build_main_layers_with_linear_attn() {
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":1,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"layer_types":["linear_attention"]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert("embed_tokens.weight".to_string(), dummy_weight("embed_tokens.weight"));
+        registry.tensors.insert("norm.weight".to_string(), dummy_weight("norm.weight"));
+        registry.tensors.insert("lm_head.weight".to_string(), dummy_weight("lm_head.weight"));
+        registry.tensors.insert("layers.0.input_layernorm.weight".to_string(), dummy_weight("layers.0.input_layernorm.weight"));
+        registry.tensors.insert("layers.0.post_attention_layernorm.weight".to_string(), dummy_weight("layers.0.post_attention_layernorm.weight"));
+        for sub in ["linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight", "linear_attn.conv1d.weight", "linear_attn.x_proj_weight.weight", "linear_attn.dt_proj_weight.weight", "linear_attn.out_proj_weight.weight"] {
+            registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
+        }
+        for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
+            registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
+        }
+        let result = build_main_layers(&mut registry, &config);
+        assert!(result.is_ok());
+        assert!(registry.layers[0].gdn.is_some());
+        let gdn = registry.layers[0].gdn.as_ref().unwrap();
+        assert_eq!(gdn.in_proj_a.name, "layers.0.linear_attn.in_proj_a.weight");
+        assert_eq!(gdn.out_proj_weight.name, "layers.0.linear_attn.out_proj_weight.weight");
+    }
+
+    #[test]
+    fn build_main_layers_extracts_scalar_weights() {
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":1,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"layer_types":["linear_attention"]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert("embed_tokens.weight".to_string(), dummy_weight("embed_tokens.weight"));
+        registry.tensors.insert("norm.weight".to_string(), dummy_weight("norm.weight"));
+        registry.tensors.insert("lm_head.weight".to_string(), dummy_weight("lm_head.weight"));
+        registry.tensors.insert("layers.0.input_layernorm.weight".to_string(), dummy_weight("layers.0.input_layernorm.weight"));
+        registry.tensors.insert("layers.0.post_attention_layernorm.weight".to_string(), dummy_weight("layers.0.post_attention_layernorm.weight"));
+        for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.x_proj_weight.weight", "gdn.dt_proj_weight.weight", "gdn.out_proj_weight.weight"] {
+            registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
+        }
+        for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
+            registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
+        }
+        let result = build_main_layers(&mut registry, &config);
+        assert!(result.is_ok());
+        assert!(registry.embedding.is_some());
+        assert!(registry.norm.is_some());
+        assert!(registry.lm_head.is_some());
+        assert_eq!(registry.embedding.as_ref().unwrap().name, "embed_tokens.weight");
+        assert_eq!(registry.norm.as_ref().unwrap().name, "norm.weight");
+        assert_eq!(registry.lm_head.as_ref().unwrap().name, "lm_head.weight");
+        // Tensors removed from flat map (not cloned)
+        assert!(!registry.tensors.contains_key("embed_tokens.weight"));
+        assert!(!registry.tensors.contains_key("norm.weight"));
+        assert!(!registry.tensors.contains_key("lm_head.weight"));
+    }
+
+    #[test]
+    fn load_model_populates_layers() {
+        // Integration test: strip + build_main_layers correctly populates the registry.
+        // We test the pipeline without needing actual safetensors files.
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":2,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"layer_types":["linear_attention","full_attention"]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+        let mut registry = WeightRegistry::new();
+        // Simulate what happens after safetensors loading: tensors have model.language_model. prefix
+        registry.tensors.insert("model.language_model.layers.0.input_layernorm.weight".to_string(), dummy_weight("model.language_model.layers.0.input_layernorm.weight"));
+        registry.tensors.insert("model.language_model.layers.0.post_attention_layernorm.weight".to_string(), dummy_weight("model.language_model.layers.0.post_attention_layernorm.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.in_proj_a.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.in_proj_a.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.in_proj_b.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.in_proj_b.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.conv1d.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.conv1d.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.x_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.x_proj_weight.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.dt_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.dt_proj_weight.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.out_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.out_proj_weight.weight"));
+        registry.tensors.insert("model.language_model.layers.0.mlp.gate_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.gate_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.0.mlp.up_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.up_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.0.mlp.down_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.down_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.input_layernorm.weight".to_string(), dummy_weight("model.language_model.layers.1.input_layernorm.weight"));
+        registry.tensors.insert("model.language_model.layers.1.post_attention_layernorm.weight".to_string(), dummy_weight("model.language_model.layers.1.post_attention_layernorm.weight"));
+        registry.tensors.insert("model.language_model.layers.1.self_attn.q_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.self_attn.q_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.self_attn.k_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.self_attn.k_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.self_attn.v_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.self_attn.v_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.self_attn.o_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.self_attn.o_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.mlp.gate_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.mlp.gate_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.mlp.up_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.mlp.up_proj.weight"));
+        registry.tensors.insert("model.language_model.layers.1.mlp.down_proj.weight".to_string(), dummy_weight("model.language_model.layers.1.mlp.down_proj.weight"));
+        registry.tensors.insert("model.language_model.embed_tokens.weight".to_string(), dummy_weight("model.language_model.embed_tokens.weight"));
+        registry.tensors.insert("model.language_model.norm.weight".to_string(), dummy_weight("model.language_model.norm.weight"));
+        registry.tensors.insert("model.language_model.lm_head.weight".to_string(), dummy_weight("model.language_model.lm_head.weight"));
+        // Visual tensor that should be removed
+        registry.tensors.insert("model.visual.patch_embed.proj.weight".to_string(), dummy_weight("model.visual.patch_embed.proj.weight"));
+        // Simulate strip_language_model_prefix then build_main_layers
+        strip_language_model_prefix(&mut registry);
+        let result = build_main_layers(&mut registry, &config);
+        assert!(result.is_ok(), "build_main_layers should succeed");
+        assert_eq!(registry.layers.len(), 2);
+        assert!(registry.embedding.is_some());
+        assert!(registry.norm.is_some());
+        assert!(registry.lm_head.is_some());
+        assert!(registry.layers[0].gdn.is_some());
+        assert!(registry.layers[1].attn.is_some());
+        // Visual tensor should be gone
+        assert!(!registry.tensors.contains_key("model.visual.patch_embed.proj.weight"));
+        // Old prefixed keys should be gone
+        assert!(!registry.tensors.contains_key("model.language_model.layers.0.input_layernorm.weight"));
     }
 }

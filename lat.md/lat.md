@@ -136,6 +136,10 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 - MemoryBudget calculator for VRAM estimation across quantization formats
 - LayerType enum with default pattern (every 4th layer full attention, rest GDN)
 - QuantizationConfig parsing from `quantization_config.json` or embedded config
+- `strip_language_model_prefix()` strips `model.language_model.` prefix from tensor names and removes `model.visual.*` tensors for Qwen3.6 multimodal models
+- `build_main_layers()` populates `WeightRegistry.layers`, `embedding`, `norm`, `lm_head` from the flat tensor map using `HashMap::remove()` (not clone) to halve memory usage
+- `build_mtp_weights()` populates `WeightRegistry.mtp` from MTP tensor map
+- `get_weight()` helper uses `remove()` to transfer ownership from flat map to structured fields, avoiding expensive clones of large tensors
 
 # Phase 4.5 Deliverables
 Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for attention softmax, KV cache management, and Gated DeltaNet state updates, and wires them into the prefill/decode paths.
