@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::gemm::{GemmConfig, GemmEngine};
+use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::{CudaSlice, CudaStream};
 use infers_model::{LayerType, LayerWeights, ModelConfig, WeightRegistry};
@@ -66,7 +66,8 @@ pub fn forward_layer_pass(
     let partial_rotary_factor = config.partial_rotary_factor;
 
     // Norm1 (pre-attention/GDN)
-    let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
+    let norm1_weight = cache.get_bf16(&layer.norm1.name)
+        .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
     let norm1_out = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -127,7 +128,8 @@ pub fn forward_layer_pass(
     let mut hidden = add::add(stream, &kernels.add, input, &attn_or_gdn_out)?;
 
     // Norm2 (pre-MLP)
-    let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
+    let norm2_weight = cache.get_bf16(&layer.norm2.name)
+        .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", layer.norm2.name))?;
     let norm2_out = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -139,9 +141,12 @@ pub fn forward_layer_pass(
 
     // MLP
     let mlp_weights = &layer.mlp;
-    let gate_proj = crate::upload::upload_weight(stream, &mlp_weights.gate_proj)?;
-    let up_proj = crate::upload::upload_weight(stream, &mlp_weights.up_proj)?;
-    let down_proj = crate::upload::upload_weight(stream, &mlp_weights.down_proj)?;
+    let gate_proj = cache.get_bf16(&mlp_weights.gate_proj.name)
+        .ok_or_else(|| anyhow::anyhow!("gate_proj weight '{}' not in cache", mlp_weights.gate_proj.name))?;
+    let up_proj = cache.get_bf16(&mlp_weights.up_proj.name)
+        .ok_or_else(|| anyhow::anyhow!("up_proj weight '{}' not in cache", mlp_weights.up_proj.name))?;
+    let down_proj = cache.get_bf16(&mlp_weights.down_proj.name)
+        .ok_or_else(|| anyhow::anyhow!("down_proj weight '{}' not in cache", mlp_weights.down_proj.name))?;
     let mlp_out = mlp::mlp_forward(
         gemm,
         stream,
@@ -199,7 +204,8 @@ pub fn full_forward_logits(
     // Embed single token
     let embed_weight = weights.embedding.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-    let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
+    let embed_table = cache.get_bf16(&embed_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
 
     let mut hidden = embedding::embed_tokens(
         stream,
@@ -230,7 +236,8 @@ pub fn full_forward_logits(
     // Final norm
     let final_norm_weight = weights.norm.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-    let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
+    let final_norm_gpu = cache.get_bf16(&final_norm_weight.name)
+        .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
     let hidden = norm::rms_norm(
         stream,
         &kernels.rmsnorm,
@@ -246,28 +253,22 @@ pub fn full_forward_logits(
     let lm_head_weight = weights.lm_head.as_ref()
         .or_else(|| weights.embedding.as_ref())
         .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-    let lm_head_gpu = crate::upload::upload_weight(stream, lm_head_weight)?;
 
     let mut logits = stream
         .alloc_zeros::<bf16>(config.vocab_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: config.vocab_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
+    crate::gemm_dispatch::gemm_projection_cached(
+        gemm,
+        &kernels.int4_gemm,
+        stream,
+        cache,
+        &lm_head_weight.name,
         &hidden,
-        &lm_head_gpu,
         &mut logits,
+        1,
+        config.vocab_size,
+        hidden_size,
+        128, // group_size
     )?;
 
     Ok(logits)
