@@ -1042,6 +1042,7 @@ dependencies = [
  "infers-kv",
  "infers-model",
  "infers-mtp",
+ "infers-tokenizer",
  "tracing",
 ]
 

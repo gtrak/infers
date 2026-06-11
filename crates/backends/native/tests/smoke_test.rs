@@ -7,10 +7,9 @@
 //! - ~30s to load model and run inference
 //!
 //! Run with: cargo test --package infers-backend-native --test smoke_test smoke_test_real_model -- --ignored --nocapture
-use std::time::Instant;
-
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
@@ -127,22 +126,41 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     // 11. Get a stream for external API calls (ignored internally by TP path)
     let external_stream = runtime.default_stream(0)?;
 
-    // 12. Run prefill with BOS token
-    let token_ids = vec![151644u32]; // BOS/im_start token for Qwen3.5
+    // 12. Tokenize a prompt and run prefill
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = if tokenizer_path.exists() {
+        Some(infers_tokenizer::Tokenizer::from_file(tokenizer_path.to_str().unwrap())?)
+    } else {
+        None
+    };
+    let prompt = if tokenizer.is_some() {
+        // Format as a chat message for Qwen3
+        "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n".to_string()
+    } else {
+        String::new()
+    };
+    let token_ids: Vec<u32> = if let Some(ref tok) = tokenizer {
+        tok.encode(&prompt)?
+    } else {
+        vec![151644u32]
+    };
+    eprintln!("Prompt tokens ({}): {:?}", token_ids.len(), &token_ids[..5.min(token_ids.len())]);
     let prefill_start = Instant::now();
     let pages_used = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
     let prefill_elapsed = prefill_start.elapsed();
     eprintln!("Prefill completed: {} pages used, {:.3}s", pages_used, prefill_elapsed.as_secs_f64());
 
-    // 13. Run decode for 10 steps
+    // 13. Run decode for 30 steps to get a coherent response
+    let mut generated_tokens: Vec<u32> = Vec::new();
     let mut token = token_ids[0];
     let mut total_decode_time = std::time::Duration::ZERO;
-    for step in 0..10 {
+    for step in 0..30 {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
         token = engine.decode_paged(&external_stream, token, pos, seq_id)?;
         let decode_elapsed = decode_start.elapsed();
         total_decode_time += decode_elapsed;
+        generated_tokens.push(token);
         eprintln!("Decode step {}: token={}, {:.3}s", step, token, decode_elapsed.as_secs_f64());
         assert!(
             token < config.vocab_size as u32,
@@ -152,18 +170,27 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
             step
         );
     }
+    let num_decode = generated_tokens.len();
     eprintln!(
         "Total decode time: {:.3}s, avg per step: {:.3}s",
         total_decode_time.as_secs_f64(),
-        total_decode_time.as_secs_f64() / 10.0,
+        total_decode_time.as_secs_f64() / num_decode as f64,
     );
 
+    // 14. Decode tokens to text
+    if let Some(ref tok) = tokenizer {
+        let text = tok.decode(&generated_tokens)?;
+        eprintln!("Decoded text ({} tokens): {}", generated_tokens.len(), text.trim());
+    }
+
     eprintln!(
-        "Smoke test PASSED: {} tokens generated | Engine: {:.2}s | Prefill: {:.3}s | Decode avg: {:.3}s/step",
-        1 + 10,
+        "Smoke test PASSED: {} generated tokens ({} prompt + {} decode) | Engine: {:.2}s | Prefill: {:.3}s | Decode avg: {:.3}s/step",
+        generated_tokens.len(),
+        token_ids.len(),
+        generated_tokens.len(),
         engine_elapsed.as_secs_f64(),
         prefill_elapsed.as_secs_f64(),
-        total_decode_time.as_secs_f64() / 10.0,
+        total_decode_time.as_secs_f64() / num_decode as f64,
     );
     Ok(())
 }

@@ -14,3 +14,6 @@ infers-mtp = { path = "../../mtp" }
 bytes = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+infers-tokenizer = { path = "../../tokenizer" }
