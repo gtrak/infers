@@ -24,6 +24,7 @@ pub mod upload;
 pub mod eviction;
 pub mod quant;
 pub mod gemm_dispatch;
+pub mod gpu_cache;
 
 pub use engine::ForwardEngine;
 pub use eviction::BackendEvictionStore;

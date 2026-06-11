@@ -513,7 +513,7 @@ Uses `MtpOperations` callbacks (embed, rms_norm, forward_layer, lm_head, sample,
 See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_mtp]].
 
 ## Module Structure
-Fourteen modules cover forward-pass operations, including eviction for memory pressure handling: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction, gemm_dispatch.
+Fifteen modules cover forward-pass operations, including GPU weight caching for Phase 4.7: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction, gemm_dispatch, gpu_cache.
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -532,7 +532,14 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
 | `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization; detects transposed [K/8, N] layout via `shape[0] * 8 == K` and passes `transposed` flag to `Int4GemmConfig` |
+| `gpu_cache` | GPU-resident weight cache: `CachedWeight` enum (Bf16 or Int4 variants), `Int4GpuBuffers` for qweight/scales/qzeros, `GpuWeightCache` HashMap keyed by tensor name with typed accessors (`get_bf16`, `get_int4`) |
 
+### GPU Weight Cache
+Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]].
+
+`CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.transposed` flag records whether the weight uses transposed layout (shape\[0\]*8 == K) for GEMM dispatch.
+
+`GpuWeightCache` wraps a `HashMap<String, CachedWeight>` and provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
 
 ### Attention Forward Pass
 
