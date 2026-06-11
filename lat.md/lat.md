@@ -532,14 +532,14 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
 | `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization; detects transposed [K/8, N] layout via `shape[0] * 8 == K` and passes `transposed` flag to `Int4GemmConfig` |
-| `gpu_cache` | GPU-resident weight cache: `CachedWeight` enum (Bf16 or Int4 variants), `Int4GpuBuffers` for qweight/scales/qzeros, `GpuWeightCache` HashMap keyed by tensor name with typed accessors (`get_bf16`, `get_int4`) |
+| `gpu_cache` | GPU-resident weight cache: `CachedWeight` enum (Bf16 or Int4 variants), `Int4GpuBuffers` for qweight/scales/qzeros with shape info, `GpuWeightCache::new()` uploads all weights from `WeightRegistry`, typed accessors (`get_bf16`, `get_int4`) |
 
 ### GPU Weight Cache
 Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]].
 
-`CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.transposed` flag records whether the weight uses transposed layout (shape\[0\]*8 == K) for GEMM dispatch.
+`CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 
-`GpuWeightCache` wraps a `HashMap<String, CachedWeight>` and provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
+`GpuWeightCache::new()` iterates every tensor in a `WeightRegistry`, classifies by dtype (BF16/Fp16/Fp32 → `CachedWeight::Bf16`; Int4Packed → `CachedWeight::Int4` with companions lookup), and uploads to GPU. Unsupported dtypes are skipped with a warning. The cache provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
 
 ### Attention Forward Pass
 
