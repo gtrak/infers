@@ -24,6 +24,7 @@ pub struct InferenceOrchestrator {
     /// GPU inference engine (forward pass).
     engine: ForwardEngine,
     /// Per-layer evicted page data store.
+    #[allow(dead_code)]
     eviction_store: BackendEvictionStore,
     /// CUDA stream for GPU kernel launches.
     stream: Arc<CudaStream>,
@@ -34,12 +35,16 @@ pub struct InferenceOrchestrator {
     /// Counter for assigning unique routing IDs.
     next_routing_id: usize,
     /// Number of transformer layers (for eviction store).
+    #[allow(dead_code)]
     num_layers: usize,
     /// Whether MTP speculative decoding is enabled.
+    #[allow(dead_code)]
     enable_mtp: bool,
     /// MTP speculative decoding engine (optional).
+    #[allow(dead_code)]
     mtp: Option<infers_mtp::MtpEngine>,
     /// MTP metrics tracker (optional).
+    #[allow(dead_code)]
     mtp_metrics: Option<infers_mtp::MtpMetrics>,
 }
 
@@ -233,16 +238,19 @@ impl InferenceOrchestrator {
     }
 
     /// Number of active sessions.
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.scheduler.active_count()
     }
 
     /// Number of pending (not yet admitted) requests.
+    #[allow(dead_code)]
     pub fn pending_count(&self) -> usize {
         self.scheduler.pending_count()
     }
 
     /// Whether the orchestrator has any work pending or in progress.
+    #[allow(dead_code)]
     pub fn is_busy(&self) -> bool {
         self.scheduler.is_busy()
     }

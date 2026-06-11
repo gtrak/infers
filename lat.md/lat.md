@@ -865,6 +865,18 @@ Two bugs fixed in both `gdn_update.cu` and `gdn_prefill.cu`:
 1. **Non-power-of-2 reduction** (MINOR): Host wrappers used `hidden_size` directly as block size, causing tree reduction to silently drop tail elements for non-power-of-2 hidden sizes. Fixed by restructuring kernels: `__global__` kernels are now placed inside `extern "C"` with names matching the registry (`infers_gdn_update_bf16`, `infers_gdn_prefill_bf16`), eliminating host wrappers. Rust-side launch configuration computes power-of-2 block sizes. Reduction loops use `tid + stride < blockDim.x` bounds checks.
 2. **Kernel name mismatch** (CRITICAL): `LoadedKernelRegistry` registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
 
+
+## Dead Code Cleanup
+
+Post-Phase 10 cleanup removed dead code and annotated deferred-feature fields with `#[allow(dead_code)]` to eliminate all compiler warnings in the server crate.
+
+### Chat Handler Dead Code
+
+`generate_id()` function removed from `chat_completions` handler. This function was used by removed mock functions. The handler now uses `routing_id` from the orchestrator for IDs. See [[crates/server/src/handlers/chat.rs]].
+
+### Orchestrator Deferred Fields
+
+Five deferred-feature fields and three monitoring methods in `InferenceOrchestrator` are annotated with `#[allow(dead_code)]`. Paged eviction and MTP speculative decoding support is deferred. See [[crates/server/src/orchestrator.rs#InferenceOrchestrator]].
 # Memory Budget
 
 Memory budget calculator for estimating VRAM requirements across different quantization formats and parallelism configurations.
