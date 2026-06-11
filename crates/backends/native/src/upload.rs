@@ -43,27 +43,32 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
     match dtype {
         WeightDtype::Bf16 => {
             // 2 bytes per bf16 value, little-endian
-            Ok(data.chunks_exact(2)
-                .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-                .collect())
+            let count = data.len() / 2;
+            let mut result = Vec::with_capacity(count);
+            for chunk in data.chunks_exact(2) {
+                result.push(bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
+            }
+            Ok(result)
         }
         WeightDtype::Fp16 => {
             // 2 bytes per f16 value → convert to bf16
-            Ok(data.chunks_exact(2)
-                .map(|chunk| {
-                    let f16_val = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
-                    bf16::from_f32(f16_val.to_f32())
-                })
-                .collect())
+            let count = data.len() / 2;
+            let mut result = Vec::with_capacity(count);
+            for chunk in data.chunks_exact(2) {
+                let f16_val = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                result.push(bf16::from_f32(f16_val.to_f32()));
+            }
+            Ok(result)
         }
         WeightDtype::Fp32 => {
             // 4 bytes per f32 value → convert to bf16
-            Ok(data.chunks_exact(4)
-                .map(|chunk| {
-                    let f32_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    bf16::from_f32(f32_val)
-                })
-                .collect())
+            let count = data.len() / 4;
+            let mut result = Vec::with_capacity(count);
+            for chunk in data.chunks_exact(4) {
+                let f32_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                result.push(bf16::from_f32(f32_val));
+            }
+            Ok(result)
         }
         _ => {
             anyhow::bail!(

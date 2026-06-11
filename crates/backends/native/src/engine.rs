@@ -161,17 +161,28 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
         };
 
-        // Build GPU-resident weight caches for each GPU
-        let mut weight_caches = Vec::with_capacity(num_gpus);
+        // Build GPU-resident weight caches for each GPU in parallel
+        let mut handles = Vec::with_capacity(num_gpus);
         for gpu_idx in 0..num_gpus {
             let gpu_stream = streams.get(gpu_idx).unwrap().clone();
-            let cache = GpuWeightCache::new(&gpu_stream, &weights[gpu_idx])?;
-            tracing::info!(
-                "GPU {}: cached {} weights",
-                gpu_idx, cache.len()
-            );
-            weight_caches.push(cache);
+            let registry = weights[gpu_idx].clone(); // cheap clone (Bytes is Arc-based)
+            handles.push(std::thread::spawn(move || {
+                let result = GpuWeightCache::new(&gpu_stream, &registry);
+                (gpu_idx, result)
+            }));
         }
+
+        let mut weight_caches: Vec<Option<GpuWeightCache>> = (0..num_gpus).map(|_| None).collect();
+        for handle in handles {
+            let (gpu_idx, result) = handle.join().expect("Weight cache thread panicked");
+            let cache = result?;
+            tracing::info!("GPU {}: cached {} weights", gpu_idx, cache.len());
+            weight_caches[gpu_idx] = Some(cache);
+        }
+        // Unwrap now that all are filled
+        let weight_caches: Vec<GpuWeightCache> = weight_caches.into_iter()
+            .map(|c| c.expect("All weight caches should be filled"))
+            .collect();
 
         // Initialize per-GPU, per-layer caches and states
         let num_layers = config.num_hidden_layers;
