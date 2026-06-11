@@ -376,6 +376,41 @@ Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
 - Stress tests and benchmark suite
 
+# Phase 4.7 Deliverables
+Phase 4.7 (GPU-Resident Weight Cache) eliminates per-GEMM weight upload overhead by caching dequantized weights as GPU-resident buffers, reducing inference latency significantly. See `plan/phase-4.7-gpu-weight-cache.md` for the full design document.
+
+## GpuWeightCache
+Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. Supports both BF16 weights and INT4 quantized weights (qweight + scales + qzeros). See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]].
+
+## Cached GEMM Dispatch
+Replaces `gemm_projection` at call-sites by looking up weights from the cache instead of re-uploading per forward pass. Sees [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
+## Engine Integration
+`ForwardEngine` holds one `GpuWeightCache` per GPU, built at construction time. Attention functions now accept the cache and look up norm weights via `cache.get_bf16()` instead of uploading per-call. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+
+## Completed
+Tasks implemented so far in Phase 4.7 GPU weight cache migration.
+
+- `GpuWeightCache` struct with BF16 and INT4 weight caching
+- One-time weight upload at `ForwardEngine` construction via `GpuWeightCache::new()`
+- `gemm_projection_cached` dispatch for cached GEMM projections
+- `forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
+- `decode_forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
+- Engine call sites updated to pass `&self.weight_caches[gpu_idx]`
+- Phase 3 per-head code in `forward_paged` preserved (still uses `weight_to_bf16_wd` + `int4_companions`)
+
+## Remaining
+Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
+
+- Replace `gemm_projection` in flat-cache `forward` and `decode_forward` functions (prefill.rs, decode.rs)
+- Replace `gemm_projection` in GDN forward functions
+- Handle embedding table and LM head caching at engine level (already done partially — embed_table looked up via cache)
+- Replace `upload_weight` calls for norm weights in prefill/decode paths
+- GDN SSM parameters caching
+- Remove Phase 3 per-head code from `forward_paged` (remove `int4_companions` parameter)
+- Memory budget validation: assert weights + KV cache + temps fit in GPU memory
+- Benchmark before/after tokens/sec
+
 # Phase 4 Deliverables
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
 

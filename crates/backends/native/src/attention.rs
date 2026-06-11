@@ -17,6 +17,7 @@ use infers_model::{AttentionWeights, Int4Companions, WeightData, WeightDtype};
 use infers_kv::KvCacheDtype;
 
 use crate::add;
+use crate::gpu_cache::GpuWeightCache;
 use crate::rope;
 
 /// Block size used by paged attention kernels.
@@ -1362,7 +1363,8 @@ pub fn forward_paged(
     rope_theta: f64,
     partial_rotary_factor: f32,
     rms_norm_eps: f32,
-    group_size: usize,
+   group_size: usize,
+    cache: &GpuWeightCache,
     int4_companions: &HashMap<String, Int4Companions>,
     hidden_size: usize,
     attn_output_gate: bool,
@@ -1385,25 +1387,26 @@ pub fn forward_paged(
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.k_proj, input, &mut k_full,
-        seq_len, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.k_proj.name, input, &mut k_full,
+        seq_len, kv_dim, hidden_size, group_size,
     )?;
 
     // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut v_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.v_proj, input, &mut v_full,
-        seq_len, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.v_proj.name, input, &mut v_full,
+        seq_len, kv_dim, hidden_size, group_size,
     )?;
 
     // --- K-norm on full K before Phase 1 RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
-        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_full = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -1457,15 +1460,16 @@ pub fn forward_paged(
     let mut q_full = stream
         .alloc_zeros::<bf16>(seq_len * q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.q_proj, input, &mut q_full,
-        seq_len, q_out_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.q_proj.name, input, &mut q_full,
+        seq_len, q_out_dim, hidden_size, group_size,
     )?;
 
     // --- Q-norm on full Q before RoPE ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
-        let q_norm_gpu = crate::upload::upload_weight(stream, q_norm_w)?;
+        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
         q_full = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -1738,10 +1742,10 @@ pub fn forward_paged(
     let mut output = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.o_proj, &gated_attn, &mut output,
-        seq_len, hidden_size, per_gpu_head_dim, group_size, int4_companions,
+        cache, &weights.o_proj.name, &gated_attn, &mut output,
+        seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
 
     Ok(output)
@@ -1783,6 +1787,7 @@ pub fn decode_forward_paged(
     partial_rotary_factor: f32,
     rms_norm_eps: f32,
     group_size: usize,
+    cache: &GpuWeightCache,
     int4_companions: &HashMap<String, Int4Companions>,
     hidden_size: usize,
     attn_output_gate: bool,
@@ -1804,25 +1809,26 @@ pub fn decode_forward_paged(
     let mut k_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.k_proj, input, &mut k_single,
-        1, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.k_proj.name, input, &mut k_single,
+        1, kv_dim, hidden_size, group_size,
     )?;
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.v_proj, input, &mut v_single,
-        1, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.v_proj.name, input, &mut v_single,
+        1, kv_dim, hidden_size, group_size,
     )?;
 
     // --- K-norm on full K before RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
-        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -1873,15 +1879,16 @@ pub fn decode_forward_paged(
     let mut q_full = stream
         .alloc_zeros::<bf16>(q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.q_proj, input, &mut q_full,
-        1, q_out_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.q_proj.name, input, &mut q_full,
+        1, q_out_dim, hidden_size, group_size,
     )?;
 
     // --- QK-norm on full Q before RoPE ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
-        let q_norm_gpu = crate::upload::upload_weight(stream, q_norm_w)?;
+        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
         q_full = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -1989,10 +1996,10 @@ pub fn decode_forward_paged(
     let mut output = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.o_proj, &gated_attn, &mut output,
-        1, hidden_size, per_gpu_head_dim, group_size, int4_companions,
+        cache, &weights.o_proj.name, &gated_attn, &mut output,
+        1, hidden_size, per_gpu_head_dim, group_size,
     )?;
 
     Ok(output)

@@ -543,7 +543,7 @@ impl ForwardEngine {
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx], &positions,
                             head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
                             config.rope_theta, config.partial_rotary_factor,
-                            config.rms_norm_eps, self.group_size, &w.int4_companions,
+                            config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx], &w.int4_companions,
                             config.hidden_size,
                             config.attn_output_gate,
                         )?
@@ -826,7 +826,7 @@ for layer_idx in 0..config.num_hidden_layers {
                             position, num_cached_tokens,
                             head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
                             config.rope_theta, config.partial_rotary_factor,
-                            config.rms_norm_eps, self.group_size, &w.int4_companions,
+                            config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx], &w.int4_companions,
                             config.hidden_size,
                             config.attn_output_gate,
                         )?
