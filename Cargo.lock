@@ -1036,6 +1036,7 @@ name = "infers-backend-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "half",
  "infers-cuda",
  "infers-kv",
@@ -1079,6 +1080,7 @@ name = "infers-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "memmap2",
  "safetensors",
  "serde",

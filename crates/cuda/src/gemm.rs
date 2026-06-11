@@ -143,6 +143,9 @@ where
 ///
 /// Weights are stored in INT4-packed format with per-group scale
 /// and zero-point. Dequantization happens on-the-fly in registers.
+///
+/// Note: K must be divisible by group_size for the INT4 path.
+/// For the BF16 (cuBLASLt) path, K can be any value.
 #[derive(Debug, Clone)]
 pub struct Int4GemmConfig {
     /// M dimension (rows of output from input).

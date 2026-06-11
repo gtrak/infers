@@ -87,8 +87,8 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | `kv_cache.cu` | `infers_kv_cache_write_bf16` | Scattered KV cache write using position IDs: writes K and V rows into cache at arbitrary positions via strided thread loops |
 | `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
 | `gdn_prefill.cu` | `infers_gdn_prefill_bf16` | Gated DeltaNet prefill kernel: processes all tokens in a sequence sequentially within each block, updating state and writing per-token output via shared memory reduction |
-| `gdn_mamba2_prefill.cu` | `infers_gdn_mamba2_prefill_bf16` | Mamba2 SSM prefill kernel: element-wise SSM recurrence with softplus delta, state update, SiLU gating — one thread per state element, sequential token loop, no shared memory |
-| `gdn_mamba2_update.cu` | `infers_gdn_mamba2_update_bf16` | Mamba2 SSM decode kernel: single-token state update with sigmoid decay, softplus delta, SiLU gating — one thread per state element, no token loop, no shared memory |
+| `gdn_mamba2_prefill.cu` | `infers_gdn_mamba2_prefill_bf16` | Mamba2 SSM prefill kernel: element-wise SSM recurrence with softplus delta, state update, SiLU gating — one thread per total_dim element (total_dim = num_heads × head_dim), per-head signals (x_proj, b_proj, A_log, dt_bias) broadcast across head_dim, sequential token loop, no shared memory |
+| `gdn_mamba2_update.cu` | `infers_gdn_mamba2_update_bf16` | Mamba2 SSM decode kernel: single-token state update with sigmoid decay, softplus delta, SiLU gating — one thread per total_dim element (total_dim = num_heads × head_dim), per-head signals broadcast across head_dim, no token loop, no shared memory |
 | `paged_kv_write.cu` | `infers_paged_kv_write_bf16` | Paged KV cache write using block-table address translation: writes K and V into interleaved per-page layout via strided thread loops, eliminating CPU round-trips during prefill |
 | `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 | `paged_attention_decode.cu` | `infers_paged_attention_decode_bf16` | Paged attention decode: computes single-token attention over paged KV cache using two-pass online softmax and weighted V accumulation, one block per KV head — Phase 1 uses strided dot-product computation, Phase 2 loops over all tokens per thread |
@@ -321,8 +321,8 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `quant` module: `KvCacheDtype` enum (Bf16, Fp8E4M3, Fp8E5M2, Nvfp4) with `bytes_per_element()`, 5 unit tests; `QuantizedKvCache` struct with `allocate()` for GPU-side quantized page pool allocation; public FP8 CPU reference helpers (`quantize_fp8_e4m3`, `dequantize_fp8_e4m3`, `quantize_fp8_e5m2`, `dequantize_fp8_e5m2`) and private conversion helpers, 6 unit tests for FP8 roundtrips; CPU-bound `write_fp8()`/`read_fp8()` methods removed — replaced by GPU-native kernels in `infers-backend-native`
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
-- `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension
-- `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection), `forward_paged` (paged KV write + per-head GEMM attention), `fp8_quantize_and_write` and `fp8_dequantize_and_read` (GPU-native FP8 quantize/dequantize using CUDA kernels — no CPU round-trip)
+- `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension. Supports GQA via outer loop over `num_query_heads / num_kv_heads` query heads per block.
+- `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection; supports GQA with `num_query_heads` param), `forward_paged` (paged KV write + per-head GEMM attention; supports GQA via `head_idx % num_kv_heads` for K/V weight extraction), `fp8_quantize_and_write` and `fp8_dequantize_and_read` (GPU-native FP8 quantize/dequantize using CUDA kernels — no CPU round-trip)
 - `infers-backend-native` now depends on `infers-kv` crate
 - `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
 - Engine integration: `ForwardEngine` has 19 kernel handles (including `fp8_quantize_kernel`, `fp8_dequantize_kernel`, `gdn_mamba2_update_kernel`), `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`, `fp8_quantize_and_write()`, `fp8_dequantize_and_read()`
@@ -352,19 +352,23 @@ Three dispatch functions for paged attention CUDA kernels.
 
 `paged_kv_read()` launches `infers_paged_kv_read_bf16` with grid `(num_cached_tokens * kv_dim + 255) / 256`, block `(256, 1, 1)` — gathers K and V from page pool into contiguous output buffers for GEMM consumption. See [[crates/backends/native/src/attention.rs#paged_kv_read]].
 
-`paged_attention_decode()` launches `infers_paged_attention_decode_bf16` with grid `(num_kv_heads, 1, 1)`, block `(256, 1, 1)`, shared memory `3 * 256 * 4 = 3072` bytes — one block per KV head, computes full decode attention (score, softmax, V accumulation) in a single kernel call. See [[crates/backends/native/src/attention.rs#paged_attention_decode]].
+`paged_attention_decode()` launches `infers_paged_attention_decode_bf16` with grid `(num_kv_heads, 1, 1)`, block `(256, 1, 1)`, shared memory `3 * 256 * 4 = 3072` bytes — one block per KV head, computes full decode attention (score, softmax, V accumulation) in a single kernel call. Supports GQA via `num_query_heads` parameter: each block loops over `num_query_heads / num_kv_heads` query heads sequentially, reloading Q into shared memory per iteration. See [[crates/backends/native/src/attention.rs#paged_attention_decode]].
 
 ### Paged Decode Forward
 
-Zero CPU round-trip decode attention. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].
+Zero CPU round-trip decode attention with GQA support. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].
 
-Computes single-token K/V via GEMM, applies RoPE, writes to paged cache, computes Q with RoPE, launches paged attention decode kernel for full attention computation, then applies O-projection via a single GEMM. Replaces the per-head loop that required CPU download/re-upload of KV cache data.
+Computes single-token K/V via GEMM, applies RoPE, writes to paged cache, computes full Q (hidden_size) with RoPE, launches paged attention decode kernel (num_query_heads output), then applies O-projection via a single GEMM. Replaces the per-head loop that required CPU download/re-upload of KV cache data.
 
 ### Paged Prefill Forward
 
-Prefill with paged KV cache write. See [[crates/backends/native/src/attention.rs#forward_paged]].
+Prefill with paged KV cache write and GQA support. See [[crates/backends/native/src/attention.rs#forward_paged]].
 
-Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once).
+Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once). For GQA, K and V weight extraction uses `head_idx % num_kv_heads` so multiple query heads share the same KV head.
+
+### Attention Output Gate
+
+When `attn_output_gate` is true, the Q output is doubled (Q + gate). The GEMM produces `[seq, heads*dim*2]`, split into Q and gate buffers. After attention, `infers_silu_glu_bf16` computes `out = attn * sigmoid(gate)`.
 
 ## Remaining
 
@@ -379,9 +383,9 @@ Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full
 Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode inference. `prefill()` and `decode()` delegate to module-level functions with cached kernel handles and per-layer KV/GDN state vectors.
 
 ### Engine Structure
-`ForwardEngine` holds config, weights, 16 cached `CudaFunction` handles, GemmEngine, NcclCommunicator, StreamPool, and paged KV fields.
+`ForwardEngine` holds config, weights, a `Vec<PerGpuKernels>` (one set of 16 `CudaFunction` handles per GPU since kernel handles are context-bound), per-GPU GEMM engines, NcclCommunicator, StreamPool, and paged KV fields.
 
-The struct owns `Option<PagedKvManager>` for the paged system, plus `paged_kv_caches` for per-layer paged caches alongside legacy `kv_caches`. Three paged kernel handles (`paged_kv_write_kernel`, `paged_kv_read_kernel`, `paged_attention_decode_kernel`) are resolved from `LoadedKernelRegistry` at init. `init_paged()` creates the manager and caches. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+The struct owns `Option<PagedKvManager>` for the paged system, plus per-GPU, per-layer paged caches (`paged_kv_caches: Vec<Vec<PagedKvCache>>`), legacy flat caches (`kv_caches: Vec<Vec<KvCache>>`), and GDN states (`gdn_states: Vec<Vec<GdnState>>`). Kernels are loaded on each GPU's context independently at init — `LoadedKernelRegistry::load_all()` is called per-GPU inside a loop over `contexts`, producing one `PerGpuKernels` instance per GPU. In non-paged paths (`prefill`, `decode`) kernel handles come from `per_gpu_kernels[0]`. In paged paths (`prefill_paged`, `decode_paged`), the per-GPU layer loop uses `per_gpu_kernels[gpu_idx]`, while the final norm/LM head outside the loop uses `per_gpu_kernels[0]`. One `GemmEngine` is created per GPU stream. `init_paged()` creates the manager and caches, computing per-GPU kv_dim as `(num_kv_heads / num_gpus) * head_dim`. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Eviction Integration
 
@@ -433,11 +437,27 @@ Key differences from flat `prefill()`: uses `attention::forward_paged` which wri
 
 ### Paged Decode Path
 
-Full decode pipeline using paged KV cache with zero CPU round-trips. See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_paged]].
+Full decode pipeline using paged KV cache with zero CPU round-trips and TP support. See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_paged]].
 
-`decode_paged()` uploads block table and current position to GPU, runs the complete layer loop for a single token: embedding, norm1, layer dispatch (GDN via `gdn::decode_forward` or full attention via `attention::decode_forward_paged`), residual add, norm2, MLP, residual add, final norm, LM head projection, and greedy sampling. Returns the sampled token ID.
+`decode_paged()` uploads block table and position to ALL GPUs via per-GPU streams. Embeds the single token independently on each GPU. Per-GPU sharded head counts are computed as `num_kv_heads / num_gpus`, `num_attention_heads / num_gpus`, and `intermediate_size / num_gpus`. The layer loop runs in phases: (A) attention/GDN per GPU with NCCL all-reduce of outputs, (B) residual add per GPU, (C) MLP with column-parallel gate/up projections and row-parallel down projection, NCCL all-reduce of MLP outputs, (D) residual add per GPU. Final norm + LM head + greedy sampling occur on GPU 0 only.
 
-Key differences from flat `decode()`: uses `attention::decode_forward_paged` which writes the new token to paged cache via `paged_kv_write` kernel, then computes attention entirely on GPU via `paged_attention_decode` kernel — eliminating the CPU download/re-upload bottleneck of the flat cache path.
+### NCCL All-Reduce Grouping
+
+Both `prefill_paged` and `decode_paged` wrap all-reduce loops with `group_start()`/`group_end()` to prevent deadlock.
+
+Without grouping, calling `all_reduce_in_place` sequentially across GPUs deadlocks: rank 0 blocks the CPU thread waiting for rank 1 to also call all-reduce, but rank 1 never starts because the CPU is stuck at rank 0. Grouping batches all collectives and blocks only once at `group_end()` when all ranks' operations are launched concurrently.
+
+Each all-reduce block (attention outputs after phase A, MLP outputs after phase C) is wrapped as:
+
+```rust
+group_start()?;
+for gpu_idx in 0..num_gpus {
+    sync::all_reduce_attention(&self.nccl, &gpu_stream, &mut attn_outputs[gpu_idx])?;
+}
+group_end()?;
+```
+
+Diagnostic `eprintln!` calls mark group boundaries and layer progress (every 8 layers).
 
 ### Multi-Dtype Weight Upload
 
@@ -522,7 +542,7 @@ Full-attention prefill with per-head weight slicing. All projections support INT
 
 **Phase 1 — Full K/V for cache**: Computes full K and V via `gemm_projection` (INT4-aware — routes BF16 to cuBLASLt or INT4 to `infers_int4_gemm`), applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache.
 
-**Phase 2 — Per-head attention**: For each head, computes Q_h/K_h/V_h via sliced weights, applies RoPE, computes attention scores with softmax (causal mask), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd()` dequantizes all four projection weights (Q, K, V, O) once before the head loop, producing BF16 `WeightData` that the existing extraction functions (`extract_head_weight_slice`, `extract_o_proj_head_slice`) can operate on.
+**Phase 2 — Per-head attention**: For each head, computes Q_h/K_h/V_h via sliced weights, applies RoPE, computes attention scores with softmax (causal mask), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd(k)` dequantizes all four projection weights (Q, K, V, O) once before the head loop using the GEMM inner dimension `k` to detect transposed [K/8, N] layout via `shape[0] * 8 == k`, producing BF16 `WeightData` that the existing extraction functions (`extract_head_weight_slice`, `extract_o_proj_head_slice`) can operate on.
 
 
 **Alternating accumulation**: Two GPU buffers accumulate per-head partial O-projection outputs; even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
@@ -541,7 +561,7 @@ Single-token decode attention with per-head weight slicing. Full K/V projections
 
 **Phase 2 — Per-head cache extraction**: Downloads full KV cache from GPU to CPU, extracts per-head K and V buffers by striding through the flat `[max_seq_len × kv_dim]` layout.
 
-**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd()` dequantizes Q and O projection weights once before the head loop, producing BF16 `WeightData` for `extract_head_weight_slice` and `extract_o_proj_head_slice`.
+**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd(k)` dequantizes Q and O projection weights once before the head loop using the GEMM inner dimension `k` to detect transposed [K/8, N] layout via `shape[0] * 8 == k`, producing BF16 `WeightData` for `extract_head_weight_slice` and `extract_o_proj_head_slice`.
 
 Same alternating accumulation pattern as prefill: even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
 
@@ -575,13 +595,13 @@ Gated DeltaNet prefill: Mamba2 SSM kernel with element-wise state recurrence, so
 
 #### Architecture
 
-ssm_dim comes from `in_proj_a` output dimension. Projections may differ in size — `extract_columns()` aligns them to ssm_dim. SSM parameters (A_log, dt_bias) are uploaded to GPU.
+SSM state has `total_dim = num_value_heads × head_dim`. Per-head signals broadcast across head_dim elements. SSM parameters (A_log, dt_bias) are uploaded to GPU.
 
-**Phase 1 — Projections**: GEMM dispatch via `gemm_projection` computes x_proj `[seq, ssm_dim]`, b_proj `[seq, b_dim]`, and z_gate `[seq, z_dim]` (INT4). dt_proj is computed only when `x_proj_weight` is present; otherwise a zero buffer is used (kernel relies on dt_bias). Projections are aligned to ssm_dim.
+**Phase 1 — Projections**: GEMM dispatch via `gemm_projection` computes x_proj `[seq, num_heads]` (per-head scalars), b_proj `[seq, b_dim]`, and z_gate `[seq, total_dim]` (INT4 — all columns kept, no extraction). dt_proj is computed only when `x_proj_weight` is present; otherwise `[seq, total_dim]` zeros are used (kernel relies on dt_bias broadcast). Per-head projections (x_proj, b_proj) are aligned to `num_heads`.
 
-**Phase 2 — State Update**: GDN state is a 1D vector `[ssm_dim]` allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_prefill_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, sequential token loop, no shared memory.
+**Phase 2 — State Update**: GDN state is a 1D vector `[total_dim]` allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_prefill_bf16` kernel runs with `ceil(total_dim/256)` blocks, one thread per total_dim element, sequential token loop, no shared memory. Each thread computes head = idx / head_dim for per-head broadcast indexing.
 
-**Phase 3 — Output Projection**: Final GEMM projects `[seq, ssm_dim]` kernel output through `out_proj_weight` to `[seq, hidden_size]`.
+**Phase 3 — Output Projection**: Final GEMM projects `[seq, total_dim]` kernel output through `out_proj_weight` to `[seq, hidden_size]`.
 
 1D convolution (`conv1d_weight`) and conv1d residual are skipped for initial release.
 
@@ -595,13 +615,13 @@ Gated DeltaNet decode: Mamba2 SSM recurrent single-token state update with sigmo
 
 #### Architecture
 
-ssm_dim is determined by `in_proj_a`'s output dimension. Projections are computed for single token (m=1) and aligned to ssm_dim via `extract_columns_single()`. SSM parameters (A_log, dt_bias) are uploaded to GPU.
+`total_dim = num_value_heads × head_dim`. Per-head signals broadcast across head_dim elements. SSM parameters (A_log, dt_bias) are uploaded to GPU.
 
-**Phase 1 — Projections**: GEMMs (m=1) compute x_proj `[ssm_dim]`, b_proj `[b_dim]`, and z_gate `[z_dim]`. dt_proj is computed only when `x_proj_weight` is present; otherwise a zero buffer is used. Projections are aligned to ssm_dim.
+**Phase 1 — Projections**: GEMMs (m=1) compute x_proj `[num_heads]` (per-head scalars), b_proj `[b_dim]`, and z_gate `[total_dim]` (all columns kept). dt_proj is computed only when `x_proj_weight` is present; otherwise `[total_dim]` zeros. Per-head projections (x_proj, b_proj) are aligned to `num_heads`.
 
-**Phase 2 — State Update**: GDN state `[ssm_dim]` is allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_update_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, no token loop, no shared memory. Unlike prefill, it takes 9 arguments (no `seq_len`).
+**Phase 2 — State Update**: GDN state `[total_dim]` is allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_update_bf16` kernel runs with `ceil(total_dim/256)` blocks, one thread per total_dim element, no token loop, no shared memory. Each thread computes head = idx / head_dim for per-head broadcast indexing.
 
-**Phase 3 — Output Projection**: Final GEMM (m=1) projects `[ssm_dim]` kernel output through `out_proj_weight` to `[hidden_size]`.
+**Phase 3 — Output Projection**: Final GEMM (m=1) projects `[total_dim]` kernel output through `out_proj_weight` to `[hidden_size]`.
 
 1D convolution is skipped, same as prefill.
 
@@ -760,7 +780,7 @@ Parsed from `config.json` with architecture parameters and hybrid attention laye
 
 ### Key Fields
 
-Fields include `num_hidden_layers`, `hidden_size`, `intermediate_size`, `vocab_size`, attention heads, `head_dim`, `max_position_embeddings`, and MTP configuration.
+Architecture parameters: layer count, dimensions, attention heads, MTP, GDN linear attention fields, and `attn_output_gate` for Qwen3.5's doubled Q projection (Q + gate). See [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]].
 
 ### LayerType Enum
 
@@ -788,7 +808,7 @@ Weight storage structures for model weights as raw byte data with shape metadata
 
 ## WeightData
 
-Raw tensor storage holding `Vec<u8>` bytes, shape dimensions, dtype, and tensor name. Weights stay as bytes until CUDA upload time to avoid requiring GPU hardware at load time. See [[crates/model/src/weights.rs#WeightData]].
+Raw tensor storage holding `bytes::Bytes` bytes, shape dimensions, dtype, and tensor name. Weights stay as bytes until CUDA upload time to avoid requiring GPU hardware at load time. See [[crates/model/src/weights.rs#WeightData]].
 
 ## WeightDtype
 
@@ -834,7 +854,15 @@ Weight sharding for tensor parallelism (TP=2) and pipeline parallelism (PP=2).
 
 ## Tensor Parallelism Sharding
 
-`shard_weights_tp()` splits weights across GPUs. Column-parallel tensors are sliced along dim 0, row-parallel along last dim. Norms and embeddings are replicated. See [[crates/model/src/sharding.rs#shard_weights_tp]].
+`shard_weights_tp()` splits weights across GPUs with INT4-aware dimension handling. See [[crates/model/src/sharding.rs#shard_weights_tp]].
+
+### BF16 sharding
+
+BF16 \[N,K\] weights: column-parallel splits dim 0, row-parallel splits dim 1. Norms and embeddings are replicated.
+
+### INT4 sharding
+
+INT4 packed (K/8,N) qweights swap split dimensions because K and N occupy reversed axes: column-parallel splits dim 1 (N), row-parallel splits dim 0 (K/8). Companion tensors follow the same strategy.
 
 ## Shard Type Detection
 
@@ -1355,4 +1383,4 @@ If the model path exists on disk, `load_model()` reads `config.json` and safeten
 
 When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for wiring validation.
 
-When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for Qwen3.6-27B wiring validation: 48 layers, 5120 hidden size, 13888 intermediate size, 152064 vocab, 40 attention heads, 40 KV heads, 128 head dim, 262144 max position embeddings, silu activation, rope_theta=10000000, partial_rotary=0.25, mRoPE interleaved, no MTP. Empty `WeightRegistry` is used — engine wiring succeeds without actual weights since kernels won't be dispatched.
+When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for Qwen3.6-27B wiring validation: 48 layers, 5120 hidden size, 13888 intermediate size, 152064 vocab, 40 attention heads, 40 KV heads, 128 head dim, 262144 max position embeddings, silu activation, rope_theta=10000000, partial_rotary=0.25, mRoPE interleaved, no MTP, linear_num_value_heads=48, linear_value_head_dim=128. Empty `WeightRegistry` is used — engine wiring succeeds without actual weights since kernels won't be dispatched.

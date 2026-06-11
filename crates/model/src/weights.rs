@@ -6,7 +6,7 @@
 //! (qweight, scales, qzeros) for AutoRound/GPTQ models.
 
 use std::collections::HashMap;
-
+use bytes::Bytes;
 use super::config::LayerType;
 
 /// Companion tensors for an INT4 quantized weight.
@@ -28,7 +28,7 @@ pub struct Int4Companions {
 #[derive(Debug, Clone)]
 pub struct WeightData {
     /// Raw tensor bytes (BF16, FP16, INT4 packed, or NVFP4 packed).
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Tensor shape, e.g. [5120, 13888] for a gate projection.
     pub shape: Vec<usize>,
     /// Data type of the stored tensor.
@@ -237,7 +237,7 @@ pub struct WeightShard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use bytes::Bytes;
     #[test]
     fn weight_registry_default() {
         let registry = WeightRegistry::default();
@@ -263,7 +263,7 @@ mod tests {
         registry.tensors.insert(
             "test.weight".to_string(),
             WeightData {
-                data: vec![0u8; 100],
+                data: Bytes::from(vec![0u8; 100]),
                 shape: vec![10, 5],
                 dtype: WeightDtype::Bf16,
                 name: "test.weight".to_string(),

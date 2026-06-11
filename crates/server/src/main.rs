@@ -179,8 +179,11 @@ async fn run() -> Result<()> {
             mrope_section: vec![11, 11, 10],
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
+            attn_output_gate: true,
             quantization_config: None,
             layer_types: None,
+            linear_num_value_heads: 48,
+            linear_value_head_dim: 128,
         };
         let weights = WeightRegistry::new();
         (Arc::new(config), vec![weights])
@@ -196,7 +199,7 @@ async fn run() -> Result<()> {
     let engine = ForwardEngine::new(
         model_config.clone(),
         weight_registry,
-        ctx.clone(),
+        vec![ctx.clone()],
         kernel_registry,
         streams,
         128, // group_size (default AutoRound)

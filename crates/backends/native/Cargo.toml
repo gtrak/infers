@@ -11,5 +11,6 @@ infers-cuda = { path = "../../cuda" }
 infers-kv = { path = "../../kv" }
 infers-model = { path = "../../model" }
 infers-mtp = { path = "../../mtp" }
+bytes = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }

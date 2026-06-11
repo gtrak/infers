@@ -4,7 +4,7 @@
 //! PP=2: split layers into two stages (0-31, 32-63).
 
 use anyhow::{Context, Result};
-
+use bytes::Bytes;
 use super::config::ModelConfig;
 use super::weights::{WeightData, WeightShard};
 
@@ -37,31 +37,92 @@ pub fn shard_weights_tp(
         .collect();
 
     // For each tensor, determine if it should be column-parallel or row-parallel
-    // and slice accordingly.
+    // and slice accordingly. INT4 weights (GPTQ/AutoRound) store qweights as
+    // (K/8, N) — swapped relative to BF16's [N, K] — so the split dimension
+    // differs between formats.
     for (name, weight) in &registry.tensors {
         let shard_type = determine_shard_type(name);
+        let is_int4 = weight.dtype == super::weights::WeightDtype::Int4Packed;
 
         match shard_type {
             ShardType::ColumnParallel => {
-                // Split along dimension 0
+                // Column-parallel: split along the output dimension (N).
+                // BF16 [N, K]: N on dim 0 → slice_weight_dim0
+                // INT4 (K/8, N): N on dim 1 → slice_weight_last_dim
                 for (gpu_id, shard) in shards.iter_mut().enumerate() {
-                    let sliced = slice_weight_dim0(weight, gpu_id, num_gpus)
-                        .context(format!("Failed to shard column-parallel weight: {}", name))?;
+                    let sliced = if is_int4 {
+                        slice_weight_last_dim(weight, gpu_id, num_gpus)
+                            .context(format!("Failed to shard INT4 column-parallel weight: {}", name))?
+                    } else {
+                        slice_weight_dim0(weight, gpu_id, num_gpus)
+                            .context(format!("Failed to shard column-parallel weight: {}", name))?
+                    };
                     shard.registry.tensors.insert(name.clone(), sliced);
+
+                    // Shard INT4 companion weights (scales, qzeros) the same way
+                    if is_int4 {
+                        if let Some(companions) = registry.int4_companions.get(name) {
+                            let scaled_scales = slice_weight_last_dim(&companions.scales, gpu_id, num_gpus)
+                                .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
+                            let sliced_qzeros = slice_weight_last_dim(&companions.qzeros, gpu_id, num_gpus)
+                                .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
+                            shard.registry.int4_companions.insert(
+                                name.clone(),
+                                super::weights::Int4Companions {
+                                    scales: scaled_scales,
+                                    qzeros: sliced_qzeros,
+                                },
+                            );
+                        }
+                    }
                 }
             }
             ShardType::RowParallel => {
-                // Split along last dimension
+                // Row-parallel: split along the input dimension (K).
+                // BF16 [N, K]: K on dim 1 → slice_weight_last_dim
+                // INT4 (K/8, N): K/8 on dim 0 → slice_weight_dim0
                 for (gpu_id, shard) in shards.iter_mut().enumerate() {
-                    let sliced = slice_weight_last_dim(weight, gpu_id, num_gpus)
-                        .context(format!("Failed to shard row-parallel weight: {}", name))?;
+                    let sliced = if is_int4 {
+                        slice_weight_dim0(weight, gpu_id, num_gpus)
+                            .context(format!("Failed to shard INT4 row-parallel weight: {}", name))?
+                    } else {
+                        slice_weight_last_dim(weight, gpu_id, num_gpus)
+                            .context(format!("Failed to shard row-parallel weight: {}", name))?
+                    };
                     shard.registry.tensors.insert(name.clone(), sliced);
+
+                    // Shard INT4 companion weights (scales, qzeros) the same way
+                    if is_int4 {
+                        if let Some(companions) = registry.int4_companions.get(name) {
+                            let sliced_scales = slice_weight_dim0(&companions.scales, gpu_id, num_gpus)
+                                .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
+                            let sliced_qzeros = slice_weight_dim0(&companions.qzeros, gpu_id, num_gpus)
+                                .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
+                            shard.registry.int4_companions.insert(
+                                name.clone(),
+                                super::weights::Int4Companions {
+                                    scales: sliced_scales,
+                                    qzeros: sliced_qzeros,
+                                },
+                            );
+                        }
+                    }
                 }
             }
             ShardType::Replicated => {
                 // Replicate on all GPUs
                 for shard in shards.iter_mut() {
                     shard.registry.tensors.insert(name.clone(), weight.clone());
+
+                    // Replicate INT4 companion weights as well
+                    if is_int4 {
+                        if let Some(companions) = registry.int4_companions.get(name) {
+                            shard.registry.int4_companions.insert(
+                                name.clone(),
+                                companions.clone(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -73,9 +134,11 @@ pub fn shard_weights_tp(
 /// How a weight tensor is distributed across GPUs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardType {
-    /// Split along dimension 0 (output dim for Q/K/V/gate/up).
+    /// Split along the output dimension (N). For BF16 \[N,K\] this is dim 0;
+    /// for INT4 packed (K/8,N) this is dim 1.
     ColumnParallel,
-    /// Split along last dimension (input dim for O/down).
+    /// Split along the input dimension (K). For BF16 \[N,K\] this is dim 1;
+    /// for INT4 packed (K/8,N) this is dim 0.
     RowParallel,
     /// Replicated on all GPUs (norms, embeddings with TP).
     Replicated,
@@ -129,7 +192,7 @@ fn slice_weight_dim0(weight: &WeightData, gpu_id: usize, num_gpus: usize) -> Res
     new_shape[0] = shard_size;
 
     Ok(WeightData {
-        data: weight.data[start_byte..end_byte].to_vec(),
+        data: weight.data.slice(start_byte..end_byte),
         shape: new_shape,
         dtype: weight.dtype,
         name: weight.name.clone(),
@@ -169,7 +232,7 @@ fn slice_weight_last_dim(weight: &WeightData, gpu_id: usize, num_gpus: usize) ->
     *new_shape.last_mut().unwrap() = shard_size;
 
     Ok(WeightData {
-        data: new_data,
+        data: Bytes::from(new_data),
         shape: new_shape,
         dtype: weight.dtype,
         name: weight.name.clone(),
@@ -232,7 +295,7 @@ pub fn shard_weights_for_stage(
 mod tests {
     use super::*;
     use crate::weights::{WeightDtype, WeightRegistry};
-
+    use bytes::Bytes;
     #[test]
     fn test_determine_shard_type() {
         assert_eq!(
@@ -278,7 +341,7 @@ mod tests {
     fn test_slice_weight_dim0() {
         // 4x8 matrix, 2 elements per row (BF16 = 2 bytes)
         let weight = WeightData {
-            data: vec![0u8; 64], // 4 rows * 8 cols * 2 bytes = 64 bytes
+            data: Bytes::from(vec![0u8; 64]), // 4 rows * 8 cols * 2 bytes = 64 bytes
             shape: vec![4, 8],
             dtype: WeightDtype::Bf16,
             name: "test.weight".to_string(),
@@ -302,7 +365,7 @@ mod tests {
     fn test_slice_weight_last_dim() {
         // 4x8 matrix, 2 bytes per element
         let weight = WeightData {
-            data: vec![0u8; 64], // 4 rows * 8 cols * 2 bytes
+            data: Bytes::from(vec![0u8; 64]), // 4 rows * 8 cols * 2 bytes
             shape: vec![4, 8],
             dtype: WeightDtype::Bf16,
             name: "test.weight".to_string(),
@@ -334,7 +397,7 @@ mod tests {
         registry.tensors.insert(
             "test.weight".to_string(),
             WeightData {
-                data: vec![1u8; 100],
+                data: Bytes::from(vec![1u8; 100]),
                 shape: vec![10, 5],
                 dtype: WeightDtype::Bf16,
                 name: "test.weight".to_string(),
@@ -361,5 +424,226 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("num_gpus must be >= 1"));
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_column_parallel() {
+        // INT4 qweight shape (K/8, N) = (4, 8). Column-parallel should split dim 1 (N).
+        // After splitting with 2 GPUs: GPU 0 gets (4, 4), GPU 1 gets (4, 4).
+        let mut registry = WeightRegistry::new();
+        let qweight = WeightData {
+            data: Bytes::from(vec![0u8; 128]), // 4*8 u32 * 4 bytes = 128
+            shape: vec![4, 8],
+            dtype: WeightDtype::Int4Packed,
+            name: "layers.0.self_attn.q_proj.qweight".to_string(),
+        };
+        registry.tensors.insert("layers.0.self_attn.q_proj.qweight".to_string(), qweight);
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        // Column-parallel: split dim 1 (N), so shape becomes [4, 4]
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
+            assert_eq!(w.shape, vec![4, 4], "GPU {} INT4 column-parallel should have shape [4, 4]", gpu_id);
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_row_parallel() {
+        // INT4 qweight shape (K/8, N) = (4, 8). Row-parallel should split dim 0 (K/8).
+        // After splitting with 2 GPUs: GPU 0 gets (2, 8), GPU 1 gets (2, 8).
+        let mut registry = WeightRegistry::new();
+        let qweight = WeightData {
+            data: Bytes::from(vec![0u8; 128]), // 4*8 u32 * 4 bytes = 128
+            shape: vec![4, 8],
+            dtype: WeightDtype::Int4Packed,
+            name: "layers.0.self_attn.o_proj.qweight".to_string(),
+        };
+        registry.tensors.insert("layers.0.self_attn.o_proj.qweight".to_string(), qweight);
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        // Row-parallel: split dim 0 (K/8), so shape becomes [2, 8]
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.o_proj.qweight").unwrap();
+            assert_eq!(w.shape, vec![2, 8], "GPU {} INT4 row-parallel should have shape [2, 8]", gpu_id);
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_companions_column_parallel() {
+        // Verify companion weights (scales, qzeros) are also sharded correctly.
+        let mut registry = WeightRegistry::new();
+        let qweight_name = "layers.0.mlp.gate_proj.qweight".to_string();
+        registry.tensors.insert(
+            qweight_name.clone(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: qweight_name.clone(),
+            },
+        );
+
+        // Scales: same shape as (K/group_size, N) — here [4, 8]
+        registry.int4_companions.insert(
+            qweight_name.clone(),
+            crate::weights::Int4Companions {
+                scales: WeightData {
+                    data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
+                    shape: vec![4, 8],
+                    dtype: WeightDtype::Bf16,
+                    name: "layers.0.mlp.gate_proj.scales".to_string(),
+                },
+                qzeros: WeightData {
+                    data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
+                    shape: vec![4, 8],
+                    dtype: WeightDtype::Int4Packed,
+                    name: "layers.0.mlp.gate_proj.qzeros".to_string(),
+                },
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+
+        for gpu_id in 0..2 {
+            // qweight should be sharded along dim 1 (N) → [4, 4]
+            let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
+            assert_eq!(w.shape, vec![4, 4]);
+
+            // scales and qzeros should also be sharded along dim 1 → [4, 4]
+            let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
+            assert_eq!(companions.scales.shape, vec![4, 4], "scales should be sharded on dim 1 for column-parallel");
+            assert_eq!(companions.qzeros.shape, vec![4, 4], "qzeros should be sharded on dim 1 for column-parallel");
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_companions_row_parallel() {
+        // Verify companion weights are sharded correctly for row-parallel.
+        let mut registry = WeightRegistry::new();
+        let qweight_name = "layers.0.mlp.down_proj.qweight".to_string();
+        registry.tensors.insert(
+            qweight_name.clone(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: qweight_name.clone(),
+            },
+        );
+
+        registry.int4_companions.insert(
+            qweight_name.clone(),
+            crate::weights::Int4Companions {
+                scales: WeightData {
+                    data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
+                    shape: vec![4, 8],
+                    dtype: WeightDtype::Bf16,
+                    name: "layers.0.mlp.down_proj.scales".to_string(),
+                },
+                qzeros: WeightData {
+                    data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
+                    shape: vec![4, 8],
+                    dtype: WeightDtype::Int4Packed,
+                    name: "layers.0.mlp.down_proj.qzeros".to_string(),
+                },
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+
+        for gpu_id in 0..2 {
+            // qweight should be sharded along dim 0 (K/8) → [2, 8]
+            let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
+            assert_eq!(w.shape, vec![2, 8]);
+
+            // scales and qzeros should also be sharded along dim 0 → [2, 8]
+            let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
+            assert_eq!(companions.scales.shape, vec![2, 8], "scales should be sharded on dim 0 for row-parallel");
+            assert_eq!(companions.qzeros.shape, vec![2, 8], "qzeros should be sharded on dim 0 for row-parallel");
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_bf16_unchanged() {
+        // Ensure BF16 weight sharding is NOT affected by INT4 changes.
+        // Column-parallel: split dim 0 → [2, 8] from [4, 8]
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.self_attn.q_proj.weight".to_string(),
+            },
+        );
+        // Row-parallel: split dim 1 → [4, 4] from [4, 8]
+        registry.tensors.insert(
+            "layers.0.self_attn.o_proj.weight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.self_attn.o_proj.weight".to_string(),
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+
+        // BF16 column-parallel: split dim 0 → [2, 8]
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.q_proj.weight").unwrap();
+            assert_eq!(w.shape, vec![2, 8], "BF16 column-parallel should split dim 0");
+        }
+
+        // BF16 row-parallel: split dim 1 → [4, 4]
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.o_proj.weight").unwrap();
+            assert_eq!(w.shape, vec![4, 4], "BF16 row-parallel should split dim 1");
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_replicated() {
+        // INT4 weights that are replicated (e.g., lm_head if INT4 quantized) should not be split.
+        let mut registry = WeightRegistry::new();
+        registry.tensors.insert(
+            "lm_head.qweight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "lm_head.qweight".to_string(),
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("lm_head.qweight").unwrap();
+            assert_eq!(w.shape, vec![4, 8], "INT4 replicated weight should not be split");
+        }
     }
 }

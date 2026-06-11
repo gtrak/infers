@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use safetensors::SafeTensors;
 use serde::Deserialize;
-
+use bytes::Bytes;
 use super::config::ModelConfig;
 use super::formats::QuantizationFormat;
 use super::weights::{
@@ -114,7 +114,7 @@ fn load_single(path: &Path) -> Result<WeightRegistry> {
         let tensor = st.tensor(name)?;
         let shape: Vec<usize> = tensor.shape().to_vec();
         let dtype = map_safetensor_dtype(tensor.dtype());
-        let data = tensor.data().to_vec();
+        let data = Bytes::copy_from_slice(tensor.data());
 
         tensors.insert(name.to_string(), WeightData {
             data,
@@ -155,7 +155,7 @@ fn load_sharded(model_dir: &Path, index_path: &Path) -> Result<WeightRegistry> {
             let tensor = st.tensor(name)?;
             let shape: Vec<usize> = tensor.shape().to_vec();
             let dtype = map_safetensor_dtype(tensor.dtype());
-            let data = tensor.data().to_vec();
+            let data = Bytes::copy_from_slice(tensor.data());
 
             all_tensors.insert(name.to_string(), WeightData {
                 data,
@@ -568,7 +568,7 @@ fn map_safetensor_dtype(dtype: safetensors::Dtype) -> WeightDtype {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use bytes::Bytes;
     fn qwen3_6_config_json() -> String {
         serde_json::json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -663,7 +663,7 @@ mod tests {
 
         let mut registry = WeightRegistry::new();
         let dummy = |name: &str| WeightData {
-            data: vec![0u8; 32],
+            data: Bytes::from(vec![0u8; 32]),
             shape: vec![2, 16],
             dtype: WeightDtype::Bf16,
             name: name.to_string(),
@@ -708,7 +708,7 @@ mod tests {
 
         let mut registry = WeightRegistry::new();
         let dummy = |name: &str| WeightData {
-            data: vec![0u8; 32],
+            data: Bytes::from(vec![0u8; 32]),
             shape: vec![2, 16],
             dtype: WeightDtype::Bf16,
             name: name.to_string(),
@@ -753,7 +753,7 @@ mod tests {
 
         let mut registry = WeightRegistry::new();
         let dummy = |name: &str| WeightData {
-            data: vec![0u8; 32],
+            data: Bytes::from(vec![0u8; 32]),
             shape: vec![2, 16],
             dtype: WeightDtype::Bf16,
             name: name.to_string(),
@@ -808,7 +808,7 @@ mod tests {
     fn mtp_weights_struct_has_expected_fields() {
         // Verify MtpWeights has all expected fields by constructing one
         let dummy = WeightData {
-            data: vec![0u8; 32],
+            data: Bytes::from(vec![0u8; 32]),
             shape: vec![2, 16],
             dtype: WeightDtype::Bf16,
             name: "test".to_string(),
@@ -826,7 +826,7 @@ mod tests {
     }
 
     fn dummy_weight(name: &str) -> WeightData {
-        WeightData { data: vec![0u8; 32], shape: vec![2, 16], dtype: WeightDtype::Bf16, name: name.to_string() }
+        WeightData { data: Bytes::from(vec![0u8; 32]), shape: vec![2, 16], dtype: WeightDtype::Bf16, name: name.to_string() }
     }
 
     #[test]
@@ -834,11 +834,11 @@ mod tests {
         let mut registry = WeightRegistry::new();
         registry.tensors.insert(
             "model.language_model.layers.0.input_layernorm.weight".to_string(),
-            WeightData { data: vec![1; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+            WeightData { data: Bytes::from(vec![1; 8]), shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
         );
         registry.tensors.insert(
             "model.language_model.norm.weight".to_string(),
-            WeightData { data: vec![2; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+            WeightData { data: Bytes::from(vec![2; 8]), shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
         );
         strip_language_model_prefix(&mut registry);
         assert!(registry.tensors.contains_key("layers.0.input_layernorm.weight"));
@@ -852,11 +852,11 @@ mod tests {
         let mut registry = WeightRegistry::new();
         registry.tensors.insert(
             "model.visual.patch_embed.proj.weight".to_string(),
-            WeightData { data: vec![3; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+            WeightData { data: Bytes::from(vec![3; 8]), shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
         );
         registry.tensors.insert(
             "layers.0.input_layernorm.weight".to_string(),
-            WeightData { data: vec![4; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+            WeightData { data: Bytes::from(vec![4; 8]), shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
         );
         strip_language_model_prefix(&mut registry);
         assert!(!registry.tensors.contains_key("model.visual.patch_embed.proj.weight"));
@@ -869,7 +869,7 @@ mod tests {
         let mut registry = WeightRegistry::new();
         registry.tensors.insert(
             "mtp.layers.0.self_attn.q_proj.weight".to_string(),
-            WeightData { data: vec![5; 8], shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
+            WeightData { data: Bytes::from(vec![5; 8]), shape: vec![4, 2], dtype: WeightDtype::Bf16, name: String::new() },
         );
         strip_language_model_prefix(&mut registry);
         assert!(registry.tensors.contains_key("mtp.layers.0.self_attn.q_proj.weight"));

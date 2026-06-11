@@ -26,6 +26,30 @@ use infers_kv::KvCacheDtype;
 use infers_cuda::CudaSlice;
 use infers_model::MtpWeights;
 
+use infers_cuda::{group_end, group_start};
+use crate::sync;
+
+/// Per-GPU cached kernel function handles.
+/// Each GPU context needs its own set since CudaFunction handles are context-bound.
+struct PerGpuKernels {
+    rmsnorm: CudaFunction,
+    silu_glu: CudaFunction,
+    rope: CudaFunction,
+    embedding: CudaFunction,
+    add: CudaFunction,
+    argmax: CudaFunction,
+    softmax: CudaFunction,
+    kv_cache_write: CudaFunction,
+    gdn_prefill: CudaFunction,
+    gdn_update: CudaFunction,
+    paged_kv_write: CudaFunction,
+    paged_kv_read: CudaFunction,
+    paged_attention_decode: CudaFunction,
+    fp8_quantize: CudaFunction,
+    fp8_dequantize: CudaFunction,
+    int4_gemm: CudaFunction,
+}
+
 /// Central engine for forward-pass inference.
 ///
 /// Owns all GPU resources: CUDA contexts, streams, loaded kernels, cuBLASLt handles,
@@ -37,50 +61,14 @@ pub struct ForwardEngine {
     /// One weight registry per GPU shard (tensor parallelism).
     weights: Vec<WeightRegistry>,
 
-    /// Loaded CUDA kernel functions (cubin-based).
-    /// Retained for future multi-kernel lookup
-    #[allow(dead_code)]
-    kernels: LoadedKernelRegistry,
-
-    /// Cached kernel function handles (resolved from LoadedKernelRegistry at init time).
-    rmsnorm_kernel: CudaFunction,
-    silu_glu_kernel: CudaFunction,
-    rope_kernel: CudaFunction,
-    embedding_kernel: CudaFunction,
-    add_kernel: CudaFunction,
-    argmax_kernel: CudaFunction,
-    softmax_kernel: CudaFunction,
-    kv_cache_write_kernel: CudaFunction,
-    gdn_prefill_kernel: CudaFunction,
-    gdn_update_kernel: CudaFunction,
-
-
-    /// Paged KV cache write kernel. Used by paged pipeline (wiring in progress).
-    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
-    paged_kv_write_kernel: CudaFunction,
-    /// Paged KV cache read kernel. Used by paged pipeline (wiring in progress).
-    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
-    paged_kv_read_kernel: CudaFunction,
-    /// Paged attention decode kernel. Used by paged pipeline (wiring in progress).
-    #[allow(dead_code)] // TODO: remove once paged pipeline is fully wired
-    paged_attention_decode_kernel: CudaFunction,
-
-    /// FP8 quantize kernel: BF16→FP8 on GPU.
-    #[allow(dead_code)]
-    fp8_quantize_kernel: CudaFunction,
-    /// FP8 dequantize kernel: FP8→BF16 on GPU.
-    #[allow(dead_code)]
-    fp8_dequantize_kernel: CudaFunction,
-
-    /// INT4 GEMM kernel: matmul with on-the-fly per-group dequantization.
-    #[allow(dead_code)]
-    int4_gemm_kernel: CudaFunction,
+    /// Per-GPU cached kernel function handles.
+    per_gpu_kernels: Vec<PerGpuKernels>,
 
     /// Paged KV cache manager (pool + prefix cache + COW).
     paged_kv_manager: Option<PagedKvManager>,
 
-    /// cuBLASLt GEMM engine.
-    gemm: GemmEngine,
+    /// cuBLASLt GEMM engines (one per GPU for tensor parallelism).
+    gemm_engines: Vec<GemmEngine>,
 
     /// NCCL communicator for tensor-parallel all-reduce.
     nccl: NcclCommunicator,
@@ -90,13 +78,13 @@ pub struct ForwardEngine {
     #[allow(dead_code)]
     streams: StreamPool,
 
-    /// Per-layer KV caches for full-attention layers (flat cache, legacy).
-    kv_caches: Vec<KvCache>,
-    /// Per-layer paged KV caches (new paged system).
-    paged_kv_caches: Vec<PagedKvCache>,
+    /// Per-GPU, per-layer KV caches for full-attention layers (flat cache, legacy).
+    kv_caches: Vec<Vec<KvCache>>,          // [gpu_idx][layer_idx]
+    /// Per-GPU, per-layer paged KV caches (new paged system).
+    paged_kv_caches: Vec<Vec<PagedKvCache>>,  // [gpu_idx][layer_idx]
 
-    /// Per-layer GDN recurrent states.
-    gdn_states: Vec<GdnState>,
+    /// Per-GPU, per-layer GDN recurrent states.
+    gdn_states: Vec<Vec<GdnState>>,      // [gpu_idx][layer_idx]
 
     /// INT4 quantization group size for on-the-fly dequantization.
     group_size: usize,
@@ -115,42 +103,50 @@ impl ForwardEngine {
     pub fn new(
         config: Arc<ModelConfig>,
         weights: Vec<WeightRegistry>,
-        ctx: Arc<CudaContext>,
+        contexts: Vec<Arc<CudaContext>>,
         kernel_registry: KernelRegistry,
         streams: StreamPool,
         group_size: usize,
     ) -> Result<Self> {
-        let kernels = LoadedKernelRegistry::load_all(ctx, &kernel_registry)
-            .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels: {e}"))?;
+        // Load CUDA kernel modules on each GPU context
+        let num_gpus = streams.len();
+        let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let ctx = contexts.get(gpu_idx)
+                .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
+            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), &kernel_registry)
+                .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
 
-        // Resolve kernel function handles from loaded modules
-        let rmsnorm_kernel = kernels.get_function("infers_rmsnorm_bf16")?;
-        let silu_glu_kernel = kernels.get_function("infers_silu_glu_bf16")?;
-        let rope_kernel = kernels.get_function("infers_rope_bf16")?;
-        let embedding_kernel = kernels.get_function("infers_embedding_gather_bf16")?;
-        let add_kernel = kernels.get_function("infers_add_bf16")?;
-        let argmax_kernel = kernels.get_function("infers_argmax_bf16")?;
-        let softmax_kernel = kernels.get_function("infers_softmax_bf16")?;
-        let kv_cache_write_kernel = kernels.get_function("infers_kv_cache_write_bf16")?;
-        let gdn_prefill_kernel = kernels.get_function("infers_gdn_mamba2_prefill_bf16")?;
-        let gdn_update_kernel = kernels.get_function("infers_gdn_mamba2_update_bf16")?;
+            let pk = PerGpuKernels {
+                rmsnorm: kernels.get_function("infers_rmsnorm_bf16")?,
+                silu_glu: kernels.get_function("infers_silu_glu_bf16")?,
+                rope: kernels.get_function("infers_rope_bf16")?,
+                embedding: kernels.get_function("infers_embedding_gather_bf16")?,
+                add: kernels.get_function("infers_add_bf16")?,
+                argmax: kernels.get_function("infers_argmax_bf16")?,
+                softmax: kernels.get_function("infers_softmax_bf16")?,
+                kv_cache_write: kernels.get_function("infers_kv_cache_write_bf16")?,
+                gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
+                gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
+                paged_kv_write: kernels.get_function("infers_paged_kv_write_bf16")?,
+                paged_kv_read: kernels.get_function("infers_paged_kv_read_bf16")?,
+                paged_attention_decode: kernels.get_function("infers_paged_attention_decode_bf16")?,
+                fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
+                fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
+                int4_gemm: kernels.get_function("int4_gemm_kernel")?,
+            };
+            per_gpu_kernels.push(pk);
+        }
 
-        // Resolve paged attention kernel handles
-        let paged_kv_write_kernel = kernels.get_function("infers_paged_kv_write_bf16")?;
-        let paged_kv_read_kernel = kernels.get_function("infers_paged_kv_read_bf16")?;
-        let paged_attention_decode_kernel = kernels.get_function("infers_paged_attention_decode_bf16")?;
-
-        // Resolve quantization kernel handles
-        let fp8_quantize_kernel = kernels.get_function("infers_fp8_quantize_bf16")?;
-        let fp8_dequantize_kernel = kernels.get_function("infers_fp8_dequantize_bf16")?;
-        let int4_gemm_kernel = kernels.get_function("int4_gemm_kernel")?;
-
-        // Create GEMM engine using the first stream
-        let default_stream = streams.get(0)
-            .ok_or_else(|| anyhow::anyhow!("StreamPool is empty"))?;
-        let gemm = GemmEngine::new(default_stream.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to create cuBLASLt engine: {e}"))?;
-
+        // Create one GEMM engine per GPU (one per stream in the pool)
+        let mut gemm_engines = Vec::with_capacity(num_gpus);
+        for i in 0..num_gpus {
+            let s = streams.get(i).ok_or_else(|| anyhow::anyhow!("Missing stream {i}"))?;
+            gemm_engines.push(
+                GemmEngine::new(s.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to create cuBLASLt engine for GPU {i}: {e}"))?
+            );
+        }
         // Create NCCL communicator for tensor parallelism
         let nccl = {
             let comm_streams: Vec<Arc<CudaStream>> = (0..streams.len())
@@ -160,10 +156,11 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
         };
 
-        // Initialize per-layer caches and states
-        let kv_caches: Vec<KvCache> = (0..config.num_hidden_layers).map(|_| KvCache::new()).collect();
-        let gdn_states: Vec<GdnState> = (0..config.num_hidden_layers).map(|_| GdnState::new()).collect();
-        let paged_kv_caches: Vec<PagedKvCache> = Vec::new();
+        // Initialize per-GPU, per-layer caches and states
+        let num_layers = config.num_hidden_layers;
+        let kv_caches: Vec<Vec<KvCache>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
+        let gdn_states: Vec<Vec<GdnState>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| GdnState::new()).collect()).collect();
+        let paged_kv_caches: Vec<Vec<PagedKvCache>> = (0..num_gpus).map(|_| Vec::new()).collect();
 
         tracing::info!(
             "ForwardEngine initialized: {} layers, {} GPU shards",
@@ -174,25 +171,9 @@ impl ForwardEngine {
         Ok(Self {
             config,
             weights,
-            kernels,
-            rmsnorm_kernel,
-            silu_glu_kernel,
-            rope_kernel,
-            embedding_kernel,
-            add_kernel,
-            argmax_kernel,
-            softmax_kernel,
-            kv_cache_write_kernel,
-            gdn_prefill_kernel,
-            gdn_update_kernel,
-            paged_kv_write_kernel,
-            paged_kv_read_kernel,
-            paged_attention_decode_kernel,
-            fp8_quantize_kernel,
-            fp8_dequantize_kernel,
-            int4_gemm_kernel,
+            per_gpu_kernels,
             paged_kv_manager: None,
-            gemm,
+            gemm_engines,
             nccl,
             streams,
             kv_caches,
@@ -215,26 +196,25 @@ impl ForwardEngine {
     /// # Returns
     /// The sampled token ID for the first generated token, or an error if GPU execution fails.
     pub fn prefill(&mut self, stream: &Arc<CudaStream>, token_ids: &[u32]) -> Result<u32> {
-        let gpu_id = 0; // Single GPU for now
-        let weights = &self.weights[gpu_id];
+        let weights = &self.weights[0];
 
         let kernels = crate::prefill::PrefillKernels {
-            rmsnorm: self.rmsnorm_kernel.clone(),
-            silu_glu: self.silu_glu_kernel.clone(),
-            rope: self.rope_kernel.clone(),
-            embedding: self.embedding_kernel.clone(),
-            add: self.add_kernel.clone(),
-            argmax: self.argmax_kernel.clone(),
-            softmax: self.softmax_kernel.clone(),
-            kv_cache_write: self.kv_cache_write_kernel.clone(),
-            gdn_prefill: self.gdn_prefill_kernel.clone(),
-            int4_gemm: self.int4_gemm_kernel.clone(),
+            rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
+            silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
+            rope: self.per_gpu_kernels[0].rope.clone(),
+            embedding: self.per_gpu_kernels[0].embedding.clone(),
+            add: self.per_gpu_kernels[0].add.clone(),
+            argmax: self.per_gpu_kernels[0].argmax.clone(),
+            softmax: self.per_gpu_kernels[0].softmax.clone(),
+            kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
+            gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
+            int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
         crate::prefill::prefill(
-            &mut self.gemm, stream, &kernels, &self.nccl,
+            &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
             &self.config, weights, token_ids,
-            &mut self.kv_caches, &mut self.gdn_states,
+            &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
     }
@@ -251,26 +231,25 @@ impl ForwardEngine {
     /// # Returns
     /// The sampled token ID for the next generated token, or an error if GPU execution fails.
     pub fn decode(&mut self, stream: &Arc<CudaStream>, token_id: u32, position: u32) -> Result<u32> {
-        let gpu_id = 0;
-        let weights = &self.weights[gpu_id];
+        let weights = &self.weights[0];
 
         let kernels = crate::decode::DecodeKernels {
-            rmsnorm: self.rmsnorm_kernel.clone(),
-            silu_glu: self.silu_glu_kernel.clone(),
-            rope: self.rope_kernel.clone(),
-            embedding: self.embedding_kernel.clone(),
-            add: self.add_kernel.clone(),
-            argmax: self.argmax_kernel.clone(),
-            softmax: self.softmax_kernel.clone(),
-            kv_cache_write: self.kv_cache_write_kernel.clone(),
-            gdn_update: self.gdn_update_kernel.clone(),
-            int4_gemm: self.int4_gemm_kernel.clone(),
+            rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
+            silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
+            rope: self.per_gpu_kernels[0].rope.clone(),
+            embedding: self.per_gpu_kernels[0].embedding.clone(),
+            add: self.per_gpu_kernels[0].add.clone(),
+            argmax: self.per_gpu_kernels[0].argmax.clone(),
+            softmax: self.per_gpu_kernels[0].softmax.clone(),
+            kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
+            gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
         crate::decode::decode(
-            &mut self.gemm, stream, &kernels, &self.nccl,
+            &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
-            &mut self.kv_caches, &mut self.gdn_states,
+            &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
     }
@@ -292,8 +271,7 @@ impl ForwardEngine {
     ) -> Result<()> {
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
+ 
         // Create the paged KV manager
         let eviction_max_bytes = total_pages * page_size * num_kv_heads * head_dim * 2;
         let manager = PagedKvManager::new(
@@ -305,14 +283,20 @@ impl ForwardEngine {
             eviction_max_bytes,
         );
 
-        // Create per-layer paged KV caches for all layers
-        let caches: Vec<PagedKvCache> = (0..self.config.num_hidden_layers)
-            .map(|_| PagedKvCache::new(total_pages, page_size, kv_dim))
+        // kv_dim is per GPU: num_kv_heads/num_gpus * head_dim
+        let num_gpus = self.weights.len();
+        let kv_dim_per_gpu = (num_kv_heads / num_gpus) * head_dim;
+
+        let caches: Vec<Vec<PagedKvCache>> = (0..num_gpus)
+            .map(|_| {
+                (0..self.config.num_hidden_layers)
+                    .map(|_| PagedKvCache::new(total_pages, page_size, kv_dim_per_gpu))
+                    .collect()
+            })
             .collect();
 
         self.paged_kv_manager = Some(manager);
         self.paged_kv_caches = caches;
-
         tracing::info!(
             "Paged KV system initialized: {} pages, page_size={}, {} layers",
             total_pages,
@@ -321,6 +305,14 @@ impl ForwardEngine {
         );
 
         Ok(())
+    }
+
+    /// Create a new sequence in the paged KV manager, returning its ID.
+    pub fn create_sequence(&mut self) -> infers_kv::SequenceId {
+        self.paged_kv_manager
+            .as_mut()
+            .map(|m| m.create_sequence())
+            .unwrap_or(0)
     }
 
     /// Write FP8-quantized K/V to a page pool using GPU kernels.
@@ -341,7 +333,7 @@ impl ForwardEngine {
     ) -> Result<()> {
         crate::attention::fp8_quantize_and_write(
             stream,
-            &self.fp8_quantize_kernel,
+            &self.per_gpu_kernels[0].fp8_quantize,
             page_pool,
             page_id,
             page_offset,
@@ -370,7 +362,7 @@ impl ForwardEngine {
     ) -> Result<(CudaSlice<half::bf16>, CudaSlice<half::bf16>)> {
         crate::attention::fp8_dequantize_and_read(
             stream,
-            &self.fp8_dequantize_kernel,
+            &self.per_gpu_kernels[0].fp8_dequantize,
             page_pool,
             page_id,
             page_offset,
@@ -398,7 +390,7 @@ impl ForwardEngine {
     ) -> Result<()> {
         infers_cuda::gemm::matmul_int4(
             stream,
-            &self.int4_gemm_kernel,
+            &self.per_gpu_kernels[0].int4_gemm,
             config,
             output,
             weight,
@@ -430,170 +422,254 @@ impl ForwardEngine {
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
-        let weights = &self.weights[0];
+        let num_gpus = self.weights.len();
         let config = &self.config;
         let page_size = manager.page_size();
         let head_dim = config.head_dim;
-        let num_heads = config.num_attention_heads;
-        let num_kv_heads = config.num_key_value_heads;
+        let seq_len = token_ids.len();
 
-        // Allocate pages for the sequence based on token count
+        // Allocate pages for the sequence
         let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
         for _ in 0..num_pages_needed {
             manager.append_page(seq_id)?;
         }
 
-        // Upload block table to GPU
+        // Upload block table and positions to ALL GPUs
         let block_table = manager.block_table(seq_id)?;
         let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
-        let block_table_gpu = stream.clone_htod(&block_table_i32)?;
-
-        // Upload positions
         let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
         let positions_i32: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
-        let positions_gpu = stream.clone_htod(&positions_i32)?;
 
-        // Ensure page pools allocated
-        for cache in &mut self.paged_kv_caches {
-            cache.ensure_allocated(stream)?;
+        // Per-GPU block tables and positions
+        let mut block_tables_gpu: Vec<CudaSlice<i32>> = Vec::new();
+        let mut positions_gpu_vec: Vec<CudaSlice<i32>> = Vec::new();
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            block_tables_gpu.push(gpu_stream.clone_htod(&block_table_i32)?);
+            positions_gpu_vec.push(gpu_stream.clone_htod(&positions_i32)?);
         }
 
-        // Embed tokens
-        let embed_weight = weights.embedding.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-        let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
-        let mut hidden = crate::embedding::embed_tokens(
-            stream, &self.embedding_kernel, token_ids, &embed_table,
-            config.hidden_size, config.vocab_size,
-        )?;
+        // Ensure page pools allocated on each GPU
+        for gpu_idx in 0..num_gpus {
+            for cache in &mut self.paged_kv_caches[gpu_idx] {
+                cache.ensure_allocated(self.streams.get(gpu_idx).unwrap())?;
+            }
+        }
+
+        // Embed tokens on each GPU
+        let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            let w = &self.weights[gpu_idx];
+            let embed_weight = w.embedding.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+            let embed_table = crate::upload::upload_weight(&gpu_stream, embed_weight)?;
+            let h = crate::embedding::embed_tokens(
+                &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, token_ids, &embed_table,
+                config.hidden_size, config.vocab_size,
+            )?;
+            hidden_states.push(h);
+        }
+
+        // Per-GPU sharded head counts
+        let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
+        let num_heads_per_gpu = config.num_attention_heads / num_gpus;
+        let sharded_intermediate = config.intermediate_size / num_gpus;
 
         // Layer loop
         for layer_idx in 0..config.num_hidden_layers {
-            let layer = &weights.layers[layer_idx];
-            let layer_type = config.get_layer_type(layer_idx);
+            tracing::info!("Layer {}/{} (phase A)", layer_idx + 1, config.num_hidden_layers);
+            // ================================================================
+            // Phase A: Attention/GDN on each GPU
+            // ================================================================
+            let mut attn_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
-            // Norm1
-            let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
-            let norm1_out = crate::norm::rms_norm(
-                stream, &self.rmsnorm_kernel, &hidden, &norm1_weight,
-                config.rms_norm_eps, config.hidden_size,
-            )?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &mut self.gemm_engines[gpu_idx];
+                let w = &self.weights[gpu_idx];
+                let layer = &w.layers[layer_idx];
+                let layer_type = config.get_layer_type(layer_idx);
 
-            // Attention/GDN dispatch
-            let attn_or_gdn_out = match layer_type {
-                LayerType::GatedDeltaNet => {
-                    let gdn_weights = layer.gdn.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                    crate::gdn::forward(
-                        &mut self.gemm, &self.int4_gemm_kernel, stream,
-                        &self.gdn_prefill_kernel, gdn_weights, &norm1_out,
-                        &mut self.gdn_states[layer_idx],
-                        config.hidden_size, self.group_size, &weights.int4_companions,
-                    )?
-                }
-                LayerType::FullAttention => {
-                    let attn_weights = layer.attn.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-                    crate::attention::forward_paged(
-                        &mut self.gemm, &self.int4_gemm_kernel, stream,
-                        &self.softmax_kernel, &self.paged_kv_write_kernel,
-                        &self.rope_kernel, &self.rmsnorm_kernel, &self.add_kernel,
-                        attn_weights, &norm1_out,
-                        &mut self.paged_kv_caches[layer_idx],
-                        &block_table_gpu, &positions_gpu, &positions,
-                        head_dim, num_heads, num_kv_heads, page_size,
-                        config.rope_theta, config.partial_rotary_factor,
-                        config.rms_norm_eps, self.group_size, &weights.int4_companions,
-                    )?
-                }
-            };
+                // Norm1
+                let norm1_weight = crate::upload::upload_weight(&gpu_stream, &layer.norm1)?;
+                let norm1_out = crate::norm::rms_norm(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
+                    config.rms_norm_eps, config.hidden_size,
+                )?;
 
-            // Residual add
-            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &attn_or_gdn_out)?;
-
-            // Norm2
-            let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
-            let norm2_out = crate::norm::rms_norm(
-                stream, &self.rmsnorm_kernel, &hidden, &norm2_weight,
-                config.rms_norm_eps, config.hidden_size,
-            )?;
-
-            // MLP (INT4-aware)
-            let mlp_weights = &layer.mlp;
-            let intermediate_size = config.intermediate_size;
-            let seq_len = token_ids.len();
-
-            // gate
-            let mut gate = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.gate_proj, &norm2_out, &mut gate,
-                seq_len, intermediate_size, config.hidden_size,
-                self.group_size, &weights.int4_companions,
-            )?;
-
-            // up
-            let mut up = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.up_proj, &norm2_out, &mut up,
-                seq_len, intermediate_size, config.hidden_size,
-                self.group_size, &weights.int4_companions,
-            )?;
-
-            // silu = SiLU(gate) * up
-            let mut silu_out = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
-            let elem_i32 = (seq_len * intermediate_size) as i32;
-            unsafe {
-                stream.launch_builder(&self.silu_glu_kernel)
-                    .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
-                    .launch(infers_cuda::LaunchConfig {
-                        grid_dim: (((seq_len * intermediate_size) as u32).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
+                // Attention or GDN with sharded weights
+                let attn_out = match layer_type {
+                    LayerType::GatedDeltaNet => {
+                        let gdn_weights = layer.gdn.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
+                        crate::gdn::forward(
+                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                            &self.per_gpu_kernels[gpu_idx].gdn_prefill, gdn_weights, &norm1_out,
+                            &mut self.gdn_states[gpu_idx][layer_idx],
+                            config.hidden_size, config.as_ref(), self.group_size,
+                            &w.int4_companions,
+                        )?
+                    }
+                    LayerType::FullAttention => {
+                        let attn_weights = layer.attn.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
+                        crate::attention::forward_paged(
+                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                            &self.per_gpu_kernels[gpu_idx].softmax, &self.per_gpu_kernels[gpu_idx].paged_kv_write,
+                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
+                            &self.per_gpu_kernels[gpu_idx].silu_glu,
+                            attn_weights, &norm1_out,
+                            &mut self.paged_kv_caches[gpu_idx][layer_idx],
+                            &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx], &positions,
+                            head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
+                            config.rope_theta, config.partial_rotary_factor,
+                            config.rms_norm_eps, self.group_size, &w.int4_companions,
+                            config.hidden_size,
+                            config.attn_output_gate,
+                        )?
+                    }
+                };
+                attn_outputs.push(attn_out);
             }
 
-            // down_proj
-            let mut mlp_out = stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.down_proj, &silu_out, &mut mlp_out,
-                seq_len, config.hidden_size, intermediate_size,
-                self.group_size, &weights.int4_companions,
-            )?;
+            // All-reduce attention outputs across GPUs (grouped)
+            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_attention(
+                    &self.nccl, &gpu_stream, &mut attn_outputs[gpu_idx],
+                )?;
+            }
+group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // Residual add
-            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &mlp_out)?;
+            // ================================================================
+            // Phase B: Residual add on each GPU
+            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                hidden_states[gpu_idx] = crate::add::add(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
+                )?;
+            }
+
+            // ================================================================
+            // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
+            // ================================================================
+            let mut mlp_outputs: Vec<CudaSlice<bf16>> = Vec::new();
+
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &mut self.gemm_engines[gpu_idx];
+                let w = &self.weights[gpu_idx];
+                let mlp_weights = &w.layers[layer_idx].mlp;
+
+                // Norm2
+                let norm2_weight = crate::upload::upload_weight(&gpu_stream, &w.layers[layer_idx].norm2)?;
+                let norm2_out = crate::norm::rms_norm(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
+                    config.rms_norm_eps, config.hidden_size,
+                )?;
+
+                // Gate projection (column-parallel: sharded_intermediate output dim)
+                let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                    seq_len, sharded_intermediate, config.hidden_size,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                // Up projection (column-parallel: sharded_intermediate output dim)
+                let mut up = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.up_proj, &norm2_out, &mut up,
+                    seq_len, sharded_intermediate, config.hidden_size,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                // SiLU(gate) * up (elementwise on sharded_intermediate)
+                let mut silu_out = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
+                let elem_i32 = (seq_len * sharded_intermediate) as i32;
+                unsafe {
+                    gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
+                        .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                        .launch(infers_cuda::LaunchConfig {
+                            grid_dim: (((seq_len * sharded_intermediate) as u32).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+
+                // Down projection (row-parallel: full hidden_size output, sharded_intermediate inner dim)
+                let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                    seq_len, config.hidden_size, sharded_intermediate,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                mlp_outputs.push(mlp_out);
+            }
+
+            // All-reduce MLP outputs across GPUs (grouped)
+            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_mlp(
+                    &self.nccl, &gpu_stream, &mut mlp_outputs[gpu_idx],
+                )?;
+            }
+group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
+
+            // ================================================================
+            // Phase D: Residual add on each GPU
+            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                hidden_states[gpu_idx] = crate::add::add(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
+                )?;
+            }
         }
 
+        // ================================================================
+        // Final norm + LM head on GPU 0 (same on all GPUs after all-reduce)
+        // ================================================================
+        let final_stream = self.streams.get(0).unwrap().clone();
+        let final_weights = &self.weights[0];
+        let mut final_hidden = hidden_states.into_iter().next().unwrap(); // GPU 0's hidden state
+
         // Final norm
-        let final_norm_weight = weights.norm.as_ref()
+        let final_norm_weight = final_weights.norm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-        let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
-        hidden = crate::norm::rms_norm(
-            stream, &self.rmsnorm_kernel, &hidden, &final_norm_gpu,
+        let final_norm_gpu = crate::upload::upload_weight(&final_stream, final_norm_weight)?;
+        final_hidden = crate::norm::rms_norm(
+            &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
 
         // LM head
-        let lm_head_weight = weights.lm_head.as_ref()
-            .or_else(|| weights.embedding.as_ref())
+        let lm_head_weight = final_weights.lm_head.as_ref()
+            .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-        let seq_len = token_ids.len();
-        let mut logits = stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
+        let mut logits = final_stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
         crate::gemm_dispatch::gemm_projection(
-            &mut self.gemm, &self.int4_gemm_kernel, stream,
-            lm_head_weight, &hidden, &mut logits,
+            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
+            lm_head_weight, &final_hidden, &mut logits,
             seq_len, config.vocab_size, config.hidden_size,
-            self.group_size, &weights.int4_companions,
-        )?;
+            self.group_size, &final_weights.int4_companions,
+)?;
 
-        // Sample: last row argmax (BF16)
+        // Sample: last row argmax
         let last_row_start = (seq_len - 1) * config.vocab_size;
         let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
         let sampled = crate::sample::greedy_sample_bf16(
-            stream, &self.argmax_kernel, &last_row_logits,
+            &final_stream, &self.per_gpu_kernels[0].argmax, &last_row_logits,
         )?;
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
@@ -625,162 +701,244 @@ impl ForwardEngine {
     ) -> Result<u32> {
         let manager = self.paged_kv_manager.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
-
-        let weights = &self.weights[0];
+        let num_gpus = self.weights.len();
         let config = &self.config;
         let page_size = manager.page_size();
         let head_dim = config.head_dim;
-        let num_heads = config.num_attention_heads;
-        let num_kv_heads = config.num_key_value_heads;
         let num_cached_tokens = manager.num_tokens(seq_id)? as i32;
 
-        // Upload block table to GPU
+        // Upload block table and position to ALL GPUs
         let block_table = manager.block_table(seq_id)?;
         let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
-        let block_table_gpu = stream.clone_htod(&block_table_i32)?;
+        let position_i32 = vec![position as i32];
 
-        // Upload position to GPU
-        let positions_i32 = vec![position as i32];
-        let positions_gpu = stream.clone_htod(&positions_i32)?;
-
-        // Ensure page pools allocated
-        for cache in &mut self.paged_kv_caches {
-            cache.ensure_allocated(stream)?;
+        let mut block_tables_gpu: Vec<CudaSlice<i32>> = Vec::new();
+        let mut positions_gpu_vec: Vec<CudaSlice<i32>> = Vec::new();
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            block_tables_gpu.push(gpu_stream.clone_htod(&block_table_i32)?);
+            positions_gpu_vec.push(gpu_stream.clone_htod(&position_i32)?);
         }
 
-        // Embed single token
-        let embed_weight = weights.embedding.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-        let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
-        let mut hidden = crate::embedding::embed_tokens(
-            stream, &self.embedding_kernel, &[token_id], &embed_table,
-            config.hidden_size, config.vocab_size,
-        )?;
+        // Ensure page pools allocated on each GPU
+        for gpu_idx in 0..num_gpus {
+            for cache in &mut self.paged_kv_caches[gpu_idx] {
+                cache.ensure_allocated(self.streams.get(gpu_idx).unwrap())?;
+            }
+        }
+
+        // Embed single token on each GPU
+        let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            let w = &self.weights[gpu_idx];
+            let embed_weight = w.embedding.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+            let embed_table = crate::upload::upload_weight(&gpu_stream, embed_weight)?;
+            let h = crate::embedding::embed_tokens(
+                &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, &[token_id], &embed_table,
+                config.hidden_size, config.vocab_size,
+            )?;
+hidden_states.push(h);
+        }
+
+        // Per-GPU sharded head counts
+        let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
+        let num_heads_per_gpu = config.num_attention_heads / num_gpus;
+        let sharded_intermediate = config.intermediate_size / num_gpus;
 
         // Layer loop
-        for layer_idx in 0..config.num_hidden_layers {
-            let layer = &weights.layers[layer_idx];
-            let layer_type = config.get_layer_type(layer_idx);
+for layer_idx in 0..config.num_hidden_layers {
+            // ================================================================
+            // Phase A: Attention/GDN on each GPU
+            // ================================================================
+            let mut attn_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
-            // Norm1
-            let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
-            let norm1_out = crate::norm::rms_norm(
-                stream, &self.rmsnorm_kernel, &hidden, &norm1_weight,
-                config.rms_norm_eps, config.hidden_size,
-            )?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &mut self.gemm_engines[gpu_idx];
+                let w = &self.weights[gpu_idx];
+                let layer = &w.layers[layer_idx];
+                let layer_type = config.get_layer_type(layer_idx);
 
-            // Attention/GDN dispatch
-            let attn_or_gdn_out = match layer_type {
-                LayerType::GatedDeltaNet => {
-                    let gdn_weights = layer.gdn.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                    crate::gdn::decode_forward(
-                        &mut self.gemm, &self.int4_gemm_kernel, stream,
-                        &self.gdn_update_kernel, gdn_weights, &norm1_out,
-                        &mut self.gdn_states[layer_idx],
-                        config.hidden_size, self.group_size, &weights.int4_companions,
-                    )?
-                }
-                LayerType::FullAttention => {
-                    let attn_weights = layer.attn.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-                    crate::attention::decode_forward_paged(
-                        &mut self.gemm, &self.int4_gemm_kernel, stream,
-                        &self.paged_kv_write_kernel, &self.paged_attention_decode_kernel,
-                        &self.rope_kernel, &self.rmsnorm_kernel, &self.add_kernel,
-                        attn_weights, &norm1_out,
-                        &mut self.paged_kv_caches[layer_idx],
-                        &block_table_gpu, &positions_gpu,
-                        position, num_cached_tokens,
-                        head_dim, num_heads, num_kv_heads, page_size,
-                        config.rope_theta, config.partial_rotary_factor,
-                        config.rms_norm_eps, self.group_size, &weights.int4_companions,
-                    )?
-                }
-            };
+                // Norm1
+                let norm1_weight = crate::upload::upload_weight(&gpu_stream, &layer.norm1)?;
+                let norm1_out = crate::norm::rms_norm(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
+                    config.rms_norm_eps, config.hidden_size,
+                )?;
 
-            // Residual add
-            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &attn_or_gdn_out)?;
-
-            // Norm2
-            let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
-            let norm2_out = crate::norm::rms_norm(
-                stream, &self.rmsnorm_kernel, &hidden, &norm2_weight,
-                config.rms_norm_eps, config.hidden_size,
-            )?;
-
-            // MLP (INT4-aware)
-            let mlp_weights = &layer.mlp;
-            let intermediate_size = config.intermediate_size;
-
-            // gate
-            let mut gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.gate_proj, &norm2_out, &mut gate,
-                1, intermediate_size, config.hidden_size,
-                self.group_size, &weights.int4_companions,
-            )?;
-
-            // up
-            let mut up = stream.alloc_zeros::<bf16>(intermediate_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.up_proj, &norm2_out, &mut up,
-                1, intermediate_size, config.hidden_size,
-                self.group_size, &weights.int4_companions,
-            )?;
-
-            // silu = SiLU(gate) * up
-            let mut silu_out = stream.alloc_zeros::<bf16>(intermediate_size)?;
-            let elem_i32 = intermediate_size as i32;
-            unsafe {
-                stream.launch_builder(&self.silu_glu_kernel)
-                    .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
-                    .launch(infers_cuda::LaunchConfig {
-                        grid_dim: ((intermediate_size as u32).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
+                // Attention or GDN (decode versions)
+                let attn_out = match layer_type {
+                    LayerType::GatedDeltaNet => {
+                        let gdn_weights = layer.gdn.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
+                        crate::gdn::decode_forward(
+                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                            &self.per_gpu_kernels[gpu_idx].gdn_update, gdn_weights, &norm1_out,
+                            &mut self.gdn_states[gpu_idx][layer_idx],
+                            config.hidden_size, config.as_ref(), self.group_size,
+                            &w.int4_companions,
+                        )?
+                    }
+                    LayerType::FullAttention => {
+                        let attn_weights = layer.attn.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
+                        crate::attention::decode_forward_paged(
+                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                            &self.per_gpu_kernels[gpu_idx].paged_kv_write, &self.per_gpu_kernels[gpu_idx].paged_attention_decode,
+                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
+                            &self.per_gpu_kernels[gpu_idx].silu_glu,
+                            attn_weights, &norm1_out,
+                            &mut self.paged_kv_caches[gpu_idx][layer_idx],
+                            &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
+                            position, num_cached_tokens,
+                            head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
+                            config.rope_theta, config.partial_rotary_factor,
+                            config.rms_norm_eps, self.group_size, &w.int4_companions,
+                            config.hidden_size,
+                            config.attn_output_gate,
+                        )?
+                    }
+                };
+                attn_outputs.push(attn_out);
             }
 
-            // down_proj
-            let mut mlp_out = stream.alloc_zeros::<bf16>(config.hidden_size)?;
-            crate::gemm_dispatch::gemm_projection(
-                &mut self.gemm, &self.int4_gemm_kernel, stream,
-                &mlp_weights.down_proj, &silu_out, &mut mlp_out,
-                1, config.hidden_size, intermediate_size,
-                self.group_size, &weights.int4_companions,
-            )?;
+            // All-reduce attention outputs across GPUs (grouped)
+            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_attention(
+                    &self.nccl, &gpu_stream, &mut attn_outputs[gpu_idx],
+                )?;
+            }
+            group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // Residual add
-            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &mlp_out)?;
+            // ================================================================
+            // Phase B: Residual add on each GPU
+            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                hidden_states[gpu_idx] = crate::add::add(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
+                )?;
+            }
+
+            // ================================================================
+            // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
+            // ================================================================
+            let mut mlp_outputs: Vec<CudaSlice<bf16>> = Vec::new();
+
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &mut self.gemm_engines[gpu_idx];
+                let w = &self.weights[gpu_idx];
+                let mlp_weights = &w.layers[layer_idx].mlp;
+
+                // Norm2
+                let norm2_weight = crate::upload::upload_weight(&gpu_stream, &w.layers[layer_idx].norm2)?;
+                let norm2_out = crate::norm::rms_norm(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
+                    config.rms_norm_eps, config.hidden_size,
+                )?;
+
+                // Gate projection (column-parallel: sharded_intermediate output dim)
+                let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                    1, sharded_intermediate, config.hidden_size,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                // Up projection (column-parallel: sharded_intermediate output dim)
+                let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.up_proj, &norm2_out, &mut up,
+                    1, sharded_intermediate, config.hidden_size,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                // SiLU(gate) * up (elementwise on sharded_intermediate)
+                let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                let elem_i32 = sharded_intermediate as i32;
+                unsafe {
+                    gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
+                        .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                        .launch(infers_cuda::LaunchConfig {
+                            grid_dim: ((sharded_intermediate as u32).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+
+                // Down projection (row-parallel: full hidden_size output)
+                let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
+                crate::gemm_dispatch::gemm_projection(
+                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                    1, config.hidden_size, sharded_intermediate,
+                    self.group_size, &w.int4_companions,
+                )?;
+
+                mlp_outputs.push(mlp_out);
+            }
+
+            // All-reduce MLP outputs across GPUs (grouped)
+            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_mlp(
+                    &self.nccl, &gpu_stream, &mut mlp_outputs[gpu_idx],
+                )?;
+            }
+            group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
+
+            // ================================================================
+            // Phase D: Residual add on each GPU
+            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                hidden_states[gpu_idx] = crate::add::add(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
+                )?;
+            }
         }
 
+        // ================================================================
+        // Final norm + LM head + sample on GPU 0
+        // ================================================================
+        let final_stream = self.streams.get(0).unwrap().clone();
+        let final_weights = &self.weights[0];
+        let mut final_hidden = hidden_states.into_iter().next().unwrap();
+
         // Final norm
-        let final_norm_weight = weights.norm.as_ref()
+        let final_norm_weight = final_weights.norm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-        let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
-        hidden = crate::norm::rms_norm(
-            stream, &self.rmsnorm_kernel, &hidden, &final_norm_gpu,
+        let final_norm_gpu = crate::upload::upload_weight(&final_stream, final_norm_weight)?;
+        final_hidden = crate::norm::rms_norm(
+            &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
 
         // LM head
-        let lm_head_weight = weights.lm_head.as_ref()
-            .or_else(|| weights.embedding.as_ref())
+        let lm_head_weight = final_weights.lm_head.as_ref()
+            .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-        let mut logits = stream.alloc_zeros::<bf16>(config.vocab_size)?;
+        let mut logits = final_stream.alloc_zeros::<bf16>(config.vocab_size)?;
         crate::gemm_dispatch::gemm_projection(
-            &mut self.gemm, &self.int4_gemm_kernel, stream,
-            lm_head_weight, &hidden, &mut logits,
+            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
+            lm_head_weight, &final_hidden, &mut logits,
             1, config.vocab_size, config.hidden_size,
-            self.group_size, &weights.int4_companions,
-        )?;
+            self.group_size, &final_weights.int4_companions,
+)?;
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::greedy_sample_bf16(
-            stream, &self.argmax_kernel, &logits.as_view(),
+            &final_stream, &self.per_gpu_kernels[0].argmax, &logits.as_view(),
         )?;
 
         Ok(sampled)
@@ -818,8 +976,10 @@ impl ForwardEngine {
         }
 
         // For each page, copy data from all layers' GPU buffers
-        for &page_id in &block_table {
-            for (layer_idx, cache) in self.paged_kv_caches.iter().enumerate() {
+        // For eviction, iterate GPU 0 only (TP eviction can be updated later)
+        if let Some(gpu_cache) = self.paged_kv_caches.first() {
+            for &page_id in &block_table {
+                for (layer_idx, cache) in gpu_cache.iter().enumerate() {
                 let page_pool = cache.page_pool()
                     .ok_or_else(|| anyhow::anyhow!("PagedKvCache not allocated for layer {layer_idx}"))?;
 
@@ -838,6 +998,7 @@ impl ForwardEngine {
                 let page_bytes = BackendEvictionStore::bf16_slice_to_bytes(&page_data_bf16);
                 store.store(layer_idx, page_id, page_bytes);
             }
+        }
         }
 
         // Mark the sequence as evicted in the KV manager (metadata only)
@@ -888,8 +1049,9 @@ impl ForwardEngine {
         // For each page, copy data from store back to all layers' GPU buffers
         for (i, &old_page_id) in evicted.page_ids.iter().enumerate() {
             let new_page_id = new_block_table[i];
-
-            for layer_idx in 0..self.paged_kv_caches.len() {
+            // For restore, use GPU 0 only (TP restore can be updated later)
+            let gpu_cache = &mut self.paged_kv_caches[0];
+            for layer_idx in 0..gpu_cache.len() {
                 // Retrieve data from store
                 let page_bytes = store
                     .retrieve(layer_idx, old_page_id)
@@ -902,7 +1064,7 @@ impl ForwardEngine {
                 let page_data_bf16 = BackendEvictionStore::bytes_to_bf16_slice(&page_bytes);
 
                 // Get mutable slice of GPU buffer for this page
-                let cache = &mut self.paged_kv_caches[layer_idx];
+                let cache = &mut gpu_cache[layer_idx];
                 let page_elements = 2 * cache.page_size() * cache.kv_dim();
                 let offset = (new_page_id as usize) * page_elements;
                 let page_pool = cache.page_pool_mut()
@@ -969,22 +1131,22 @@ impl ForwardEngine {
         let weights = &self.weights[gpu_id];
 
         let kernels = crate::decode::DecodeKernels {
-            rmsnorm: self.rmsnorm_kernel.clone(),
-            silu_glu: self.silu_glu_kernel.clone(),
-            rope: self.rope_kernel.clone(),
-            embedding: self.embedding_kernel.clone(),
-            add: self.add_kernel.clone(),
-            argmax: self.argmax_kernel.clone(),
-            softmax: self.softmax_kernel.clone(),
-            kv_cache_write: self.kv_cache_write_kernel.clone(),
-            gdn_update: self.gdn_update_kernel.clone(),
-            int4_gemm: self.int4_gemm_kernel.clone(),
+            rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
+            silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
+            rope: self.per_gpu_kernels[0].rope.clone(),
+            embedding: self.per_gpu_kernels[0].embedding.clone(),
+            add: self.per_gpu_kernels[0].add.clone(),
+            argmax: self.per_gpu_kernels[0].argmax.clone(),
+            softmax: self.per_gpu_kernels[0].softmax.clone(),
+            kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
+            gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
         crate::decode::decode_with_hidden(
-            &mut self.gemm, stream, &kernels, &self.nccl,
+            &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
-            &mut self.kv_caches, &mut self.gdn_states,
+            &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
     }
@@ -1017,16 +1179,16 @@ impl ForwardEngine {
         mtp_metrics: &mut infers_mtp::MtpMetrics,
     ) -> Result<Vec<u32>> {
         let kernels = crate::decode::DecodeKernels {
-            rmsnorm: self.rmsnorm_kernel.clone(),
-            silu_glu: self.silu_glu_kernel.clone(),
-            rope: self.rope_kernel.clone(),
-            embedding: self.embedding_kernel.clone(),
-            add: self.add_kernel.clone(),
-            argmax: self.argmax_kernel.clone(),
-            softmax: self.softmax_kernel.clone(),
-            kv_cache_write: self.kv_cache_write_kernel.clone(),
-            gdn_update: self.gdn_update_kernel.clone(),
-            int4_gemm: self.int4_gemm_kernel.clone(),
+            rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
+            silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
+            rope: self.per_gpu_kernels[0].rope.clone(),
+            embedding: self.per_gpu_kernels[0].embedding.clone(),
+            add: self.per_gpu_kernels[0].add.clone(),
+            argmax: self.per_gpu_kernels[0].argmax.clone(),
+            softmax: self.per_gpu_kernels[0].softmax.clone(),
+            kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
+            gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
         use std::cell::Cell;
@@ -1042,9 +1204,9 @@ impl ForwardEngine {
         //   3. References remain valid as long as self is alive
         // keep the kv_caches and gdn_states pointers for mutable access in full_forward_fn
         let kv_caches_ptr: Arc<*mut Vec<KvCache>> =
-            Arc::new(&mut self.kv_caches as *mut Vec<KvCache>);
+            Arc::new(&mut self.kv_caches[0] as *mut Vec<KvCache>);
         let gdn_states_ptr: Arc<*mut Vec<GdnState>> =
-            Arc::new(&mut self.gdn_states as *mut Vec<GdnState>);
+            Arc::new(&mut self.gdn_states[0] as *mut Vec<GdnState>);
 
         // Read-only references captured via Arc<*const _> for use in Fn closures
         // alongside the mutable-access raw pointers above
@@ -1193,7 +1355,7 @@ impl ForwardEngine {
                 sampled_token,
                 num_drafts,
                 stream,
-                &mut self.gemm,
+                &mut self.gemm_engines[0],
                 &ops,
             )?;
 
@@ -1201,7 +1363,7 @@ impl ForwardEngine {
             // Reset position counter before each verification batch
             verify_pos.set(current_pos.get());
             let verification =
-                mtp.verify_drafts(&drafts, stream, &mut self.gemm, &ops)?;
+                mtp.verify_drafts(&drafts, stream, &mut self.gemm_engines[0], &ops)?;
 
             // Step 5: Record metrics
             mtp_metrics.record_step(verification.num_accepted(), verification.num_drafts());

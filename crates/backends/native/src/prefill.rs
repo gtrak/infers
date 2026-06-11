@@ -138,6 +138,7 @@ pub fn prefill(
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
+                    config,
                     group_size,
                     &weights.int4_companions,
                 )?
@@ -158,6 +159,7 @@ pub fn prefill(
                     &norm1_out,
                     &mut kv_caches[layer_idx],
                     &positions,
+                    hidden_size,
                     head_dim,
                     num_heads,
                     num_kv_heads,

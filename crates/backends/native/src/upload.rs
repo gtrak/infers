@@ -218,6 +218,7 @@ pub fn dequantize_int4_to_bf16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use half::{bf16, f16};
 
     // =====================================================================
@@ -399,19 +400,19 @@ mod tests {
         }
 
         let qweight = WeightData {
-            data: qweight_bytes,
+            data: Bytes::from(qweight_bytes),
             shape: vec![n, k_packed],
             dtype: WeightDtype::Int4Packed,
             name: "test_qweight".to_string(),
         };
         let scales = WeightData {
-            data: scales_bytes,
+            data: Bytes::from(scales_bytes),
             shape: vec![n, num_groups],
             dtype: WeightDtype::Bf16,
             name: "test_scales".to_string(),
         };
         let qzeros = WeightData {
-            data: qzeros_bytes,
+            data: Bytes::from(qzeros_bytes),
             shape: vec![n, num_groups / 8],
             dtype: WeightDtype::Int4Packed,
             name: "test_qzeros".to_string(),
@@ -536,19 +537,19 @@ mod tests {
         let qzeros_bytes = vec![0u8; 4];
 
         let qweight = WeightData {
-            data: qweight_bytes,
+            data: Bytes::from(qweight_bytes),
             shape: vec![n, k_packed],
             dtype: WeightDtype::Int4Packed,
             name: "multi_group_qweight".to_string(),
         };
         let scales = WeightData {
-            data: scales_bytes,
+            data: Bytes::from(scales_bytes),
             shape: vec![n, num_groups],
             dtype: WeightDtype::Bf16,
             name: "multi_group_scales".to_string(),
         };
         let qzeros = WeightData {
-            data: qzeros_bytes,
+            data: Bytes::from(qzeros_bytes),
             shape: vec![n, 1],
             dtype: WeightDtype::Int4Packed,
             name: "multi_group_qzeros".to_string(),
@@ -593,19 +594,19 @@ mod tests {
     fn dequantize_int4_empty() {
         // Edge case: empty weights
         let qweight = WeightData {
-            data: vec![],
+            data: Bytes::from(vec![]),
             shape: vec![0, 0],
             dtype: WeightDtype::Int4Packed,
             name: "empty".to_string(),
         };
         let scales = WeightData {
-            data: vec![],
+            data: Bytes::from(vec![]),
             shape: vec![0, 0],
             dtype: WeightDtype::Bf16,
             name: "empty_scales".to_string(),
         };
         let qzeros = WeightData {
-            data: vec![],
+            data: Bytes::from(vec![]),
             shape: vec![0, 0],
             dtype: WeightDtype::Int4Packed,
             name: "empty_qzeros".to_string(),

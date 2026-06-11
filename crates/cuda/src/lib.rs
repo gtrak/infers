@@ -20,3 +20,4 @@ pub use cudarc::cublaslt::safe::{
 pub use cudarc::nccl::safe::{
     Comm as NcclComm, ReduceOp as NcclReduceOp, NcclType,
 };
+pub use cudarc::nccl::result::{group_end, group_start};

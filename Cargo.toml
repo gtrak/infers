@@ -63,7 +63,7 @@ cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
 # ML / Data
 safetensors = "0.8.0"
 memmap2 = "0.9.10"
-
+bytes = "1"
 # Half-precision floats
 half = "2.6.0"
 

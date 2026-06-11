@@ -79,6 +79,14 @@ pub struct ModelConfig {
     /// mRoPE section sizes (e.g. `[11, 11, 10]`).
     pub mrope_section: Vec<usize>,
 
+    /// Number of value heads for GDN linear attention (Qwen3.6: 48).
+    #[serde(default = "default_linear_num_value_heads")]
+    pub linear_num_value_heads: usize,
+
+    /// Per-head state dimension for GDN linear attention (Qwen3.6: 128).
+    #[serde(default = "default_linear_value_head_dim")]
+    pub linear_value_head_dim: usize,
+
     /// Number of MTP hidden layers (defaults to 0).
     #[serde(default)]
     pub mtp_num_hidden_layers: usize,
@@ -86,6 +94,11 @@ pub struct ModelConfig {
     /// Whether MTP uses dedicated embeddings (defaults to false).
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: bool,
+
+    /// Whether the Q projection includes an attention output gate (doubled Q output).
+// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+    #[serde(default)]
+    pub attn_output_gate: bool,
 
     /// Optional quantization configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,9 +109,13 @@ pub struct ModelConfig {
     pub layer_types: Option<Vec<String>>,
 }
 
+
 /// Default interval for full-attention layers in the hybrid attention pattern.
 /// Every Nth layer (0-indexed, 1-based modulo) is full attention.
 const FULL_ATTENTION_INTERVAL: usize = 4;
+
+const fn default_linear_num_value_heads() -> usize { 1 }
+const fn default_linear_value_head_dim() -> usize { 1 }
 
 /// Shallow-merge `text_config` into the root object.
 ///

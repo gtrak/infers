@@ -91,6 +91,7 @@ pub fn forward_layer_pass(
                 &norm1_out,
                 &mut gdn_states[layer_idx],
                 hidden_size,
+                config,
                 128, // group_size default
                 &int4_companions,
             )?

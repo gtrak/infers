@@ -19,7 +19,15 @@ use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use infers_cuda::gemm::GemmEngine;
-use infers_model::{GdnWeights, Int4Companions};
+use infers_model::{GdnWeights, Int4Companions, ModelConfig, WeightDtype};
+
+/// Get the output dimension from a weight tensor.
+///
+/// BF16/FP16/FP32 weights are stored as [N, K] → output dim = shape[0]
+/// INT4 qweights are stored as [K/8, N] → output dim = shape[1]
+fn weight_output_dim(w: &infers_model::WeightData) -> usize {
+    if w.dtype == WeightDtype::Int4Packed { w.shape[1] } else { w.shape[0] }
+}
 
 /// GDN recurrent state, maintained across decode steps.
 ///
@@ -165,31 +173,35 @@ pub fn forward(
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
     hidden_size: usize,
+    config: &ModelConfig,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
 
-    // SSM dimension is determined by in_proj_a's output dimension (columns).
-    // in_proj_a.shape = [hidden_size, ssm_dim]
-    let ssm_dim = weights.in_proj_a.shape[1];
+    // Number of value heads from in_proj_a's output dimension.
+    // BF16: shape = [N, K] = [num_heads, hidden_size] → N = shape[0]
+    // INT4: shape = [K/8, N] → N = shape[1]
+    let num_value_heads = weight_output_dim(&weights.in_proj_a);
+    let head_dim = config.linear_value_head_dim;
+    let total_dim = num_value_heads * head_dim;
 
     // =========================================================================
     // Phase 1: Projection GEMMs (INT4-aware via gemm_projection)
     // =========================================================================
 
-    // x_proj = input @ in_proj_a^T  [seq_len, ssm_dim]  (BF16 weight)
+    // x_proj = input @ in_proj_a^T  [seq_len, num_value_heads]  (per-head scalar)
     let mut x_proj = stream
-        .alloc_zeros::<bf16>(seq_len * ssm_dim)
+        .alloc_zeros::<bf16>(seq_len * num_value_heads)
         .map_err(|e| anyhow::anyhow!("Failed to allocate x_proj buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection(
         gemm, int4_kernel, stream,
         &weights.in_proj_a, input, &mut x_proj,
-        seq_len, ssm_dim, hidden_size, group_size, int4_companions,
+        seq_len, num_value_heads, hidden_size, group_size, int4_companions,
     )?;
 
     // b_proj = input @ in_proj_b^T  [seq_len, b_dim]
-    let b_dim = weights.in_proj_b.shape[1];
+    let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream
         .alloc_zeros::<bf16>(seq_len * b_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate b_proj buffer: {e}"))?;
@@ -201,8 +213,10 @@ pub fn forward(
 
     // dt_proj: if x_proj_weight exists, compute dt_proj = input @ x_proj_weight
     // If not, dt is just dt_bias (no projection needed)
+    // NOTE: when x_proj_weight maps to num_value_heads (per-head), the result
+    // must be broadcast to total_dim. Currently unsupported — assumes None.
     let dt_proj = if let Some(x_proj_w) = &weights.x_proj_weight {
-        let dt_dim = x_proj_w.shape[1];
+        let dt_dim = weight_output_dim(x_proj_w);
         let mut dt = stream
             .alloc_zeros::<bf16>(seq_len * dt_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
@@ -211,16 +225,16 @@ pub fn forward(
             x_proj_w, input, &mut dt,
             seq_len, dt_dim, hidden_size, group_size, int4_companions,
         )?;
-        Some(extract_columns(stream, &dt, seq_len, dt_dim, ssm_dim)?)
+        Some(extract_columns(stream, &dt, seq_len, dt_dim, num_value_heads)?)
     } else {
         None
     };
 
 
-    // z_gate = input @ in_proj_z^T (INT4)  [seq_len, z_dim]
-    // If in_proj_z is absent, use zeros
+    // z_gate = input @ in_proj_z^T (INT4)  [seq_len, total_dim]
+    // Use the full z_gate_raw directly (NO column extraction — z_dim == total_dim)
     let z_gate = if let Some(z_weight) = &weights.in_proj_z {
-        let z_dim = z_weight.shape[1];
+        let z_dim = weight_output_dim(z_weight);
         let mut z_gate_raw = stream
             .alloc_zeros::<bf16>(seq_len * z_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate z_gate buffer: {e}"))?;
@@ -229,30 +243,30 @@ pub fn forward(
             z_weight, input, &mut z_gate_raw,
             seq_len, z_dim, hidden_size, group_size, int4_companions,
         )?;
-        // Extract first ssm_dim columns for kernel
-        Some(extract_columns(stream, &z_gate_raw, seq_len, z_dim, ssm_dim)?)
+        // Keep all columns — z_dim should equal total_dim
+        Some(z_gate_raw)
     } else {
         None
     };
 
     // =========================================================================
-    // Phase 2: Align projections to ssm_dim
+    // Phase 2: Align projections
     // =========================================================================
 
-    // b_proj: extract/pad to ssm_dim
-    let b_proj = extract_columns(stream, &b_proj_raw, seq_len, b_dim, ssm_dim)?;
+    // b_proj: extract/pad to num_value_heads
+    let b_proj = extract_columns(stream, &b_proj_raw, seq_len, b_dim, num_value_heads)?;
 
-    // dt_proj: use zeros if x_proj_weight was absent
+    // dt_proj: use zeros if x_proj_weight was absent (full [seq_len, total_dim])
     let dt_proj_buf = dt_proj.unwrap_or_else(|| {
         stream
-            .alloc_zeros::<bf16>(seq_len * ssm_dim)
+            .alloc_zeros::<bf16>(seq_len * total_dim)
             .expect("Failed to allocate dt_proj zeros")
     });
 
-    // z_gate: default zeros if absent
+    // z_gate: default zeros if absent (full [seq_len, total_dim])
     let z_gate = z_gate.unwrap_or_else(|| {
         stream
-            .alloc_zeros::<bf16>(seq_len * ssm_dim)
+            .alloc_zeros::<bf16>(seq_len * total_dim)
             .expect("Failed to allocate default z_gate zeros")
     });
 
@@ -263,31 +277,32 @@ pub fn forward(
     let a_log_gpu = weights.a_log.as_ref()
         .map(|w| crate::upload::upload_weight(stream, w))
         .transpose()?
-        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(ssm_dim).expect("Failed to allocate A_log"));
+        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(num_value_heads).expect("Failed to allocate A_log"));
 
     let dt_bias_gpu = weights.dt_bias.as_ref()
         .map(|w| crate::upload::upload_weight(stream, w))
         .transpose()?
-        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(ssm_dim).expect("Failed to allocate dt_bias"));
+        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(num_value_heads).expect("Failed to allocate dt_bias"));
 
     // =========================================================================
     // Phase 4: Ensure GDN state is allocated and launch Mamba2 prefill kernel
     // =========================================================================
 
-    gdn_state.ensure_allocated(stream, ssm_dim)?;
+    gdn_state.ensure_allocated(stream, total_dim)?;
 
     let mut gdn_output = stream
-        .alloc_zeros::<bf16>(seq_len * ssm_dim)
+        .alloc_zeros::<bf16>(seq_len * total_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate GDN output buffer: {e}"))?;
 
     let state_ref = gdn_state.state.as_mut()
         .expect("GDN state should be allocated");
 
     let seq_len_i32 = seq_len as i32;
-    let ssm_dim_i32 = ssm_dim as i32;
+    let num_value_heads_i32 = num_value_heads as i32;
+    let head_dim_i32 = head_dim as i32;
 
-    // Grid: ceil(ssm_dim / 256), Block: 256
-    let grid = (ssm_dim as u32).div_ceil(256);
+    // Grid: ceil(total_dim / 256), Block: 256
+    let grid = (total_dim as u32).div_ceil(256);
     let config = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (256, 1, 1),
@@ -297,22 +312,23 @@ pub fn forward(
     unsafe {
         stream
             .launch_builder(gdn_prefill_kernel)
-            .arg(&x_proj)           // x_proj [seq, ssm_dim]
-            .arg(&b_proj)           // b_proj [seq, ssm_dim]
-            .arg(&dt_proj_buf)    // dt_proj [seq, ssm_dim]
-            .arg(&z_gate)           // z_gate [seq, ssm_dim]
-            .arg(&a_log_gpu)        // A_log [ssm_dim]
-            .arg(&dt_bias_gpu)      // dt_bias [ssm_dim]
-            .arg(state_ref)         // state [ssm_dim] (mut in/out)
-            .arg(&mut gdn_output)  // output [seq, ssm_dim] (mut out)
+            .arg(&x_proj)           // x_proj [seq, num_value_heads]
+            .arg(&b_proj)           // b_proj [seq, num_value_heads]
+            .arg(&dt_proj_buf)    // dt_proj [seq, total_dim]
+            .arg(&z_gate)           // z_gate [seq, total_dim]
+            .arg(&a_log_gpu)        // A_log [num_value_heads]
+            .arg(&dt_bias_gpu)      // dt_bias [num_value_heads]
+            .arg(state_ref)         // state [total_dim] (mut in/out)
+            .arg(&mut gdn_output)  // output [seq, total_dim] (mut out)
             .arg(&seq_len_i32)      // seq_len (i32)
-            .arg(&ssm_dim_i32)      // ssm_dim (i32)
+            .arg(&num_value_heads_i32) // num_value_heads (i32)
+            .arg(&head_dim_i32)     // head_dim (i32)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("GDN Mamba2 prefill kernel launch failed: {e}"))?;
     }
 
     // =========================================================================
-    // Phase 5: Output projection — project [seq_len, ssm_dim] → [seq_len, hidden]
+    // Phase 5: Output projection — [seq_len, total_dim] → [seq_len, hidden]
     // =========================================================================
 
     let mut output = stream
@@ -321,7 +337,7 @@ pub fn forward(
     crate::gemm_dispatch::gemm_projection(
         gemm, int4_kernel, stream,
         &weights.out_proj_weight, &gdn_output, &mut output,
-        seq_len, hidden_size, ssm_dim, group_size, int4_companions,
+        seq_len, hidden_size, total_dim, group_size, int4_companions,
     )?;
 
     Ok(output)
@@ -358,28 +374,31 @@ pub fn decode_forward(
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
     hidden_size: usize,
+    config: &ModelConfig,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
-    // SSM dimension from in_proj_a's output dimension
-    let ssm_dim = weights.in_proj_a.shape[1];
+    // Number of value heads from in_proj_a's output dimension
+    let num_value_heads = weight_output_dim(&weights.in_proj_a);
+    let head_dim = config.linear_value_head_dim;
+    let total_dim = num_value_heads * head_dim;
 
     // =========================================================================
     // Phase 1: Projection GEMMs (single token, m=1, INT4-aware)
     // =========================================================================
 
-    // x_proj = input @ in_proj_a^T  [1, ssm_dim]
+    // x_proj = input @ in_proj_a^T  [1, num_value_heads]  (per-head scalar)
     let mut x_proj = stream
-        .alloc_zeros::<bf16>(ssm_dim)
+        .alloc_zeros::<bf16>(num_value_heads)
         .map_err(|e| anyhow::anyhow!("Failed to allocate x_proj buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection(
         gemm, int4_kernel, stream,
         &weights.in_proj_a, input, &mut x_proj,
-        1, ssm_dim, hidden_size, group_size, int4_companions,
+        1, num_value_heads, hidden_size, group_size, int4_companions,
     )?;
 
     // b_proj = input @ in_proj_b^T  [1, b_dim]
-    let b_dim = weights.in_proj_b.shape[1];
+    let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream
         .alloc_zeros::<bf16>(b_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate b_proj buffer: {e}"))?;
@@ -392,7 +411,7 @@ pub fn decode_forward(
     // dt_proj: if x_proj_weight exists, compute dt_proj = input @ x_proj_weight
     // If not, dt is just dt_bias (no projection needed)
     let dt_proj = if let Some(x_proj_w) = &weights.x_proj_weight {
-        let dt_dim = x_proj_w.shape[1];
+        let dt_dim = weight_output_dim(x_proj_w);
         let mut dt = stream
             .alloc_zeros::<bf16>(dt_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
@@ -401,15 +420,16 @@ pub fn decode_forward(
             x_proj_w, input, &mut dt,
             1, dt_dim, hidden_size, group_size, int4_companions,
         )?;
-        Some(extract_columns_single(stream, &dt, dt_dim, ssm_dim)?)
+        Some(extract_columns_single(stream, &dt, dt_dim, num_value_heads)?)
     } else {
         None
     };
 
 
-    // z_gate = input @ in_proj_z^T (INT4)  [1, z_dim]
+    // z_gate = input @ in_proj_z^T (INT4)  [1, total_dim]
+    // Keep all columns — z_dim should equal total_dim
     let z_gate = if let Some(z_weight) = &weights.in_proj_z {
-        let z_dim = z_weight.shape[1];
+        let z_dim = weight_output_dim(z_weight);
         let mut z_gate_raw = stream
             .alloc_zeros::<bf16>(z_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate z_gate buffer: {e}"))?;
@@ -418,26 +438,26 @@ pub fn decode_forward(
             z_weight, input, &mut z_gate_raw,
             1, z_dim, hidden_size, group_size, int4_companions,
         )?;
-        Some(extract_columns_single(stream, &z_gate_raw, z_dim, ssm_dim)?)
+        Some(z_gate_raw)
     } else {
         None
     };
 
     // =========================================================================
-    // Phase 2: Align projections to ssm_dim
+    // Phase 2: Align projections
     // =========================================================================
 
-    let b_proj = extract_columns_single(stream, &b_proj_raw, b_dim, ssm_dim)?;
-    // dt_proj: use zeros if x_proj_weight was absent
+    let b_proj = extract_columns_single(stream, &b_proj_raw, b_dim, num_value_heads)?;
+    // dt_proj: use zeros if x_proj_weight was absent (full [total_dim])
     let dt_proj_buf = dt_proj.unwrap_or_else(|| {
         stream
-            .alloc_zeros::<bf16>(ssm_dim)
+            .alloc_zeros::<bf16>(total_dim)
             .expect("Failed to allocate dt_proj zeros")
     });
 
     let z_gate = z_gate.unwrap_or_else(|| {
         stream
-            .alloc_zeros::<bf16>(ssm_dim)
+            .alloc_zeros::<bf16>(total_dim)
             .expect("Failed to allocate default z_gate zeros")
     });
 
@@ -448,30 +468,31 @@ pub fn decode_forward(
     let a_log_gpu = weights.a_log.as_ref()
         .map(|w| crate::upload::upload_weight(stream, w))
         .transpose()?
-        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(ssm_dim).expect("Failed to allocate A_log"));
+        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(num_value_heads).expect("Failed to allocate A_log"));
 
     let dt_bias_gpu = weights.dt_bias.as_ref()
         .map(|w| crate::upload::upload_weight(stream, w))
         .transpose()?
-        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(ssm_dim).expect("Failed to allocate dt_bias"));
+        .unwrap_or_else(|| stream.alloc_zeros::<bf16>(num_value_heads).expect("Failed to allocate dt_bias"));
 
     // =========================================================================
     // Phase 4: Ensure GDN state and launch Mamba2 update kernel
     // =========================================================================
 
-    gdn_state.ensure_allocated(stream, ssm_dim)?;
+    gdn_state.ensure_allocated(stream, total_dim)?;
 
     let mut gdn_output = stream
-        .alloc_zeros::<bf16>(ssm_dim)
+        .alloc_zeros::<bf16>(total_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate GDN output buffer: {e}"))?;
 
     let state_ref = gdn_state.state.as_mut()
         .expect("GDN state should be allocated");
 
-    let ssm_dim_i32 = ssm_dim as i32;
+    let num_value_heads_i32 = num_value_heads as i32;
+    let head_dim_i32 = head_dim as i32;
 
-    // Grid: ceil(ssm_dim / 256), Block: 256
-    let grid = (ssm_dim as u32).div_ceil(256);
+    // Grid: ceil(total_dim / 256), Block: 256
+    let grid = (total_dim as u32).div_ceil(256);
     let config = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (256, 1, 1),
@@ -481,21 +502,22 @@ pub fn decode_forward(
     unsafe {
         stream
             .launch_builder(gdn_update_kernel)
-            .arg(&x_proj)           // x_proj [ssm_dim]
-            .arg(&b_proj)           // b_proj [ssm_dim]
-            .arg(&dt_proj_buf)    // dt_proj [ssm_dim]
-            .arg(&z_gate)           // z_gate [ssm_dim]
-            .arg(&a_log_gpu)        // A_log [ssm_dim]
-            .arg(&dt_bias_gpu)      // dt_bias [ssm_dim]
-            .arg(state_ref)         // state [ssm_dim] (mut in/out)
-            .arg(&mut gdn_output)  // output [ssm_dim] (mut out)
-            .arg(&ssm_dim_i32)      // ssm_dim (i32)
+            .arg(&x_proj)           // x_proj [num_value_heads]
+            .arg(&b_proj)           // b_proj [num_value_heads]
+            .arg(&dt_proj_buf)    // dt_proj [total_dim]
+            .arg(&z_gate)           // z_gate [total_dim]
+            .arg(&a_log_gpu)        // A_log [num_value_heads]
+            .arg(&dt_bias_gpu)      // dt_bias [num_value_heads]
+            .arg(state_ref)         // state [total_dim] (mut in/out)
+            .arg(&mut gdn_output)  // output [total_dim] (mut out)
+            .arg(&num_value_heads_i32) // num_value_heads (i32)
+            .arg(&head_dim_i32)     // head_dim (i32)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("GDN Mamba2 update kernel launch failed: {e}"))?;
     }
 
     // =========================================================================
-    // Phase 5: Output projection — [ssm_dim] → [hidden_size]
+    // Phase 5: Output projection — [total_dim] → [hidden_size]
     // =========================================================================
 
     let mut output = stream
@@ -504,7 +526,7 @@ pub fn decode_forward(
     crate::gemm_dispatch::gemm_projection(
         gemm, int4_kernel, stream,
         &weights.out_proj_weight, &gdn_output, &mut output,
-        1, hidden_size, ssm_dim, group_size, int4_companions,
+        1, hidden_size, total_dim, group_size, int4_companions,
     )?;
 
     Ok(output)

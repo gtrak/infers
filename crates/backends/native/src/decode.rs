@@ -145,6 +145,7 @@ pub fn decode(
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
+                    config,
                     group_size,
                     &weights.int4_companions,
                 )?
@@ -387,6 +388,7 @@ pub fn decode_with_hidden(
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
+                    config,
                     group_size,
                     &weights.int4_companions,
                 )?
