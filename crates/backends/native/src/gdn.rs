@@ -2,14 +2,16 @@
 //!
 //! Implements the recurrent linear-attention layer used in the hybrid
 //! attention pattern. Uses custom CUDA GDN kernels for state update.
+//! Uses INT4-aware GEMM dispatch via `gemm_projection`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use infers_cuda::gemm::{GemmConfig, GemmEngine};
-use infers_model::GdnWeights;
+use infers_cuda::gemm::GemmEngine;
+use infers_model::{GdnWeights, Int4Companions};
 
 /// GDN recurrent state, maintained across decode steps.
 ///
@@ -58,138 +60,83 @@ impl GdnState {
 ///
 /// Steps:
 /// 1. RMSNorm (handled by caller)
-/// 2. GDN projections: in_proj_a, in_proj_b, x_proj, dt_proj
+/// 2. GDN projections: in_proj_a, in_proj_b, x_proj, dt_proj (INT4-aware)
 /// 3. GDN prefill kernel (gated delta rule state update)
-/// 4. Output projection
+/// 4. Output projection (INT4-aware)
 ///
 /// conv1d is skipped (not critical for Phase 4.5).
 /// TP all-reduce is handled by the caller in prefill.rs.
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
+/// * `int4_kernel` — INT4 GEMM kernel for quantized weights
 /// * `stream` — CUDA stream
 /// * `gdn_prefill_kernel` — Loaded CUDA function for `infers_gdn_prefill_bf16`
 /// * `weights` — GDN layer weights
 /// * `input` — Input tensor `[seq_len × hidden_size]`
 /// * `gdn_state` — Mutable state (allocated/updated in-place)
 /// * `hidden_size` — Model hidden dimension
+/// * `group_size` — INT4 quantization group size (typically 128)
+/// * `int4_companions` — Companion tensors for INT4 weights
 ///
 /// # Returns
 /// GDN output `[seq_len × hidden_size]`
 pub fn forward(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     gdn_prefill_kernel: &CudaFunction,
     weights: &GdnWeights,
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
     hidden_size: usize,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
 
     // =========================================================================
-    // Phase 1: Projection GEMMs
+    // Phase 1: Projection GEMMs (INT4-aware via gemm_projection)
     // =========================================================================
-
-    // Upload projection weights
-    let in_proj_a = crate::upload::upload_weight(stream, &weights.in_proj_a)?;
-    let in_proj_b = crate::upload::upload_weight(stream, &weights.in_proj_b)?;
-    let x_proj = crate::upload::upload_weight(stream, &weights.x_proj_weight)?;
-    let dt_proj = crate::upload::upload_weight(stream, &weights.dt_proj_weight)?;
-    let out_proj = crate::upload::upload_weight(stream, &weights.out_proj_weight)?;
-
-    // TODO: conv1d_weight is skipped — not critical for Phase 4.5
 
     // a = GEMM(input, in_proj_a^T)  [seq_len × hidden_size]
     let mut a = stream
         .alloc_zeros::<bf16>(seq_len * hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate a buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &in_proj_a,
-        &mut a,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.in_proj_a, input, &mut a,
+        seq_len, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // b = GEMM(input, in_proj_b^T)  [seq_len × hidden_size]
     let mut b = stream
         .alloc_zeros::<bf16>(seq_len * hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate b buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &in_proj_b,
-        &mut b,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.in_proj_b, input, &mut b,
+        seq_len, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // x = GEMM(input, x_proj^T)  [seq_len × hidden_size]
     let mut x = stream
         .alloc_zeros::<bf16>(seq_len * hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate x buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &x_proj,
-        &mut x,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.x_proj_weight, input, &mut x,
+        seq_len, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // dt = GEMM(input, dt_proj^T)  [seq_len × hidden_size]
     let mut dt = stream
         .alloc_zeros::<bf16>(seq_len * hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate dt buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &dt_proj,
-        &mut dt,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.dt_proj_weight, input, &mut dt,
+        seq_len, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // =========================================================================
@@ -221,7 +168,6 @@ pub fn forward(
     };
 
     // Kernel requires mutable state pointer (IN/OUT).
-    // We extract the &mut CudaSlice and pass it directly.
     let state_ref = gdn_state.state.as_mut()
         .expect("GDN state should be allocated");
 
@@ -241,30 +187,17 @@ pub fn forward(
     }
 
     // =========================================================================
-    // Phase 3: Output projection
+    // Phase 3: Output projection (INT4-aware)
     // =========================================================================
 
     // output = GEMM(gdn_output, out_proj^T)  [seq_len × hidden_size]
     let mut output = stream
         .alloc_zeros::<bf16>(seq_len * hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate GDN final output: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        &gdn_output,
-        &out_proj,
-        &mut output,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.out_proj_weight, &gdn_output, &mut output,
+        seq_len, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     Ok(output)
@@ -288,125 +221,72 @@ pub fn forward(
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
+/// * `int4_kernel` — INT4 GEMM kernel for quantized weights
 /// * `stream` — CUDA stream
 /// * `gdn_update_kernel` — Loaded CUDA function for `infers_gdn_update_bf16`
 /// * `weights` — GDN layer weights
 /// * `input` — Single-token input `[1 × hidden_size]`
 /// * `gdn_state` — Mutable recurrent state (updated in-place)
 /// * `hidden_size` — Model hidden dimension
+/// * `group_size` — INT4 quantization group size (typically 128)
+/// * `int4_companions` — Companion tensors for INT4 weights
 ///
 /// # Returns
 /// GDN output `[1 × hidden_size]`
 pub fn decode_forward(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     gdn_update_kernel: &CudaFunction,
     weights: &GdnWeights,
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
     hidden_size: usize,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     // =========================================================================
-    // Phase 1: Projection GEMMs (single token, m=1)
+    // Phase 1: Projection GEMMs (single token, m=1, INT4-aware)
     // =========================================================================
-
-    // Upload projection weights
-    let in_proj_a = crate::upload::upload_weight(stream, &weights.in_proj_a)?;
-    let in_proj_b = crate::upload::upload_weight(stream, &weights.in_proj_b)?;
-    let x_proj = crate::upload::upload_weight(stream, &weights.x_proj_weight)?;
-    let dt_proj = crate::upload::upload_weight(stream, &weights.dt_proj_weight)?;
-    let out_proj = crate::upload::upload_weight(stream, &weights.out_proj_weight)?;
 
     // a = GEMM(input, in_proj_a^T)  [1 × hidden_size]
     let mut a = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate a buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &in_proj_a,
-        &mut a,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.in_proj_a, input, &mut a,
+        1, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // b = GEMM(input, in_proj_b^T)  [1 × hidden_size]
     let mut b = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate b buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &in_proj_b,
-        &mut b,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.in_proj_b, input, &mut b,
+        1, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // x = GEMM(input, x_proj^T)  [1 × hidden_size]
     let mut x = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate x buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &x_proj,
-        &mut x,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.x_proj_weight, input, &mut x,
+        1, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // dt = GEMM(input, dt_proj^T)  [1 × hidden_size]
     let mut dt = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate dt buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &dt_proj,
-        &mut dt,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.dt_proj_weight, input, &mut dt,
+        1, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     // =========================================================================
@@ -455,31 +335,17 @@ pub fn decode_forward(
     }
 
     // =========================================================================
-    // Phase 3: Output projection
+    // Phase 3: Output projection (INT4-aware)
     // =========================================================================
 
     // output = GEMM(gdn_output, out_proj^T)  [1 × hidden_size]
-    // gdn_output is [hidden_size], treated as [1 × hidden_size]
     let mut output = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate GDN final output: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        &gdn_output,
-        &out_proj,
-        &mut output,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.out_proj_weight, &gdn_output, &mut output,
+        1, hidden_size, hidden_size, group_size, int4_companions,
     )?;
 
     Ok(output)

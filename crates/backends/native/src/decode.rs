@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
-use infers_cuda::gemm::{GemmConfig, GemmEngine};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, PushKernelArg};
+use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_model::{LayerType, ModelConfig, WeightRegistry};
 
@@ -15,7 +15,6 @@ use crate::add;
 use crate::attention::{self, KvCache};
 use crate::embedding;
 use crate::gdn::{self, GdnState};
-use crate::mlp;
 use crate::norm;
 use crate::sample;
 
@@ -30,6 +29,8 @@ pub struct DecodeKernels {
     pub softmax: CudaFunction,
     pub kv_cache_write: CudaFunction,
     pub gdn_update: CudaFunction,
+    /// INT4 GEMM kernel for quantized weight dispatch.
+    pub int4_gemm: CudaFunction,
 }
 
 /// Execute a single-token decode step.
@@ -58,6 +59,7 @@ pub struct DecodeKernels {
 /// * `position` — Position index for RoPE
 /// * `kv_caches` — KV cache state for each attention layer
 /// * `gdn_states` — GDN recurrent state for each GDN layer
+/// * `group_size` — INT4 quantization group size (typically 128)
 ///
 /// # Returns
 /// Sampled token ID for the next generated token
@@ -72,6 +74,7 @@ pub fn decode(
     position: u32,
     kv_caches: &mut Vec<KvCache>,
     gdn_states: &mut Vec<GdnState>,
+    group_size: usize,
 ) -> Result<u32> {
     let hidden_size = config.hidden_size;
     let intermediate_size = config.intermediate_size;
@@ -135,12 +138,15 @@ pub fn decode(
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
                 gdn::decode_forward(
                     gemm,
+                    &kernels.int4_gemm,
                     stream,
                     &kernels.gdn_update,
                     gdn_weights,
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
+                    group_size,
+                    &weights.int4_companions,
                 )?
             }
             LayerType::FullAttention => {
@@ -148,6 +154,7 @@ pub fn decode(
                     .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
                 attention::decode_forward(
                     gemm,
+                    &kernels.int4_gemm,
                     stream,
                     &kernels.softmax,
                     &kernels.kv_cache_write,
@@ -163,6 +170,8 @@ pub fn decode(
                     max_seq_len,
                     rope_theta,
                     partial_rotary_factor,
+                    group_size,
+                    &weights.int4_companions,
                 )?
             }
         };
@@ -181,21 +190,64 @@ pub fn decode(
             hidden_size,
         )?;
 
-        // --- MLP ---
+        // --- MLP (INT4-aware) ---
         let mlp_weights = &layer.mlp;
-        let gate_proj = crate::upload::upload_weight(stream, &mlp_weights.gate_proj)?;
-        let up_proj = crate::upload::upload_weight(stream, &mlp_weights.up_proj)?;
-        let down_proj = crate::upload::upload_weight(stream, &mlp_weights.down_proj)?;
-        let mlp_out = mlp::mlp_forward(
-            gemm,
-            stream,
-            &kernels.silu_glu,
-            &gate_proj,
-            &up_proj,
-            &down_proj,
-            &norm2_out,
-            hidden_size,
-            intermediate_size,
+
+        // gate = GEMM(norm2_out, gate_proj)  [1 × intermediate_size]
+        let gate_size = intermediate_size;
+        let mut gate = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.gate_proj, &norm2_out, &mut gate,
+            1, intermediate_size, hidden_size, group_size,
+            &weights.int4_companions,
+        )?;
+
+        // up = GEMM(norm2_out, up_proj)  [1 × intermediate_size]
+        let mut up = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate up buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.up_proj, &norm2_out, &mut up,
+            1, intermediate_size, hidden_size, group_size,
+            &weights.int4_companions,
+        )?;
+
+        // silu_out = SiLU(gate) ⊗ up
+        let mut silu_out = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate silu_out buffer: {e}"))?;
+        {
+            let elem_count_i32 = gate_size as i32;
+            let config = infers_cuda::LaunchConfig {
+                grid_dim: ((gate_size as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&kernels.silu_glu)
+                    .arg(&gate)
+                    .arg(&up)
+                    .arg(&mut silu_out)
+                    .arg(&elem_count_i32)
+                    .launch(config)
+                    .map_err(|e| anyhow::anyhow!("SiLU+GLU kernel launch failed: {e}"))?;
+            }
+        }
+
+        // output = GEMM(silu_out, down_proj^T)  [1 × hidden_size]
+        let mut mlp_out = stream
+            .alloc_zeros::<bf16>(hidden_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate MLP output: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+            1, hidden_size, intermediate_size, group_size,
+            &weights.int4_companions,
         )?;
 
         // --- Residual add (MLP output + hidden) ---
@@ -219,30 +271,18 @@ pub fn decode(
     )?;
 
     let lm_head_weight = weights.lm_head.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("LM head weights not found"))?;
-    let lm_head_gpu = crate::upload::upload_weight(stream, lm_head_weight)?;
+        .or_else(|| weights.embedding.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
 
     // LM head: logits = hidden @ lm_head^T → [1 × vocab_size]
     let mut logits = stream
         .alloc_zeros::<bf16>(config.vocab_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: config.vocab_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        &hidden,
-        &lm_head_gpu,
-        &mut logits,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, &kernels.int4_gemm, stream,
+        lm_head_weight, &hidden, &mut logits,
+        1, config.vocab_size, hidden_size, group_size,
+        &weights.int4_companions,
     )?;
 
     // =========================================================================
@@ -284,6 +324,7 @@ pub fn decode_with_hidden(
     position: u32,
     kv_caches: &mut Vec<KvCache>,
     gdn_states: &mut Vec<GdnState>,
+    group_size: usize,
 ) -> Result<(u32, CudaSlice<bf16>)> {
     let hidden_size = config.hidden_size;
     let intermediate_size = config.intermediate_size;
@@ -344,22 +385,26 @@ pub fn decode_with_hidden(
         let attn_or_gdn_out = match layer_type {
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
+                    .ok_or_else(|| anyhow::anyhow!("GDN weights not found for MTP layer {}", layer_idx))?;
                 gdn::decode_forward(
                     gemm,
+                    &kernels.int4_gemm,
                     stream,
                     &kernels.gdn_update,
                     gdn_weights,
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
+                    group_size,
+                    &weights.int4_companions,
                 )?
             }
             LayerType::FullAttention => {
                 let attn_weights = layer.attn.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
+                    .ok_or_else(|| anyhow::anyhow!("Attention weights not found for MTP layer {}", layer_idx))?;
                 attention::decode_forward(
                     gemm,
+                    &kernels.int4_gemm,
                     stream,
                     &kernels.softmax,
                     &kernels.kv_cache_write,
@@ -375,6 +420,8 @@ pub fn decode_with_hidden(
                     max_seq_len,
                     rope_theta,
                     partial_rotary_factor,
+                    group_size,
+                    &weights.int4_companions,
                 )?
             }
         };
@@ -393,21 +440,64 @@ pub fn decode_with_hidden(
             hidden_size,
         )?;
 
-        // --- MLP ---
+        // --- MLP (INT4-aware) ---
         let mlp_weights = &layer.mlp;
-        let gate_proj = crate::upload::upload_weight(stream, &mlp_weights.gate_proj)?;
-        let up_proj = crate::upload::upload_weight(stream, &mlp_weights.up_proj)?;
-        let down_proj = crate::upload::upload_weight(stream, &mlp_weights.down_proj)?;
-        let mlp_out = mlp::mlp_forward(
-            gemm,
-            stream,
-            &kernels.silu_glu,
-            &gate_proj,
-            &up_proj,
-            &down_proj,
-            &norm2_out,
-            hidden_size,
-            intermediate_size,
+
+        // gate = GEMM(norm2_out, gate_proj)  [1 × intermediate_size]
+        let gate_size = intermediate_size;
+        let mut gate = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.gate_proj, &norm2_out, &mut gate,
+            1, intermediate_size, hidden_size, group_size,
+            &weights.int4_companions,
+        )?;
+
+        // up = GEMM(norm2_out, up_proj)  [1 × intermediate_size]
+        let mut up = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate up buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.up_proj, &norm2_out, &mut up,
+            1, intermediate_size, hidden_size, group_size,
+            &weights.int4_companions,
+        )?;
+
+        // silu_out = SiLU(gate) ⊗ up
+        let mut silu_out = stream
+            .alloc_zeros::<bf16>(gate_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate silu_out buffer: {e}"))?;
+        {
+            let elem_count_i32 = gate_size as i32;
+            let config = infers_cuda::LaunchConfig {
+                grid_dim: ((gate_size as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&kernels.silu_glu)
+                    .arg(&gate)
+                    .arg(&up)
+                    .arg(&mut silu_out)
+                    .arg(&elem_count_i32)
+                    .launch(config)
+                    .map_err(|e| anyhow::anyhow!("SiLU+GLU kernel launch failed: {e}"))?;
+            }
+        }
+
+        // output = GEMM(silu_out, down_proj^T)  [1 × hidden_size]
+        let mut mlp_out = stream
+            .alloc_zeros::<bf16>(hidden_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate MLP output: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, &kernels.int4_gemm, stream,
+            &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+            1, hidden_size, intermediate_size, group_size,
+            &weights.int4_companions,
         )?;
 
         // --- Residual add (MLP output + hidden) ---
@@ -434,30 +524,18 @@ pub fn decode_with_hidden(
     let mtp_hidden = hidden.clone();
 
     let lm_head_weight = weights.lm_head.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("LM head weights not found"))?;
-    let lm_head_gpu = crate::upload::upload_weight(stream, lm_head_weight)?;
+        .or_else(|| weights.embedding.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
 
     // LM head: logits = hidden @ lm_head^T → [1 × vocab_size]
     let mut logits = stream
         .alloc_zeros::<bf16>(config.vocab_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: config.vocab_size,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        &hidden,
-        &lm_head_gpu,
-        &mut logits,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, &kernels.int4_gemm, stream,
+        lm_head_weight, &hidden, &mut logits,
+        1, config.vocab_size, hidden_size, group_size,
+        &weights.int4_companions,
     )?;
 
     // =========================================================================

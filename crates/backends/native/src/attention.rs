@@ -4,13 +4,14 @@
 //! subsystem for zero CPU round-trip decode. Uses per-head weight slicing to
 //! avoid strided GPU sub-slices (cudarc limitation).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use half::bf16;
+use half::{bf16, f16};
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
-use infers_model::{AttentionWeights, WeightData};
+use infers_model::{AttentionWeights, Int4Companions, WeightData, WeightDtype};
 
 use infers_kv::KvCacheDtype;
 
@@ -222,6 +223,76 @@ fn extract_o_proj_head_slice(
     }
     Ok(result)
 }
+
+/// Convert an attention projection weight to a flat BF16 Vec.
+///
+/// If the weight is already BF16/FP16/FP32, converts directly.
+/// If the weight is Int4Packed, dequantizes it using companion tensors.
+fn attention_weight_to_bf16_vec(
+    weight: &WeightData,
+    int4_companions: &HashMap<String, Int4Companions>,
+    group_size: usize,
+) -> Result<Vec<bf16>> {
+    match weight.dtype {
+        WeightDtype::Bf16 => {
+            Ok(weight.data.chunks_exact(2)
+                .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
+        WeightDtype::Fp16 => {
+            Ok(weight.data.chunks_exact(2)
+                .map(|c| {
+                    let f16_val = f16::from_bits(u16::from_le_bytes([c[0], c[1]]));
+                    bf16::from_f32(f16_val.to_f32())
+                })
+                .collect())
+        }
+        WeightDtype::Fp32 => {
+            Ok(weight.data.chunks_exact(4)
+                .map(|c| bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect())
+        }
+        WeightDtype::Int4Packed => {
+            let companions = int4_companions.get(&weight.name)
+                .ok_or_else(|| anyhow::anyhow!("No INT4 companions for weight '{}'", weight.name))?;
+            let qzeros = &companions.qzeros;
+            let scales = &companions.scales;
+            let qweight_wd = WeightData {
+                data: weight.data.clone(),
+                shape: weight.shape.clone(),
+                dtype: WeightDtype::Int4Packed,
+                name: weight.name.clone(),
+            };
+            Ok(crate::upload::dequantize_int4_to_bf16(&qweight_wd, scales, qzeros, group_size))
+        }
+        _ => anyhow::bail!("Unsupported weight dtype {:?} for '{}'", weight.dtype, weight.name),
+    }
+}
+
+/// Create a BF16 WeightData from any weight dtype (dequantizes INT4 if needed).
+fn weight_to_bf16_wd(
+    weight: &WeightData,
+    int4_companions: &HashMap<String, Int4Companions>,
+    group_size: usize,
+) -> Result<WeightData> {
+    let bf16_data = attention_weight_to_bf16_vec(weight, int4_companions, group_size)?;
+    let bytes: Vec<u8> = bf16_data.iter().flat_map(|b| b.to_bits().to_le_bytes()).collect();
+    let shape = {
+        let mut s = weight.shape.clone();
+        // For INT4, shape is [N, K/8] — convert K/8 back to K
+        if weight.dtype == WeightDtype::Int4Packed && s.len() >= 2 {
+            s[1] *= 8;
+        }
+        s
+    };
+    Ok(WeightData {
+        data: bytes,
+        shape,
+        dtype: WeightDtype::Bf16,
+        name: weight.name.clone(),
+    })
+}
+
 
 // ============================================================================
 // Paged Kernel Dispatch Functions
@@ -467,6 +538,7 @@ pub fn paged_attention_decode(
 /// Attention output `[seq_len × hidden_size]`
 pub fn forward(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     softmax_kernel: &CudaFunction,
     kv_cache_write_kernel: &CudaFunction,
@@ -482,6 +554,8 @@ pub fn forward(
     max_seq_len: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -496,54 +570,24 @@ pub fn forward(
     // Phase 1: Full K, V computation + RoPE + KV cache write
     // =========================================================================
 
-    // Upload full K and V projection weights
-    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
-
-    // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim]
+    // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &k_proj_full,
-        &mut k_full,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.k_proj, input, &mut k_full,
+        seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim]
+    // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut v_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &v_proj_full,
-        &mut v_full,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.v_proj, input, &mut v_full,
+        seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
     // Apply RoPE to K_full. rope::apply_rope modifies both Q and K in-place;
@@ -607,12 +651,18 @@ pub fn forward(
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
 
+    // --- Dequantize weights to BF16 once before the loop ---
+    let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size)?;
+    let k_proj_bf16 = weight_to_bf16_wd(&weights.k_proj, int4_companions, group_size)?;
+    let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size)?;
+    let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
+
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
-        let q_proj_h = extract_head_weight_slice(&weights.q_proj, head_idx, head_dim)?;
-        let k_proj_h = extract_head_weight_slice(&weights.k_proj, head_idx, head_dim)?;
-        let v_proj_h = extract_head_weight_slice(&weights.v_proj, head_idx, head_dim)?;
-        let o_proj_h = extract_o_proj_head_slice(&weights.o_proj, head_idx, head_dim)?;
+        let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
+        let k_proj_h = extract_head_weight_slice(&k_proj_bf16, head_idx, head_dim)?;
+        let v_proj_h = extract_head_weight_slice(&v_proj_bf16, head_idx, head_dim)?;
+        let o_proj_h = extract_o_proj_head_slice(&o_proj_bf16, head_idx, head_dim)?;
 
         let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
         let k_proj_h_gpu = upload_bf16_slice(stream, &k_proj_h)?;
@@ -853,6 +903,7 @@ pub fn forward(
 /// Attention output `[1 × hidden_size]`
 pub fn decode_forward(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     softmax_kernel: &CudaFunction,
     kv_cache_write_kernel: &CudaFunction,
@@ -868,6 +919,8 @@ pub fn decode_forward(
     max_seq_len: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -882,53 +935,24 @@ pub fn decode_forward(
     // Phase 1: Full K, V computation + RoPE + KV cache write
     // =========================================================================
 
-    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
-
-    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim]
+    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut k_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &k_proj_full,
-        &mut k_single,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.k_proj, input, &mut k_single,
+        1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // v_single = GEMM(input, v_proj^T)  [1 × kv_dim]
+    // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &v_proj_full,
-        &mut v_single,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.v_proj, input, &mut v_single,
+        1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
     // Apply RoPE to K_single
@@ -1000,11 +1024,14 @@ pub fn decode_forward(
     let mut accum_b = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
+    // --- Dequantize weights to BF16 once before the loop ---
+    let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size)?;
+    let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
 
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
-        let q_proj_h = extract_head_weight_slice(&weights.q_proj, head_idx, head_dim)?;
-        let o_proj_h = extract_o_proj_head_slice(&weights.o_proj, head_idx, head_dim)?;
+        let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
+        let o_proj_h = extract_o_proj_head_slice(&o_proj_bf16, head_idx, head_dim)?;
 
         let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
         let o_proj_h_gpu = upload_bf16_slice(stream, &o_proj_h)?;
@@ -1192,6 +1219,7 @@ pub fn decode_forward(
 /// - Phase 3: Same per-head attention using the already-computed K/V buffers
 pub fn forward_paged(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     softmax_kernel: &CudaFunction,
     paged_kv_write_kernel: &CudaFunction,
@@ -1209,6 +1237,8 @@ pub fn forward_paged(
     page_size: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1223,53 +1253,24 @@ pub fn forward_paged(
     // Phase 1: Full K, V computation + RoPE
     // =========================================================================
 
-    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
-
-    // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim]
+    // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &k_proj_full,
-        &mut k_full,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.k_proj, input, &mut k_full,
+        seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim]
+    // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut v_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: seq_len,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &v_proj_full,
-        &mut v_full,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.v_proj, input, &mut v_full,
+        seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
     // Apply RoPE to K_full
@@ -1319,13 +1320,18 @@ pub fn forward_paged(
     let mut accum_b = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
+    // --- Dequantize weights to BF16 once before the loop ---
+    let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size)?;
+    let k_proj_bf16 = weight_to_bf16_wd(&weights.k_proj, int4_companions, group_size)?;
+    let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size)?;
+    let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
 
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
-        let q_proj_h = extract_head_weight_slice(&weights.q_proj, head_idx, head_dim)?;
-        let k_proj_h = extract_head_weight_slice(&weights.k_proj, head_idx, head_dim)?;
-        let v_proj_h = extract_head_weight_slice(&weights.v_proj, head_idx, head_dim)?;
-        let o_proj_h = extract_o_proj_head_slice(&weights.o_proj, head_idx, head_dim)?;
+        let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
+        let k_proj_h = extract_head_weight_slice(&k_proj_bf16, head_idx, head_dim)?;
+        let v_proj_h = extract_head_weight_slice(&v_proj_bf16, head_idx, head_dim)?;
+        let o_proj_h = extract_o_proj_head_slice(&o_proj_bf16, head_idx, head_dim)?;
 
         let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
         let k_proj_h_gpu = upload_bf16_slice(stream, &k_proj_h)?;
@@ -1541,6 +1547,7 @@ pub fn forward_paged(
 /// 5. Apply O-projection to attention output
 pub fn decode_forward_paged(
     gemm: &mut GemmEngine,
+    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     paged_kv_write_kernel: &CudaFunction,
     paged_attention_decode_kernel: &CudaFunction,
@@ -1559,6 +1566,8 @@ pub fn decode_forward_paged(
     page_size: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    group_size: usize,
+    int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1572,53 +1581,24 @@ pub fn decode_forward_paged(
     // Phase 1: Single-token K, V computation + RoPE
     // =========================================================================
 
-    let k_proj_full = crate::upload::upload_weight(stream, &weights.k_proj)?;
-    let v_proj_full = crate::upload::upload_weight(stream, &weights.v_proj)?;
-
-    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim]
+    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut k_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &k_proj_full,
-        &mut k_single,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.k_proj, input, &mut k_single,
+        1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // v_single = GEMM(input, v_proj^T)  [1 × kv_dim]
+    // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &v_proj_full,
-        &mut v_single,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.v_proj, input, &mut v_single,
+        1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
     // Apply RoPE to K_single
@@ -1661,28 +1641,14 @@ pub fn decode_forward_paged(
     // Phase 3: Compute Q for attention decode kernel
     // =========================================================================
 
-    // Q projection: full Q via GEMM [1 × hidden_size] @ [hidden_size × kv_dim] → [1 × kv_dim]
-    let q_proj_full = crate::upload::upload_weight(stream, &weights.q_proj)?;
+    // Q projection: full Q via GEMM [1 × hidden_size] @ [hidden_size × kv_dim] → [1 × kv_dim] (INT4-aware)
     let mut q_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: kv_dim,
-            k: hidden_size,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        input,
-        &q_proj_full,
-        &mut q_single,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.q_proj, input, &mut q_single,
+        1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
     // Apply RoPE to Q_single
@@ -1722,34 +1688,20 @@ pub fn decode_forward_paged(
     )?;
 
     // =========================================================================
-    // Phase 5: O-projection — single GEMM over all heads
+    // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
     // =========================================================================
 
     // attention_output is [num_kv_heads * head_dim] = [kv_dim]
     // o_proj is [kv_dim × hidden_size]
     // output = attention_output @ o_proj^T → [1 × hidden_size]
 
-    let o_proj_full = crate::upload::upload_weight(stream, &weights.o_proj)?;
     let mut output = stream
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
-    gemm.matmul_bf16(
-        &GemmConfig {
-            m: 1,
-            n: hidden_size,
-            k: kv_dim,
-            transa: true,
-            transb: false,
-            alpha: 1.0,
-            beta: 0.0,
-            lda: None,
-            ldb: None,
-            ldc: None,
-            activation: None,
-        },
-        &attn_output,
-        &o_proj_full,
-        &mut output,
+    crate::gemm_dispatch::gemm_projection(
+        gemm, int4_kernel, stream,
+        &weights.o_proj, &attn_output, &mut output,
+        1, hidden_size, kv_dim, group_size, int4_companions,
     )?;
 
     Ok(output)

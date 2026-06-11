@@ -223,12 +223,14 @@ impl ForwardEngine {
             softmax: self.softmax_kernel.clone(),
             kv_cache_write: self.kv_cache_write_kernel.clone(),
             gdn_prefill: self.gdn_prefill_kernel.clone(),
+            int4_gemm: self.int4_gemm_kernel.clone(),
         };
 
         crate::prefill::prefill(
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_ids,
             &mut self.kv_caches, &mut self.gdn_states,
+            128, // group_size (default AutoRound)
         )
     }
 
@@ -257,12 +259,14 @@ impl ForwardEngine {
             softmax: self.softmax_kernel.clone(),
             kv_cache_write: self.kv_cache_write_kernel.clone(),
             gdn_update: self.gdn_update_kernel.clone(),
+            int4_gemm: self.int4_gemm_kernel.clone(),
         };
 
         crate::decode::decode(
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
             &mut self.kv_caches, &mut self.gdn_states,
+            128, // group_size (default AutoRound)
         )
     }
 
@@ -700,12 +704,14 @@ impl ForwardEngine {
             softmax: self.softmax_kernel.clone(),
             kv_cache_write: self.kv_cache_write_kernel.clone(),
             gdn_update: self.gdn_update_kernel.clone(),
+            int4_gemm: self.int4_gemm_kernel.clone(),
         };
 
         crate::decode::decode_with_hidden(
             &mut self.gemm, stream, &kernels, &self.nccl,
             &self.config, weights, token_id, position,
             &mut self.kv_caches, &mut self.gdn_states,
+            128, // group_size (default AutoRound)
         )
     }
 
@@ -746,6 +752,7 @@ impl ForwardEngine {
             softmax: self.softmax_kernel.clone(),
             kv_cache_write: self.kv_cache_write_kernel.clone(),
             gdn_update: self.gdn_update_kernel.clone(),
+            int4_gemm: self.int4_gemm_kernel.clone(),
         };
 
         use std::cell::Cell;

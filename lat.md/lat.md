@@ -472,7 +472,7 @@ Uses `MtpOperations` callbacks (embed, rms_norm, forward_layer, lm_head, sample,
 See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_mtp]].
 
 ## Module Structure
-Fourteen modules cover forward-pass operations, including eviction for memory pressure handling: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction.
+Fourteen modules cover forward-pass operations, including eviction for memory pressure handling: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction, gemm_dispatch.
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -490,17 +490,19 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
+| `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization |
 
 
 ### Attention Forward Pass
 
-Full-attention prefill implementation using per-head weight slicing. Extracts each attention head's weight slice on CPU, uploads to GPU, and computes per-head GEMMs — avoids strided GPU sub-slices unsupported by cudarc.
+Full-attention prefill with per-head weight slicing. All projections support INT4: full K/V via `gemm_projection`, per-head slices via dequantization.
 
 #### Architecture
 
-**Phase 1 — Full K/V for cache**: Computes full K and V via GEMM, applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache.
+**Phase 1 — Full K/V for cache**: Computes full K and V via `gemm_projection` (INT4-aware — routes BF16 to cuBLASLt or INT4 to `infers_int4_gemm`), applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache.
 
-**Phase 2 — Per-head attention**: For each head, computes Q_h/K_h/V_h via sliced weights, applies RoPE, computes attention scores with softmax (causal mask), produces partial output via O-projection.
+**Phase 2 — Per-head attention**: For each head, computes Q_h/K_h/V_h via sliced weights, applies RoPE, computes attention scores with softmax (causal mask), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd()` dequantizes all four projection weights (Q, K, V, O) once before the head loop, producing BF16 `WeightData` that the existing extraction functions (`extract_head_weight_slice`, `extract_o_proj_head_slice`) can operate on.
+
 
 **Alternating accumulation**: Two GPU buffers accumulate per-head partial O-projection outputs; even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
 
@@ -510,15 +512,15 @@ See [[crates/backends/native/src/attention.rs#forward]].
 
 ### Decode Attention Forward Pass
 
-Single-token attention for decode-time generation. Projects a single input token into Q/K/V, applies RoPE, appends to KV cache, then computes attention over all cached tokens.
+Single-token decode attention with per-head weight slicing. Full K/V projections use INT4-aware `gemm_projection`; per-head Q and O slices use dequantization.
 
 #### Architecture
 
-**Phase 1 — Full K/V for cache**: Computes full K and V via GEMM from single-token input, applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache at current position.
+**Phase 1 — Full K/V for cache**: Computes full K and V via `gemm_projection` (INT4-aware), applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache at current position.
 
 **Phase 2 — Per-head cache extraction**: Downloads full KV cache from GPU to CPU, extracts per-head K and V buffers by striding through the flat `[max_seq_len × kv_dim]` layout.
 
-**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection.
+**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd()` dequantizes Q and O projection weights once before the head loop, producing BF16 `WeightData` for `extract_head_weight_slice` and `extract_o_proj_head_slice`.
 
 Same alternating accumulation pattern as prefill: even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
 
@@ -528,11 +530,11 @@ See [[crates/backends/native/src/attention.rs#decode_forward]].
 
 ### GDN Forward Pass
 
-Gated DeltaNet prefill: projection GEMMs feed `infers_gdn_prefill_bf16` kernel, then output projection.
+Gated DeltaNet prefill: projection GEMMs via INT4-aware `gemm_projection` dispatch feed `infers_gdn_prefill_bf16` kernel, then output projection.
 
 #### Architecture
 
-**Phase 1 — Projections**: Five projection weights are uploaded from CPU bytes to GPU BF16 buffers. Four GEMMs compute `a`, `b`, `x`, and `dt` projections from input. 1D convolution (`conv1d_weight`) is skipped for Phase 4.5.
+**Phase 1 — Projections**: Five projection weights are dispatched via `gemm_projection`. BF16 weights route to cuBLASLt; INT4 weights use `infers_int4_gemm` for on-the-fly dequantization. Four GEMMs compute `a`, `b`, `x`, and `dt` projections from input. 1D convolution (`conv1d_weight`) is skipped for Phase 4.5.
 
 **Phase 2 — State Update**: GDN state (H×H matrix) is allocated lazily on first call. The `infers_gdn_prefill_bf16` kernel runs with `hidden_size` blocks (one per state row), each block processing all `seq_len` tokens sequentially via shared memory reduction.
 
@@ -544,11 +546,11 @@ See [[crates/backends/native/src/gdn.rs#forward]].
 
 ### GDN Decode Forward Pass
 
-Gated DeltaNet decode: recurrent single-token state update using `infers_gdn_update_bf16` kernel.
+Gated DeltaNet decode: recurrent single-token state update using `infers_gdn_update_bf16` kernel. All projections use INT4-aware `gemm_projection` dispatch.
 
 #### Architecture
 
-**Phase 1 — Projections**: Four projection weights are uploaded from CPU bytes to GPU BF16 buffers. Four GEMMs (m=1) compute `a`, `b`, `x`, and `dt` projections from a single-token input `[1 × hidden_size]`. 1D convolution is skipped, same as prefill.
+**Phase 1 — Projections**: Four projection weights are dispatched via `gemm_projection` (BF16 weights route to cuBLASLt, INT4 weights route to `infers_int4_gemm` kernel). Four GEMMs (m=1) compute `a`, `b`, `x`, and `dt` projections from a single-token input `[1 × hidden_size]`. 1D convolution is skipped, same as prefill.
 
 **Phase 2 — State Update**: GDN state is allocated lazily via `ensure_allocated()`. The `infers_gdn_update_bf16` kernel runs with `hidden_size` blocks (one per state row) and power-of-2 block size up to 256. Unlike prefill, it processes only a single token and takes 7 arguments (no `seq_len`).
 

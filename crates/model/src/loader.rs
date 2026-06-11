@@ -13,8 +13,8 @@ use serde::Deserialize;
 use super::config::ModelConfig;
 use super::formats::QuantizationFormat;
 use super::weights::{
-    AttentionWeights, GdnWeights, LayerWeights, MlpWeights, MtpWeights, WeightData, WeightDtype,
-    WeightRegistry,
+    AttentionWeights, GdnWeights, Int4Companions, LayerWeights, MlpWeights, MtpWeights,
+    WeightData, WeightDtype, WeightRegistry,
 };
 
 /// Index file for sharded safetensors models.
@@ -249,29 +249,29 @@ fn build_main_layer(
     let (gdn, attn) = match layer_type {
         super::config::LayerType::GatedDeltaNet => {
             let gdn = GdnWeights {
-                in_proj_a: get_weight(registry, &format!("{}.{}.in_proj_a.weight", prefix, gdn_sub))?,
-                in_proj_b: get_weight(registry, &format!("{}.{}.in_proj_b.weight", prefix, gdn_sub))?,
+                in_proj_a: get_weight_or_int4(registry, &format!("{}.{}.in_proj_a.weight", prefix, gdn_sub), &format!("{}.{}.in_proj_a", prefix, gdn_sub))?,
+                in_proj_b: get_weight_or_int4(registry, &format!("{}.{}.in_proj_b.weight", prefix, gdn_sub), &format!("{}.{}.in_proj_b", prefix, gdn_sub))?,
                 conv1d_weight: get_weight(registry, &format!("{}.{}.conv1d.weight", prefix, gdn_sub))?,
-                x_proj_weight: get_weight(registry, &format!("{}.{}.x_proj_weight.weight", prefix, gdn_sub))?,
-                dt_proj_weight: get_weight(registry, &format!("{}.{}.dt_proj_weight.weight", prefix, gdn_sub))?,
-                out_proj_weight: get_weight(registry, &format!("{}.{}.out_proj_weight.weight", prefix, gdn_sub))?,
+                x_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.x_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.x_proj_weight", prefix, gdn_sub))?,
+                dt_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.dt_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.dt_proj_weight", prefix, gdn_sub))?,
+                out_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.out_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.out_proj_weight", prefix, gdn_sub))?,
             };
             (Some(gdn), None)
         }
         super::config::LayerType::FullAttention => {
             let attn = AttentionWeights {
-                q_proj: get_weight(registry, &format!("{}.self_attn.q_proj.weight", prefix))?,
-                k_proj: get_weight(registry, &format!("{}.self_attn.k_proj.weight", prefix))?,
-                v_proj: get_weight(registry, &format!("{}.self_attn.v_proj.weight", prefix))?,
-                o_proj: get_weight(registry, &format!("{}.self_attn.o_proj.weight", prefix))?,
+                q_proj: get_weight_or_int4(registry, &format!("{}.self_attn.q_proj.weight", prefix), &format!("{}.self_attn.q_proj", prefix))?,
+                k_proj: get_weight_or_int4(registry, &format!("{}.self_attn.k_proj.weight", prefix), &format!("{}.self_attn.k_proj", prefix))?,
+                v_proj: get_weight_or_int4(registry, &format!("{}.self_attn.v_proj.weight", prefix), &format!("{}.self_attn.v_proj", prefix))?,
+                o_proj: get_weight_or_int4(registry, &format!("{}.self_attn.o_proj.weight", prefix), &format!("{}.self_attn.o_proj", prefix))?,
             };
             (None, Some(attn))
         }
     };
     let mlp = MlpWeights {
-        gate_proj: get_weight(registry, &format!("{}.mlp.gate_proj.weight", prefix))?,
-        up_proj: get_weight(registry, &format!("{}.mlp.up_proj.weight", prefix))?,
-        down_proj: get_weight(registry, &format!("{}.mlp.down_proj.weight", prefix))?,
+        gate_proj: get_weight_or_int4(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix))?,
+        up_proj: get_weight_or_int4(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix))?,
+        down_proj: get_weight_or_int4(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix))?,
     };
     Ok(LayerWeights {
         layer_type,
@@ -347,30 +347,30 @@ fn build_mtp_layer(
     let (gdn, attn) = match layer_type {
         super::config::LayerType::GatedDeltaNet => {
             let gdn = GdnWeights {
-                in_proj_a: get_weight(registry, &format!("{}.gdn.in_proj_a.weight", prefix))?,
-                in_proj_b: get_weight(registry, &format!("{}.gdn.in_proj_b.weight", prefix))?,
+                in_proj_a: get_weight_or_int4(registry, &format!("{}.gdn.in_proj_a.weight", prefix), &format!("{}.gdn.in_proj_a", prefix))?,
+                in_proj_b: get_weight_or_int4(registry, &format!("{}.gdn.in_proj_b.weight", prefix), &format!("{}.gdn.in_proj_b", prefix))?,
                 conv1d_weight: get_weight(registry, &format!("{}.gdn.conv1d_weight.weight", prefix))?,
-                x_proj_weight: get_weight(registry, &format!("{}.gdn.x_proj_weight.weight", prefix))?,
-                dt_proj_weight: get_weight(registry, &format!("{}.gdn.dt_proj_weight.weight", prefix))?,
-                out_proj_weight: get_weight(registry, &format!("{}.gdn.out_proj_weight.weight", prefix))?,
+                x_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.x_proj_weight.weight", prefix), &format!("{}.gdn.x_proj_weight", prefix))?,
+                dt_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.dt_proj_weight.weight", prefix), &format!("{}.gdn.dt_proj_weight", prefix))?,
+                out_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.out_proj_weight.weight", prefix), &format!("{}.gdn.out_proj_weight", prefix))?,
             };
             (Some(gdn), None)
         }
         super::config::LayerType::FullAttention => {
             let attn = AttentionWeights {
-                q_proj: get_weight(registry, &format!("{}.self_attn.q_proj.weight", prefix))?,
-                k_proj: get_weight(registry, &format!("{}.self_attn.k_proj.weight", prefix))?,
-                v_proj: get_weight(registry, &format!("{}.self_attn.v_proj.weight", prefix))?,
-                o_proj: get_weight(registry, &format!("{}.self_attn.o_proj.weight", prefix))?,
+                q_proj: get_weight_or_int4(registry, &format!("{}.self_attn.q_proj.weight", prefix), &format!("{}.self_attn.q_proj", prefix))?,
+                k_proj: get_weight_or_int4(registry, &format!("{}.self_attn.k_proj.weight", prefix), &format!("{}.self_attn.k_proj", prefix))?,
+                v_proj: get_weight_or_int4(registry, &format!("{}.self_attn.v_proj.weight", prefix), &format!("{}.self_attn.v_proj", prefix))?,
+                o_proj: get_weight_or_int4(registry, &format!("{}.self_attn.o_proj.weight", prefix), &format!("{}.self_attn.o_proj", prefix))?,
             };
             (None, Some(attn))
         }
     };
 
     let mlp = MlpWeights {
-        gate_proj: get_weight(registry, &format!("{}.mlp.gate_proj.weight", prefix))?,
-        up_proj: get_weight(registry, &format!("{}.mlp.up_proj.weight", prefix))?,
-        down_proj: get_weight(registry, &format!("{}.mlp.down_proj.weight", prefix))?,
+        gate_proj: get_weight_or_int4(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix))?,
+        up_proj: get_weight_or_int4(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix))?,
+        down_proj: get_weight_or_int4(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix))?,
     };
 
     Ok(LayerWeights {
@@ -393,12 +393,59 @@ fn get_weight(registry: &mut WeightRegistry, name: &str) -> Result<WeightData> {
         .with_context(|| format!("tensor not found: {}", name))
 }
 
+/// Get a weight tensor, falling back to INT4 quantized triplet.
+///
+/// First tries `{name}` (BF16/FP16/FP32 weight). If not found, tries
+/// `{name_base}.qweight` (INT4 packed). When INT4 is found, also extracts
+/// `qzeros` and `scales` companions and stores them in `registry.int4_companions`.
+///
+/// # Arguments
+/// * `registry` — Weight registry (mutated: tensors removed, companions added)
+/// * `bf16_name` — Full tensor name for BF16 weight (e.g., `layers.0.mlp.gate_proj.weight`)
+/// * `int4_base` — Base name for INT4 triplet (e.g., `layers.0.mlp.gate_proj`)
+fn get_weight_or_int4(
+    registry: &mut WeightRegistry,
+    bf16_name: &str,
+    int4_base: &str,
+) -> Result<WeightData> {
+    // Try BF16 weight first
+    if let Some(w) = registry.tensors.remove(bf16_name) {
+        return Ok(w);
+    }
+
+    // Fall back to INT4 qweight
+    let qweight_name = format!("{}.qweight", int4_base);
+    let qweight = registry
+        .tensors
+        .remove(&qweight_name)
+        .with_context(|| format!("neither '{}' nor '{}' found", bf16_name, qweight_name))?;
+
+    // Extract companion tensors
+    let qzeros_name = format!("{}.qzeros", int4_base);
+    let scales_name = format!("{}.scales", int4_base);
+
+    let qzeros = registry
+        .tensors
+        .remove(&qzeros_name)
+        .with_context(|| format!("INT4 qzeros '{}' not found (qweight '{}')", qzeros_name, qweight_name))?;
+    let scales = registry
+        .tensors
+        .remove(&scales_name)
+        .with_context(|| format!("INT4 scales '{}' not found (qweight '{}')", scales_name, qweight_name))?;
+
+    // Store companions keyed by qweight name
+    registry.int4_companions.insert(qweight_name.clone(), Int4Companions { qzeros, scales });
+
+    Ok(qweight)
+}
+
 /// Map safetensors dtype to our WeightDtype.
 fn map_safetensor_dtype(dtype: safetensors::Dtype) -> WeightDtype {
     match dtype {
         safetensors::Dtype::BF16 => WeightDtype::Bf16,
         safetensors::Dtype::F16 => WeightDtype::Fp16,
         safetensors::Dtype::F32 => WeightDtype::Fp32,
+        safetensors::Dtype::U32 => WeightDtype::Int4Packed, // INT4 packed as u32
         safetensors::Dtype::U8 => WeightDtype::Other,
         safetensors::Dtype::I8 => WeightDtype::Other,
         safetensors::Dtype::I16 => WeightDtype::Other,

@@ -2,10 +2,26 @@
 //!
 //! Stores model weights as raw byte data with shape metadata,
 //! ready for GPU upload when the CUDA runtime is available.
+//! Supports both direct BF16/FP16 weights and INT4 quantized triplets
+//! (qweight, scales, qzeros) for AutoRound/GPTQ models.
 
 use std::collections::HashMap;
 
 use super::config::LayerType;
+
+/// Companion tensors for an INT4 quantized weight.
+///
+/// When a projection uses INT4 quantization, the qweight is stored as the
+/// main `WeightData` in layer structs (e.g., `MlpWeights.gate_proj`), and
+/// the scales/qzeros companions are stored in `WeightRegistry.int4_companions`
+/// keyed by the qweight's tensor name.
+#[derive(Debug, Clone)]
+pub struct Int4Companions {
+    /// Packed zero points (u32, 8 per u32).
+    pub qzeros: WeightData,
+    /// BF16 group scales.
+    pub scales: WeightData,
+}
 
 /// Raw tensor data with shape metadata, stored as bytes until GPU upload.
 // @lat: [[lat#Weight Registry and Tensors#WeightData]]
@@ -158,6 +174,10 @@ pub struct WeightRegistry {
     pub norm: Option<WeightData>,
     /// All tensors by name, for lookup and sharding.
     pub tensors: HashMap<String, WeightData>,
+    /// Companion tensors for INT4 weights (qzeros, scales) keyed by the
+    /// qweight tensor name. Populated during `build_main_layers` when
+    /// INT4 quantized projections are detected.
+    pub int4_companions: HashMap<String, Int4Companions>,
 }
 
 impl WeightRegistry {
@@ -170,6 +190,7 @@ impl WeightRegistry {
             lm_head: None,
             norm: None,
             tensors: HashMap::new(),
+            int4_companions: HashMap::new(),
         }
     }
 

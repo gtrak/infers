@@ -3,6 +3,7 @@
 //! Provides `forward_layer_pass` and `full_forward_logits` functions
 //! that the ForwardEngine uses to build MTP operation callbacks.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -75,18 +76,23 @@ pub fn forward_layer_pass(
     )?;
 
     // Attention / GDN dispatch
+    // MTP is optional/deferred: pass empty HashMap for int4_companions.
+    let int4_companions = HashMap::<String, infers_model::Int4Companions>::new();
     let attn_or_gdn_out = match layer.layer_type {
         LayerType::GatedDeltaNet => {
             let gdn_weights = layer.gdn.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("GDN weights not found for MTP layer {}", layer_idx))?;
             gdn::decode_forward(
                 gemm,
+                &kernels.int4_gemm,
                 stream,
                 &kernels.gdn_update,
                 gdn_weights,
                 &norm1_out,
                 &mut gdn_states[layer_idx],
                 hidden_size,
+                128, // group_size default
+                &int4_companions,
             )?
         }
         LayerType::FullAttention => {
@@ -94,6 +100,7 @@ pub fn forward_layer_pass(
                 .ok_or_else(|| anyhow::anyhow!("Attention weights not found for MTP layer {}", layer_idx))?;
             attention::decode_forward(
                 gemm,
+                &kernels.int4_gemm,
                 stream,
                 &kernels.softmax,
                 &kernels.kv_cache_write,
@@ -109,6 +116,8 @@ pub fn forward_layer_pass(
                 max_seq_len,
                 rope_theta,
                 partial_rotary_factor,
+                128, // group_size default
+                &int4_companions,
             )?
         }
     };
