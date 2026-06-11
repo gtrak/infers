@@ -195,15 +195,22 @@ pub fn matmul_int4(
         "K must be divisible by group_size"
     );
 
-    // Launch config: 16x16 threads per block
-    let block = (16, 16, 1);
+    // Launch config: for m=1 (single-token decode) use a 1D grid with 256
+    // threads per block so every thread does useful work. For m>1 (prefill)
+    // use 16x16 tiling where each thread computes one output element.
+    // This avoids 93% wasted threads for the common m=1 decode case.
+    let (tx, ty) = if config.m == 1 {
+        (256u32, 1u32)
+    } else {
+        (16u32, 16u32)
+    };
     let launch_config = LaunchConfig {
         grid_dim: (
-            (config.n as u32 + block.0 - 1) / block.0,
-            (config.m as u32 + block.1 - 1) / block.1,
+            (config.n as u32 + tx - 1) / tx,
+            (config.m as u32 + ty - 1) / ty,
             1,
         ),
-        block_dim: block,
+        block_dim: (tx, ty, 1),
         shared_mem_bytes: 0,
     };
 
