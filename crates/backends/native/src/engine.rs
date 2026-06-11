@@ -44,6 +44,7 @@ struct PerGpuKernels {
     gdn_prefill: CudaFunction,
     gdn_update: CudaFunction,
     paged_kv_write: CudaFunction,
+    #[allow(dead_code)]
     paged_kv_read: CudaFunction,
     paged_attention_decode: CudaFunction,
     fp8_quantize: CudaFunction,
@@ -432,7 +433,7 @@ impl ForwardEngine {
     // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Prefill Path]]
     pub fn prefill_paged(
         &mut self,
-        stream: &Arc<CudaStream>,
+        _stream: &Arc<CudaStream>,
         token_ids: &[u32],
         seq_id: infers_kv::SequenceId,
     ) -> Result<usize> {
@@ -723,7 +724,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
     // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Decode Path]]
     pub fn decode_paged(
         &mut self,
-        stream: &Arc<CudaStream>,
+        _stream: &Arc<CudaStream>,
         token_id: u32,
         position: u32,
         seq_id: infers_kv::SequenceId,

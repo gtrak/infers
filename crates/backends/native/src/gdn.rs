@@ -163,6 +163,7 @@ fn extract_columns_single(
 ///
 /// # Returns
 /// GDN output `[seq_len × hidden_size]`
+#[allow(unused_assignments)]
 pub fn forward(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
@@ -375,6 +376,7 @@ pub fn forward(
 ///
 /// # Returns
 /// GDN output `[1 × hidden_size]`
+#[allow(unused_assignments)]
 pub fn decode_forward(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,

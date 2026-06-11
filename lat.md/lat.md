@@ -1033,6 +1033,12 @@ Post-Phase 10 cleanup removed dead code and annotated deferred-feature fields wi
 ### Orchestrator Deferred Fields
 
 Five deferred-feature fields and three monitoring methods in `InferenceOrchestrator` are annotated with `#[allow(dead_code)]`. Paged eviction and MTP speculative decoding support is deferred. See [[crates/server/src/orchestrator.rs#InferenceOrchestrator]].
+
+### Native Crate Warning Fixes
+
+Fixed all compiler warnings in `infers-backend-native` crate (TD-5).
+
+Unused `stream` parameters in `prefill_paged` and `decode_paged` prefixed with `_`. The `paged_kv_read` field in `PerGpuKernels` annotated with `#[allow(dead_code)]` — kernel loaded but unused, retained for potential future use. `a_log_zeros`/`dt_bias_zeros` double-assignment warnings suppressed via `#[allow(unused_assignments)]` on both `forward` and `decode_forward` functions; the Option<None> initialization is required because zero-allocated buffers must live at function scope to satisfy borrow checker constraints across if/else branches. See [[crates/backends/native/src/engine.rs#PerGpuKernels]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 # Memory Budget
 
 Memory budget calculator for estimating VRAM requirements across different quantization formats and parallelism configurations.
