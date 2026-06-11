@@ -397,7 +397,7 @@ Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 - `forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
 - `decode_forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
 - Engine call sites updated to pass `&self.weight_caches[gpu_idx]`
-- Phase 3 per-head code in `forward_paged` preserved (still uses `weight_to_bf16_wd` + `int4_companions`)
+- Phase 3 per-head K/V GEMMs in `forward_paged`: removed redundant CPU dequantization, weight extraction, and GEMM calls; replaced with GPU-to-GPU copies from k_full/v_full buffers (RoPE and K-norm already applied in Phase 1); removed `int4_companions` parameter from both `forward_paged` and `decode_forward_paged` signatures
 - GDN `forward` and `decode_forward`: replaced all `gemm_projection` calls with `gemm_projection_cached`, replaced SSM parameter uploads (a_log, dt_bias) with cache lookups, removed `int4_companions` parameter in favor of `&GpuWeightCache`
 - Updated prefill.rs/decode.rs/mtp.rs call sites to pass weight cache through GDN functions
 
@@ -407,7 +407,6 @@ Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
 - Replace `gemm_projection` in flat-cache `forward` and `decode_forward` functions (prefill.rs, decode.rs) for attention path
 - Handle embedding table and LM head caching at engine level (already done partially — embed_table looked up via cache)
 - Replace `upload_weight` calls for norm weights in prefill/decode paths
-- Remove Phase 3 per-head code from `forward_paged` (remove `int4_companions` parameter)
 - Memory budget validation: assert weights + KV cache + temps fit in GPU memory
 - Benchmark before/after tokens/sec
 

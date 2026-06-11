@@ -1348,7 +1348,7 @@ pub fn forward_paged(
     paged_kv_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
-    add_kernel: &CudaFunction,
+    _add_kernel: &CudaFunction,
     silu_glu_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -1365,7 +1365,6 @@ pub fn forward_paged(
     rms_norm_eps: f32,
    group_size: usize,
     cache: &GpuWeightCache,
-    int4_companions: &HashMap<String, Int4Companions>,
     hidden_size: usize,
     attn_output_gate: bool,
 ) -> Result<CudaSlice<bf16>> {
@@ -1500,7 +1499,7 @@ pub fn forward_paged(
     };
 
     // =========================================================================
-    // Phase 3: Per-head attention (same as [[forward]] but using full K/V buffers)
+    // Phase 3: Per-head attention — extract K/V from full buffers (GPU copies)
     // =========================================================================
 
     let buf_size = seq_len * hidden_size;  // full output buffer [seq_len x config.hidden_size]
@@ -1509,24 +1508,9 @@ pub fn forward_paged(
     let mut attn_combined = stream
         .alloc_zeros::<bf16>(attn_combined_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate attn_combined buffer: {e}"))?;
-    // --- Dequantize weights to BF16 once before the loop ---
-    let k_proj_bf16 = weight_to_bf16_wd(&weights.k_proj, int4_companions, group_size, hidden_size)?;
-    let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size, hidden_size)?;
-
-    // --- Upload K-norm weights to GPU once before the loop ---
-    let k_norm_gpu = weights
-        .k_norm
-        .as_ref()
-        .map(|w| crate::upload::upload_weight(stream, w))
-        .transpose()?;
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
         let kv_head_idx = head_idx % num_kv_heads;
-        let k_proj_h = extract_head_weight_slice(&k_proj_bf16, kv_head_idx, head_dim)?;
-        let v_proj_h = extract_head_weight_slice(&v_proj_bf16, kv_head_idx, head_dim)?;
-
-        let k_proj_h_gpu = upload_bf16_slice(stream, &k_proj_h)?;
-        let v_proj_h_gpu = upload_bf16_slice(stream, &v_proj_h)?;
 
         // --- Q projection: copy from precomputed q_full ---
         // q_full has shape [seq_len, per_gpu_head_dim] (or [seq_len, per_gpu_head_dim * 2] with gate)
@@ -1544,69 +1528,42 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy per-head Q from q_full failed: {e}"))?;
         }
 
+        // --- Extract per-head K from k_full (already has RoPE applied from Phase 1) ---
         let mut k_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate k_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &k_proj_h_gpu,
-            &mut k_h,
-        )?;
+        for s in 0..seq_len {
+            let src_offset = s * kv_dim + kv_head_idx * head_dim;
+            let dst_offset = s * head_dim;
+            let src_slice = k_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = k_h.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy per-head K from k_full failed: {e}"))?;
+        }
 
+        // --- Extract per-head V from v_full ---
         let mut v_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate v_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &v_proj_h_gpu,
-            &mut v_h,
-        )?;
-
-        // --- QK-norm (before RoPE) ---
-        // Q-norm is handled in Phase 2.5 via full Q-norm on q_full
-        if let Some(k_norm_w) = &k_norm_gpu {
-            k_h = crate::norm::rms_norm_per_head(
-                stream,
-                rmsnorm_kernel,
-                &k_h,
-                k_norm_w,
-                rms_norm_eps,
-                head_dim,
-            )?;
+        for s in 0..seq_len {
+            let src_offset = s * kv_dim + kv_head_idx * head_dim;
+            let dst_offset = s * head_dim;
+            let src_slice = v_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = v_h.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy per-head V from v_full failed: {e}"))?;
         }
 
-        // --- RoPE (per-head, num_heads=1) ---
+        // --- RoPE (per-head, num_heads=1) — apply only to q_h (k_h already has RoPE from Phase 1) ---
+        let mut k_h_dummy = stream.alloc_zeros::<bf16>(seq_len * head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
         rope::apply_rope(
             stream,
             rope_kernel,
             &mut q_h,
-            &mut k_h,
+            &mut k_h_dummy,  // dummy — k_h already has RoPE from Phase 1
             positions,
             1,
             head_dim,
@@ -1788,7 +1745,6 @@ pub fn decode_forward_paged(
     rms_norm_eps: f32,
     group_size: usize,
     cache: &GpuWeightCache,
-    int4_companions: &HashMap<String, Int4Companions>,
     hidden_size: usize,
     attn_output_gate: bool,
 ) -> Result<CudaSlice<bf16>> {
