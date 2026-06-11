@@ -575,7 +575,7 @@ Gated DeltaNet prefill: Mamba2 SSM kernel with element-wise state recurrence, so
 
 ssm_dim comes from `in_proj_a` output dimension. Projections may differ in size — `extract_columns()` aligns them to ssm_dim. SSM parameters (A_log, dt_bias) are uploaded to GPU.
 
-**Phase 1 — Projections**: GEMM dispatch via `gemm_projection` computes x_proj `[seq, ssm_dim]`, b_proj `[seq, b_dim]`, dt_proj `[seq, dt_dim]`, and z_gate `[seq, z_dim]` (INT4). Projections are aligned to ssm_dim.
+**Phase 1 — Projections**: GEMM dispatch via `gemm_projection` computes x_proj `[seq, ssm_dim]`, b_proj `[seq, b_dim]`, and z_gate `[seq, z_dim]` (INT4). dt_proj is computed only when `x_proj_weight` is present; otherwise a zero buffer is used (kernel relies on dt_bias). Projections are aligned to ssm_dim.
 
 **Phase 2 — State Update**: GDN state is a 1D vector `[ssm_dim]` allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_prefill_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, sequential token loop, no shared memory.
 
@@ -595,7 +595,7 @@ Gated DeltaNet decode: Mamba2 SSM recurrent single-token state update with sigmo
 
 ssm_dim is determined by `in_proj_a`'s output dimension. Projections are computed for single token (m=1) and aligned to ssm_dim via `extract_columns_single()`. SSM parameters (A_log, dt_bias) are uploaded to GPU.
 
-**Phase 1 — Projections**: Four GEMMs (m=1) compute x_proj `[ssm_dim]`, b_proj `[b_dim]`, dt_proj `[dt_dim]`, and z_gate `[z_dim]`. Projections are aligned to ssm_dim.
+**Phase 1 — Projections**: GEMMs (m=1) compute x_proj `[ssm_dim]`, b_proj `[b_dim]`, and z_gate `[z_dim]`. dt_proj is computed only when `x_proj_weight` is present; otherwise a zero buffer is used. Projections are aligned to ssm_dim.
 
 **Phase 2 — State Update**: GDN state `[ssm_dim]` is allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_update_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, no token loop, no shared memory. Unlike prefill, it takes 9 arguments (no `seq_len`).
 
@@ -796,7 +796,7 @@ Enumeration of weight data types: BF16, FP16, FP32, INT4 packed, NVFP4, and Othe
 
 Typed weight structures for GDN layers (`GdnWeights`), attention layers (`AttentionWeights`), and MLP layers (`MlpWeights`).
 
-`GdnWeights` has 6 required fields (in_proj_a, in_proj_b, conv1d_weight, x_proj_weight, dt_proj_weight, out_proj_weight) plus 5 optional Mamba2-style fields (in_proj_qkv, in_proj_z, a_log, dt_bias, norm) that are present in Qwen3.6 real models. See [[crates/model/src/weights.rs#GdnWeights]].
+`GdnWeights` has 4 required fields (in_proj_a, in_proj_b, conv1d_weight, out_proj_weight) plus 2 optional projection fields (x_proj_weight, dt_proj_weight) that may be absent in Qwen3.6 AutoRound INT4 models, and 5 optional Mamba2-style fields (in_proj_qkv, in_proj_z, a_log, dt_bias, norm) that are present in Qwen3.6 real models. See [[crates/model/src/weights.rs#GdnWeights]].
 
 `AttentionWeights` has 4 required fields (q_proj, k_proj, v_proj, o_proj) plus 2 optional fields (q_norm, k_norm) for Q/K normalization in full attention layers. See [[crates/model/src/weights.rs#AttentionWeights]].
 

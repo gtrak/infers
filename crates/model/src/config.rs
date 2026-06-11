@@ -113,7 +113,14 @@ fn merge_text_config(value: serde_json::Value) -> serde_json::Value {
     };
 
     if let Some(serde_json::Value::Object(text_config)) = obj.remove("text_config") {
-        for (k, v) in text_config {
+        let mut merged = text_config;
+        // Flatten `rope_parameters` if present (Qwen3 config nests rope params)
+        if let Some(serde_json::Value::Object(rope_params)) = merged.remove("rope_parameters") {
+            for (k, v) in rope_params {
+                merged.entry(k).or_insert(v);
+            }
+        }
+        for (k, v) in merged {
             // Root takes priority — only insert if key not already present
             obj.entry(k).or_insert(v);
         }

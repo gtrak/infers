@@ -199,16 +199,23 @@ pub fn forward(
         seq_len, b_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // dt_proj = input @ x_proj_weight^T  [seq_len, dt_dim]
-    let dt_dim = weights.x_proj_weight.shape[1];
-    let mut dt_proj_raw = stream
-        .alloc_zeros::<bf16>(seq_len * dt_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
-        gemm, int4_kernel, stream,
-        &weights.x_proj_weight, input, &mut dt_proj_raw,
-        seq_len, dt_dim, hidden_size, group_size, int4_companions,
-    )?;
+    // dt_proj: if x_proj_weight exists, compute dt_proj = input @ x_proj_weight
+    // If not, dt is just dt_bias (no projection needed)
+    let dt_proj = if let Some(x_proj_w) = &weights.x_proj_weight {
+        let dt_dim = x_proj_w.shape[1];
+        let mut dt = stream
+            .alloc_zeros::<bf16>(seq_len * dt_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, int4_kernel, stream,
+            x_proj_w, input, &mut dt,
+            seq_len, dt_dim, hidden_size, group_size, int4_companions,
+        )?;
+        Some(extract_columns(stream, &dt, seq_len, dt_dim, ssm_dim)?)
+    } else {
+        None
+    };
+
 
     // z_gate = input @ in_proj_z^T (INT4)  [seq_len, z_dim]
     // If in_proj_z is absent, use zeros
@@ -235,8 +242,12 @@ pub fn forward(
     // b_proj: extract/pad to ssm_dim
     let b_proj = extract_columns(stream, &b_proj_raw, seq_len, b_dim, ssm_dim)?;
 
-    // dt_proj: extract/pad to ssm_dim
-    let dt_proj = extract_columns(stream, &dt_proj_raw, seq_len, dt_dim, ssm_dim)?;
+    // dt_proj: use zeros if x_proj_weight was absent
+    let dt_proj_buf = dt_proj.unwrap_or_else(|| {
+        stream
+            .alloc_zeros::<bf16>(seq_len * ssm_dim)
+            .expect("Failed to allocate dt_proj zeros")
+    });
 
     // z_gate: default zeros if absent
     let z_gate = z_gate.unwrap_or_else(|| {
@@ -288,7 +299,7 @@ pub fn forward(
             .launch_builder(gdn_prefill_kernel)
             .arg(&x_proj)           // x_proj [seq, ssm_dim]
             .arg(&b_proj)           // b_proj [seq, ssm_dim]
-            .arg(&dt_proj)          // dt_proj [seq, ssm_dim]
+            .arg(&dt_proj_buf)    // dt_proj [seq, ssm_dim]
             .arg(&z_gate)           // z_gate [seq, ssm_dim]
             .arg(&a_log_gpu)        // A_log [ssm_dim]
             .arg(&dt_bias_gpu)      // dt_bias [ssm_dim]
@@ -378,16 +389,23 @@ pub fn decode_forward(
         1, b_dim, hidden_size, group_size, int4_companions,
     )?;
 
-    // dt_proj = input @ x_proj_weight^T  [1, dt_dim]
-    let dt_dim = weights.x_proj_weight.shape[1];
-    let mut dt_proj_raw = stream
-        .alloc_zeros::<bf16>(dt_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
-        gemm, int4_kernel, stream,
-        &weights.x_proj_weight, input, &mut dt_proj_raw,
-        1, dt_dim, hidden_size, group_size, int4_companions,
-    )?;
+    // dt_proj: if x_proj_weight exists, compute dt_proj = input @ x_proj_weight
+    // If not, dt is just dt_bias (no projection needed)
+    let dt_proj = if let Some(x_proj_w) = &weights.x_proj_weight {
+        let dt_dim = x_proj_w.shape[1];
+        let mut dt = stream
+            .alloc_zeros::<bf16>(dt_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate dt_proj buffer: {e}"))?;
+        crate::gemm_dispatch::gemm_projection(
+            gemm, int4_kernel, stream,
+            x_proj_w, input, &mut dt,
+            1, dt_dim, hidden_size, group_size, int4_companions,
+        )?;
+        Some(extract_columns_single(stream, &dt, dt_dim, ssm_dim)?)
+    } else {
+        None
+    };
+
 
     // z_gate = input @ in_proj_z^T (INT4)  [1, z_dim]
     let z_gate = if let Some(z_weight) = &weights.in_proj_z {
@@ -410,7 +428,12 @@ pub fn decode_forward(
     // =========================================================================
 
     let b_proj = extract_columns_single(stream, &b_proj_raw, b_dim, ssm_dim)?;
-    let dt_proj = extract_columns_single(stream, &dt_proj_raw, dt_dim, ssm_dim)?;
+    // dt_proj: use zeros if x_proj_weight was absent
+    let dt_proj_buf = dt_proj.unwrap_or_else(|| {
+        stream
+            .alloc_zeros::<bf16>(ssm_dim)
+            .expect("Failed to allocate dt_proj zeros")
+    });
 
     let z_gate = z_gate.unwrap_or_else(|| {
         stream
@@ -460,7 +483,7 @@ pub fn decode_forward(
             .launch_builder(gdn_update_kernel)
             .arg(&x_proj)           // x_proj [ssm_dim]
             .arg(&b_proj)           // b_proj [ssm_dim]
-            .arg(&dt_proj)          // dt_proj [ssm_dim]
+            .arg(&dt_proj_buf)    // dt_proj [ssm_dim]
             .arg(&z_gate)           // z_gate [ssm_dim]
             .arg(&a_log_gpu)        // A_log [ssm_dim]
             .arg(&dt_bias_gpu)      // dt_bias [ssm_dim]

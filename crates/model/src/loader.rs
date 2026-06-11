@@ -23,9 +23,10 @@ use super::weights::{
 pub struct ShardIndex {
     /// Map from tensor name to shard filename.
     pub weight_map: HashMap<String, String>,
-    /// Metadata (model name, etc).
+    /// Metadata (model name, etc). Uses Value to handle mixed types
+    /// (some models store integers like `total_shards: 10`).
     #[serde(default)]
-    pub metadata: HashMap<String, String>,
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 /// Result of loading a model directory.
@@ -203,7 +204,11 @@ pub fn strip_language_model_prefix(registry: &mut WeightRegistry) {
         registry.tensors.remove(&key);
     }
     for (old_key, new_key) in to_rename {
-        if let Some(weight) = registry.tensors.remove(&old_key) {
+        if let Some(mut weight) = registry.tensors.remove(&old_key) {
+            // Also update the internal name field so companion lookups match
+            if weight.name == old_key || weight.name.starts_with("model.language_model.") {
+                weight.name = new_key.clone();
+            }
             registry.tensors.insert(new_key, weight);
         }
     }
@@ -253,9 +258,11 @@ fn build_main_layer(
             let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
             let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
             let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d.weight"))?;
-            let x_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
-            let dt_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
-            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj_weight.weight"), &format!("{p}.{sub}.out_proj_weight"))?;
+            // x_proj_weight and dt_proj_weight are optional — not present in Qwen3.6
+            let x_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
+            let dt_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            // out_proj (not out_proj_weight) — matches real Qwen3.6 tensor names
+            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"))?;
             // Optional Mamba2-style weights
             let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
             let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
@@ -371,18 +378,25 @@ fn build_mtp_layer(
     let norm1 = get_weight(registry, &format!("{}.input_layernorm.weight", prefix))?;
     let norm2 = get_weight(registry, &format!("{}.post_attention_layernorm.weight", prefix))?;
 
-    let layer_type = config.get_layer_type(layer_idx);
+    // MTP layers use full_attention by default (detect from available tensors)
+    let layer_type = if registry.tensors.contains_key(&format!("{}.linear_attn.in_proj_a.weight", prefix)) {
+        super::config::LayerType::GatedDeltaNet
+    } else {
+        super::config::LayerType::FullAttention
+    };
 
     let (gdn, attn) = match layer_type {
         super::config::LayerType::GatedDeltaNet => {
             let p = &prefix;
-            let sub = "gdn";
+            let sub = "linear_attn";  // MTP GDN layers always use linear_attn prefix
             let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
             let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
-            let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d_weight.weight"))?;
-            let x_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
-            let dt_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
-            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj_weight.weight"), &format!("{p}.{sub}.out_proj_weight"))?;
+            let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d.weight"))?;
+            // x_proj_weight and dt_proj_weight are optional — not present in Qwen3.6
+            let x_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
+            let dt_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            // out_proj (not out_proj_weight) — matches real Qwen3.6 tensor names
+            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"))?;
             // Optional Mamba2-style weights
             let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
             let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
@@ -538,6 +552,7 @@ fn map_safetensor_dtype(dtype: safetensors::Dtype) -> WeightDtype {
         safetensors::Dtype::F16 => WeightDtype::Fp16,
         safetensors::Dtype::F32 => WeightDtype::Fp32,
         safetensors::Dtype::U32 => WeightDtype::Int4Packed, // INT4 packed as u32
+        safetensors::Dtype::I32 => WeightDtype::Int4Packed, // INT4 packed as i32 (used by newer AutoRound)
         safetensors::Dtype::U8 => WeightDtype::Other,
         safetensors::Dtype::I8 => WeightDtype::Other,
         safetensors::Dtype::I16 => WeightDtype::Other,
@@ -709,13 +724,11 @@ mod tests {
         registry.tensors.insert("mtp.layers.0.input_layernorm.weight".to_string(), dummy("mtp.layers.0.input_layernorm.weight"));
         registry.tensors.insert("mtp.layers.0.post_attention_layernorm.weight".to_string(), dummy("mtp.layers.0.post_attention_layernorm.weight"));
 
-        // Layer 0: GDN
+        // Layer 0: GDN (x_proj_weight and dt_proj_weight are optional — omitted like real Qwen3.6 model)
         registry.tensors.insert("mtp.layers.0.gdn.in_proj_a.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_a.weight"));
         registry.tensors.insert("mtp.layers.0.gdn.in_proj_b.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_b.weight"));
         registry.tensors.insert("mtp.layers.0.gdn.conv1d_weight.weight".to_string(), dummy("mtp.layers.0.gdn.conv1d_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.x_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.x_proj_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.dt_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.dt_proj_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.out_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj_weight.weight"));
+        registry.tensors.insert("mtp.layers.0.gdn.out_proj.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj.weight"));
 
         // Layer 0: MLP
         registry.tensors.insert("mtp.layers.0.mlp.gate_proj.weight".to_string(), dummy("mtp.layers.0.mlp.gate_proj.weight"));
@@ -759,13 +772,11 @@ mod tests {
         registry.tensors.insert("mtp.layers.0.input_layernorm.weight".to_string(), dummy("mtp.layers.0.input_layernorm.weight"));
         registry.tensors.insert("mtp.layers.0.post_attention_layernorm.weight".to_string(), dummy("mtp.layers.0.post_attention_layernorm.weight"));
 
-        // Layer 0: GDN
+        // Layer 0: GDN (x_proj_weight and dt_proj_weight are optional — omitted like real Qwen3.6 model)
         registry.tensors.insert("mtp.layers.0.gdn.in_proj_a.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_a.weight"));
         registry.tensors.insert("mtp.layers.0.gdn.in_proj_b.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_b.weight"));
         registry.tensors.insert("mtp.layers.0.gdn.conv1d_weight.weight".to_string(), dummy("mtp.layers.0.gdn.conv1d_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.x_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.x_proj_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.dt_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.dt_proj_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.out_proj_weight.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj_weight.weight"));
+        registry.tensors.insert("mtp.layers.0.gdn.out_proj.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj.weight"));
 
         // Layer 0: MLP
         registry.tensors.insert("mtp.layers.0.mlp.gate_proj.weight".to_string(), dummy("mtp.layers.0.mlp.gate_proj.weight"));
@@ -878,7 +889,7 @@ mod tests {
             registry.tensors.insert(format!("{}.input_layernorm.weight", prefix), dummy_weight(&format!("{}.input_layernorm.weight", prefix)));
             registry.tensors.insert(format!("{}.post_attention_layernorm.weight", prefix), dummy_weight(&format!("{}.post_attention_layernorm.weight", prefix)));
             if i < 3 {
-                for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.x_proj_weight.weight", "gdn.dt_proj_weight.weight", "gdn.out_proj_weight.weight"] {
+                for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.out_proj.weight"] {
                     registry.tensors.insert(format!("{}.{}", prefix, sub), dummy_weight(&format!("{}.{}", prefix, sub)));
                 }
             } else {
@@ -919,7 +930,7 @@ mod tests {
         registry.tensors.insert("lm_head.weight".to_string(), dummy_weight("lm_head.weight"));
         registry.tensors.insert("layers.0.input_layernorm.weight".to_string(), dummy_weight("layers.0.input_layernorm.weight"));
         registry.tensors.insert("layers.0.post_attention_layernorm.weight".to_string(), dummy_weight("layers.0.post_attention_layernorm.weight"));
-        for sub in ["linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight", "linear_attn.conv1d.weight", "linear_attn.x_proj_weight.weight", "linear_attn.dt_proj_weight.weight", "linear_attn.out_proj_weight.weight"] {
+        for sub in ["linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight", "linear_attn.conv1d.weight", "linear_attn.out_proj.weight"] {
             registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
         }
         for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
@@ -930,7 +941,7 @@ mod tests {
         assert!(registry.layers[0].gdn.is_some());
         let gdn = registry.layers[0].gdn.as_ref().unwrap();
         assert_eq!(gdn.in_proj_a.name, "layers.0.linear_attn.in_proj_a.weight");
-        assert_eq!(gdn.out_proj_weight.name, "layers.0.linear_attn.out_proj_weight.weight");
+        assert_eq!(gdn.out_proj_weight.name, "layers.0.linear_attn.out_proj.weight");
     }
 
     #[test]
@@ -943,7 +954,7 @@ mod tests {
         registry.tensors.insert("lm_head.weight".to_string(), dummy_weight("lm_head.weight"));
         registry.tensors.insert("layers.0.input_layernorm.weight".to_string(), dummy_weight("layers.0.input_layernorm.weight"));
         registry.tensors.insert("layers.0.post_attention_layernorm.weight".to_string(), dummy_weight("layers.0.post_attention_layernorm.weight"));
-        for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.x_proj_weight.weight", "gdn.dt_proj_weight.weight", "gdn.out_proj_weight.weight"] {
+        for sub in ["gdn.in_proj_a.weight", "gdn.in_proj_b.weight", "gdn.conv1d.weight", "gdn.out_proj.weight"] {
             registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
         }
         for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
@@ -976,9 +987,7 @@ mod tests {
         registry.tensors.insert("model.language_model.layers.0.gdn.in_proj_a.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.in_proj_a.weight"));
         registry.tensors.insert("model.language_model.layers.0.gdn.in_proj_b.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.in_proj_b.weight"));
         registry.tensors.insert("model.language_model.layers.0.gdn.conv1d.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.conv1d.weight"));
-        registry.tensors.insert("model.language_model.layers.0.gdn.x_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.x_proj_weight.weight"));
-        registry.tensors.insert("model.language_model.layers.0.gdn.dt_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.dt_proj_weight.weight"));
-        registry.tensors.insert("model.language_model.layers.0.gdn.out_proj_weight.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.out_proj_weight.weight"));
+        registry.tensors.insert("model.language_model.layers.0.gdn.out_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.gdn.out_proj.weight"));
         registry.tensors.insert("model.language_model.layers.0.mlp.gate_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.gate_proj.weight"));
         registry.tensors.insert("model.language_model.layers.0.mlp.up_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.up_proj.weight"));
         registry.tensors.insert("model.language_model.layers.0.mlp.down_proj.weight".to_string(), dummy_weight("model.language_model.layers.0.mlp.down_proj.weight"));

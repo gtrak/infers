@@ -76,10 +76,10 @@ pub struct GdnWeights {
     pub in_proj_b: WeightData,
     /// 1D convolution weight.
     pub conv1d_weight: WeightData,
-    /// State projection weight.
-    pub x_proj_weight: WeightData,
-    /// Delta projection weight.
-    pub dt_proj_weight: WeightData,
+    /// State projection weight (optional in Qwen3.6).
+    pub x_proj_weight: Option<WeightData>,
+    /// Delta projection weight (optional in Qwen3.6).
+    pub dt_proj_weight: Option<WeightData>,
     /// Output projection weight.
     pub out_proj_weight: WeightData,
     /// Combined QKV projection (INT4 in real model).

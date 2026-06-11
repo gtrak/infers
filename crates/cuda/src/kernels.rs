@@ -58,26 +58,29 @@ impl KernelRegistry {
 
     /// Register the standard set of infers CUDA kernels.
     /// Paths point to .cubin files in the kernels/compiled/ directory.
+    /// Uses CARGO_MANIFEST_DIR to resolve paths relative to the infers-cuda crate root.
     pub fn register_infers_kernels(&mut self) {
-        self.register("infers_rmsnorm_bf16", "kernels/compiled/rmsnorm.cubin");
-        self.register("infers_silu_glu_bf16", "kernels/compiled/silu.cubin");
-        self.register("infers_rope_bf16", "kernels/compiled/rope.cubin");
-        self.register("infers_embedding_gather_bf16", "kernels/compiled/embedding.cubin");
-        self.register("infers_add_bf16", "kernels/compiled/elementwise.cubin");
-        self.register("infers_argmax_f32", "kernels/compiled/sampling.cubin");
-        self.register("infers_argmax_bf16", "kernels/compiled/sampling.cubin");
-        self.register("infers_softmax_bf16", "kernels/compiled/softmax.cubin");
-        self.register("infers_kv_cache_write_bf16", "kernels/compiled/kv_cache.cubin");
-        self.register("infers_paged_kv_write_bf16", "kernels/compiled/paged_kv_write.cubin");
-        self.register("infers_paged_kv_read_bf16", "kernels/compiled/paged_kv_read.cubin");
-        self.register("infers_gdn_update_bf16", "kernels/compiled/gdn_update.cubin");
-        self.register("infers_gdn_prefill_bf16", "kernels/compiled/gdn_prefill.cubin");
-        self.register("infers_gdn_mamba2_prefill_bf16", "kernels/compiled/gdn_mamba2_prefill.cubin");
-        self.register("infers_gdn_mamba2_update_bf16", "kernels/compiled/gdn_mamba2_update.cubin");
-        self.register("infers_paged_attention_decode_bf16", "kernels/compiled/paged_attention_decode.cubin");
-        self.register("infers_fp8_quantize_bf16", "kernels/compiled/fp8_quantize.cubin");
-        self.register("infers_fp8_dequantize_bf16", "kernels/compiled/fp8_quantize.cubin");
-        self.register("int4_gemm_kernel", "kernels/compiled/int4_gemm.cubin");
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let kdir = |path: &str| format!("{}/kernels/compiled/{}", crate_dir, path);
+        self.register("infers_rmsnorm_bf16", kdir("rmsnorm.cubin"));
+        self.register("infers_silu_glu_bf16", kdir("silu.cubin"));
+        self.register("infers_rope_bf16", kdir("rope.cubin"));
+        self.register("infers_embedding_gather_bf16", kdir("embedding.cubin"));
+        self.register("infers_add_bf16", kdir("elementwise.cubin"));
+        self.register("infers_argmax_f32", kdir("sampling.cubin"));
+        self.register("infers_argmax_bf16", kdir("sampling.cubin"));
+        self.register("infers_softmax_bf16", kdir("softmax.cubin"));
+        self.register("infers_kv_cache_write_bf16", kdir("kv_cache.cubin"));
+        self.register("infers_paged_kv_write_bf16", kdir("paged_kv_write.cubin"));
+        self.register("infers_paged_kv_read_bf16", kdir("paged_kv_read.cubin"));
+        self.register("infers_gdn_update_bf16", kdir("gdn_update.cubin"));
+        self.register("infers_gdn_prefill_bf16", kdir("gdn_prefill.cubin"));
+        self.register("infers_gdn_mamba2_prefill_bf16", kdir("gdn_mamba2_prefill.cubin"));
+        self.register("infers_gdn_mamba2_update_bf16", kdir("gdn_mamba2_update.cubin"));
+        self.register("infers_paged_attention_decode_bf16", kdir("paged_attention_decode.cubin"));
+        self.register("infers_fp8_quantize_bf16", kdir("fp8_quantize.cubin"));
+        self.register("infers_fp8_dequantize_bf16", kdir("fp8_quantize.cubin"));
+        self.register("int4_gemm_kernel", kdir("int4_gemm.cubin"));
     }
 }
 
