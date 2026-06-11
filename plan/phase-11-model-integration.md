@@ -1,5 +1,22 @@
 # Phase 11: Model Integration — Load Real Models and Run Inference
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Real model loads, shards, builds layers. BUT: Performance 200× off. No reference comparison against HuggingFace.
+**Actual Deliverables**:
+- [x] Config loading fix (`text_config` merging)
+- [x] Weight loader rewrite (prefix stripping, visual filtering)
+- [x] INT4 inference path (native INT4 GEMM wired)
+- [~] GDN forward pass adaptation (works but not verified against reference)
+- [x] KV cache and attention fixes (head_dim, dimensions)
+- [ ] PrismaSCOUT NVFP4 support
+- [x] Server configuration integration
+- [~] Smoke test and debugging (passes but slow)
+- [ ] Performance target (≥1 tok/s)
+- [ ] Reference comparison against HuggingFace
+---
+
 **Duration:** 3–4 weeks  
 **Goal:** Load and run inference with real Qwen3.6-27B models (AutoRound INT4 and PrismaSCOUT NVFP4) on 2× RTX 5060 Ti.
 
@@ -66,7 +83,7 @@ MTP has `self_attn` (no GDN layers), INT4 quantized, and expects `pre_fc_norm_*`
 
 ## Deliverables
 
-### 1. Config Loading Fix (3 days)
+### 1. [x] Config Loading Fix (3 days)
 
 - Modify `ModelConfig::load()` to merge `text_config` fields into root JSON before deserialization
 - Add `#[serde(default)]` for fields that may be missing depending on model format
@@ -75,7 +92,7 @@ MTP has `self_attn` (no GDN layers), INT4 quantized, and expects `pre_fc_norm_*`
 
 **Files:** `crates/model/src/config.rs`
 
-### 2. Weight Loader Rewrite (1 week)
+### 2. [x] Weight Loader Rewrite (1 week)
 
 - Add `strip_prefix()` support in `load_safetensors()` — remove `model.language_model.` from tensor names
 - Filter out `model.visual.*` tensors (or optionally load for multimodal support)
@@ -92,7 +109,7 @@ MTP has `self_attn` (no GDN layers), INT4 quantized, and expects `pre_fc_norm_*`
 
 **Files:** `crates/model/src/loader.rs`, `crates/model/src/weights.rs`
 
-### 3. INT4 Inference Path (2 weeks)
+### 3. [x] INT4 Inference Path (2 weeks)
 
 This is the largest deliverable. Two sub-paths:
 
@@ -111,7 +128,7 @@ This is the largest deliverable. Two sub-paths:
 
 **Files:** `crates/backends/native/src/prefill.rs`, `crates/backends/native/src/decode.rs`, `crates/backends/native/src/upload.rs`
 
-### 4. GDN Forward Pass Adaptation (1 week)
+### 4. [~] GDN Forward Pass Adaptation (1 week — works but unverified)
 
 The actual model's GDN layer uses Mamba2-style SSM with these weights per layer:
 - `in_proj_a`: BF16, shape `[hidden, 2*linear_num_key_heads*key_dim]`
@@ -130,7 +147,7 @@ The engine's `gdn.rs` has `gdn_prefill` and `gdn_update` kernels but these imple
 
 **Files:** `crates/backends/native/src/gdn.rs`, `crates/cuda/kernels/infers/`
 
-### 5. KV Cache and Attention Fixes (3 days)
+### 5. [x] KV Cache and Attention Fixes (3 days)
 
 - Use `config.head_dim` (256) and `config.num_key_value_heads` (4) for KV cache sizing
 - Add optional QK LayerNorm (`q_norm.weight`, `k_norm.weight`) to the attention path
@@ -139,7 +156,7 @@ The engine's `gdn.rs` has `gdn_prefill` and `gdn_update` kernels but these imple
 
 **Files:** `crates/backends/native/src/attention.rs`, `crates/backends/native/src/rope.rs`, `crates/kv/src/`
 
-### 6. PrismaSCOUT NVFP4 Support (1 week, parallel track)
+### 6. [ ] PrismaSCOUT NVFP4 Support (1 week, parallel track)
 
 The NVFP4 model uses a mixed-precision manifest (`mixed_native_manifest.json`) that specifies which tensors are FP4 vs BF16.
 
@@ -150,7 +167,7 @@ The NVFP4 model uses a mixed-precision manifest (`mixed_native_manifest.json`) t
 
 **Files:** `crates/model/src/loader.rs`, `crates/backends/native/src/quant.rs`, `crates/cuda/kernels/infers/`
 
-### 7. Server Configuration Integration (2 days)
+### 7. [x] Server Configuration Integration (2 days)
 
 - Remove hardcoded defaults in `main.rs` — use `ModelConfig` values for all KV/dimension params
 - Wire `--kv-cache-dtype` CLI arg to engine initialization
@@ -159,7 +176,7 @@ The NVFP4 model uses a mixed-precision manifest (`mixed_native_manifest.json`) t
 
 **Files:** `crates/server/src/main.rs`
 
-### 8. Smoke Test and Debugging (3 days)
+### 8. [~] Smoke Test and Debugging (3 days — passes but slow)
 
 - Write a test that loads the model, runs a single prefill step, and verifies output
 - Run server with real model end-to-end

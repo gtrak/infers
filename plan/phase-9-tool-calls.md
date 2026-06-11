@@ -1,19 +1,35 @@
 # Phase 9: Tool Calls + Final Polish
 
+---
+**Status**: NOT DONE
+**Last Updated**: 2026-06-11
+**Rationale**: Server API scaffold exists but not wired to tool calling logic. Blocked by server not using real inference engine.
+**Actual Deliverables**:
+- [ ] Qwen3.6 chat template integration
+- [ ] Tool call streaming
+- [ ] `enable-auto-tool-choice` API parameter
+- [ ] Tool call parser
+- [ ] OpenAI-compatible tool call responses
+- [ ] End-to-end benchmark vs vLLM baseline
+- [ ] 24-hour stability test
+- [ ] Documentation
+- [ ] Performance optimization pass
+---
+
 **Duration:** 2 weeks  
 **Goal:** Implement tool calling, SSE streaming with tools, end-to-end benchmarking, and stability testing.
 
 ## Deliverables
 
-1. Qwen3.6 chat template integration (thinking tokens, tool calls)
-2. Tool call streaming (delta format for `tool_calls`)
-3. `enable-auto-tool-choice` API parameter
-4. Tool call parser (`qwen3_xml` or `qwen3_coder`)
-5. OpenAI-compatible tool call responses
-6. End-to-end benchmark vs vLLM baseline
-7. 24-hour stability test
-8. Documentation
-9. Performance optimization pass
+- [ ] Qwen3.6 chat template integration (thinking tokens, tool calls)
+- [ ] Tool call streaming (delta format for `tool_calls`)
+- [ ] `enable-auto-tool-choice` API parameter
+- [ ] Tool call parser (`qwen3_xml` or `qwen3_coder`)
+- [ ] OpenAI-compatible tool call responses
+- [ ] End-to-end benchmark vs vLLM baseline
+- [ ] 24-hour stability test
+- [ ] Documentation
+- [ ] Performance optimization pass
 
 ## Technical Details
 

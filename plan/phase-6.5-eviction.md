@@ -1,5 +1,16 @@
 # Phase 6.5: Session Eviction to CPU + Memory Pressure Handling
 
+---
+**Status**: NOT DONE
+**Last Updated**: 2026-06-11
+**Rationale**: Blocked by Phase 6 (continuous batching). CPU-side eviction infrastructure planned but not implemented.
+**Actual Deliverables**:
+- [ ] `CpuPagePool` in `infers-kv/eviction.rs`
+- [ ] `PagedKvManager::evict_sequence` / `restore_sequence`
+- [ ] Scheduler memory pressure + LRU eviction policy
+- [ ] Unit + integration tests
+---
+
 **Duration:** 1 week  
 **Goal:** Implement session-level KV cache eviction to CPU and memory-pressure-driven eviction policy.
 
@@ -62,10 +73,10 @@ crates/scheduler/src/
 
 ## Deliverables
 
-1. `CpuPagePool` in `infers-kv/eviction.rs` — CPU storage for evicted page data
-2. `PagedKvManager::evict_sequence` / `restore_sequence` — coordination layer
-3. Scheduler memory pressure + LRU eviction policy
-4. Unit + integration tests
+- [ ] `CpuPagePool` in `infers-kv/eviction.rs` — CPU storage for evicted page data
+- [ ] `PagedKvManager::evict_sequence` / `restore_sequence` — coordination layer
+- [ ] Scheduler memory pressure + LRU eviction policy
+- [ ] Unit + integration tests
 
 ## Deferred (out of scope)
 

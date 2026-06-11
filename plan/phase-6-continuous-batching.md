@@ -1,19 +1,35 @@
 # Phase 6: Continuous Batching
 
+---
+**Status**: NOT DONE
+**Last Updated**: 2026-06-11
+**Rationale**: Blocked by Phase 4.7 (GPU weight cache). Cannot do continuous batching without weight caching.
+**Actual Deliverables**:
+- [ ] Hybrid KV state manager (Mamba + paged)
+- [ ] Block allocator with free lists
+- [ ] Session lifecycle management
+- [ ] Batch builder with dynamic join/leave
+- [ ] Round-robin scheduler
+- [ ] Request queue with priority
+- [ ] Prefill/decode interleaving
+- [ ] Session eviction to CPU/SSD
+- [ ] Memory pressure handling
+---
+
 **Duration:** 3 weeks  
 **Goal:** Implement continuous batching with dynamic join/leave, round-robin scheduling, and the hybrid KV manager.
 
 ## Deliverables
 
-1. Hybrid KV state manager (Mamba + paged)
-2. Block allocator with free lists
-3. Session lifecycle management
-4. Batch builder with dynamic join/leave
-5. Round-robin scheduler
-6. Request queue with priority
-7. Prefill/decode interleaving
-8. Session eviction to CPU/SSD (for paged KV only)
-9. Memory pressure handling
+- [ ] Hybrid KV state manager (Mamba + paged)
+- [ ] Block allocator with free lists
+- [ ] Session lifecycle management
+- [ ] Batch builder with dynamic join/leave
+- [ ] Round-robin scheduler
+- [ ] Request queue with priority
+- [ ] Prefill/decode interleaving
+- [ ] Session eviction to CPU/SSD (for paged KV only)
+- [ ] Memory pressure handling
 
 ## Technical Details
 

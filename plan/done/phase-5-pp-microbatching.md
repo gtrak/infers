@@ -1,17 +1,31 @@
 # Phase 5: PP=2 with Microbatching
 
+---
+**Status**: OUT OF SCOPE
+**Last Updated**: 2026-06-11
+**Rationale**: With 2 GPUs, TP=2 is the optimal parallelism. PP adds complexity without benefit. Revisit if moving to 4+ GPUs.
+**Actual Deliverables**:
+- [n] Stage partitioning
+- [n] P2P communication between stages
+- [n] Microbatch scheduler
+- [n] Pipeline bubble minimization
+- [n] KV cache per-stage management
+- [n] Switch between TP and PP at load time
+- [n] Performance parity with TP for small batches
+---
+
 **Duration:** 3 weeks  
 **Goal:** Implement Pipeline Parallelism with microbatching across 2 GPUs.
 
 ## Deliverables
 
-1. Stage partitioning (layers 0-31 on GPU0, 32-63 on GPU1)
-2. P2P communication between stages (send/recv hidden states)
-3. Microbatch scheduler
-4. Pipeline bubble minimization
-5. KV cache per-stage management
-6. Switch between TP and PP at load time
-7. Performance parity with TP for small batches
+- [n] Stage partitioning (layers 0-31 on GPU0, 32-63 on GPU1) — OUT OF SCOPE
+- [n] P2P communication between stages (send/recv hidden states) — OUT OF SCOPE
+- [n] Microbatch scheduler — OUT OF SCOPE
+- [n] Pipeline bubble minimization — OUT OF SCOPE
+- [n] KV cache per-stage management — OUT OF SCOPE
+- [n] Switch between TP and PP at load time — OUT OF SCOPE
+- [n] Performance parity with TP for small batches — OUT OF SCOPE
 
 ## Technical Details
 

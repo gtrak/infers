@@ -1,17 +1,31 @@
 # Phase 7: MTP (Multi-Token Prediction)
 
+---
+**Status**: NOT DONE
+**Last Updated**: 2026-06-11
+**Rationale**: Blocked by Phase 4.7 (GPU weight cache) + Phase 6 (continuous batching). MTP requires working decode loop first.
+**Actual Deliverables**:
+- [ ] MTP head weight loading
+- [ ] MTP forward pass
+- [ ] Draft token generation
+- [ ] Verification: main model checks draft tokens
+- [ ] Acceptance logic
+- [ ] `speculative-config` API parameter
+- [ ] MTP metrics
+---
+
 **Duration:** 2 weeks  
 **Goal:** Implement native MTP speculative decoding for Qwen3.6-27B.
 
 ## Deliverables
 
-1. MTP head weight loading
-2. MTP forward pass (reuse standard attention kernel)
-3. Draft token generation (greedy sampling from MTP head)
-4. Verification: main model checks draft tokens in single forward pass
-5. Acceptance logic: accept longest valid prefix
-6. `speculative-config` API parameter
-7. MTP metrics (acceptance rate, tokens saved)
+- [ ] MTP head weight loading
+- [ ] MTP forward pass (reuse standard attention kernel)
+- [ ] Draft token generation (greedy sampling from MTP head)
+- [ ] Verification: main model checks draft tokens in single forward pass
+- [ ] Acceptance logic: accept longest valid prefix
+- [ ] `speculative-config` API parameter
+- [ ] MTP metrics (acceptance rate, tokens saved)
 
 ## Technical Details
 

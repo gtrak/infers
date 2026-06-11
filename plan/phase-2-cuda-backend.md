@@ -1,18 +1,33 @@
 # Phase 2: CUDA Backend
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: cudarc works, kernels compile, NCCL works. cuda-oxide is OUT OF SCOPE — we use cudarc exclusively. Memory allocator (block pool) may not exist.
+**Actual Deliverables**:
+- [n] cuda-oxide workspace integration — OUT OF SCOPE (cudarc only)
+- [x] cudarc cuBLASLt bindings
+- [x] NCCL communicator setup for 2 GPUs
+- [x] Custom CUDA kernel compilation pipeline
+- [n] Kernel loading test via cuda-oxide — OUT OF SCOPE
+- [~] Memory allocator (GPU block pool, pinned host buffers)
+- [x] Stream management for 2 GPUs
+- [n] Context sharing between cuda-oxide and cudarc — OUT OF SCOPE
+---
+
 **Duration:** 2 weeks  
 **Goal:** Set up CUDA runtime, compile custom CUDA kernels, and establish the kernel launching pipeline.
 
 ## Deliverables
 
-1. cuda-oxide workspace integration (`cuda-core`, `cuda-async`, `cuda-host`)
-2. cudarc cuBLASLt bindings
-3. NCCL communicator setup for 2 GPUs
-4. Custom CUDA kernel compilation pipeline
-5. Kernel loading test (load `.cubin` via cuda-oxide)
-6. Memory allocator (GPU block pool, pinned host buffers)
-7. Stream management for 2 GPUs
-8. Context sharing between cuda-oxide and cudarc
+- [n] cuda-oxide workspace integration (`cuda-core`, `cuda-async`, `cuda-host`) — OUT OF SCOPE
+- [x] cudarc cuBLASLt bindings
+- [x] NCCL communicator setup for 2 GPUs
+- [x] Custom CUDA kernel compilation pipeline
+- [n] Kernel loading test (load `.cubin` via cuda-oxide) — OUT OF SCOPE
+- [~] Memory allocator (GPU block pool, pinned host buffers)
+- [x] Stream management for 2 GPUs
+- [n] Context sharing between cuda-oxide and cudarc — OUT OF SCOPE
 
 ## Technical Details
 

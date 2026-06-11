@@ -1,19 +1,35 @@
 # Phase 3: Model Loading
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: AutoRound INT4 works, safetensors loads, sharding works. BUT: BF16, PrismaSCOUT, GGUF NOT implemented. Memory budget calculator unknown.
+**Actual Deliverables**:
+- [x] Safetensors parallel reader
+- [x] `config.json` parser for Qwen3.6
+- [x] Quantization format auto-detection
+- [ ] PrismaSCOUT loader
+- [x] AutoRound loader
+- [x] Weight registry with tensor lookup
+- [x] Weight sharding for TP=2
+- [ ] Memory budget calculator
+- [~] Model validation (checksums, shape verification)
+---
+
 **Duration:** 3 weeks  
 **Goal:** Implement multi-format model loader with auto-detection, weight sharding, and memory budgeting.
 
 ## Deliverables
 
-1. Safetensors parallel reader
-2. `config.json` parser for Qwen3.6
-3. Quantization format auto-detection
-4. PrismaSCOUT loader
-5. AutoRound loader
-6. Weight registry with tensor lookup
-7. Weight sharding for TP=2
-8. Memory budget calculator
-9. Model validation (checksums, shape verification)
+- [x] Safetensors parallel reader
+- [x] `config.json` parser for Qwen3.6
+- [x] Quantization format auto-detection
+- [ ] PrismaSCOUT loader
+- [x] AutoRound loader
+- [x] Weight registry with tensor lookup
+- [x] Weight sharding for TP=2
+- [ ] Memory budget calculator
+- [~] Model validation (checksums, shape verification)
 
 ## Technical Details
 

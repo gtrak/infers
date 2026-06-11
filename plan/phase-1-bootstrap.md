@@ -1,19 +1,37 @@
 # Phase 1: Bootstrap
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Workspace exists, crates exist, server has mock responses. BUT: Server NOT wired to real inference. Some API types exist.
+**Actual Deliverables**:
+- [x] Workspace `Cargo.toml` with nightly toolchain
+- [x] `rust-toolchain.toml`
+- [x] Crate skeletons for all crates
+- [~] OpenAI API types (partial — basic structs exist)
+- [x] Basic axum HTTP server with mock responses
+- [~] SSE streaming scaffold
+- [x] Prometheus metrics endpoint
+- [x] CLI argument parsing
+- [x] Health check endpoint
+- [ ] Server wired to real inference engine
+---
+
 **Duration:** 2 weeks  
 **Goal:** Create the Rust workspace, crate skeletons, and API scaffolding.
 
 ## Deliverables
 
-1. Workspace `Cargo.toml` with nightly toolchain
-2. `rust-toolchain.toml` (nightly-2026-04-03, rust-src, rustc-dev, llvm-tools)
-3. Crate skeletons for all crates
-4. OpenAI API types (request/response structs)
-5. Basic axum HTTP server with mock responses
-6. SSE streaming scaffold
-7. Prometheus metrics endpoint
-8. CLI argument parsing
-9. Health check endpoint
+- [x] Workspace `Cargo.toml` with nightly toolchain
+- [x] `rust-toolchain.toml` (nightly-2026-04-03, rust-src, rustc-dev, llvm-tools)
+- [x] Crate skeletons for all crates
+- [~] OpenAI API types (partial — basic structs exist)
+- [x] Basic axum HTTP server with mock responses
+- [~] SSE streaming scaffold
+- [x] Prometheus metrics endpoint
+- [x] CLI argument parsing
+- [x] Health check endpoint
+- [ ] Server wired to real inference engine
 
 ## Crate Structure
 

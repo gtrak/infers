@@ -1,17 +1,31 @@
 # Phase 8: Quantization Polish
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: AutoRound INT4 works end-to-end. BUT: GGUF, PrismaSCOUT, FP8/NVFP4 not implemented.
+**Actual Deliverables**:
+- [x] AutoRound INT4 end-to-end test
+- [ ] GGUF parser and loader
+- [ ] llama.cpp backend integration
+- [ ] NVFP4 KV cache implementation
+- [ ] FP8 KV cache implementation
+- [ ] Cross-format benchmarking
+- [ ] Backend routing (auto-detect → native or llama.cpp)
+---
+
 **Duration:** 3 weeks  
 **Goal:** Complete AutoRound INT4 and GGUF support, optimize quantization kernels.
 
 ## Deliverables
 
-1. AutoRound INT4 end-to-end test
-2. GGUF parser and loader
-3. llama.cpp backend integration
-4. NVFP4 KV cache implementation
-5. FP8 KV cache implementation
-6. Cross-format benchmarking
-7. Backend routing (auto-detect → native or llama.cpp)
+- [x] AutoRound INT4 end-to-end test
+- [ ] GGUF parser and loader
+- [ ] llama.cpp backend integration
+- [ ] NVFP4 KV cache implementation
+- [ ] FP8 KV cache implementation
+- [ ] Cross-format benchmarking
+- [ ] Backend routing (auto-detect → native or llama.cpp)
 
 ## Technical Details
 

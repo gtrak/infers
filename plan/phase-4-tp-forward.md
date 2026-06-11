@@ -1,21 +1,49 @@
 # Phase 4: TP=2 Forward Pass
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Forward pass works end-to-end, produces tokens. BUT: Performance is 200× off target (0.1 vs 20 tok/s). No reference comparison. Only greedy sampling.
+**Actual Deliverables**:
+- [x] GDN prefill kernel integration
+- [x] GDN decode kernel integration
+- [x] Standard attention prefill/decode
+- [x] Layer dispatch based on `layer_type`
+- [x] GEMM via cuBLASLt
+- [x] NCCL all-reduce after attention/MLP
+- [x] RMSNorm + SiLU activation
+- [x] RoPE position embedding
+- [x] Prefill path: tokenize → allocate → forward → sample
+- [x] Decode path: single token → update KV → forward → sample
+- [x] KV cache allocation and distribution
+- [ ] Performance target (>20 tok/s) — NOT MET (~0.1 tok/s)
+- [ ] Reference comparison against HF
+- [ ] Single-GPU parity verification
+- [~] GDN works but not verified against reference
+- [~] Sampling: only greedy (no temperature/top_p/top_k)
+---
+
 **Duration:** 3 weeks  
 **Goal:** Implement the model forward pass with Tensor Parallelism across 2 GPUs.
 
 ## Deliverables
 
-1. GDN prefill kernel integration (custom CUDA kernels)
-2. GDN decode kernel integration (custom CUDA kernels)
-3. Standard attention prefill/decode (custom CUDA kernels)
-4. Layer dispatch based on `layer_type`
-5. GEMM via cuBLASLt (NVFP4, FP16, BF16)
-6. NCCL all-reduce after attention/MLP
-7. RMSNorm + SiLU activation
-8. RoPE position embedding
-9. Prefill path: tokenize → allocate → forward → sample
-10. Decode path: single token → update KV → forward → sample
-11. KV cache allocation and distribution
+- [x] GDN prefill kernel integration (custom CUDA kernels)
+- [x] GDN decode kernel integration (custom CUDA kernels)
+- [x] Standard attention prefill/decode (custom CUDA kernels)
+- [x] Layer dispatch based on `layer_type`
+- [x] GEMM via cuBLASLt (NVFP4, FP16, BF16)
+- [x] NCCL all-reduce after attention/MLP
+- [x] RMSNorm + SiLU activation
+- [x] RoPE position embedding
+- [x] Prefill path: tokenize → allocate → forward → sample
+- [x] Decode path: single token → update KV → forward → sample
+- [x] KV cache allocation and distribution
+- [ ] Performance target (>20 tok/s) — NOT MET (~0.1 tok/s)
+- [ ] Reference comparison against HF
+- [ ] Single-GPU parity verification
+- [~] GDN works but not verified against reference
+- [~] Sampling: only greedy (no temperature/top_p/top_k)
 
 ## Technical Details
 

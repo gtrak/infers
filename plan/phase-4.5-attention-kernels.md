@@ -1,9 +1,20 @@
 # Phase 4.5: Attention, KV Cache, and GDN Kernels (Custom Build)
 
-**Duration:** 1-2 weeks
-**Goal:** Complete the forward pass by building custom CUDA kernels for attention softmax, KV cache management, and Gated DeltaNet state updates, and wire them into the prefill/decode paths.
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Kernels exist and compile. Had transpose/dimension bugs (now fixed). Not all GEMM configs verified. No standalone kernel tests.
+**Actual Deliverables**:
+- [x] Attention kernels compile and run
+- [x] KV cache management kernels
+- [x] GDN state update kernels
+- [~] Fixed transpose/dimension bugs in kernels
+- [~] GEMM configs verified for some cases, not all
+- [ ] Standalone kernel unit tests
+---
 
-**Status:** Partially complete from Phase 4. This phase captures the remaining work.
+**Duration:** 1-2 weeks
+**Goal:** Complete the forward pass by building custom CUDA kernels for attention softmax, KV cache management, and Gated DeltaNet state updates, and wire them into the prefill/decode paths. This phase captures the remaining work.
 
 ---
 
@@ -147,17 +158,17 @@ Follow the strict review-fix-commit cycle for each sub-task:
 
 ## Deliverables Checklist
 
-- [ ] `kernels/infers/softmax.cu` + `.cubin`
-- [ ] `kernels/infers/kv_cache.cu` + `.cubin`
-- [ ] `kernels/infers/gdn_update.cu` + `.cubin`
-- [ ] `kernels/infers/gdn_prefill.cu` + `.cubin`
-- [ ] `attention.rs` wired (QKV, RoPE, KV cache, scores, softmax, O-proj, all-reduce)
-- [ ] `gdn.rs` wired (projections, conv1d, delta rule, out-proj, all-reduce)
-- [ ] `prefill.rs` wired end-to-end
-- [ ] `decode.rs` wired end-to-end
-- [ ] `engine.rs` owns kernel handles and caches
-- [ ] All kernel dispatches reviewed for arg order, shared mem, launch config
-- [ ] All GEMM configs reviewed for transpose correctness
+- [x] `kernels/infers/softmax.cu` + `.cubin`
+- [x] `kernels/infers/kv_cache.cu` + `.cubin`
+- [x] `kernels/infers/gdn_update.cu` + `.cubin`
+- [x] `kernels/infers/gdn_prefill.cu` + `.cubin`
+- [x] `attention.rs` wired (QKV, RoPE, KV cache, scores, softmax, O-proj, all-reduce)
+- [x] `gdn.rs` wired (projections, conv1d, delta rule, out-proj, all-reduce)
+- [x] `prefill.rs` wired end-to-end
+- [x] `decode.rs` wired end-to-end
+- [x] `engine.rs` owns kernel handles and caches
+- [~] All kernel dispatches reviewed for arg order, shared mem, launch config
+- [~] All GEMM configs reviewed for transpose correctness
 - [ ] `lat.md` updated with Phase 4.5 deliverables
 - [ ] `lat check` passes
 

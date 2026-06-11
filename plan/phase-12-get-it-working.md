@@ -1,5 +1,21 @@
 # Phase 12: Get It Working — End-to-End Real Model Inference
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: End-to-end smoke test passes (varied non-zero tokens). BUT: Server not wired. No reference comparison. Performance terrible (~0.1 tok/s, 200× off target).
+**Actual Deliverables**:
+- [x] End-to-end smoke test passes with real model
+- [x] Token validity (non-zero, in vocab range)
+- [ ] Output coherence (legible text)
+- [ ] Determinism check
+- [~] No CUDA errors (some kernel warnings remain)
+- [~] Graceful shutdown
+- [ ] Server wired to engine
+- [ ] Reference comparison
+- [~] Performance improvement (still ~200× off target of 20 tok/s)
+---
+
 **Duration:** 3–4 weeks  
 **Goal:** Run end-to-end inference with real Qwen3.6-27B AutoRound INT4 model and get coherent token output, not garbage.
 
@@ -204,15 +220,14 @@ Un-stub `prefill_paged()` and `decode_paged()`:
 
 ## Success Criteria
 
-1. **Output coherence**: `cargo run -- --model ~/opt/vllm/models/qwen3.6-27b-autoround-int4/` starts and `curl POST /v1/chat/completions` returns tokens that decode to legible text (not all-zeros, not all-<unk>, not garbage bytes)
-
-2. **Token validity**: All sampled tokens are in range `[0, vocab_size)`, never identical for 10+ consecutive steps (no repetition loop)
-
-3. **Determinism**: Same input + seed produces same output sequence (regression check)
-
-4. **No CUDA errors**: No illegal memory access, no kernel launch failures, no NaN detection
-
-5. **Graceful shutdown**: Ctrl+C triggers `delete_sequence` and GPU memory cleanup (verify with `nvidia-smi` before/after)
+- [~] **Output coherence**: `cargo run` starts and returns tokens (legibility not verified)
+- [x] **Token validity**: All sampled tokens are in range `[0, vocab_size)`, non-zero
+- [ ] **Determinism**: Same input + seed produces same output sequence
+- [~] **No CUDA errors**: No illegal memory access (some kernel warnings remain)
+- [~] **Graceful shutdown**: Ctrl+C triggers cleanup (partially working)
+- [ ] **Performance**: ≥20 tok/s target (currently ~0.1 tok/s, 200× off)
+- [ ] **Server wired**: `curl` returns real generated tokens via server API
+- [ ] **Reference comparison**: Matches HuggingFace output within tolerance
 
 ## Files to Modify
 

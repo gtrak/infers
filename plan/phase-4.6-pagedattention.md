@@ -1,9 +1,20 @@
 # Phase 4.6: PagedAttention + Prefix Caching
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Paged KV read/write kernels work. Paged paths used by engine. BUT: No standalone tests for paged attention correctness. Prefix caching and COW not fully implemented.
+**Actual Deliverables**:
+- [x] Paged KV read/write kernels
+- [x] Paged paths used by engine
+- [ ] Prefix caching with Blake3 hashing
+- [ ] Copy-on-write page sharing
+- [ ] Standalone tests for paged attention correctness
+- [ ] Benchmark suite
+---
+
 **Duration:** 2-3 weeks
 **Goal:** Replace the flat contiguous KV cache with a production-quality PagedAttention subsystem supporting prefix caching, copy-on-write page sharing, and groundwork for future CPU KV offload.
-
-**Status:** Not started.
 
 **Target:** Qwen 3.6, Rust runtime, cudarc, dual NVIDIA GPUs (sm_120 Blackwell)
 **Workloads:** Long-context agent inference, multiple concurrent subagents, deep tree-of-thought branching
@@ -33,13 +44,13 @@ Phase 4.6 replaces this with a true paged design inspired by vLLM.
 
 ## Deliverables Checklist
 
-- [ ] `infers-kv` crate: paged block allocator, sequence page tables, prefix cache
-- [ ] New CUDA kernels: paged KV cache write, paged KV cache read, paged attention decode
+- [x] `infers-kv` crate: paged block allocator, sequence page tables
+- [x] New CUDA kernels: paged KV cache write, paged KV cache read, paged attention decode
 - [ ] Prefix cache: Blake3 hashing, page chain storage, LRU eviction
 - [ ] Copy-on-write page sharing for branching prompts
-- [ ] attention.rs rewrite: paged decode (no CPU round-trips)
+- [x] attention.rs rewrite: paged decode (no CPU round-trips)
 - [ ] MemoryBudget update: block-aware KV estimation
-- [ ] engine.rs update: integrate PagedKvManager
+- [x] engine.rs update: integrate PagedKvManager
 - [ ] Unit + stress tests for all subsystems
 - [ ] Benchmark suite for prefill throughput, decode latency, cache hit rate
 - [ ] Architecture documentation in lat.md

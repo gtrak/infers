@@ -1,5 +1,20 @@
 # Phase 10: Server Orchestration — Wire Everything Together
 
+---
+**Status**: PARTIAL
+**Last Updated**: 2026-06-11
+**Rationale**: Server binary exists with axum routes. BUT: NOT wired to real inference engine. Still returns mock responses.
+**Actual Deliverables**:
+- [x] Server binary exists with axum routes
+- [x] HTTP server starts and responds
+- [ ] `InferenceOrchestrator` wired to real engine
+- [ ] Background scheduler loop
+- [ ] Token streaming through `mpsc` channels
+- [ ] Chat handler with real tokenization + streaming
+- [ ] Two concurrent requests produce interleaved tokens
+- [ ] Session cleanup
+---
+
 **Duration:** 1.5 weeks  
 **Goal:** Connect the HTTP server, scheduler, and inference backend into an end-to-end pipeline. Replace mock handlers with real generation.
 
@@ -45,7 +60,7 @@ Each session needs a channel back to the HTTP response. Use `tokio::sync::mpsc`:
 
 ## Deliverables
 
-### 1. InferenceOrchestrator (new struct)
+### 1. [ ] InferenceOrchestrator (new struct)
 
 Owns `RoundRobinScheduler`, `ForwardEngine`, `BackendEvictionStore`, and response channels.
 
@@ -66,7 +81,7 @@ Methods:
 - `process_batch(decode_batch) -> Result<Vec<u32>>` — dispatches decode batch to ForwardEngine
 - `cleanup_session(seq_id)` — marks complete, sends final token
 
-### 2. Background Scheduler Loop
+### 2. [ ] Background Scheduler Loop
 
 A tokio task that calls `orchestrator.step()` in a loop with a small delay (or triggered by events):
 
@@ -83,7 +98,7 @@ pub async fn run_scheduler_loop(orchestrator: Arc<Mutex<InferenceOrchestrator>>)
 }
 ```
 
-### 3. Token Streaming
+### 3. [ ] Token Streaming
 
 Each generate-session token is sent through an `mpsc` channel to the HTTP handler:
 
@@ -104,7 +119,7 @@ let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
     .map(|token| Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
 ```
 
-### 4. AppState Update
+### 4. [~] AppState Update (struct exists but not wired to real engine)
 
 ```rust
 pub struct AppState {
@@ -114,7 +129,7 @@ pub struct AppState {
 }
 ```
 
-### 5. Chat Handler Rewrite
+### 5. [ ] Chat Handler Rewrite
 
 Replace mock streaming with real pipeline:
 

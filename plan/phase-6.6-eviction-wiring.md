@@ -1,5 +1,15 @@
 # Phase 6.6: Eviction Wiring — GPU Data Movement Through Backend
 
+---
+**Status**: NOT DONE
+**Last Updated**: 2026-06-11
+**Rationale**: Blocked by Phase 6 (continuous batching). GPU data movement for eviction not wired.
+**Actual Deliverables**:
+- [ ] `BackendEvictionStore`
+- [ ] `mark_evicted()` / `allocate_for_restore()` in `PagedKvManager`
+- [ ] `evict_session()` / `restore_session()` in `ForwardEngine`
+---
+
 **Duration:** 3 days  
 **Goal:** Wire the eviction path through `infers-backend-native`, connecting the scheduler's eviction policy to actual GPU→CPU data movement.
 
