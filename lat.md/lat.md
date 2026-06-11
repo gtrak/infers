@@ -420,6 +420,20 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 
 See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
+### Multi-Dtype Weight Upload
+
+The `upload_weight()` function checks `weight.dtype` and converts to BF16. Handles Bf16 (direct), Fp16 (via f16 cast), and Fp32 (via f32 cast). Returns `CudaSlice<bf16>`.
+
+Conversion logic extracted into `bytes_to_bf16()` for GPU-free unit testing.
+
+### INT4 Triplet Upload
+
+`upload_int4_weight()` uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. Returns `(qweight_gpu, scales_gpu, qzeros_gpu)` for `int4_gemm_kernel` on-the-fly dequantization.
+
+`dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>` using `(int4_val - zero_point) * scale`.
+
+See [[crates/backends/native/src/upload.rs#upload_int4_weight]], [[crates/backends/native/src/upload.rs#dequantize_int4_to_bf16]].
+
 ### Decode with Hidden State
 Variant of `decode` that also returns the pre-LM-head hidden state for MTP speculative decoding.
 
@@ -474,7 +488,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `gdn` | Gated DeltaNet: projection GEMMs, `infers_gdn_prefill_bf16` kernel, output projection |
 | `sync` | NCCL all-reduce for TP collectives (`all_reduce_attention`, `all_reduce_mlp`) |
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
-| `upload` | Shared weight upload utility: converts `WeightData` bytes to GPU-resident BF16 buffers (`upload_weight`) |
+| `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
 
 
