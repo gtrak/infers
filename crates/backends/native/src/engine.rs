@@ -1267,19 +1267,23 @@ for layer_idx in 0..config.num_hidden_layers {
 
         // --- Draft position counter for verification ---
         // Tracks which draft index we're on so each draft gets the correct position
+        // Capture group_size for use in MTP closures
+        let group_size = self.group_size;
         let verify_pos = Cell::new(current_pos.get());
 
         // Build embed callback for MTP operations
         let embed_fn = |token: u32, s: &Arc<CudaStream>| -> Result<CudaSlice<bf16>> {
             let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
+            let weight_cache: &crate::gpu_cache::GpuWeightCache = unsafe { &*weight_cache_ptr };
             let embed_weight = weights.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
-            let embed_table = crate::upload::upload_weight(s, embed_weight)?;
+            let embed_table = weight_cache.get_bf16(&embed_weight.name)
+                .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
             crate::embedding::embed_tokens(
                 s,
                 &kernels.embedding,
                 &[token],
-                &embed_table,
+                embed_table,
                 config.hidden_size,
                 config.vocab_size,
             )
@@ -1312,7 +1316,7 @@ for layer_idx in 0..config.num_hidden_layers {
                 crate::mtp::forward_layer_pass(
                     layer, input, g, s, &kernels, config, weight_cache_ref,
                     &mut mtp_kv, &mut mtp_gdn,
-                    current_pos.get(), 0,
+                    current_pos.get(), 0, group_size,
                 )
             };
 
@@ -1321,30 +1325,18 @@ for layer_idx in 0..config.num_hidden_layers {
                           s: &Arc<CudaStream>,
                           g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
             let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
+            let weight_cache: &crate::gpu_cache::GpuWeightCache = unsafe { &*weight_cache_ptr };
             let lm_head_weight = weights.lm_head.as_ref()
                 .or_else(|| weights.embedding.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-            let lm_head_gpu = crate::upload::upload_weight(s, lm_head_weight)?;
             let mut logits = s
                 .alloc_zeros::<bf16>(config.vocab_size)
                 .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
-            g.matmul_bf16(
-                &infers_cuda::gemm::GemmConfig {
-                    m: 1,
-                    n: config.vocab_size,
-                    k: config.hidden_size,
-                    transa: true,
-                    transb: false,
-                    alpha: 1.0,
-                    beta: 0.0,
-                    lda: None,
-                    ldb: None,
-                    ldc: None,
-                    activation: None,
-                },
-                hidden,
-                &lm_head_gpu,
-                &mut logits,
+            crate::gemm_dispatch::gemm_projection_cached(
+                g, &kernels.int4_gemm, s,
+                weight_cache, &lm_head_weight.name,
+                hidden, &mut logits,
+                1, config.vocab_size, config.hidden_size, group_size,
             )?;
             Ok(logits)
         };
@@ -1374,6 +1366,7 @@ for layer_idx in 0..config.num_hidden_layers {
                     config.as_ref(), weights, weight_cache_ref,
                     kv_caches, gdn_states,
                     pos, // each draft gets incrementing position
+                    group_size,
                 )
             };
 

@@ -406,7 +406,6 @@ Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 ## Remaining
 Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
 
-- Replace `upload_weight` calls for embedding table, norm weights, and LM head in legacy prefill/decode paths
 - Memory budget validation: assert weights + KV cache + temps fit in GPU memory
 - Benchmark before/after tokens/sec
 

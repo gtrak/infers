@@ -54,6 +54,7 @@ pub fn forward_layer_pass(
     gdn_states: &mut [GdnState],
     position: u32,
     layer_idx: usize,
+    group_size: usize,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = config.hidden_size;
     let intermediate_size = config.intermediate_size;
@@ -92,7 +93,7 @@ pub fn forward_layer_pass(
                 &mut gdn_states[layer_idx],
                 hidden_size,
                 config,
-                128, // group_size default
+                group_size,
                 cache,
             )?
         }
@@ -118,7 +119,7 @@ pub fn forward_layer_pass(
                 rope_theta,
                 partial_rotary_factor,
                 rms_norm_eps,
-                128, // group_size default
+                group_size,
                 cache,
             )?
         }
@@ -197,6 +198,7 @@ pub fn full_forward_logits(
     kv_caches: &mut [KvCache],
     gdn_states: &mut [GdnState],
     position: u32,
+    group_size: usize,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
@@ -230,7 +232,8 @@ pub fn full_forward_logits(
             gdn_states,
             position,
             layer_idx,
-        )?;
+            group_size,
+)?;
     }
 
     // Final norm
@@ -268,8 +271,8 @@ pub fn full_forward_logits(
         1,
         config.vocab_size,
         hidden_size,
-        128, // group_size
-    )?;
+        group_size,
+)?;
 
     Ok(logits)
 }
