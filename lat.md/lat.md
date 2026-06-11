@@ -528,6 +528,26 @@ Unlike prefill, the softmax uses `use_causal=0` because a single query token can
 
 See [[crates/backends/native/src/attention.rs#decode_forward]].
 
+
+### QK-Normalization
+
+RMSNorm applied per-head to Q and K before RoPE in full attention layers.
+
+QK-norm uses the same `infers_rmsnorm_bf16` CUDA kernel as layer normalization, applied per-head with `hidden_size=head_dim`. The `rms_norm_per_head()` wrapper in `norm.rs` delegates to `rms_norm()` with the head dimension.
+
+#### When Applied
+
+K-norm normalizes full K before Phase 1 RoPE. Q-norm normalizes each head's Q before per-head RoPE.
+
+Both stages use `weights.q_norm` and `weights.k_norm` (optional `Option<WeightData>`).
+
+#### Implementation
+
+QK-norm weights are uploaded once before the per-head loop.
+
+Normalization uses `crate::norm::rms_norm_per_head()` for per-head Q/K and `crate::norm::rms_norm()` for full K tensors. All four attention functions accept `rmsnorm_kernel` and `rms_norm_eps` parameters.
+
+See [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/norm.rs#rms_norm_per_head]].
 ### GDN Forward Pass
 
 Gated DeltaNet prefill: projection GEMMs via INT4-aware `gemm_projection` dispatch feed `infers_gdn_prefill_bf16` kernel, then output projection.

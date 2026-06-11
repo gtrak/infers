@@ -105,6 +105,7 @@ pub fn forward_layer_pass(
                 &kernels.softmax,
                 &kernels.kv_cache_write,
                 &kernels.rope,
+                &kernels.rmsnorm,
                 &kernels.add,
                 attn_weights,
                 &norm1_out,
@@ -116,6 +117,7 @@ pub fn forward_layer_pass(
                 max_seq_len,
                 rope_theta,
                 partial_rotary_factor,
+                rms_norm_eps,
                 128, // group_size default
                 &int4_companions,
             )?

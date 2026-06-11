@@ -152,6 +152,7 @@ pub fn prefill(
                     &kernels.softmax,
                     &kernels.kv_cache_write,
                     &kernels.rope,
+                    &kernels.rmsnorm,
                     &kernels.add,
                     attn_weights,
                     &norm1_out,
@@ -163,6 +164,7 @@ pub fn prefill(
                     max_seq_len,
                     rope_theta,
                     partial_rotary_factor,
+                    rms_norm_eps,
                     group_size,
                     &weights.int4_companions,
                 )?

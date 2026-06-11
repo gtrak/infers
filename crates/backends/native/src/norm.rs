@@ -66,3 +66,20 @@ pub fn rms_norm(
 
     Ok(output)
 }
+
+
+/// Apply RMSNorm to a per-head Q or K vector.
+///
+/// This is a convenience wrapper around `rms_norm()` with `hidden_size=head_dim`.
+/// Each head's Q/K buffer `[seq_len × head_dim]` is normalized independently
+/// using the shared norm weight `[head_dim]`.
+pub fn rms_norm_per_head(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    head_tensor: &CudaSlice<bf16>,  // [seq_len × head_dim]
+    norm_weight: &CudaSlice<bf16>,  // [head_dim]
+    eps: f32,
+    head_dim: usize,
+) -> Result<CudaSlice<bf16>> {
+    rms_norm(stream, kernel, head_tensor, norm_weight, eps, head_dim)
+}

@@ -543,6 +543,7 @@ pub fn forward(
     softmax_kernel: &CudaFunction,
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
+    rmsnorm_kernel: &CudaFunction,
     add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -554,6 +555,7 @@ pub fn forward(
     max_seq_len: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    rms_norm_eps: f32,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
@@ -589,6 +591,14 @@ pub fn forward(
         &weights.v_proj, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
+
+    // --- K-norm on full K before Phase 1 RoPE ---
+    if let Some(k_norm_w) = weights.k_norm.as_ref() {
+        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        k_full = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
 
     // Apply RoPE to K_full. rope::apply_rope modifies both Q and K in-place;
     // we allocate a dummy Q buffer and discard it.
@@ -657,6 +667,17 @@ pub fn forward(
     let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size)?;
     let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
 
+    // --- Upload QK-norm weights to GPU once before the loop ---
+    let q_norm_gpu = weights
+        .q_norm
+        .as_ref()
+        .map(|w| crate::upload::upload_weight(stream, w))
+        .transpose()?;
+    let k_norm_gpu = weights
+        .k_norm
+        .as_ref()
+        .map(|w| crate::upload::upload_weight(stream, w))
+        .transpose()?;
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
         let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
@@ -735,6 +756,28 @@ pub fn forward(
             &v_proj_h_gpu,
             &mut v_h,
         )?;
+
+        // --- QK-norm (before RoPE) ---
+        if let Some(q_norm_w) = &q_norm_gpu {
+            q_h = crate::norm::rms_norm_per_head(
+                stream,
+                rmsnorm_kernel,
+                &q_h,
+                q_norm_w,
+                rms_norm_eps,
+                head_dim,
+            )?;
+        }
+        if let Some(k_norm_w) = &k_norm_gpu {
+            k_h = crate::norm::rms_norm_per_head(
+                stream,
+                rmsnorm_kernel,
+                &k_h,
+                k_norm_w,
+                rms_norm_eps,
+                head_dim,
+            )?;
+        }
 
         // --- RoPE (per-head, num_heads=1) ---
         rope::apply_rope(
@@ -908,6 +951,7 @@ pub fn decode_forward(
     softmax_kernel: &CudaFunction,
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
+    rmsnorm_kernel: &CudaFunction,
     add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -919,6 +963,7 @@ pub fn decode_forward(
     max_seq_len: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    rms_norm_eps: f32,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
@@ -954,6 +999,14 @@ pub fn decode_forward(
         &weights.v_proj, input, &mut v_single,
         1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
+
+    // --- K-norm on full K before Phase 1 RoPE ---
+    if let Some(k_norm_w) = weights.k_norm.as_ref() {
+        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        k_single = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
 
     // Apply RoPE to K_single
     let mut q_dummy = stream
@@ -1028,6 +1081,12 @@ pub fn decode_forward(
     let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size)?;
     let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
 
+    // --- Upload QK-norm weight to GPU once before the loop ---
+    let q_norm_gpu = weights
+        .q_norm
+        .as_ref()
+        .map(|w| crate::upload::upload_weight(stream, w))
+        .transpose()?;
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
         let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
@@ -1071,6 +1130,18 @@ pub fn decode_forward(
             &q_proj_h_gpu,
             &mut q_h,
         )?;
+
+        // --- Q-norm (before RoPE) ---
+        if let Some(q_norm_w) = &q_norm_gpu {
+            q_h = crate::norm::rms_norm_per_head(
+                stream,
+                rmsnorm_kernel,
+                &q_h,
+                q_norm_w,
+                rms_norm_eps,
+                head_dim,
+            )?;
+        }
 
         // --- RoPE (per-head, num_heads=1) ---
         let mut k_rope_dummy = stream
@@ -1224,6 +1295,7 @@ pub fn forward_paged(
     softmax_kernel: &CudaFunction,
     paged_kv_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
+    rmsnorm_kernel: &CudaFunction,
     add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -1237,6 +1309,7 @@ pub fn forward_paged(
     page_size: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    rms_norm_eps: f32,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
@@ -1272,6 +1345,14 @@ pub fn forward_paged(
         &weights.v_proj, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size, int4_companions,
     )?;
+
+    // --- K-norm on full K before Phase 1 RoPE ---
+    if let Some(k_norm_w) = weights.k_norm.as_ref() {
+        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        k_full = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
 
     // Apply RoPE to K_full
     let mut q_dummy = stream
@@ -1326,6 +1407,17 @@ pub fn forward_paged(
     let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size)?;
     let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size)?;
 
+    // --- Upload QK-norm weights to GPU once before the loop ---
+    let q_norm_gpu = weights
+        .q_norm
+        .as_ref()
+        .map(|w| crate::upload::upload_weight(stream, w))
+        .transpose()?;
+    let k_norm_gpu = weights
+        .k_norm
+        .as_ref()
+        .map(|w| crate::upload::upload_weight(stream, w))
+        .transpose()?;
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
         let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
@@ -1404,6 +1496,28 @@ pub fn forward_paged(
             &v_proj_h_gpu,
             &mut v_h,
         )?;
+
+        // --- QK-norm (before RoPE) ---
+        if let Some(q_norm_w) = &q_norm_gpu {
+            q_h = crate::norm::rms_norm_per_head(
+                stream,
+                rmsnorm_kernel,
+                &q_h,
+                q_norm_w,
+                rms_norm_eps,
+                head_dim,
+            )?;
+        }
+        if let Some(k_norm_w) = &k_norm_gpu {
+            k_h = crate::norm::rms_norm_per_head(
+                stream,
+                rmsnorm_kernel,
+                &k_h,
+                k_norm_w,
+                rms_norm_eps,
+                head_dim,
+            )?;
+        }
 
         // --- RoPE (per-head, num_heads=1) ---
         rope::apply_rope(
@@ -1552,6 +1666,7 @@ pub fn decode_forward_paged(
     paged_kv_write_kernel: &CudaFunction,
     paged_attention_decode_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
+    rmsnorm_kernel: &CudaFunction,
     _add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -1566,6 +1681,7 @@ pub fn decode_forward_paged(
     page_size: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    rms_norm_eps: f32,
     group_size: usize,
     int4_companions: &HashMap<String, Int4Companions>,
 ) -> Result<CudaSlice<bf16>> {
@@ -1600,6 +1716,14 @@ pub fn decode_forward_paged(
         &weights.v_proj, input, &mut v_single,
         1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
+
+    // --- K-norm on full K before RoPE ---
+    if let Some(k_norm_w) = weights.k_norm.as_ref() {
+        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        k_single = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
 
     // Apply RoPE to K_single
     let mut q_dummy = stream
@@ -1651,6 +1775,13 @@ pub fn decode_forward_paged(
         1, kv_dim, hidden_size, group_size, int4_companions,
     )?;
 
+    // --- QK-norm on full Q before RoPE ---
+    if let Some(q_norm_w) = weights.q_norm.as_ref() {
+        let q_norm_gpu = crate::upload::upload_weight(stream, q_norm_w)?;
+        q_single = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
     // Apply RoPE to Q_single
     let mut k_rope_dummy = stream
         .alloc_zeros::<bf16>(kv_dim)
