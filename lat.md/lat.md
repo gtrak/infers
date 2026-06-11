@@ -639,24 +639,45 @@ All API routes registered on the Axum router with middleware layers.
 
 Routes are wrapped with `TraceLayer` for request logging and `CorsLayer::permissive()` for cross-origin access.
 
+## InferenceOrchestrator
+
+Central orchestrator that wires the scheduler, GPU inference engine, and response channels for continuous batching. See [[crates/server/src/orchestrator.rs#InferenceOrchestrator]].
+
+`InferenceOrchestrator` holds a `RoundRobinScheduler`, `ForwardEngine`, `BackendEvictionStore`, `CudaStream`, and two response channel maps: `response_tx` (active sessions mapped by `SequenceId`) and `pending_tx` (unadmitted requests mapped by `routing_id`). A `next_routing_id` counter assigns unique routing IDs for request-channel correlation.
+
+`enqueue_request()` creates a new `Request` with the given prompt tokens and sampling config, assigns a `routing_id`, and enqueues it to the scheduler — returns the routing ID. `register_response_channel()` stores the `mpsc::Sender<u32>` in `pending_tx` keyed by routing ID. The caller (HTTP handler) must lock the orchestrator, call both methods, then unlock before consuming the receiver.
+
+`step()` runs one scheduling iteration: schedules batches, maps new sessions to response channels, handles eviction, runs prefill/decode, sends generated tokens through response channels, and cleans up completed sessions.
+
 ## Chat Completions Handler
 
-Handles the OpenAI-compatible chat completions endpoint with both streaming and non-streaming modes.
+Handles the OpenAI-compatible chat completions endpoint with both streaming and non-streaming modes, wired to the real inference pipeline. See [[crates/server/src/handlers/chat.rs#chat_completions]].
 
-### Non-streaming Response
+### Request Pipeline
 
-Returns a single `ChatCompletionResponse` with a mock assistant message. Response includes ID, timestamp, model name, one choice with `"stop"` finish reason, and token usage stats.
+Both streaming and non-streaming modes share the same inference pipeline:
+
+1. **Template build**: Constructs `QwenChatTemplate` from `chat_template_kwargs` (enable_thinking, preserve_thinking)
+2. **Prompt formatting**: Calls `template.apply(messages, tools)` to produce a formatted prompt string
+3. **Tokenization**: Encodes the formatted prompt into token IDs via `Tokenizer::encode()`
+4. **Sampling config**: Builds `SamplingConfig` with `Greedy` strategy, `max_tokens` (from request or 512 default), and empty stop sequences
+5. **Channel setup**: Creates `mpsc::channel::<u32>(256)` for token delivery
+6. **Orchestrator enqueue**: Locks `InferenceOrchestrator`, calls `enqueue_request()` to get a `routing_id`, then `register_response_channel()` to bind the sender — unlock after both operations
 
 ### Streaming Response
 
-Returns an SSE stream of `ChatCompletionChunk` objects following the OpenAI streaming protocol:
+Returns an SSE stream of `ChatCompletionChunk` objects built from the token receiver channel via `create_token_stream()`:
 
 1. **Role delta chunk**: Sets `role: "assistant"` with empty content
-2. **Token chunks**: Four incremental token chunks (`"Hello"`, `" from"`, `" infers"`, `"!"`)
+2. **Token chunks**: Each token from the receiver is decoded individually via `Tokenizer::decode(&[token])` and emitted as a content delta
 3. **Finish chunk**: Empty delta with `finish_reason: "stop"`
 4. **[DONE]**: Final SSE event signaling stream completion
 
-Each chunk includes the same request ID, timestamp, and model name.
+The stream is wrapped in `Sse::new(stream).keep_alive(interval: 5s)` for connection liveness.
+
+### Non-streaming Response
+
+Collects all tokens from the receiver, decodes the full sequence via `Tokenizer::decode(&tokens)`, and returns a single `ChatCompletionResponse` with decoded text and usage stats.
 
 # Model Config and Format Detection
 
