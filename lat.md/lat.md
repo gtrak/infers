@@ -531,7 +531,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
-| `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization; detects transposed [K/8, N] layout via `shape[0] * 8 == K` and passes `transposed` flag to `Int4GemmConfig` |
+| `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` (upload path) routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization; `gemm_projection_cached()` (cache path) looks up pre-uploaded weights from `GpuWeightCache` and dispatches the same GEMM kernels without upload overhead; both detect transposed [K/8, N] layout via `shape[0] * 8 == K` and pass `transposed` flag to `Int4GemmConfig` |
 | `gpu_cache` | GPU-resident weight cache: `CachedWeight` enum (Bf16 or Int4 variants), `Int4GpuBuffers` for qweight/scales/qzeros with shape info, `GpuWeightCache::new()` uploads all weights from `WeightRegistry`, typed accessors (`get_bf16`, `get_int4`) |
 
 ### GPU Weight Cache
@@ -540,6 +540,12 @@ Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. 
 `CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 
 `GpuWeightCache::new()` iterates every tensor in a `WeightRegistry`, classifies by dtype (BF16/Fp16/Fp32 → `CachedWeight::Bf16`; Int4Packed → `CachedWeight::Int4` with companions lookup), and uploads to GPU. Unsupported dtypes are skipped with a warning. The cache provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
+
+### Cached GEMM Dispatch
+
+Zero-upload GEMM dispatch using GPU-resident cached weights. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
+`gemm_projection_cached()` eliminates the CPU-to-GPU weight upload overhead per projection call by looking up weights from `GpuWeightCache` by tensor name. For `CachedWeight::Bf16`, it calls `gemm.matmul_bf16()` directly with the cached buffer. For `CachedWeight::Int4`, it determines transposition via `shape[0] * 8 == k` and dispatches `matmul_int4()` using the cached qweight/scales/qzeros buffers. If the weight is not found in the cache, it bails with a descriptive error.
 
 ### Attention Forward Pass
 
