@@ -16,6 +16,7 @@ use infers_cuda::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
 use infers_model::{LayerType, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
+use crate::gpu_cache::GpuWeightCache;
 use crate::eviction::BackendEvictionStore;
 use crate::gdn::GdnState;
 
@@ -60,6 +61,9 @@ pub struct ForwardEngine {
 
     /// One weight registry per GPU shard (tensor parallelism).
     weights: Vec<WeightRegistry>,
+
+    /// Per-GPU weight caches with GPU-resident buffers.
+    weight_caches: Vec<GpuWeightCache>,
 
     /// Per-GPU cached kernel function handles.
     per_gpu_kernels: Vec<PerGpuKernels>,
@@ -156,6 +160,18 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
         };
 
+        // Build GPU-resident weight caches for each GPU
+        let mut weight_caches = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            let cache = GpuWeightCache::new(&gpu_stream, &weights[gpu_idx])?;
+            tracing::info!(
+                "GPU {}: cached {} weights",
+                gpu_idx, cache.len()
+            );
+            weight_caches.push(cache);
+        }
+
         // Initialize per-GPU, per-layer caches and states
         let num_layers = config.num_hidden_layers;
         let kv_caches: Vec<Vec<KvCache>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
@@ -171,6 +187,7 @@ impl ForwardEngine {
         Ok(Self {
             config,
             weights,
+            weight_caches,
             per_gpu_kernels,
             paged_kv_manager: None,
             gemm_engines,
