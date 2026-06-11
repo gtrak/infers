@@ -291,18 +291,8 @@ pub fn decode(
     // Phase 4: Sample token (greedy — argmax of logits)
     // =========================================================================
 
-    // Download bf16 logits, convert to f32 for argmax kernel
-    let logits_bf16: Vec<bf16> = stream
-        .clone_dtoh(&logits)
-        .map_err(|e| anyhow::anyhow!("Failed to download logits from device: {e}"))?;
-    let logits_f32: Vec<f32> = logits_bf16.iter().map(|v| v.to_f32()).collect();
-
-    // Upload f32 logits for argmax kernel
-    let logits_f32_gpu = stream
-        .clone_htod(&logits_f32)
-        .map_err(|e| anyhow::anyhow!("Failed to upload f32 logits: {e}"))?;
-
-    sample::greedy_sample(stream, &kernels.argmax, &logits_f32_gpu)
+    // Argmax directly on BF16 logits on GPU (no CPU round-trip)
+    sample::greedy_sample_bf16(stream, &kernels.argmax, &logits.as_view())
 }
 
 /// Execute a single-token decode step and return both the sampled token
@@ -546,18 +536,8 @@ pub fn decode_with_hidden(
     // Phase 4: Sample token (greedy — argmax of logits)
     // =========================================================================
 
-    // Download bf16 logits, convert to f32 for argmax kernel
-    let logits_bf16: Vec<bf16> = stream
-        .clone_dtoh(&logits)
-        .map_err(|e| anyhow::anyhow!("Failed to download logits from device: {e}"))?;
-    let logits_f32: Vec<f32> = logits_bf16.iter().map(|v| v.to_f32()).collect();
-
-    // Upload f32 logits for argmax kernel
-    let logits_f32_gpu = stream
-        .clone_htod(&logits_f32)
-        .map_err(|e| anyhow::anyhow!("Failed to upload f32 logits: {e}"))?;
-
-    let sampled_token = sample::greedy_sample(stream, &kernels.argmax, &logits_f32_gpu)?;
+    // Argmax directly on BF16 logits on GPU (no CPU round-trip)
+    let sampled_token = sample::greedy_sample_bf16(stream, &kernels.argmax, &logits.as_view())?;
 
     Ok((sampled_token, mtp_hidden))
 }

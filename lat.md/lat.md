@@ -82,7 +82,7 @@ Seventeen kernel implementations across 15 files for transformer forward-pass op
 | `rope.cu` | `infers_rope_bf16` | Rotary Position Embedding applied to query and key tensors |
 | `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |
 | `elementwise.cu` | `infers_add_bf16` | Element-wise addition for residual connections |
-| `sampling.cu` | `infers_argmax_f32` | Greedy argmax sampling from FP32 logits |
+| `sampling.cu` | `infers_argmax_f32`, `infers_argmax_bf16` | Greedy argmax sampling: F32 variant for legacy CPU round-trip path, BF16 variant operates directly on BF16 logits on GPU eliminating download→convert→upload cycle |
 | `softmax.cu` | `infers_softmax_bf16` | Online softmax for attention scores with optional causal masking, using three-phase parallel reduction (max, sum, normalize) in shared memory |
 | `kv_cache.cu` | `infers_kv_cache_write_bf16` | Scattered KV cache write using position IDs: writes K and V rows into cache at arbitrary positions via strided thread loops |
 | `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
@@ -117,7 +117,7 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (17 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (18 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_f32, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
@@ -400,7 +400,7 @@ The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel
 
 **Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[seq_len × vocab_size]` BF16 matrix.
 
-**Phase 4 — Sampling**: Downloads BF16 logits to host, extracts last token's row, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel.
+**Phase 4 — Sampling**: Extracts last row of BF16 logits via `CudaSlice::slice()` to get a `CudaView`, then dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel — zero CPU round-trip.
 
 See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
@@ -416,7 +416,7 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 
 **Phase 3 — Final Norm + LM Head**: Applies final RMSNorm, then computes logits via `hidden @ lm_head^T` GEMM producing `[1 × vocab_size]` BF16 vector.
 
-**Phase 4 — Sampling**: Downloads BF16 logits to host, converts to FP32, uploads to GPU, and calls `sample::greedy_sample` with the argmax kernel. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
+**Phase 4 — Sampling**: Dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel directly on BF16 logits via `CudaSlice::as_view()` — zero CPU round-trip. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
 
 See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
 
@@ -585,7 +585,7 @@ Tensor-parallel all-reduce is handled by the caller in `decode.rs`.
 See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 ### Sampling
-`SamplingStrategy` enum with `Greedy`, `Temperature`, `TopK`, `TopP` variants. `SamplingConfig` holds strategy, max tokens, and stop sequences. See [[crates/backends/native/src/sample.rs#SamplingStrategy]].
+`SamplingStrategy` enum and `SamplingConfig` for token selection. `greedy_sample_bf16()` dispatches `infers_argmax_bf16` directly on BF16 logits (no CPU round-trip). See [[crates/backends/native/src/sample.rs#SamplingStrategy]], [[crates/backends/native/src/sample.rs#greedy_sample_bf16]].
 
 ### Kernel Dispatch
 Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].

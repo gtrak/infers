@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+use half::bf16;
 
 /// Reserved for future sampling strategies
 /// Sampling strategy selection for token generation.
@@ -83,6 +84,59 @@ pub fn greedy_sample(
     }
 
     // Copy result back to host
+    let result_host = stream
+        .clone_dtoh(&result_gpu)
+        .map_err(|e| anyhow::anyhow!("Failed to copy argmax result from device: {e}"))?;
+
+    Ok(result_host[0] as u32)
+}
+
+/// Greedy sampling directly on BF16 logits (no CPU round-trip).
+///
+/// Uses the `infers_argmax_bf16` kernel to compute argmax on GPU,
+/// avoiding the download→convert→upload cycle of the F32 path.
+///
+/// # Arguments
+/// * `stream` — CUDA stream for kernel launch
+/// * `kernel` — Loaded function handle for `infers_argmax_bf16`
+/// * `logits` — BF16 logit view `[vocab_size]`
+///
+/// # Returns
+/// The token ID with the highest logit
+pub fn greedy_sample_bf16(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    logits: &CudaView<'_, bf16>,
+) -> Result<u32> {
+    let vocab_size = logits.len();
+    anyhow::ensure!(vocab_size > 0, "Logit vector must not be empty");
+
+    // Allocate result buffer on device (a single i32 for the argmax index)
+    let mut result_gpu = stream
+        .alloc_zeros::<i32>(1)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate argmax result: {e}"))?;
+
+    let vocab_size_i32 = vocab_size as i32;
+    let batch_size_i32 = 1i32;
+
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1), // single block for argmax
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (256 * 8) as u32, // shared mem for reduction (2 values per thread: val + idx)
+    };
+
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(logits)
+            .arg(&mut result_gpu)
+            .arg(&batch_size_i32)
+            .arg(&vocab_size_i32)
+            .launch(config)
+            .map_err(|e| anyhow::anyhow!("Argmax BF16 kernel launch failed: {e}"))?;
+    }
+
+    // Copy result back to host (single i32 — minimal transfer)
     let result_host = stream
         .clone_dtoh(&result_gpu)
         .map_err(|e| anyhow::anyhow!("Failed to copy argmax result from device: {e}"))?;

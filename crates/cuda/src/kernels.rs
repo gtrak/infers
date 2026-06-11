@@ -65,6 +65,7 @@ impl KernelRegistry {
         self.register("infers_embedding_gather_bf16", "kernels/compiled/embedding.cubin");
         self.register("infers_add_bf16", "kernels/compiled/elementwise.cubin");
         self.register("infers_argmax_f32", "kernels/compiled/sampling.cubin");
+        self.register("infers_argmax_bf16", "kernels/compiled/sampling.cubin");
         self.register("infers_softmax_bf16", "kernels/compiled/softmax.cubin");
         self.register("infers_kv_cache_write_bf16", "kernels/compiled/kv_cache.cubin");
         self.register("infers_paged_kv_write_bf16", "kernels/compiled/paged_kv_write.cubin");

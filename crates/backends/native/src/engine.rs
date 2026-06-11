@@ -129,7 +129,7 @@ impl ForwardEngine {
         let rope_kernel = kernels.get_function("infers_rope_bf16")?;
         let embedding_kernel = kernels.get_function("infers_embedding_gather_bf16")?;
         let add_kernel = kernels.get_function("infers_add_bf16")?;
-        let argmax_kernel = kernels.get_function("infers_argmax_f32")?;
+        let argmax_kernel = kernels.get_function("infers_argmax_bf16")?;
         let softmax_kernel = kernels.get_function("infers_softmax_bf16")?;
         let kv_cache_write_kernel = kernels.get_function("infers_kv_cache_write_bf16")?;
         let gdn_prefill_kernel = kernels.get_function("infers_gdn_prefill_bf16")?;
@@ -871,17 +871,10 @@ impl ForwardEngine {
             Ok(logits)
         };
 
-        // Build sample callback
+        // Build sample callback — BF16 argmax directly on GPU (no CPU round-trip)
         let sample_fn = |logits: &CudaSlice<bf16>,
-                         s: &Arc<CudaStream>| -> Result<u32> {
-            let logits_bf16: Vec<bf16> = s
-                .clone_dtoh(logits)
-                .map_err(|e| anyhow::anyhow!("Failed to download logits: {e}"))?;
-            let logits_f32: Vec<f32> = logits_bf16.iter().map(|v| v.to_f32()).collect();
-            let logits_f32_gpu = s
-                .clone_htod(&logits_f32)
-                .map_err(|e| anyhow::anyhow!("Failed to upload f32 logits: {e}"))?;
-            crate::sample::greedy_sample(s, &kernels.argmax, &logits_f32_gpu)
+                          s: &Arc<CudaStream>| -> Result<u32> {
+            crate::sample::greedy_sample_bf16(s, &kernels.argmax, &logits.as_view())
         };
 
         // Build full_forward callback (for draft verification)

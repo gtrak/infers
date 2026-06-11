@@ -286,19 +286,10 @@ pub fn prefill(
     // Phase 4: Sample first token (greedy — argmax of last token's logits)
     // =========================================================================
 
-    // Download bf16 logits, extract last row, convert to f32 for argmax kernel
-    let logits_host: Vec<bf16> = stream
-        .clone_dtoh(&logits)
-        .map_err(|e| anyhow::anyhow!("Failed to download logits from device: {e}"))?;
+    // Extract last row's logits on GPU directly (no CPU round-trip)
     let last_row_start = (seq_len - 1) * config.vocab_size;
-    let last_row_bf16 =
-        &logits_host[last_row_start..last_row_start + config.vocab_size];
-    let last_row_f32: Vec<f32> = last_row_bf16.iter().map(|v| v.to_f32()).collect();
+    let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
 
-    // Upload f32 logits for argmax kernel
-    let logits_f32_gpu = stream
-        .clone_htod(&last_row_f32)
-        .map_err(|e| anyhow::anyhow!("Failed to upload f32 logits: {e}"))?;
-
-    sample::greedy_sample(stream, &kernels.argmax, &logits_f32_gpu)
+    // Argmax directly on BF16 logits on GPU
+    sample::greedy_sample_bf16(stream, &kernels.argmax, &last_row_logits)
 }
