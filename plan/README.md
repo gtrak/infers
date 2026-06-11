@@ -54,8 +54,9 @@ CUDA Kernels
 | [Phase 9](phase-9-tool-calls.md) | 2 weeks | Tool calls, benchmarking, stability | Production-ready server |
 | [Phase 10](phase-10-server-orchestration.md) | 1.5 weeks | Server orchestration — wire everything together | End-to-end pipeline (mock model) |
 | [Phase 11](phase-11-model-integration.md) | 3–4 weeks | Model integration — real model loading and inference | Working inference with real Qwen3.6-27B |
+| [Phase 12](phase-12-get-it-working.md) | 3–4 weeks | End-to-end real model inference | Correct token output with real Qwen3.6-27B |
 
-**Total: ~29 weeks (7 months)**
+**Total: ~33 weeks (8 months)**
 
 ## Research Documents
 
