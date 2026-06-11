@@ -248,22 +248,51 @@ fn build_main_layer(
     };
     let (gdn, attn) = match layer_type {
         super::config::LayerType::GatedDeltaNet => {
+            let p = &prefix;
+            let sub = gdn_sub;
+            let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
+            let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
+            let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d.weight"))?;
+            let x_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
+            let dt_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj_weight.weight"), &format!("{p}.{sub}.out_proj_weight"))?;
+            // Optional Mamba2-style weights
+            let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
+            let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
+            let norm = registry.tensors.remove(&format!("{p}.{sub}.norm.weight"));
+            let in_proj_qkv = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"))?;
+            let in_proj_z = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"))?;
             let gdn = GdnWeights {
-                in_proj_a: get_weight_or_int4(registry, &format!("{}.{}.in_proj_a.weight", prefix, gdn_sub), &format!("{}.{}.in_proj_a", prefix, gdn_sub))?,
-                in_proj_b: get_weight_or_int4(registry, &format!("{}.{}.in_proj_b.weight", prefix, gdn_sub), &format!("{}.{}.in_proj_b", prefix, gdn_sub))?,
-                conv1d_weight: get_weight(registry, &format!("{}.{}.conv1d.weight", prefix, gdn_sub))?,
-                x_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.x_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.x_proj_weight", prefix, gdn_sub))?,
-                dt_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.dt_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.dt_proj_weight", prefix, gdn_sub))?,
-                out_proj_weight: get_weight_or_int4(registry, &format!("{}.{}.out_proj_weight.weight", prefix, gdn_sub), &format!("{}.{}.out_proj_weight", prefix, gdn_sub))?,
+                in_proj_a,
+                in_proj_b,
+                conv1d_weight,
+                x_proj_weight,
+                dt_proj_weight,
+                out_proj_weight,
+                in_proj_qkv,
+                in_proj_z,
+                a_log,
+                dt_bias,
+                norm,
             };
             (Some(gdn), None)
         }
         super::config::LayerType::FullAttention => {
+            let p = &prefix;
+            let q_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"))?;
+            let k_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"))?;
+            let v_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"))?;
+            let o_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"))?;
+            // Optional Q/K norm weights
+            let q_norm = registry.tensors.remove(&format!("{p}.self_attn.q_norm.weight"));
+            let k_norm = registry.tensors.remove(&format!("{p}.self_attn.k_norm.weight"));
             let attn = AttentionWeights {
-                q_proj: get_weight_or_int4(registry, &format!("{}.self_attn.q_proj.weight", prefix), &format!("{}.self_attn.q_proj", prefix))?,
-                k_proj: get_weight_or_int4(registry, &format!("{}.self_attn.k_proj.weight", prefix), &format!("{}.self_attn.k_proj", prefix))?,
-                v_proj: get_weight_or_int4(registry, &format!("{}.self_attn.v_proj.weight", prefix), &format!("{}.self_attn.v_proj", prefix))?,
-                o_proj: get_weight_or_int4(registry, &format!("{}.self_attn.o_proj.weight", prefix), &format!("{}.self_attn.o_proj", prefix))?,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm,
+                k_norm,
             };
             (None, Some(attn))
         }
@@ -346,22 +375,51 @@ fn build_mtp_layer(
 
     let (gdn, attn) = match layer_type {
         super::config::LayerType::GatedDeltaNet => {
+            let p = &prefix;
+            let sub = "gdn";
+            let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
+            let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
+            let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d_weight.weight"))?;
+            let x_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
+            let dt_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj_weight.weight"), &format!("{p}.{sub}.out_proj_weight"))?;
+            // Optional Mamba2-style weights
+            let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
+            let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
+            let norm = registry.tensors.remove(&format!("{p}.{sub}.norm.weight"));
+            let in_proj_qkv = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"))?;
+            let in_proj_z = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"))?;
             let gdn = GdnWeights {
-                in_proj_a: get_weight_or_int4(registry, &format!("{}.gdn.in_proj_a.weight", prefix), &format!("{}.gdn.in_proj_a", prefix))?,
-                in_proj_b: get_weight_or_int4(registry, &format!("{}.gdn.in_proj_b.weight", prefix), &format!("{}.gdn.in_proj_b", prefix))?,
-                conv1d_weight: get_weight(registry, &format!("{}.gdn.conv1d_weight.weight", prefix))?,
-                x_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.x_proj_weight.weight", prefix), &format!("{}.gdn.x_proj_weight", prefix))?,
-                dt_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.dt_proj_weight.weight", prefix), &format!("{}.gdn.dt_proj_weight", prefix))?,
-                out_proj_weight: get_weight_or_int4(registry, &format!("{}.gdn.out_proj_weight.weight", prefix), &format!("{}.gdn.out_proj_weight", prefix))?,
+                in_proj_a,
+                in_proj_b,
+                conv1d_weight,
+                x_proj_weight,
+                dt_proj_weight,
+                out_proj_weight,
+                in_proj_qkv,
+                in_proj_z,
+                a_log,
+                dt_bias,
+                norm,
             };
             (Some(gdn), None)
         }
         super::config::LayerType::FullAttention => {
+            let p = &prefix;
+            let q_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"))?;
+            let k_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"))?;
+            let v_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"))?;
+            let o_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"))?;
+            // Optional Q/K norm weights
+            let q_norm = registry.tensors.remove(&format!("{p}.self_attn.q_norm.weight"));
+            let k_norm = registry.tensors.remove(&format!("{p}.self_attn.k_norm.weight"));
             let attn = AttentionWeights {
-                q_proj: get_weight_or_int4(registry, &format!("{}.self_attn.q_proj.weight", prefix), &format!("{}.self_attn.q_proj", prefix))?,
-                k_proj: get_weight_or_int4(registry, &format!("{}.self_attn.k_proj.weight", prefix), &format!("{}.self_attn.k_proj", prefix))?,
-                v_proj: get_weight_or_int4(registry, &format!("{}.self_attn.v_proj.weight", prefix), &format!("{}.self_attn.v_proj", prefix))?,
-                o_proj: get_weight_or_int4(registry, &format!("{}.self_attn.o_proj.weight", prefix), &format!("{}.self_attn.o_proj", prefix))?,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm,
+                k_norm,
             };
             (None, Some(attn))
         }
@@ -437,6 +495,40 @@ fn get_weight_or_int4(
     registry.int4_companions.insert(qweight_name.clone(), Int4Companions { qzeros, scales });
 
     Ok(qweight)
+}
+
+/// Optional version of `get_weight_or_int4` that returns `Ok(None)` when
+/// neither BF16 nor INT4 weights are found, instead of erroring.
+/// INT4 companions are stored in `registry.int4_companions` when INT4 is used.
+fn get_weight_or_int4_optional(
+    registry: &mut WeightRegistry,
+    bf16_name: &str,
+    int4_base: &str,
+) -> Result<Option<WeightData>> {
+    // Try BF16 weight first
+    if let Some(w) = registry.tensors.remove(bf16_name) {
+        return Ok(Some(w));
+    }
+
+    // Fall back to INT4 qweight (optional — return None if missing)
+    let qweight_name = format!("{}.qweight", int4_base);
+    let qweight = match registry.tensors.remove(&qweight_name) {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+
+    // Extract companion tensors (required once qweight exists)
+    let qzeros_name = format!("{}.qzeros", int4_base);
+    let scales_name = format!("{}.scales", int4_base);
+    let qzeros = registry.tensors.remove(&qzeros_name)
+        .with_context(|| format!("INT4 qzeros '{}' not found (qweight '{}')", qzeros_name, qweight_name))?;
+    let scales = registry.tensors.remove(&scales_name)
+        .with_context(|| format!("INT4 scales '{}' not found (qweight '{}')", scales_name, qweight_name))?;
+
+    // Store companions keyed by qweight name
+    registry.int4_companions.insert(qweight_name.clone(), Int4Companions { qzeros, scales });
+
+    Ok(Some(qweight))
 }
 
 /// Map safetensors dtype to our WeightDtype.

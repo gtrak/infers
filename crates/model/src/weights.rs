@@ -82,6 +82,16 @@ pub struct GdnWeights {
     pub dt_proj_weight: WeightData,
     /// Output projection weight.
     pub out_proj_weight: WeightData,
+    /// Combined QKV projection (INT4 in real model).
+    pub in_proj_qkv: Option<WeightData>,
+    /// Output gate projection (INT4 in real model).
+    pub in_proj_z: Option<WeightData>,
+    /// SSM state transition log (BF16).
+    pub a_log: Option<WeightData>,
+    /// SSM timescale bias (BF16).
+    pub dt_bias: Option<WeightData>,
+    /// GDN normalization weight (BF16).
+    pub norm: Option<WeightData>,
 }
 
 /// Standard attention layer weights.
@@ -95,6 +105,10 @@ pub struct AttentionWeights {
     pub v_proj: WeightData,
     /// Output projection.
     pub o_proj: WeightData,
+    /// Q-norm weight for full attention layers.
+    pub q_norm: Option<WeightData>,
+    /// K-norm weight for full attention layers.
+    pub k_norm: Option<WeightData>,
 }
 
 /// MLP layer weights.

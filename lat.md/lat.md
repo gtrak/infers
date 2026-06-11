@@ -745,7 +745,13 @@ Enumeration of weight data types: BF16, FP16, FP32, INT4 packed, NVFP4, and Othe
 
 ## Layer Weight Structures
 
-Typed weight structures for GDN layers (`GdnWeights`), attention layers (`AttentionWeights`), and MLP layers (`MlpWeights`). Each contains named `WeightData` fields matching safetensors tensor names. See [[crates/model/src/weights.rs#GdnWeights]], [[crates/model/src/weights.rs#AttentionWeights]], [[crates/model/src/weights.rs#MlpWeights]].
+Typed weight structures for GDN layers (`GdnWeights`), attention layers (`AttentionWeights`), and MLP layers (`MlpWeights`).
+
+`GdnWeights` has 6 required fields (in_proj_a, in_proj_b, conv1d_weight, x_proj_weight, dt_proj_weight, out_proj_weight) plus 5 optional Mamba2-style fields (in_proj_qkv, in_proj_z, a_log, dt_bias, norm) that are present in Qwen3.6 real models. See [[crates/model/src/weights.rs#GdnWeights]].
+
+`AttentionWeights` has 4 required fields (q_proj, k_proj, v_proj, o_proj) plus 2 optional fields (q_norm, k_norm) for Q/K normalization in full attention layers. See [[crates/model/src/weights.rs#AttentionWeights]].
+
+`MlpWeights` has 3 fields (gate_proj, up_proj, down_proj). See [[crates/model/src/weights.rs#MlpWeights]].
 
 ## MtpWeights
 
