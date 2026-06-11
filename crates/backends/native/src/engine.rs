@@ -230,7 +230,7 @@ impl ForwardEngine {
 
         crate::prefill::prefill(
             &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
-            &self.config, weights, token_ids,
+            &self.config, weights, &self.weight_caches[0], token_ids,
             &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
@@ -265,7 +265,7 @@ impl ForwardEngine {
 
         crate::decode::decode(
             &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
-            &self.config, weights, token_id, position,
+            &self.config, weights, &self.weight_caches[0], token_id, position,
             &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
@@ -527,7 +527,7 @@ impl ForwardEngine {
                             &self.per_gpu_kernels[gpu_idx].gdn_prefill, gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
-                            &w.int4_companions,
+                            &self.weight_caches[gpu_idx],
                         )?
                     }
                     LayerType::FullAttention => {
@@ -809,7 +809,7 @@ for layer_idx in 0..config.num_hidden_layers {
                             &self.per_gpu_kernels[gpu_idx].gdn_update, gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
-                            &w.int4_companions,
+                            &self.weight_caches[gpu_idx],
                         )?
                     }
                     LayerType::FullAttention => {
@@ -1186,7 +1186,7 @@ for layer_idx in 0..config.num_hidden_layers {
 
         crate::decode::decode_with_hidden(
             &mut self.gemm_engines[0], stream, &kernels, &self.nccl,
-            &self.config, weights, token_id, position,
+            &self.config, weights, &self.weight_caches[0], token_id, position,
             &mut self.kv_caches[0], &mut self.gdn_states[0],
             self.group_size,
         )
@@ -1261,6 +1261,9 @@ for layer_idx in 0..config.num_hidden_layers {
         // Clone config Arc for use in closures (no raw pointer needed)
         let config = self.config.clone();
 
+        // Read-only pointer to weight cache for MTP operations (raw ptr avoids borrow conflict with decode_with_hidden)
+        let weight_cache_ptr: *const crate::gpu_cache::GpuWeightCache = &self.weight_caches[0];
+
         // --- Draft position counter for verification ---
         // Tracks which draft index we're on so each draft gets the correct position
         let verify_pos = Cell::new(current_pos.get());
@@ -1303,8 +1306,10 @@ for layer_idx in 0..config.num_hidden_layers {
                 let mut mtp_kv = vec![crate::attention::KvCache::new()];
                 let mut mtp_gdn = vec![crate::gdn::GdnState::new()];
                 let config: &ModelConfig = config.as_ref();
+                // SAFETY: weight_cache_ptr is valid for the lifetime of this function (self.weight_caches[0])
+                let weight_cache_ref: &crate::gpu_cache::GpuWeightCache = unsafe { &*weight_cache_ptr };
                 crate::mtp::forward_layer_pass(
-                    layer, input, g, s, &kernels, config,
+                    layer, input, g, s, &kernels, config, weight_cache_ref,
                     &mut mtp_kv, &mut mtp_gdn,
                     current_pos.get(), 0,
                 )
@@ -1352,18 +1357,20 @@ for layer_idx in 0..config.num_hidden_layers {
         // Build full_forward callback (for draft verification)
         // NOTE: position advances with each call via verify_pos counter
         let full_forward_fn =
-            |token: u32,
-             s: &Arc<CudaStream>,
-             g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
+         |token: u32,
+              s: &Arc<CudaStream>,
+              g: &mut GemmEngine| -> Result<CudaSlice<bf16>> {
                 let kv_caches: &mut [KvCache] = unsafe { &mut **kv_caches_ptr };
                 let gdn_states: &mut [GdnState] = unsafe { &mut **gdn_states_ptr };
                 let weights: &infers_model::WeightRegistry = unsafe { &**weights_ptr };
                 let nccl: &NcclCommunicator = unsafe { &**nccl_ptr };
+                // SAFETY: weight_cache_ptr is valid for the lifetime of this function (self.weight_caches[0])
+                let weight_cache_ref: &crate::gpu_cache::GpuWeightCache = unsafe { &*weight_cache_ptr };
                 let pos = verify_pos.get();
                 verify_pos.set(pos + 1);
                 crate::mtp::full_forward_logits(
                     token, g, s, &kernels, nccl,
-                    config.as_ref(), weights,
+                    config.as_ref(), weights, weight_cache_ref,
                     kv_caches, gdn_states,
                     pos, // each draft gets incrementing position
                 )

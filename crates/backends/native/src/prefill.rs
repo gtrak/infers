@@ -15,6 +15,7 @@ use crate::add;
 use crate::attention::{self, KvCache};
 use crate::embedding;
 use crate::gdn::{self, GdnState};
+use crate::gpu_cache::GpuWeightCache;
 use crate::norm;
 use crate::sample;
 
@@ -60,6 +61,7 @@ pub fn prefill(
     _nccl: &NcclCommunicator,
     config: &ModelConfig,
     weights: &WeightRegistry,
+    cache: &GpuWeightCache,
     token_ids: &[u32],
     kv_caches: &mut Vec<KvCache>,
     gdn_states: &mut Vec<GdnState>,
@@ -140,7 +142,7 @@ pub fn prefill(
                     hidden_size,
                     config,
                     group_size,
-                    &weights.int4_companions,
+                    cache,
                 )?
             }
             LayerType::FullAttention => {

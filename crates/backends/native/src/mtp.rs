@@ -17,6 +17,7 @@ use crate::add;
 use crate::attention::{self, KvCache};
 use crate::embedding;
 use crate::gdn::{self, GdnState};
+use crate::gpu_cache::GpuWeightCache;
 use crate::mlp;
 use crate::norm;
 use crate::decode::DecodeKernels;
@@ -49,6 +50,7 @@ pub fn forward_layer_pass(
     stream: &Arc<CudaStream>,
     kernels: &DecodeKernels,
     config: &ModelConfig,
+    cache: &GpuWeightCache,
     kv_caches: &mut [KvCache],
     gdn_states: &mut [GdnState],
     position: u32,
@@ -76,8 +78,6 @@ pub fn forward_layer_pass(
     )?;
 
     // Attention / GDN dispatch
-    // MTP is optional/deferred: pass empty HashMap for int4_companions.
-    let int4_companions = HashMap::<String, infers_model::Int4Companions>::new();
     let attn_or_gdn_out = match layer.layer_type {
         LayerType::GatedDeltaNet => {
             let gdn_weights = layer.gdn.as_ref()
@@ -93,10 +93,12 @@ pub fn forward_layer_pass(
                 hidden_size,
                 config,
                 128, // group_size default
-                &int4_companions,
+                cache,
             )?
         }
         LayerType::FullAttention => {
+            // MTP is optional/deferred: pass empty HashMap for int4_companions (attention path)
+            let int4_companions = HashMap::<String, infers_model::Int4Companions>::new();
             let attn_weights = layer.attn.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Attention weights not found for MTP layer {}", layer_idx))?;
             attention::decode_forward(
@@ -174,6 +176,7 @@ pub fn forward_layer_pass(
 /// * `_nccl` — NCCL communicator
 /// * `config` — Model configuration
 /// * `weights` — Weight registry
+/// * `cache` — GPU weight cache
 /// * `kv_caches` — Per-layer KV caches
 /// * `gdn_states` — Per-layer GDN states
 /// * `position` — Current sequence position
@@ -189,6 +192,7 @@ pub fn full_forward_logits(
     _nccl: &NcclCommunicator,
     config: &ModelConfig,
     weights: &WeightRegistry,
+    cache: &GpuWeightCache,
     kv_caches: &mut [KvCache],
     gdn_states: &mut [GdnState],
     position: u32,
@@ -219,6 +223,7 @@ pub fn full_forward_logits(
             stream,
             kernels,
             config,
+            cache,
             kv_caches,
             gdn_states,
             position,

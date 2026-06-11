@@ -15,6 +15,7 @@ use crate::add;
 use crate::attention::{self, KvCache};
 use crate::embedding;
 use crate::gdn::{self, GdnState};
+use crate::gpu_cache::GpuWeightCache;
 use crate::norm;
 use crate::sample;
 
@@ -70,6 +71,7 @@ pub fn decode(
     _nccl: &NcclCommunicator,
     config: &ModelConfig,
     weights: &WeightRegistry,
+    cache: &GpuWeightCache,
     token_id: u32,
     position: u32,
     kv_caches: &mut Vec<KvCache>,
@@ -147,7 +149,7 @@ pub fn decode(
                     hidden_size,
                     config,
                     group_size,
-                    &weights.int4_companions,
+                    cache,
                 )?
             }
             LayerType::FullAttention => {
@@ -313,6 +315,7 @@ pub fn decode_with_hidden(
     _nccl: &NcclCommunicator,
     config: &ModelConfig,
     weights: &WeightRegistry,
+    cache: &GpuWeightCache,
     token_id: u32,
     position: u32,
     kv_caches: &mut Vec<KvCache>,
@@ -390,7 +393,7 @@ pub fn decode_with_hidden(
                     hidden_size,
                     config,
                     group_size,
-                    &weights.int4_companions,
+                    cache,
                 )?
             }
             LayerType::FullAttention => {
