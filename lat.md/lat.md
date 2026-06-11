@@ -152,9 +152,8 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 - `gdn_prefill.cu` + `.cubin`: Chunked prefill state update across all tokens
 - `gdn_mamba2_prefill.cu` + `.cubin`: Mamba2 SSM prefill with element-wise state recurrence, softplus delta, SiLU gating
 - `gdn_mamba2_update.cu` + `.cubin`: Mamba2 SSM decode with single-token state update, sigmoid decay, softplus delta, SiLU gating
-- `gdn_mamba2_update.cu` + `.cubin`: Mamba2 SSM decode with single-token state update, sigmoid decay, softplus delta, SiLU gating
 - `attention.rs` wired: per-head weight slicing, QKV/RoPE/KV cache/scores/softmax/O-proj/all-reduce (prefill + decode)
-- `gdn.rs` wired: projection GEMMs, GDN kernel dispatch, output projection (prefill + decode)
+- `gdn.rs` wired: Mamba2 projection GEMMs (x_proj, b_proj, dt_proj, z_gate), column alignment to ssm_dim, kernel dispatch, output projection (prefill + decode)
 - `prefill.rs` wired: embed → layer loop (norm1 → GDN/attention → residual → norm2 → MLP → residual) → final norm → LM head → sample
 - `decode.rs` wired: embed single token → layer loop (decode variants) → final norm → LM head → sample
 - `engine.rs`: 11 cached CudaFunction handles, per-layer kv_caches and gdn_states, prefill/decode delegation
@@ -490,7 +489,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `mlp` | SwiGLU forward via cuBLASLt GEMM + SiLU kernel |
 | `sample` | Greedy argmax (`infers_argmax_f32`) + strategy enum |
 | `attention` | Full attention: per-head weight slicing, QKV GEMMs, RoPE, KV cache write, softmax, O-projection |
-| `gdn` | Gated DeltaNet: projection GEMMs, `infers_gdn_prefill_bf16` kernel, output projection |
+| `gdn` | Gated DeltaNet (Mamba2): projection GEMMs (x_proj, b_proj, dt_proj, z_gate), column alignment to ssm_dim, `infers_gdn_mamba2_prefill_bf16` / `infers_gdn_mamba2_update_bf16` kernels, output projection |
 | `sync` | NCCL all-reduce for TP collectives (`all_reduce_attention`, `all_reduce_mlp`) |
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
@@ -555,17 +554,19 @@ Normalization uses `crate::norm::rms_norm_per_head()` for per-head Q/K and `crat
 See [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/norm.rs#rms_norm_per_head]].
 ### GDN Forward Pass
 
-Gated DeltaNet prefill: projection GEMMs via INT4-aware `gemm_projection` dispatch feed `infers_gdn_prefill_bf16` kernel, then output projection.
+Gated DeltaNet prefill: Mamba2 SSM kernel with element-wise state recurrence, softplus delta, and SiLU gating. Projection GEMMs compute x_proj, b_proj, dt_proj, and z_gate from input, then feed the `infers_gdn_mamba2_prefill_bf16` kernel.
 
 #### Architecture
 
-Five projection weights dispatch via `gemm_projection` for GDN prefill, routing BF16 to cuBLASLt and INT4 to `infers_int4_gemm`. Four GEMMs compute `a`, `b`, `x`, `dt` projections from input.
+ssm_dim comes from `in_proj_a` output dimension. Projections may differ in size — `extract_columns()` aligns them to ssm_dim. SSM parameters (A_log, dt_bias) are uploaded to GPU.
 
-1D convolution (`conv1d_weight`) is skipped for Phase 4.5.
+**Phase 1 — Projections**: GEMM dispatch via `gemm_projection` computes x_proj `[seq, ssm_dim]`, b_proj `[seq, b_dim]`, dt_proj `[seq, dt_dim]`, and z_gate `[seq, z_dim]` (INT4). Projections are aligned to ssm_dim.
 
-**Phase 2 — State Update**: GDN state (H×H matrix) is allocated lazily on first call. The `infers_gdn_prefill_bf16` kernel runs with `hidden_size` blocks (one per state row), each block processing all `seq_len` tokens sequentially via shared memory reduction.
+**Phase 2 — State Update**: GDN state is a 1D vector `[ssm_dim]` allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_prefill_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, sequential token loop, no shared memory.
 
-**Phase 3 — Output Projection**: Final GEMM multiplies kernel output by `out_proj_weight`.
+**Phase 3 — Output Projection**: Final GEMM projects `[seq, ssm_dim]` kernel output through `out_proj_weight` to `[seq, hidden_size]`.
+
+1D convolution (`conv1d_weight`) and conv1d residual are skipped for initial release.
 
 Tensor-parallel all-reduce is handled by the caller in `prefill.rs`.
 
@@ -573,17 +574,19 @@ See [[crates/backends/native/src/gdn.rs#forward]].
 
 ### GDN Decode Forward Pass
 
-Gated DeltaNet decode: recurrent single-token state update using `infers_gdn_update_bf16` kernel. All projections use INT4-aware `gemm_projection` dispatch.
+Gated DeltaNet decode: Mamba2 SSM recurrent single-token state update with sigmoid decay, softplus delta, and SiLU gating using `infers_gdn_mamba2_update_bf16` kernel. All projections use INT4-aware `gemm_projection` dispatch.
 
 #### Architecture
 
-Four projection weights dispatch via `gemm_projection` for GDN decode, routing BF16 to cuBLASLt and INT4 to `infers_int4_gemm`. Four GEMMs (m=1) compute `a`, `b`, `x`, `dt` from single-token input.
+ssm_dim is determined by `in_proj_a`'s output dimension. Projections are computed for single token (m=1) and aligned to ssm_dim via `extract_columns_single()`. SSM parameters (A_log, dt_bias) are uploaded to GPU.
+
+**Phase 1 — Projections**: Four GEMMs (m=1) compute x_proj `[ssm_dim]`, b_proj `[b_dim]`, dt_proj `[dt_dim]`, and z_gate `[z_dim]`. Projections are aligned to ssm_dim.
+
+**Phase 2 — State Update**: GDN state `[ssm_dim]` is allocated lazily via `ensure_allocated()`. The `infers_gdn_mamba2_update_bf16` kernel runs with `ceil(ssm_dim/256)` blocks, one thread per SSM element, no token loop, no shared memory. Unlike prefill, it takes 9 arguments (no `seq_len`).
+
+**Phase 3 — Output Projection**: Final GEMM (m=1) projects `[ssm_dim]` kernel output through `out_proj_weight` to `[hidden_size]`.
 
 1D convolution is skipped, same as prefill.
-
-**Phase 2 — State Update**: GDN state is allocated lazily via `ensure_allocated()`. The `infers_gdn_update_bf16` kernel runs with `hidden_size` blocks (one per state row) and power-of-2 block size up to 256. Unlike prefill, it processes only a single token and takes 7 arguments (no `seq_len`).
-
-**Phase 3 — Output Projection**: Final GEMM (m=1) multiplies `[hidden_size]` kernel output by `out_proj_weight`.
 
 Tensor-parallel all-reduce is handled by the caller in `decode.rs`.
 
@@ -1169,6 +1172,12 @@ The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Req
 End-to-end integration tests verifying full scheduling flows across module boundaries.
 
 The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` — enqueue, schedule, prefill, decode, complete, and cleanup across multiple sessions; (2) `test_batch_builder_with_real_kv_manager` — decode batch construction with real `PagedKvManager` page tables; (3) `test_page_lifecycle_with_sessions` — page allocation, usage tracking, and deallocation across sequences; (4) `test_scheduler_page_reclamation` — verify pages are freed when sessions complete; (5) `test_priority_queue_integration` — priority ordering with mixed-priority requests; (6) `test_session_eviction_timing` — eviction detection based on idle duration; (7) `test_sampling_config_reexport` — verify re-exported types are usable; (8) `test_memory_pressure_triggers_eviction` — end-to-end memory pressure detection when pool is full; (9) `test_evict_restore_round_trip_integration` — evict and restore a sequence through `PagedKvManager` with data integrity verification; (10) `test_lru_eviction_candidate_selection` — LRU eviction selection picks the oldest evictable session; (11) `test_cpu_page_pool_budget_integration` — `CpuPagePool` budget enforcement across store/retrieve cycles. See [[crates/scheduler/tests/integration.rs]].
+
+## Smoke Tests
+
+Ignored integration tests that validate the full engine with real model weights and GPU hardware.
+
+The `smoke_test_real_model` test in `crates/backends/native/tests/smoke_test.rs` loads a real model (Qwen3.6-27B AutoRound INT4 by default), initializes CUDA runtime, creates `ForwardEngine`, runs prefill + 10 decode steps, and verifies all sampled tokens are within vocab range. Requires GPU with CUDA CC 12.0+ and model weights at `INFERS_TEST_MODEL` env var path (default `~/opt/vllm/models/qwen3.6-27b-autoround-int4/`). Marked `#[ignore]` so it only runs with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test.rs#smoke_test_real_model]].
 
 # Tokenizer
 

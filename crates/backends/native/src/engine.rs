@@ -132,8 +132,8 @@ impl ForwardEngine {
         let argmax_kernel = kernels.get_function("infers_argmax_bf16")?;
         let softmax_kernel = kernels.get_function("infers_softmax_bf16")?;
         let kv_cache_write_kernel = kernels.get_function("infers_kv_cache_write_bf16")?;
-        let gdn_prefill_kernel = kernels.get_function("infers_gdn_prefill_bf16")?;
-        let gdn_update_kernel = kernels.get_function("infers_gdn_update_bf16")?;
+        let gdn_prefill_kernel = kernels.get_function("infers_gdn_mamba2_prefill_bf16")?;
+        let gdn_update_kernel = kernels.get_function("infers_gdn_mamba2_update_bf16")?;
 
         // Resolve paged attention kernel handles
         let paged_kv_write_kernel = kernels.get_function("infers_paged_kv_write_bf16")?;
