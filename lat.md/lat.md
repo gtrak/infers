@@ -380,10 +380,10 @@ Future deliverables for Phase 4.6 completion.
 Phase 4.7 (GPU-Resident Weight Cache) eliminates per-GEMM weight upload overhead by caching dequantized weights as GPU-resident buffers, reducing inference latency significantly. See `plan/phase-4.7-gpu-weight-cache.md` for the full design document.
 
 ## GpuWeightCache
-Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. Supports both BF16 weights and INT4 quantized weights (qweight + scales + qzeros). See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]].
+Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. Supports both BF16 weights and INT4 quantized weights (qweight + scales + qzeros). See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gpu_cache.rs#CachedWeight]], [[crates/backends/native/src/gpu_cache.rs#Int4GpuBuffers]].
 
 ## Cached GEMM Dispatch
-Replaces `gemm_projection` at call-sites by looking up weights from the cache instead of re-uploading per forward pass. Sees [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+Replaces `gemm_projection` at call-sites by looking up weights from the cache instead of re-uploading per forward pass. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
 ## Engine Integration
 `ForwardEngine` holds one `GpuWeightCache` per GPU, built at construction time. Attention functions now accept the cache and look up norm weights via `cache.get_bf16()` instead of uploading per-call. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
@@ -405,8 +405,7 @@ Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
 
 - Replace `gemm_projection` in flat-cache `forward` and `decode_forward` functions (prefill.rs, decode.rs) for attention path
-- Handle embedding table and LM head caching at engine level (already done partially — embed_table looked up via cache)
-- Replace `upload_weight` calls for norm weights in prefill/decode paths
+- Replace `upload_weight` calls for norm weights, embedding table, and LM head in legacy prefill/decode paths
 - Memory budget validation: assert weights + KV cache + temps fit in GPU memory
 - Benchmark before/after tokens/sec
 
@@ -569,7 +568,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `gpu_cache` | GPU-resident weight cache: `CachedWeight` enum (Bf16 or Int4 variants), `Int4GpuBuffers` for qweight/scales/qzeros with shape info, `GpuWeightCache::new()` uploads all weights from `WeightRegistry`, typed accessors (`get_bf16`, `get_int4`) |
 
 ### GPU Weight Cache
-Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]].
+Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gpu_cache.rs#CachedWeight]], [[crates/backends/native/src/gpu_cache.rs#Int4GpuBuffers]].
 
 `CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 

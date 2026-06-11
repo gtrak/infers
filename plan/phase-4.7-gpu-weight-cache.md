@@ -1,20 +1,20 @@
 # Phase 4.7: GPU-Resident Weight Cache
 
 ---
-**Status**: NOT DONE
+**Status**: in-progress
 **Last Updated**: 2026-06-11
 **Rationale**: Plan written but no implementation. This is the next major work item and the primary blocker for performance.
 **Actual Deliverables**:
-- [ ] `GpuWeightCache` struct
-- [ ] One-time weight upload at `ForwardEngine` construction
-- [ ] Replace `gemm_projection` call-sites to use cached weights
-- [ ] Handle INT4 weights caching
-- [ ] Handle BF16/FP16 weights caching
-- [ ] Handle per-head weight slices
-- [ ] Handle attention output gate weights
-- [ ] Handle embedding table and LM head caching
-- [ ] RMSNorm weights caching
-- [ ] GDN SSM parameters caching
+- [x] `GpuWeightCache` struct
+- [x] One-time weight upload at `ForwardEngine` construction
+- [x] Replace `gemm_projection` call-sites to use cached weights
+- [x] Handle INT4 weights caching
+- [x] Handle BF16/FP16 weights caching
+- [x] Handle per-head weight slices (removed per-head K/V GEMMs, use GPU copies from k_full/v_full)
+- [x] Handle attention output gate weights
+- [x] Handle embedding table and LM head caching
+- [x] RMSNorm weights caching
+- [x] GDN SSM parameters caching
 - [ ] Memory budget validation
 - [ ] Benchmark before/after
 ---
