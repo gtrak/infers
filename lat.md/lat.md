@@ -72,7 +72,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 ### Kernel Source Files
 All kernels use `extern "C" __global__` so function names are directly loadable from cubin files. Launch configuration is determined by Rust dispatch code, not kernel wrappers.
 
-Eighteen kernel implementations across 16 files for transformer forward-pass operations using BF16 data, plus INT4 GEMM for AutoRound quantization.
+Nineteen kernel implementations across 17 files for transformer forward-pass operations using BF16 data, plus INT4 GEMM for AutoRound quantization.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -88,6 +88,7 @@ Eighteen kernel implementations across 16 files for transformer forward-pass ope
 | `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
 | `gdn_prefill.cu` | `infers_gdn_prefill_bf16` | Gated DeltaNet prefill kernel: processes all tokens in a sequence sequentially within each block, updating state and writing per-token output via shared memory reduction |
 | `gdn_mamba2_prefill.cu` | `infers_gdn_mamba2_prefill_bf16` | Mamba2 SSM prefill kernel: element-wise SSM recurrence with softplus delta, state update, SiLU gating — one thread per state element, sequential token loop, no shared memory |
+| `gdn_mamba2_update.cu` | `infers_gdn_mamba2_update_bf16` | Mamba2 SSM decode kernel: single-token state update with sigmoid decay, softplus delta, SiLU gating — one thread per state element, no token loop, no shared memory |
 | `paged_kv_write.cu` | `infers_paged_kv_write_bf16` | Paged KV cache write using block-table address translation: writes K and V into interleaved per-page layout via strided thread loops, eliminating CPU round-trips during prefill |
 | `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 | `paged_attention_decode.cu` | `infers_paged_attention_decode_bf16` | Paged attention decode: computes single-token attention over paged KV cache using two-pass online softmax and weighted V accumulation, one block per KV head — Phase 1 uses strided dot-product computation, Phase 2 loops over all tokens per thread |
@@ -118,11 +119,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (19 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_f32, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, gdn_mamba2_prefill, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (20 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_f32, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, gdn_mamba2_prefill, gdn_mamba2_update, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_mamba2_prefill.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 
 # Phase 3 Deliverables
@@ -150,6 +151,8 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 - `gdn_update.cu` + `.cubin`: Single-token decode recurrent state update
 - `gdn_prefill.cu` + `.cubin`: Chunked prefill state update across all tokens
 - `gdn_mamba2_prefill.cu` + `.cubin`: Mamba2 SSM prefill with element-wise state recurrence, softplus delta, SiLU gating
+- `gdn_mamba2_update.cu` + `.cubin`: Mamba2 SSM decode with single-token state update, sigmoid decay, softplus delta, SiLU gating
+- `gdn_mamba2_update.cu` + `.cubin`: Mamba2 SSM decode with single-token state update, sigmoid decay, softplus delta, SiLU gating
 - `attention.rs` wired: per-head weight slicing, QKV/RoPE/KV cache/scores/softmax/O-proj/all-reduce (prefill + decode)
 - `gdn.rs` wired: projection GEMMs, GDN kernel dispatch, output projection (prefill + decode)
 - `prefill.rs` wired: embed → layer loop (norm1 → GDN/attention → residual → norm2 → MLP → residual) → final norm → LM head → sample
@@ -323,7 +326,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection), `forward_paged` (paged KV write + per-head GEMM attention), `fp8_quantize_and_write` and `fp8_dequantize_and_read` (GPU-native FP8 quantize/dequantize using CUDA kernels — no CPU round-trip)
 - `infers-backend-native` now depends on `infers-kv` crate
 - `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
-- Engine integration: `ForwardEngine` has 18 kernel handles (including `fp8_quantize_kernel`, `fp8_dequantize_kernel`), `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`, `fp8_quantize_and_write()`, `fp8_dequantize_and_read()`
+- Engine integration: `ForwardEngine` has 19 kernel handles (including `fp8_quantize_kernel`, `fp8_dequantize_kernel`, `gdn_mamba2_update_kernel`), `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`, `fp8_quantize_and_write()`, `fp8_dequantize_and_read()`
 - `eviction.rs` (backend-native): `BackendEvictionStore` with 8 unit tests — empty store, store/retrieve, per-layer isolation, nonexistent retrieval, overwrite, remove_page, clear, bf16 round-trip
 
 ## Paged Attention Implementation

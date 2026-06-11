@@ -73,6 +73,7 @@ impl KernelRegistry {
         self.register("infers_gdn_update_bf16", "kernels/compiled/gdn_update.cubin");
         self.register("infers_gdn_prefill_bf16", "kernels/compiled/gdn_prefill.cubin");
         self.register("infers_gdn_mamba2_prefill_bf16", "kernels/compiled/gdn_mamba2_prefill.cubin");
+        self.register("infers_gdn_mamba2_update_bf16", "kernels/compiled/gdn_mamba2_update.cubin");
         self.register("infers_paged_attention_decode_bf16", "kernels/compiled/paged_attention_decode.cubin");
         self.register("infers_fp8_quantize_bf16", "kernels/compiled/fp8_quantize.cubin");
         self.register("infers_fp8_dequantize_bf16", "kernels/compiled/fp8_quantize.cubin");
