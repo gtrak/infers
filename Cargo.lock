@@ -1132,6 +1132,7 @@ dependencies = [
  "infers-cuda",
  "infers-kv",
  "infers-metrics",
+ "infers-model",
  "infers-mtp",
  "infers-scheduler",
  "infers-tokenizer",

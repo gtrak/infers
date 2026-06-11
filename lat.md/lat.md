@@ -622,7 +622,9 @@ Uses `clap` derive API. Key arguments include model name, parallelism, KV cache 
 
 ## AppState
 
-Shared state struct holding the model name, wrapped in `Arc` for async-safe sharing across handler calls.
+Shared state struct holding the model name, inference orchestrator, and tokenizer, wrapped in `Arc` for async-safe sharing across handler calls.
+
+`AppState` has three fields: `model_name` (`String`), `orchestrator` (`Arc<Mutex<InferenceOrchestrator>>`), and `tokenizer` (`Tokenizer`). `SharedState` is a type alias for `Arc<AppState>`. The orchestrator is wrapped in `tokio::sync::Mutex` for safe concurrent access from the HTTP handlers and the background scheduler loop. See [[crates/server/src/state.rs#AppState]].
 
 ## Route Structure
 
@@ -1192,3 +1194,45 @@ The chat handler now produces OpenAI-compatible tool call responses when `tools`
 ## Tool Call Response Schema
 
 Non-streaming tool responses set `content` null and populate `tool_calls`. Streaming emits deltas with `index`, `id`, `type`, and partial `function` arguments. See `plan/research/api.md#Tool Calls` for the full schema.
+
+# Phase 10 Deliverables
+
+Phase 10 (Server Wiring) connects all crates into a working inference server by initializing CUDA runtime, model loading, KV management, scheduler, engine, tokenizer, and the background scheduler loop.
+
+## Server Initialization
+
+`main.rs` wires all crates into a single `run()` function that creates the full inference pipeline.
+
+The initialization sequence: (1) parse CLI args, (2) initialize CUDA runtime via `CudaRuntime::new()`, (3) create `StreamPool` with one stream per device, (4) load model config and weights from disk (or create defaults if path missing), (5) register and load CUDA kernels, (6) create `ForwardEngine`, (7) create `PagedKvManager`, (8) create `RoundRobinScheduler`, (9) create `BackendEvictionStore`, (10) create `InferenceOrchestrator`, (11) create `Tokenizer`, (12) build `AppState` with orchestrator and tokenizer, (13) spawn background scheduler loop, (14) start HTTP server.
+
+### CUDA Runtime
+
+`CudaRuntime::new()` enumerates all CUDA devices and creates contexts. `device(0)` returns `&Arc<CudaContext>` for the first GPU. See [[crates/cuda/src/context.rs#CudaRuntime]].
+
+### Stream Pool
+
+`StreamPool::new()` creates one async CUDA stream per context. `get(0)` returns the first stream for orchestrator use. See [[crates/cuda/src/stream.rs#StreamPool]].
+
+### Model Loading
+
+If the model path exists on disk, `load_model()` reads `config.json` and safetensors files, returning `(ModelConfig, WeightRegistry)`. If the path is missing, a default Qwen3.6-27B config is created with empty weights for wiring validation. See [[crates/model/src/loader.rs#load_model]].
+
+### Kernel Registration
+
+`KernelRegistry::register_infers_kernels()` registers all 15 infers kernels by name and cubin path. `ForwardEngine::new()` loads them into GPU memory via `LoadedKernelRegistry::load_all()`. See [[crates/cuda/src/kernels.rs#KernelRegistry#register_infers_kernels]].
+
+### AppState Evolution
+
+`AppState` now holds three fields: `model_name`, `orchestrator` (`Arc<Mutex<InferenceOrchestrator>>`), and `tokenizer` (`Tokenizer`). The `SharedState` type alias is `Arc<AppState>`. See [[crates/server/src/state.rs#AppState]].
+
+### Scheduler Loop
+
+`server::spawn_scheduler_loop()` spawns a background task that continuously calls `orchestrator.step()`.
+
+`server::spawn_scheduler_loop()` spawns a tokio task that continuously calls `orchestrator.step()` with a 1ms sleep between iterations. Each iteration locks the orchestrator, runs scheduling (admit, cleanup, eviction, prefill, decode), then releases the lock. Errors are logged with `tracing::error`. See [[crates/server/src/server.rs#spawn_scheduler_loop]].
+
+## Default Model Config
+
+When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for wiring validation.
+
+When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for Qwen3.6-27B wiring validation: 48 layers, 5120 hidden size, 13888 intermediate size, 152064 vocab, 40 attention heads, 40 KV heads, 128 head dim, 262144 max position embeddings, silu activation, rope_theta=10000000, partial_rotary=0.25, mRoPE interleaved, no MTP. Empty `WeightRegistry` is used — engine wiring succeeds without actual weights since kernels won't be dispatched.

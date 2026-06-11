@@ -25,6 +25,7 @@ infers-tokenizer = { path = "../tokenizer" }
 infers-kv = { path = "../kv" }
 infers-cuda = { path = "../cuda" }
 infers-mtp = { path = "../mtp" }
+infers-model = { path = "../model" }
 
 # External
 tokio-stream = "0.1"
