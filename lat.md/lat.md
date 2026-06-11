@@ -370,7 +370,6 @@ Same K/V computation and RoPE as original `forward`, but writes to paged cache v
 
 Future deliverables for Phase 4.6 completion.
 - GPU-side COW memcpy: actual data copy from original page to COW page in attention kernel layer
-- Full paged pipeline: complete `prefill_paged` and `decode_paged` with layer-by-layer dispatch (embedding, projections, RoPE, paged attention, MLP, sampling)
 - Stress tests and benchmark suite
 
 # Phase 4 Deliverables
@@ -382,7 +381,7 @@ Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode
 ### Engine Structure
 `ForwardEngine` holds config, weights, 16 cached `CudaFunction` handles, GemmEngine, NcclCommunicator, StreamPool, and paged KV fields.
 
-The struct owns `Option<PagedKvManager>` for the paged system, plus `paged_kv_caches` for per-layer paged caches alongside legacy `kv_caches`. Three paged kernel handles (`paged_kv_write_kernel`, `paged_kv_read_kernel`, `paged_attention_decode_kernel`) are resolved from `LoadedKernelRegistry` at init. `init_paged()` creates the manager and caches. `prefill_paged()` and `decode_paged()` provide paged entry points. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+The struct owns `Option<PagedKvManager>` for the paged system, plus `paged_kv_caches` for per-layer paged caches alongside legacy `kv_caches`. Three paged kernel handles (`paged_kv_write_kernel`, `paged_kv_read_kernel`, `paged_attention_decode_kernel`) are resolved from `LoadedKernelRegistry` at init. `init_paged()` creates the manager and caches. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Eviction Integration
 
@@ -423,6 +422,22 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 **Phase 4 — Sampling**: Dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel directly on BF16 logits via `CudaSlice::as_view()` — zero CPU round-trip. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
 
 See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]], [[crates/backends/native/src/upload.rs#upload_weight]].
+
+### Paged Prefill Path
+
+Full prefill pipeline using paged KV cache instead of flat buffers. See [[crates/backends/native/src/engine.rs#ForwardEngine#prefill_paged]].
+
+`prefill_paged()` allocates pages via `PagedKvManager`, uploads block table and positions to GPU, then runs the complete layer loop: embedding, norm1, layer dispatch (GDN via `gdn::forward` or full attention via `attention::forward_paged`), residual add, norm2, MLP (gate/up/silu/down_proj), residual add, final norm, LM head projection, and greedy sampling. Returns the number of pages allocated.
+
+Key differences from flat `prefill()`: uses `attention::forward_paged` which writes K/V to paged cache via `paged_kv_write` kernel, passes block table GPU pointer and positions GPU pointer to the attention function.
+
+### Paged Decode Path
+
+Full decode pipeline using paged KV cache with zero CPU round-trips. See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_paged]].
+
+`decode_paged()` uploads block table and current position to GPU, runs the complete layer loop for a single token: embedding, norm1, layer dispatch (GDN via `gdn::decode_forward` or full attention via `attention::decode_forward_paged`), residual add, norm2, MLP, residual add, final norm, LM head projection, and greedy sampling. Returns the sampled token ID.
+
+Key differences from flat `decode()`: uses `attention::decode_forward_paged` which writes the new token to paged cache via `paged_kv_write` kernel, then computes attention entirely on GPU via `paged_attention_decode` kernel — eliminating the CPU download/re-upload bottleneck of the flat cache path.
 
 ### Multi-Dtype Weight Upload
 

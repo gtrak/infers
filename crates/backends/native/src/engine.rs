@@ -12,8 +12,8 @@ use infers_cuda::gemm::Int4GemmConfig;
 use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
-use infers_cuda::{CudaContext, CudaFunction, CudaStream};
-use infers_model::{ModelConfig, WeightRegistry};
+use infers_cuda::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
+use infers_model::{LayerType, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
 use crate::eviction::BackendEvictionStore;
@@ -420,7 +420,7 @@ impl ForwardEngine {
     ///
     /// # Returns
     /// The number of pages allocated for the sequence.
-    #[allow(unused_variables)]
+    // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Prefill Path]]
     pub fn prefill_paged(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -430,10 +430,12 @@ impl ForwardEngine {
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
+        let weights = &self.weights[0];
+        let config = &self.config;
         let page_size = manager.page_size();
-        let _num_kv_heads = self.config.num_key_value_heads;
-        let _head_dim = self.config.head_dim;
-        let _kv_dim = _num_kv_heads * _head_dim;
+        let head_dim = config.head_dim;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
 
         // Allocate pages for the sequence based on token count
         let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
@@ -441,28 +443,160 @@ impl ForwardEngine {
             manager.append_page(seq_id)?;
         }
 
-        // Get block table and upload to GPU
+        // Upload block table to GPU
         let block_table = manager.block_table(seq_id)?;
         let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
-        let block_table_gpu = stream
-            .clone_htod(&block_table_i32)
-            .map_err(|e| anyhow::anyhow!("Failed to upload block table: {e}"))?;
+        let block_table_gpu = stream.clone_htod(&block_table_i32)?;
 
-        // Upload positions to GPU
+        // Upload positions
         let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
-        let positions_gpu = stream
-            .clone_htod(&positions)
-            .map_err(|e| anyhow::anyhow!("Failed to upload positions: {e}"))?;
+        let positions_i32: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
+        let positions_gpu = stream.clone_htod(&positions_i32)?;
 
-        // Ensure page pools are allocated for each layer
+        // Ensure page pools allocated
         for cache in &mut self.paged_kv_caches {
             cache.ensure_allocated(stream)?;
         }
 
-        // TODO: Full prefill pipeline with embedding, layer loop, projections, RoPE,
-        //       and paged KV write for each layer. The paged_kv_write kernel is ready;
-        //       the full integration requires the layer-by-layer dispatch from prefill.rs.
-        //       For now, allocate pages and upload block table.
+        // Embed tokens
+        let embed_weight = weights.embedding.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+        let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
+        let mut hidden = crate::embedding::embed_tokens(
+            stream, &self.embedding_kernel, token_ids, &embed_table,
+            config.hidden_size, config.vocab_size,
+        )?;
+
+        // Layer loop
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer = &weights.layers[layer_idx];
+            let layer_type = config.get_layer_type(layer_idx);
+
+            // Norm1
+            let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
+            let norm1_out = crate::norm::rms_norm(
+                stream, &self.rmsnorm_kernel, &hidden, &norm1_weight,
+                config.rms_norm_eps, config.hidden_size,
+            )?;
+
+            // Attention/GDN dispatch
+            let attn_or_gdn_out = match layer_type {
+                LayerType::GatedDeltaNet => {
+                    let gdn_weights = layer.gdn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
+                    crate::gdn::forward(
+                        &mut self.gemm, &self.int4_gemm_kernel, stream,
+                        &self.gdn_prefill_kernel, gdn_weights, &norm1_out,
+                        &mut self.gdn_states[layer_idx],
+                        config.hidden_size, self.group_size, &weights.int4_companions,
+                    )?
+                }
+                LayerType::FullAttention => {
+                    let attn_weights = layer.attn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
+                    crate::attention::forward_paged(
+                        &mut self.gemm, &self.int4_gemm_kernel, stream,
+                        &self.softmax_kernel, &self.paged_kv_write_kernel,
+                        &self.rope_kernel, &self.rmsnorm_kernel, &self.add_kernel,
+                        attn_weights, &norm1_out,
+                        &mut self.paged_kv_caches[layer_idx],
+                        &block_table_gpu, &positions_gpu, &positions,
+                        head_dim, num_heads, num_kv_heads, page_size,
+                        config.rope_theta, config.partial_rotary_factor,
+                        config.rms_norm_eps, self.group_size, &weights.int4_companions,
+                    )?
+                }
+            };
+
+            // Residual add
+            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &attn_or_gdn_out)?;
+
+            // Norm2
+            let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
+            let norm2_out = crate::norm::rms_norm(
+                stream, &self.rmsnorm_kernel, &hidden, &norm2_weight,
+                config.rms_norm_eps, config.hidden_size,
+            )?;
+
+            // MLP (INT4-aware)
+            let mlp_weights = &layer.mlp;
+            let intermediate_size = config.intermediate_size;
+            let seq_len = token_ids.len();
+
+            // gate
+            let mut gate = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                seq_len, intermediate_size, config.hidden_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // up
+            let mut up = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.up_proj, &norm2_out, &mut up,
+                seq_len, intermediate_size, config.hidden_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // silu = SiLU(gate) * up
+            let mut silu_out = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
+            let elem_i32 = (seq_len * intermediate_size) as i32;
+            unsafe {
+                stream.launch_builder(&self.silu_glu_kernel)
+                    .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                    .launch(infers_cuda::LaunchConfig {
+                        grid_dim: (((seq_len * intermediate_size) as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+
+            // down_proj
+            let mut mlp_out = stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                seq_len, config.hidden_size, intermediate_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // Residual add
+            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &mlp_out)?;
+        }
+
+        // Final norm
+        let final_norm_weight = weights.norm.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
+        let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
+        hidden = crate::norm::rms_norm(
+            stream, &self.rmsnorm_kernel, &hidden, &final_norm_gpu,
+            config.rms_norm_eps, config.hidden_size,
+        )?;
+
+        // LM head
+        let lm_head_weight = weights.lm_head.as_ref()
+            .or_else(|| weights.embedding.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
+        let seq_len = token_ids.len();
+        let mut logits = stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
+        crate::gemm_dispatch::gemm_projection(
+            &mut self.gemm, &self.int4_gemm_kernel, stream,
+            lm_head_weight, &hidden, &mut logits,
+            seq_len, config.vocab_size, config.hidden_size,
+            self.group_size, &weights.int4_companions,
+        )?;
+
+        // Sample: last row argmax (BF16)
+        let last_row_start = (seq_len - 1) * config.vocab_size;
+        let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
+        let sampled = crate::sample::greedy_sample_bf16(
+            stream, &self.argmax_kernel, &last_row_logits,
+        )?;
+
+        tracing::info!("Paged prefill sampled token: {}", sampled);
 
         Ok(num_pages_needed)
     }
@@ -481,7 +615,7 @@ impl ForwardEngine {
     ///
     /// # Returns
     /// The sampled token ID for the next generated token.
-    #[allow(unused_variables)]
+    // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Decode Path]]
     pub fn decode_paged(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -492,29 +626,164 @@ impl ForwardEngine {
         let manager = self.paged_kv_manager.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
-        // Get block table and upload to GPU
+        let weights = &self.weights[0];
+        let config = &self.config;
+        let page_size = manager.page_size();
+        let head_dim = config.head_dim;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let num_cached_tokens = manager.num_tokens(seq_id)? as i32;
+
+        // Upload block table to GPU
         let block_table = manager.block_table(seq_id)?;
         let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
-        let block_table_gpu = stream
-            .clone_htod(&block_table_i32)
-            .map_err(|e| anyhow::anyhow!("Failed to upload block table: {e}"))?;
+        let block_table_gpu = stream.clone_htod(&block_table_i32)?;
 
-        let num_pages = manager.num_pages(seq_id)?;
-        let num_cached_tokens = manager.num_tokens(seq_id)?;
-        let page_size = manager.page_size();
+        // Upload position to GPU
+        let positions_i32 = vec![position as i32];
+        let positions_gpu = stream.clone_htod(&positions_i32)?;
 
-        // Ensure page pools are allocated for each layer
+        // Ensure page pools allocated
         for cache in &mut self.paged_kv_caches {
             cache.ensure_allocated(stream)?;
         }
 
-        // TODO: Full decode pipeline with embedding, layer loop, Q projection,
-        //       paged attention read/decode kernels, MLP, norm, and sampling.
-        //       The paged_kv_read and paged_attention_decode kernels are ready;
-        //       the full integration requires the layer-by-layer dispatch from decode.rs.
+        // Embed single token
+        let embed_weight = weights.embedding.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+        let embed_table = crate::upload::upload_weight(stream, embed_weight)?;
+        let mut hidden = crate::embedding::embed_tokens(
+            stream, &self.embedding_kernel, &[token_id], &embed_table,
+            config.hidden_size, config.vocab_size,
+        )?;
 
-        // Placeholder: return the input token_id until full pipeline is wired.
-        Ok(token_id)
+        // Layer loop
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer = &weights.layers[layer_idx];
+            let layer_type = config.get_layer_type(layer_idx);
+
+            // Norm1
+            let norm1_weight = crate::upload::upload_weight(stream, &layer.norm1)?;
+            let norm1_out = crate::norm::rms_norm(
+                stream, &self.rmsnorm_kernel, &hidden, &norm1_weight,
+                config.rms_norm_eps, config.hidden_size,
+            )?;
+
+            // Attention/GDN dispatch
+            let attn_or_gdn_out = match layer_type {
+                LayerType::GatedDeltaNet => {
+                    let gdn_weights = layer.gdn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
+                    crate::gdn::decode_forward(
+                        &mut self.gemm, &self.int4_gemm_kernel, stream,
+                        &self.gdn_update_kernel, gdn_weights, &norm1_out,
+                        &mut self.gdn_states[layer_idx],
+                        config.hidden_size, self.group_size, &weights.int4_companions,
+                    )?
+                }
+                LayerType::FullAttention => {
+                    let attn_weights = layer.attn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
+                    crate::attention::decode_forward_paged(
+                        &mut self.gemm, &self.int4_gemm_kernel, stream,
+                        &self.paged_kv_write_kernel, &self.paged_attention_decode_kernel,
+                        &self.rope_kernel, &self.rmsnorm_kernel, &self.add_kernel,
+                        attn_weights, &norm1_out,
+                        &mut self.paged_kv_caches[layer_idx],
+                        &block_table_gpu, &positions_gpu,
+                        position, num_cached_tokens,
+                        head_dim, num_heads, num_kv_heads, page_size,
+                        config.rope_theta, config.partial_rotary_factor,
+                        config.rms_norm_eps, self.group_size, &weights.int4_companions,
+                    )?
+                }
+            };
+
+            // Residual add
+            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &attn_or_gdn_out)?;
+
+            // Norm2
+            let norm2_weight = crate::upload::upload_weight(stream, &layer.norm2)?;
+            let norm2_out = crate::norm::rms_norm(
+                stream, &self.rmsnorm_kernel, &hidden, &norm2_weight,
+                config.rms_norm_eps, config.hidden_size,
+            )?;
+
+            // MLP (INT4-aware)
+            let mlp_weights = &layer.mlp;
+            let intermediate_size = config.intermediate_size;
+
+            // gate
+            let mut gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.gate_proj, &norm2_out, &mut gate,
+                1, intermediate_size, config.hidden_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // up
+            let mut up = stream.alloc_zeros::<bf16>(intermediate_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.up_proj, &norm2_out, &mut up,
+                1, intermediate_size, config.hidden_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // silu = SiLU(gate) * up
+            let mut silu_out = stream.alloc_zeros::<bf16>(intermediate_size)?;
+            let elem_i32 = intermediate_size as i32;
+            unsafe {
+                stream.launch_builder(&self.silu_glu_kernel)
+                    .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                    .launch(infers_cuda::LaunchConfig {
+                        grid_dim: ((intermediate_size as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+
+            // down_proj
+            let mut mlp_out = stream.alloc_zeros::<bf16>(config.hidden_size)?;
+            crate::gemm_dispatch::gemm_projection(
+                &mut self.gemm, &self.int4_gemm_kernel, stream,
+                &mlp_weights.down_proj, &silu_out, &mut mlp_out,
+                1, config.hidden_size, intermediate_size,
+                self.group_size, &weights.int4_companions,
+            )?;
+
+            // Residual add
+            hidden = crate::add::add(stream, &self.add_kernel, &hidden, &mlp_out)?;
+        }
+
+        // Final norm
+        let final_norm_weight = weights.norm.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
+        let final_norm_gpu = crate::upload::upload_weight(stream, final_norm_weight)?;
+        hidden = crate::norm::rms_norm(
+            stream, &self.rmsnorm_kernel, &hidden, &final_norm_gpu,
+            config.rms_norm_eps, config.hidden_size,
+        )?;
+
+        // LM head
+        let lm_head_weight = weights.lm_head.as_ref()
+            .or_else(|| weights.embedding.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
+        let mut logits = stream.alloc_zeros::<bf16>(config.vocab_size)?;
+        crate::gemm_dispatch::gemm_projection(
+            &mut self.gemm, &self.int4_gemm_kernel, stream,
+            lm_head_weight, &hidden, &mut logits,
+            1, config.vocab_size, config.hidden_size,
+            self.group_size, &weights.int4_companions,
+        )?;
+
+        // Sample (BF16 argmax)
+        let sampled = crate::sample::greedy_sample_bf16(
+            stream, &self.argmax_kernel, &logits.as_view(),
+        )?;
+
+        Ok(sampled)
     }
 
     /// Evict a sequence's pages from GPU to the backend eviction store.
