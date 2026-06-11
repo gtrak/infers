@@ -3,7 +3,6 @@
 //! Provides `forward_layer_pass` and `full_forward_logits` functions
 //! that the ForwardEngine uses to build MTP operation callbacks.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -97,8 +96,6 @@ pub fn forward_layer_pass(
             )?
         }
         LayerType::FullAttention => {
-            // MTP is optional/deferred: pass empty HashMap for int4_companions (attention path)
-            let int4_companions = HashMap::<String, infers_model::Int4Companions>::new();
             let attn_weights = layer.attn.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Attention weights not found for MTP layer {}", layer_idx))?;
             attention::decode_forward(
@@ -109,7 +106,6 @@ pub fn forward_layer_pass(
                 &kernels.kv_cache_write,
                 &kernels.rope,
                 &kernels.rmsnorm,
-                &kernels.add,
                 attn_weights,
                 &norm1_out,
                 &mut kv_caches[layer_idx],
@@ -122,7 +118,7 @@ pub fn forward_layer_pass(
                 partial_rotary_factor,
                 rms_norm_eps,
                 128, // group_size default
-                &int4_companions,
+                cache,
             )?
         }
     };

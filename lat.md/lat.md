@@ -400,12 +400,13 @@ Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 - Phase 3 per-head K/V GEMMs in `forward_paged`: removed redundant CPU dequantization, weight extraction, and GEMM calls; replaced with GPU-to-GPU copies from k_full/v_full buffers (RoPE and K-norm already applied in Phase 1); removed `int4_companions` parameter from both `forward_paged` and `decode_forward_paged` signatures
 - GDN `forward` and `decode_forward`: replaced all `gemm_projection` calls with `gemm_projection_cached`, replaced SSM parameter uploads (a_log, dt_bias) with cache lookups, removed `int4_companions` parameter in favor of `&GpuWeightCache`
 - Updated prefill.rs/decode.rs/mtp.rs call sites to pass weight cache through GDN functions
+- Flat-cache `forward`: replaced all `gemm_projection` calls with `gemm_projection_cached`, replaced norm uploads with cache lookups, removed per-head CPU dequantization and GEMM calls for Q/K/V in favor of GPU-to-GPU copies from full projections (q_full, k_full, v_full), replaced alternating accumulation with combined attention buffer + single O-proj cached GEMM, removed `int4_companions` and `add_kernel` parameters
+- Flat-cache `decode_forward`: same migration as `forward` — replaced all `gemm_projection` calls with cached variants, norm uploads with cache lookups, per-head Q GEMMs with GPU copy from q_single, combined attention buffer + single O-proj cached GEMM, removed dead code (`upload_bf16_slice`, `extract_head_weight_slice`, `extract_o_proj_head_slice`, `attention_weight_to_bf16_vec`, `weight_to_bf16_wd`) and unused imports
 
 ## Remaining
 Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
 
-- Replace `gemm_projection` in flat-cache `forward` and `decode_forward` functions (prefill.rs, decode.rs) for attention path
-- Replace `upload_weight` calls for norm weights, embedding table, and LM head in legacy prefill/decode paths
+- Replace `upload_weight` calls for embedding table, norm weights, and LM head in legacy prefill/decode paths
 - Memory budget validation: assert weights + KV cache + temps fit in GPU memory
 - Benchmark before/after tokens/sec
 

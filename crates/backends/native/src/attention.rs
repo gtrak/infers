@@ -1,22 +1,22 @@
 //! Standard softmax attention forward pass and paged KV cache attention.
 //!
 //! Implements both the original flat-cache attention and the new paged attention
-//! subsystem for zero CPU round-trip decode. Uses per-head weight slicing to
-//! avoid strided GPU sub-slices (cudarc limitation).
+//! subsystem for zero CPU round-trip decode. Flat-cache path uses GPU-resident
+//! weight cache with full GEMM projections + per-head extraction via device-to-device
+//! memcpy, eliminating CPU dequantization overhead. Paged path adds block-pool
+//! KV management for prefix caching.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
-use half::{bf16, f16};
+use half::bf16;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
-use infers_model::{AttentionWeights, Int4Companions, WeightData, WeightDtype};
+use infers_model::AttentionWeights;
 
 use infers_kv::KvCacheDtype;
 
-use crate::add;
+
 use crate::gpu_cache::GpuWeightCache;
 use crate::rope;
 
@@ -156,188 +156,6 @@ impl PagedKvCache {
         self.kv_dim
     }
 }
-
-/// Upload a [&[bf16]] slice to GPU memory.
-fn upload_bf16_slice(
-    stream: &Arc<CudaStream>,
-    data: &[bf16],
-) -> Result<CudaSlice<bf16>> {
-    stream
-        .clone_htod(data)
-        .map_err(|e| anyhow::anyhow!("Failed to upload BF16 slice: {e}"))
-}
-
-/// Extract rows [head_idx * head_dim .. (head_idx+1) * head_dim] from a
-/// row-major BF16 weight matrix.
-fn extract_head_weight_slice(
-    full_weight: &WeightData,
-    head_idx: usize,
-    head_dim: usize,
-) -> Result<Vec<bf16>> {
-    let in_dim = full_weight.shape[1];
-    let out_dim = full_weight.shape[0];
-    let head_start_row = head_idx * head_dim;
-    let head_end_row = head_start_row + head_dim;
-    anyhow::ensure!(
-        head_end_row <= out_dim,
-        "Head index {} out of bounds (out_dim={})",
-        head_end_row,
-        out_dim
-    );
-    let mut result = Vec::with_capacity(head_dim * in_dim);
-    for row in head_start_row..head_end_row {
-        let row_start = row * in_dim * 2;
-        for col_idx in 0..in_dim {
-            let byte_offset = row_start + col_idx * 2;
-            let lo = full_weight.data[byte_offset];
-            let hi = full_weight.data[byte_offset + 1];
-            result.push(bf16::from_bits(u16::from_le_bytes([lo, hi])));
-        }
-    }
-    Ok(result)
-}
-
-/// Extract columns [head_idx * head_dim .. (head_idx+1) * head_dim] from a
-/// row-major BF16 weight matrix (for output projection).
-fn extract_o_proj_head_slice(
-    o_proj: &WeightData,
-    head_idx: usize,
-    head_dim: usize,
-) -> Result<Vec<bf16>> {
-    let in_dim = o_proj.shape[1];
-    let out_dim = o_proj.shape[0];
-    let col_start = head_idx * head_dim;
-    let col_end = col_start + head_dim;
-    anyhow::ensure!(
-        col_end <= in_dim,
-        "O-proj head column {} out of bounds (in_dim={})",
-        col_end,
-        in_dim
-    );
-    let mut result = Vec::with_capacity(out_dim * head_dim);
-    for row in 0..out_dim {
-        for col in col_start..col_end {
-            let byte_offset = (row * in_dim + col) * 2;
-            let lo = o_proj.data[byte_offset];
-            let hi = o_proj.data[byte_offset + 1];
-            result.push(bf16::from_bits(u16::from_le_bytes([lo, hi])));
-        }
-    }
-    Ok(result)
-}
-
-/// Convert an attention projection weight to a flat BF16 Vec.
-///
-/// If the weight is already BF16/FP16/FP32, converts directly.
-/// If the weight is Int4Packed, dequantizes it using companion tensors.
-fn attention_weight_to_bf16_vec(
-    weight: &WeightData,
-    int4_companions: &HashMap<String, Int4Companions>,
-    group_size: usize,
-) -> Result<Vec<bf16>> {
-    match weight.dtype {
-        WeightDtype::Bf16 => {
-            Ok(weight.data.chunks_exact(2)
-                .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
-                .collect())
-        }
-        WeightDtype::Fp16 => {
-            Ok(weight.data.chunks_exact(2)
-                .map(|c| {
-                    let f16_val = f16::from_bits(u16::from_le_bytes([c[0], c[1]]));
-                    bf16::from_f32(f16_val.to_f32())
-                })
-                .collect())
-        }
-        WeightDtype::Fp32 => {
-            Ok(weight.data.chunks_exact(4)
-                .map(|c| bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-                .collect())
-        }
-        WeightDtype::Int4Packed => {
-            let companions = int4_companions.get(&weight.name)
-                .ok_or_else(|| anyhow::anyhow!("No INT4 companions for weight '{}'", weight.name))?;
-            let qzeros = &companions.qzeros;
-            let scales = &companions.scales;
-            let qweight_wd = WeightData {
-                data: weight.data.clone(),
-                shape: weight.shape.clone(),
-                dtype: WeightDtype::Int4Packed,
-                name: weight.name.clone(),
-            };
-            Ok(crate::upload::dequantize_int4_to_bf16(&qweight_wd, scales, qzeros, group_size))
-        }
-        _ => anyhow::bail!("Unsupported weight dtype {:?} for '{}'", weight.dtype, weight.name),
-    }
-}
-
-/// Create a BF16 WeightData from any weight dtype (dequantizes INT4 if needed).
-fn weight_to_bf16_wd(
-    weight: &WeightData,
-    int4_companions: &HashMap<String, Int4Companions>,
-    group_size: usize,
-    k: usize,
-) -> Result<WeightData> {
-    // Detect transposed INT4 layout: [K/8, N] instead of standard [N, K/8]
-    // When transposed, shape[0]*8 is the K dimension and shape[1] is N.
-    // We transpose to [N, K/8] before dequantizing so the output is [N, K].
-    let is_transposed = weight.dtype == WeightDtype::Int4Packed
-        && weight.shape.len() >= 2
-        && weight.shape[0] * 8 == k;
-    
-    let bf16_data = if is_transposed {
-        // Transpose [K/8, N] → [N, K/8] then dequantize
-        let rows = weight.shape[0]; // K/8
-        let cols = weight.shape[1]; // N
-        let qweight_u32: Vec<u32> = weight.data.chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let mut transposed = vec![0u32; rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                transposed[j * rows + i] = qweight_u32[i * cols + j];
-            }
-        }
-        let transposed_bytes: Vec<u8> = transposed.iter()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
-        let transposed_qweight = WeightData {
-            data: Bytes::from(transposed_bytes),
-            shape: vec![cols, rows], // [N, K/8]
-            dtype: WeightDtype::Int4Packed,
-            name: weight.name.clone(),
-        };
-        attention_weight_to_bf16_vec(&transposed_qweight, int4_companions, group_size)?
-    } else {
-        attention_weight_to_bf16_vec(weight, int4_companions, group_size)?
-    };
-    
-    let bytes: Vec<u8> = bf16_data.iter().flat_map(|b| b.to_bits().to_le_bytes()).collect();
-    let shape = {
-        let mut s = weight.shape.clone();
-        if weight.dtype == WeightDtype::Int4Packed && s.len() >= 2 {
-            if is_transposed {
-                // [K/8, N] → dequantized data is [N, K/8*8] = [N, K]
-                let n = s[1];
-                let k = s[0] * 8;
-                vec![n, k]
-            } else {
-                // [N, K/8] → [N, K]
-                s[1] *= 8;
-                s
-            }
-        } else {
-            s
-        }
-    };
-    Ok(WeightData {
-        data: Bytes::from(bytes),
-        shape,
-        dtype: WeightDtype::Bf16,
-        name: weight.name.clone(),
-    })
-}
-
 
 // ============================================================================
 // Paged Kernel Dispatch Functions
@@ -593,7 +411,6 @@ pub fn forward(
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
-    add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -607,7 +424,7 @@ pub fn forward(
     partial_rotary_factor: f32,
     rms_norm_eps: f32,
     group_size: usize,
-    int4_companions: &HashMap<String, Int4Companions>,
+    cache: &GpuWeightCache,
 ) -> Result<CudaSlice<bf16>> {
     let kv_dim = num_kv_heads * head_dim;
     let seq_len = positions.len();
@@ -626,25 +443,26 @@ pub fn forward(
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.k_proj, input, &mut k_full,
-        seq_len, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.k_proj.name, input, &mut k_full,
+        seq_len, kv_dim, hidden_size, group_size,
     )?;
 
     // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut v_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.v_proj, input, &mut v_full,
-        seq_len, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.v_proj.name, input, &mut v_full,
+        seq_len, kv_dim, hidden_size, group_size,
     )?;
 
     // --- K-norm on full K before Phase 1 RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
-        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_full = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -700,142 +518,89 @@ pub fn forward(
     }
 
     // =========================================================================
-    // Phase 2: Per-head attention with alternating accumulation
+    // Phase 2: Full Q projection + combined attention output buffer
     // =========================================================================
 
     let buf_size = seq_len * hidden_size;
-    let mut accum_a = stream
-        .alloc_zeros::<bf16>(buf_size)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_a buffer: {e}"))?;
-    let mut accum_b = stream
-        .alloc_zeros::<bf16>(buf_size)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
+    let per_gpu_head_dim = num_heads * head_dim;
 
-    // --- Dequantize weights to BF16 once before the loop ---
-    let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size, hidden_size)?;
-    let k_proj_bf16 = weight_to_bf16_wd(&weights.k_proj, int4_companions, group_size, hidden_size)?;
-    let v_proj_bf16 = weight_to_bf16_wd(&weights.v_proj, int4_companions, group_size, hidden_size)?;
-    let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size, num_heads * head_dim)?;
+    // q_full = GEMM(input, q_proj^T)  [seq_len × per_gpu_head_dim]
+    let mut q_full = stream
+        .alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
+    crate::gemm_dispatch::gemm_projection_cached(
+        gemm, int4_kernel, stream,
+        cache, &weights.q_proj.name, input, &mut q_full,
+        seq_len, per_gpu_head_dim, hidden_size, group_size,
+    )?;
 
-    // --- Upload QK-norm weights to GPU once before the loop ---
-    let q_norm_gpu = weights
-        .q_norm
-        .as_ref()
-        .map(|w| crate::upload::upload_weight(stream, w))
-        .transpose()?;
-    let k_norm_gpu = weights
-        .k_norm
-        .as_ref()
-        .map(|w| crate::upload::upload_weight(stream, w))
-        .transpose()?;
+    // --- Q-norm on full Q before RoPE ---
+    if let Some(q_norm_w) = weights.q_norm.as_ref() {
+        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
+        q_full = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
+
+    // --- Combined attention output buffer [seq_len x per_gpu_head_dim] ---
+    let attn_combined_size = seq_len * per_gpu_head_dim;
+    let mut attn_combined = stream
+        .alloc_zeros::<bf16>(attn_combined_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate attn_combined buffer: {e}"))?;
     for head_idx in 0..num_heads {
-        // --- Extract and upload per-head weight slices ---
-        let kv_head = head_idx % num_kv_heads;
-        let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
-        let k_proj_h = extract_head_weight_slice(&k_proj_bf16, kv_head, head_dim)?;
-        let v_proj_h = extract_head_weight_slice(&v_proj_bf16, kv_head, head_dim)?;
-        let o_proj_h = extract_o_proj_head_slice(&o_proj_bf16, head_idx, head_dim)?;
+        let kv_head_idx = head_idx % num_kv_heads;
 
-        let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
-        let k_proj_h_gpu = upload_bf16_slice(stream, &k_proj_h)?;
-        let v_proj_h_gpu = upload_bf16_slice(stream, &v_proj_h)?;
-        let o_proj_h_gpu = upload_bf16_slice(stream, &o_proj_h)?;
-
-        // --- Q, K, V projections (per-head) ---
+        // --- Extract per-head Q from q_full via GPU copy ---
         let mut q_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &q_proj_h_gpu,
-            &mut q_h,
-        )?;
+        for s in 0..seq_len {
+            let src_offset = s * per_gpu_head_dim + head_idx * head_dim;
+            let dst_offset = s * head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = q_h.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy per-head Q from q_full failed: {e}"))?;
+        }
 
+        // --- Extract per-head K from k_full (already has RoPE applied) ---
         let mut k_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate k_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &k_proj_h_gpu,
-            &mut k_h,
-        )?;
+        for s in 0..seq_len {
+            let src_offset = s * kv_dim + kv_head_idx * head_dim;
+            let dst_offset = s * head_dim;
+            let src_slice = k_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = k_h.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy per-head K from k_full failed: {e}"))?;
+        }
 
+        // --- Extract per-head V from v_full ---
         let mut v_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate v_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &v_proj_h_gpu,
-            &mut v_h,
-        )?;
-
-        // --- QK-norm (before RoPE) ---
-        if let Some(q_norm_w) = &q_norm_gpu {
-            q_h = crate::norm::rms_norm_per_head(
-                stream,
-                rmsnorm_kernel,
-                &q_h,
-                q_norm_w,
-                rms_norm_eps,
-                head_dim,
-            )?;
-        }
-        if let Some(k_norm_w) = &k_norm_gpu {
-            k_h = crate::norm::rms_norm_per_head(
-                stream,
-                rmsnorm_kernel,
-                &k_h,
-                k_norm_w,
-                rms_norm_eps,
-                head_dim,
-            )?;
+        for s in 0..seq_len {
+            let src_offset = s * kv_dim + kv_head_idx * head_dim;
+            let dst_offset = s * head_dim;
+            let src_slice = v_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = v_h.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy per-head V from v_full failed: {e}"))?;
         }
 
-        // --- RoPE (per-head, num_heads=1) ---
+        // --- RoPE (per-head, num_heads=1) — apply only to q_h (k_h already has RoPE from Phase 1) ---
+        let mut k_h_dummy = stream.alloc_zeros::<bf16>(seq_len * head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
         rope::apply_rope(
             stream,
             rope_kernel,
             &mut q_h,
-            &mut k_h,
+            &mut k_h_dummy,  // dummy — k_h already has RoPE from Phase 1
             positions,
             1,
             head_dim,
@@ -925,39 +690,30 @@ pub fn forward(
             &mut attn_out_h,
         )?;
 
-        // --- Partial O-projection: attn_out_h @ o_proj_h^T → [seq_len × hidden_size] ---
-        let mut partial_out = stream
-            .alloc_zeros::<bf16>(buf_size)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate partial_out buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: seq_len,
-                n: hidden_size,
-                k: head_dim,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            &attn_out_h,
-            &o_proj_h_gpu,
-            &mut partial_out,
-        )?;
-
-        // --- Accumulate into alternating buffers ---
-        if head_idx % 2 == 0 {
-            accum_b = add::add(stream, add_kernel, &accum_a, &partial_out)?;
-        } else {
-            accum_a = add::add(stream, add_kernel, &accum_b, &partial_out)?;
+        // --- Copy attention output to combined buffer at correct head offset ---
+        for s in 0..seq_len {
+            let src_offset = s * head_dim;
+            let dst_offset = s * per_gpu_head_dim + head_idx * head_dim;
+            let src_slice = attn_out_h.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = attn_combined.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy attn_out_h to combined buffer failed: {e}"))?;
         }
     }
 
-    // Final result: accum_a if num_heads is even (last head odd → wrote accum_a), accum_b if odd (last head even → wrote accum_b)
-    let output = if num_heads.is_multiple_of(2) { accum_a } else { accum_b };
+    // =========================================================================
+    // O-projection using combined attention output
+    // =========================================================================
+    let mut output = stream
+        .alloc_zeros::<bf16>(buf_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
+    crate::gemm_dispatch::gemm_projection_cached(
+        gemm, int4_kernel, stream,
+        cache, &weights.o_proj.name, &attn_combined, &mut output,
+        seq_len, hidden_size, per_gpu_head_dim, group_size,
+    )?;
+
     Ok(output)
 }
 
@@ -1003,7 +759,6 @@ pub fn decode_forward(
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
-    add_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -1016,7 +771,7 @@ pub fn decode_forward(
     partial_rotary_factor: f32,
     rms_norm_eps: f32,
     group_size: usize,
-    int4_companions: &HashMap<String, Int4Companions>,
+    cache: &GpuWeightCache,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1036,25 +791,26 @@ pub fn decode_forward(
     let mut k_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.k_proj, input, &mut k_single,
-        1, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.k_proj.name, input, &mut k_single,
+        1, kv_dim, hidden_size, group_size,
     )?;
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection(
+    crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        &weights.v_proj, input, &mut v_single,
-        1, kv_dim, hidden_size, group_size, int4_companions,
+        cache, &weights.v_proj.name, input, &mut v_single,
+        1, kv_dim, hidden_size, group_size,
     )?;
 
     // --- K-norm on full K before Phase 1 RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
-        let k_norm_gpu = crate::upload::upload_weight(stream, k_norm_w)?;
+        let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
@@ -1119,35 +875,50 @@ pub fn decode_forward(
     let v_cache_host = &kv_cache_data[max_seq_len * kv_dim..];
 
     // =========================================================================
-    // Phase 3: Per-head attention with alternating accumulation
+    // Phase 2.5: Full Q projection + combined attention output buffer
     // =========================================================================
 
     let buf_size = hidden_size;
-    let mut accum_a = stream
-        .alloc_zeros::<bf16>(buf_size)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_a buffer: {e}"))?;
-    let mut accum_b = stream
-        .alloc_zeros::<bf16>(buf_size)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate accum_b buffer: {e}"))?;
-    // --- Dequantize weights to BF16 once before the loop ---
-    let q_proj_bf16 = weight_to_bf16_wd(&weights.q_proj, int4_companions, group_size, hidden_size)?;
-    let o_proj_bf16 = weight_to_bf16_wd(&weights.o_proj, int4_companions, group_size, hidden_size)?;
+    let per_gpu_head_dim = num_heads * head_dim;
 
-    // --- Upload QK-norm weight to GPU once before the loop ---
-    let q_norm_gpu = weights
-        .q_norm
-        .as_ref()
-        .map(|w| crate::upload::upload_weight(stream, w))
-        .transpose()?;
+    // q_single = GEMM(input, q_proj^T)  [1 × per_gpu_head_dim]
+    let mut q_single = stream
+        .alloc_zeros::<bf16>(per_gpu_head_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
+    crate::gemm_dispatch::gemm_projection_cached(
+        gemm, int4_kernel, stream,
+        cache, &weights.q_proj.name, input, &mut q_single,
+        1, per_gpu_head_dim, hidden_size, group_size,
+    )?;
+
+    // --- Q-norm on full Q before RoPE ---
+    if let Some(q_norm_w) = weights.q_norm.as_ref() {
+        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
+        q_single = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
+
+    // --- Combined attention output buffer [per_gpu_head_dim] ---
+    let mut attn_combined = stream
+        .alloc_zeros::<bf16>(per_gpu_head_dim)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate attn_combined buffer: {e}"))?;
     for head_idx in 0..num_heads {
-        // --- Extract and upload per-head weight slices ---
-        let q_proj_h = extract_head_weight_slice(&q_proj_bf16, head_idx, head_dim)?;
-        let o_proj_h = extract_o_proj_head_slice(&o_proj_bf16, head_idx, head_dim)?;
 
-        let q_proj_h_gpu = upload_bf16_slice(stream, &q_proj_h)?;
-        let o_proj_h_gpu = upload_bf16_slice(stream, &o_proj_h)?;
+        // --- Extract per-head Q from q_single via GPU copy (m=1) ---
+        let mut q_h = stream
+            .alloc_zeros::<bf16>(head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
+        let src_offset = head_idx * head_dim;
+        let dst_offset = 0usize;
+        let src_slice = q_single.slice(src_offset..src_offset + head_dim);
+        let mut dst_slice = q_h.slice_mut(dst_offset..dst_offset + head_dim);
+        stream
+            .memcpy_dtod(&src_slice, &mut dst_slice)
+            .map_err(|e| anyhow::anyhow!("Copy per-head Q from q_single failed: {e}"))?;
 
-        // --- Extract per-head KV cache on CPU ---
+        // --- Extract per-head KV cache on CPU and upload to GPU ---
         let mut k_h_cache = Vec::with_capacity(num_cached * head_dim);
         let mut v_h_cache = Vec::with_capacity(num_cached * head_dim);
         for pos in 0..num_cached {
@@ -1157,43 +928,10 @@ pub fn decode_forward(
             }
         }
 
-        let k_h_cache_gpu = upload_bf16_slice(stream, &k_h_cache)?;
-        let v_h_cache_gpu = upload_bf16_slice(stream, &v_h_cache)?;
-
-        // --- Q projection (per-head) ---
-        let mut q_h = stream
-            .alloc_zeros::<bf16>(head_dim)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: 1,
-                n: head_dim,
-                k: hidden_size,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            input,
-            &q_proj_h_gpu,
-            &mut q_h,
-        )?;
-
-        // --- Q-norm (before RoPE) ---
-        if let Some(q_norm_w) = &q_norm_gpu {
-            q_h = crate::norm::rms_norm_per_head(
-                stream,
-                rmsnorm_kernel,
-                &q_h,
-                q_norm_w,
-                rms_norm_eps,
-                head_dim,
-            )?;
-        }
+        let k_h_cache_gpu = stream.clone_htod(&k_h_cache)
+            .map_err(|e| anyhow::anyhow!("Failed to upload K cache: {e}"))?;
+        let v_h_cache_gpu = stream.clone_htod(&v_h_cache)
+            .map_err(|e| anyhow::anyhow!("Failed to upload V cache: {e}"))?;
 
         // --- RoPE (per-head, num_heads=1) ---
         let mut k_rope_dummy = stream
@@ -1291,38 +1029,28 @@ pub fn decode_forward(
             &mut attn_out_h,
         )?;
 
-        // --- Partial O-projection: attn_out_h @ o_proj_h^T → [1 × hidden_size] ---
-        let mut partial_out = stream
-            .alloc_zeros::<bf16>(buf_size)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate partial_out buffer: {e}"))?;
-        gemm.matmul_bf16(
-            &GemmConfig {
-                m: 1,
-                n: hidden_size,
-                k: head_dim,
-                transa: true,
-                transb: false,
-                alpha: 1.0,
-                beta: 0.0,
-                lda: None,
-                ldb: None,
-                ldc: None,
-                activation: None,
-            },
-            &attn_out_h,
-            &o_proj_h_gpu,
-            &mut partial_out,
-        )?;
-
-        // --- Accumulate into alternating buffers ---
-        if head_idx % 2 == 0 {
-            accum_b = add::add(stream, add_kernel, &accum_a, &partial_out)?;
-        } else {
-            accum_a = add::add(stream, add_kernel, &accum_b, &partial_out)?;
-        }
+        // --- Copy attention output to combined buffer at correct head offset ---
+        let src_offset = 0usize;
+        let dst_offset = head_idx * head_dim;
+        let src_slice = attn_out_h.slice(src_offset..src_offset + head_dim);
+        let mut dst_slice = attn_combined.slice_mut(dst_offset..dst_offset + head_dim);
+        stream
+            .memcpy_dtod(&src_slice, &mut dst_slice)
+            .map_err(|e| anyhow::anyhow!("Copy attn_out_h to combined buffer failed: {e}"))?;
     }
 
-    let output = if num_heads.is_multiple_of(2) { accum_a } else { accum_b };
+    // =========================================================================
+    // O-projection using combined attention output
+    // =========================================================================
+    let mut output = stream
+        .alloc_zeros::<bf16>(buf_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
+    crate::gemm_dispatch::gemm_projection_cached(
+        gemm, int4_kernel, stream,
+        cache, &weights.o_proj.name, &attn_combined, &mut output,
+        1, hidden_size, per_gpu_head_dim, group_size,
+    )?;
+
     Ok(output)
 }
 

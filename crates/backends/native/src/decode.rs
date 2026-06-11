@@ -163,7 +163,6 @@ pub fn decode(
                     &kernels.kv_cache_write,
                     &kernels.rope,
                     &kernels.rmsnorm,
-                    &kernels.add,
                     attn_weights,
                     &norm1_out,
                     &mut kv_caches[layer_idx],
@@ -176,7 +175,7 @@ pub fn decode(
                     partial_rotary_factor,
                     rms_norm_eps,
                     group_size,
-                    &weights.int4_companions,
+                    cache,
                 )?
             }
         };
@@ -407,7 +406,6 @@ pub fn decode_with_hidden(
                     &kernels.kv_cache_write,
                     &kernels.rope,
                     &kernels.rmsnorm,
-                    &kernels.add,
                     attn_weights,
                     &norm1_out,
                     &mut kv_caches[layer_idx],
@@ -420,7 +418,7 @@ pub fn decode_with_hidden(
                     partial_rotary_factor,
                     rms_norm_eps,
                     group_size,
-                    &weights.int4_companions,
+                    cache,
                 )?
             }
         };
