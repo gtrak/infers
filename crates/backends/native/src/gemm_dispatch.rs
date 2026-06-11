@@ -82,10 +82,12 @@ pub fn gemm_projection(
                 stream, &weight, &companions.scales, &companions.qzeros,
             )?;
 
+            let is_transposed = weight.shape.len() >= 2 && weight.shape[0] * 8 == k;
+
             infers_cuda::gemm::matmul_int4(
                 stream,
                 int4_kernel,
-                &Int4GemmConfig { m, n, k, group_size },
+                &Int4GemmConfig { m, n, k, group_size, transposed: is_transposed },
                 output,
                 &qweight_gpu,
                 &scales_gpu,

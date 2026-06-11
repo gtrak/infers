@@ -17,20 +17,30 @@
 #include "common.cuh"
 #include <stdint.h>
 
-/// INT4 GEMM kernel: output[M][N] = dequant(weight[N][K]) @ input[M][K]
+/// INT4 GEMM kernel: output[M][N] = dequant(weight) @ input[M][K]
 ///
 /// Each thread computes one output element output[row][col].
 ///
+/// Supports two weight layouts via the `transposed` flag:
+/// - `transposed=0`: weight in [N, K/8], scales in [N, K/group_size], zeros in [N, K/group_size/8]
+///   (standard row-major layout where N is the outer dimension).
+/// - `transposed=1`: weight in [K/8, N], scales in [K/group_size, N], zeros in [K/group_size, ceil(N/8)]
+///   (column-major layout used by AutoRound models like Qwen3.6-27B).
+///
+/// In both cases the weight stays packed as INT4 (8 weights per uint32_t)
+/// and dequantization happens on-the-fly in registers.
+///
 /// # Arguments
 /// * `output` — [M, N] output in BF16
-/// * `weight` — [N, K/8] packed INT4 (8 weights per uint32_t)
-/// * `scales` — [N, K/group_size] FP16 group scales
-/// * `zeros`  — [N, K/group_size/8] packed INT4 zero points (8 per uint32_t)
+/// * `weight` — packed INT4 weights (8 weights per uint32_t)
+/// * `scales` — BF16 group scales
+/// * `zeros`  — packed INT4 zero points (8 per uint32_t)
 /// * `input`  — [M, K] activation in BF16
 /// * `M` — rows of input and output
 /// * `N` — columns of output (rows of weight)
 /// * `K` — inner dimension (columns of input and weight)
 /// * `group_size` — quantization group size (typically 128)
+/// * `transposed` — 0: standard [N, K/8] layout; 1: transposed [K/8, N] layout
 extern "C" {
 __global__ void int4_gemm_kernel(
     __nv_bfloat16* __restrict__ output,
@@ -39,7 +49,8 @@ __global__ void int4_gemm_kernel(
     const uint32_t* __restrict__ zeros,
     const __nv_bfloat16* __restrict__ input,
     int M, int N, int K,
-    int group_size
+    int group_size,
+    int transposed
 ) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -51,17 +62,26 @@ __global__ void int4_gemm_kernel(
     for (int k = 0; k < K; k += group_size) {
         // Load scale and zero point for this group
         int group_idx = k / group_size;
-        float scale = __bfloat162float(scales[col * (K / group_size) + group_idx]);
+        float scale = __bfloat162float(transposed
+            ? scales[group_idx * N + col]
+            : scales[col * (K / group_size) + group_idx]);
 
         // Unpack zero point (8 per uint32_t)
-        int zero_packed_idx = (col * (K / group_size) + group_idx) / 8;
-        int zero_shift = ((col * (K / group_size) + group_idx) % 8) * 4;
+        int zero_packed_idx, zero_shift;
+        if (transposed) {
+            int n_packed = (N + 7) / 8;
+            zero_packed_idx = group_idx * n_packed + col / 8;
+            zero_shift = (col % 8) * 4;
+        } else {
+            zero_packed_idx = (col * (K / group_size) + group_idx) / 8;
+            zero_shift = ((col * (K / group_size) + group_idx) % 8) * 4;
+        }
         uint32_t zero_packed = zeros[zero_packed_idx];
         int8_t zero = (int8_t)((zero_packed >> zero_shift) & 0xF);
 
         for (int kk = 0; kk < group_size; kk += 8) {
             // Load 8 INT4 weights from one uint32_t
-            int weight_idx = (col * K + k + kk) / 8;
+            int weight_idx = transposed ? ((k + kk) >> 3) * N + col : (col * K + k + kk) / 8;
             uint32_t packed = weight[weight_idx];
 
             // Unpack each of 8 weights and compute

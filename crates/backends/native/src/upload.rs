@@ -86,11 +86,10 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
 /// - **scales**: BF16 group-wise scales.
 /// - **qzeros**: Packed INT4 zero-points as `u32` (8 per u32).
 ///
-/// The `int4_gemm_kernel` expects qweight in `[N, K/8]` layout (N rows, each row
-/// has K/8 packed elements). Some models store weights as `[K/8, N]` (transposed).
-/// When detected, the weights are transposed to `[N, K/8]` on the CPU.
+/// The `int4_gemm_kernel` handles both standard [N, K/8] and transposed [K/8, N]
+/// layouts natively, so weights are uploaded as-is without CPU transposition.
 ///
-/// The `int4_gemm_kernel` performs on-the-fly dequantization in registers,
+/// The kernel performs on-the-fly dequantization in registers,
 /// so no dequantized copy is needed on GPU.
 ///
 /// # Returns
@@ -101,13 +100,6 @@ pub fn upload_int4_weight(
     scales: &WeightData,
     qzeros: &WeightData,
 ) -> Result<(CudaSlice<u32>, CudaSlice<bf16>, CudaSlice<u32>)> {
-    // Detect layout: kernel expects [N, K/8] but some models store [K/8, N].
-    // In [N, K/8] layout, shape[0] = N (output dim) ≥ shape[1] * 8 (K) typically.
-    // In [K/8, N] layout, shape[0] = K/8 (packed input dim) < shape[1] (output dim) typically.
-    // Detect by: if first dim < second dim, it's likely [K/8, N] (transposed).
-    let shape = &qweight.shape;
-    let is_transposed = shape.len() >= 2 && shape[0] < shape[1];
-
     // Parse packed u32 data
     let qweight_u32: Vec<u32> = qweight
         .data
@@ -122,67 +114,17 @@ pub fn upload_int4_weight(
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
 
-    if is_transposed {
-        // Current layout: qweight[K/8, N], scales[K/group_size, N], qzeros[K/group_size, N/8]
-        // Target layout: qweight[N, K/8], scales[N, K/group_size], qzeros[N, K/group_size/8]
-        let k_packed = shape[0]; // K/8
-        let n = shape[1];        // N
-        let k = k_packed * 8;
-        let num_groups = k / 128; // group_size = 128
+    let qweight_gpu = stream
+        .clone_htod(&qweight_u32)
+        .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", qweight.name, e))?;
+    let scales_gpu = stream
+        .clone_htod(&scales_vec)
+        .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", scales.name, e))?;
+    let qzeros_gpu = stream
+        .clone_htod(&qzeros_u32)
+        .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", qzeros.name, e))?;
 
-        // Transpose qweight: [K/8, N] → [N, K/8]
-        let mut transposed_qweight = vec![0u32; n * k_packed];
-        for i in 0..k_packed {
-            for j in 0..n {
-                transposed_qweight[j * k_packed + i] = qweight_u32[i * n + j];
-            }
-        }
-
-        // Transpose scales: [K/group_size, N] → [N, K/group_size]
-        let mut transposed_scales = vec![bf16::from_f32(0.0); n * num_groups];
-        for i in 0..num_groups {
-            for j in 0..n {
-                transposed_scales[j * num_groups + i] = scales_vec[i * n + j];
-            }
-        }
-
-        // Transpose qzeros: [K/group_size, N/8] → [N, K/group_size/8]
-        let qzeros_k_packed = shape[0] * 8 / 128; // K/group_size
-        let qzeros_n = (shape[1] + 7) / 8;         // ceil(N/8)
-        let mut transposed_qzeros = vec![0u32; n * qzeros_k_packed];
-        // Note: qzeros shape from the model is [K/group_size, ceil(N/8)]
-        // where qzeros_k_packed = K/group_size = K/128 rows
-        for i in 0..qzeros_k_packed {
-            for j in 0..qzeros_n {
-                transposed_qzeros[j * qzeros_k_packed + i] = qzeros_u32[i * qzeros_n + j];
-            }
-        }
-
-        let qweight_gpu = stream
-            .clone_htod(&transposed_qweight)
-            .map_err(|e| anyhow::anyhow!("Failed to upload transposed qweight '{}': {}", qweight.name, e))?;
-        let scales_gpu = stream
-            .clone_htod(&transposed_scales)
-            .map_err(|e| anyhow::anyhow!("Failed to upload transposed scales '{}': {}", scales.name, e))?;
-        let qzeros_gpu = stream
-            .clone_htod(&transposed_qzeros)
-            .map_err(|e| anyhow::anyhow!("Failed to upload transposed qzeros '{}': {}", qzeros.name, e))?;
-
-        Ok((qweight_gpu, scales_gpu, qzeros_gpu))
-    } else {
-        // Standard [N, K/8] layout — upload as-is
-        let qweight_gpu = stream
-            .clone_htod(&qweight_u32)
-            .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", qweight.name, e))?;
-        let scales_gpu = stream
-            .clone_htod(&scales_vec)
-            .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", scales.name, e))?;
-        let qzeros_gpu = stream
-            .clone_htod(&qzeros_u32)
-            .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", qzeros.name, e))?;
-
-        Ok((qweight_gpu, scales_gpu, qzeros_gpu))
-    }
+    Ok((qweight_gpu, scales_gpu, qzeros_gpu))
 }
 
 // ---------------------------------------------------------------------------

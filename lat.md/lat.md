@@ -53,7 +53,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | stream | CUDA stream pool for async execution |
 | memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
-| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization |
+| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
 | nccl | Multi-GPU collective operations for TP/PP |
 
 # Kernel Extraction and Build System
@@ -93,7 +93,7 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 | `paged_attention_decode.cu` | `infers_paged_attention_decode_bf16` | Paged attention decode: computes single-token attention over paged KV cache using two-pass online softmax and weighted V accumulation, one block per KV head — Phase 1 uses strided dot-product computation, Phase 2 loops over all tokens per thread |
 | `fp8_quantize.cu` | `infers_fp8_quantize_bf16`, `infers_fp8_dequantize_bf16` | FP8 quantize (BF16→FP8) and dequantize (FP8→BF16) for KV cache quantization, supporting both E4M3 (mode=0) and E5M2 (mode=1) formats — one thread per element, 256 threads per block |
-| `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - zero) * scale` on-the-fly during inner loop, accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
+| `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers and native transposed [K/8, N] layout support via `transposed` flag: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - zero) * scale` on-the-fly during inner loop, accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -447,7 +447,9 @@ Conversion logic extracted into `bytes_to_bf16()` for GPU-free unit testing.
 
 ### INT4 Triplet Upload
 
-`upload_int4_weight()` uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. Returns `(qweight_gpu, scales_gpu, qzeros_gpu)` for `int4_gemm_kernel` on-the-fly dequantization.
+Uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. The kernel handles both layouts natively — no CPU transposition is needed.
+
+`upload_int4_weight()` returns `(qweight_gpu, scales_gpu, qzeros_gpu)` for `int4_gemm_kernel` on-the-fly dequantization. Both standard [N, K/8] and transposed [K/8, N] layouts are supported via the kernel's `transposed` flag.
 
 `dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>` using `(int4_val - zero_point) * scale`.
 
@@ -509,7 +511,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 | `add` | Element-wise addition for residual connections (`infers_add_bf16`) |
 | `upload` | Weight upload utilities: multi-dtype contiguous upload (`upload_weight` handles Bf16, Fp16, Fp32), INT4 triplet upload (`upload_int4_weight` uploads qweight/scales/qzeros for `int4_gemm_kernel`), CPU dequantize fallback (`dequantize_int4_to_bf16`) |
 | `eviction` | Per-layer CPU storage for evicted KV page data (`BackendEvictionStore`) |
-| `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization |
+| `gemm_dispatch` | INT4-aware GEMM dispatch: `gemm_projection()` routes BF16/FP16/FP32 weights to cuBLASLt `matmul_bf16` and INT4-packed weights to `infers_int4_gemm` kernel with on-the-fly dequantization; detects transposed [K/8, N] layout via `shape[0] * 8 == K` and passes `transposed` flag to `Int4GemmConfig` |
 
 
 ### Attention Forward Pass

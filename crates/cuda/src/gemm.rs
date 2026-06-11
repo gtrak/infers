@@ -153,6 +153,8 @@ pub struct Int4GemmConfig {
     pub k: usize,
     /// Quantization group size (typically 128).
     pub group_size: usize,
+    /// Whether weight is in transposed [K/8, N] layout (true) or standard [N, K/8] (false).
+    pub transposed: bool,
 }
 
 /// Execute INT4 GEMM with on-the-fly dequantization.
@@ -165,7 +167,7 @@ pub struct Int4GemmConfig {
 /// # Arguments
 /// * `stream` — CUDA stream to launch on
 /// * `kernel` — The `int4_gemm_kernel` CudaFunction handle
-/// * `config` — M, N, K, group_size dimensions
+/// * `config` — M, N, K, group_size, transposed dimensions
 /// * `output` — [M, N] BF16 output buffer
 /// * `weight` — [N, K/8] packed INT4 weights
 /// * `scales` — [N, K/group_size] BF16 group scales
@@ -214,6 +216,7 @@ pub fn matmul_int4(
             .arg(&(config.n as i32))
             .arg(&(config.k as i32))
             .arg(&(config.group_size as i32))
+            .arg(&(if config.transposed { 1i32 } else { 0i32 }))
             .launch(launch_config)
             .map_err(|e| anyhow::anyhow!("int4_gemm_kernel launch failed: {:?}", e))?;
     }
