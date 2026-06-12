@@ -64,6 +64,7 @@ impl KernelRegistry {
         let kdir = |path: &str| format!("{}/kernels/compiled/{}", crate_dir, path);
         self.register("infers_rmsnorm_bf16", kdir("rmsnorm.cubin"));
         self.register("infers_silu_glu_bf16", kdir("silu.cubin"));
+        self.register("infers_attn_output_gate_bf16", kdir("silu.cubin"));
         self.register("infers_rope_bf16", kdir("rope.cubin"));
         self.register("infers_embedding_gather_bf16", kdir("embedding.cubin"));
         self.register("infers_add_bf16", kdir("elementwise.cubin"));

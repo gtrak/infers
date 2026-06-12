@@ -51,5 +51,32 @@ __global__ void infers_silu_glu_bf16(
         output[i] = __float2bfloat16(x_val * g_val * sig);
     }
 }
+// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+/// Attention output gate kernel: output[i] = x[i] * sigmoid(gate[i])
+///
+/// Unlike SwiGLU (x * gate * sigmoid(gate)), this applies only the sigmoid to the gate,
+/// which is the correct behavior for Qwen3.5 with output_gate_type="swish".
+///
+/// # Launch configuration
+/// * grid: `(total_elements + block_size - 1) / block_size`
+/// * block: `INFERS_BLOCK_SIZE`
+__launch_bounds__(INFERS_BLOCK_SIZE)
+__global__ void infers_attn_output_gate_bf16(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ output,
+    int total_elements
+) {
+    int idx = INFERS_THREAD_IDX;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = idx; i < total_elements; i += stride) {
+        float x_val = __bfloat162float(x[i]);
+        float g_val = __bfloat162float(gate[i]);
+        float sig = 1.0f / (1.0f + expf(-g_val));
+        // x * sigmoid(gate) — NOT x * gate * sigmoid(gate)
+        output[i] = __float2bfloat16(x_val * sig);
+    }
+}
 
 } // extern "C"

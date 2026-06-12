@@ -307,5 +307,32 @@ pub fn prefill(
     let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
 
     // Argmax directly on BF16 logits on GPU
-    sample::greedy_sample_bf16(stream, &kernels.argmax, &last_row_logits)
+    let sampled = sample::greedy_sample_bf16(stream, &kernels.argmax, &last_row_logits)?;
+
+    // DEBUG: dump top-5 logits for the last token position
+    {
+        let all_logits: Vec<bf16> = stream.clone_dtoh(&logits)?;
+        let last_start = (seq_len - 1) * config.vocab_size;
+        let last_logits = &all_logits[last_start..last_start + config.vocab_size];
+        let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate()
+            .map(|(i, &v)| (i, v.to_f32()))
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("DEBUG TOP-5 LOGITS (last token):");
+        for (rank, (idx, val)) in indexed.iter().take(5).enumerate() {
+            eprintln!("  #{}: token_id={} logit={:.6}", rank+1, idx, val);
+        }
+        // Also check if expected token 248068 is in top-20
+        if let Some(pos) = indexed.iter().position(|&(idx, _)| idx == 248068) {
+            let (idx, val) = indexed[pos];
+            eprintln!("  Expected token 248068 at rank #{} with logit={:.6}", pos+1, val);
+        } else {
+            eprintln!("  Expected token 248068 NOT found in sorted logits!");
+            if let Some(val) = last_logits.get(248068) {
+                eprintln!("  Token 248068 raw logit={:.6}", val.to_f32());
+            }
+        }
+    }
+
+    Ok(sampled)
 }

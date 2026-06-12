@@ -367,9 +367,9 @@ Prefill with paged KV cache write and GQA support. See [[crates/backends/native/
 Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once). For GQA, K and V weight extraction uses `head_idx % num_kv_heads` so multiple query heads share the same KV head.
 
 ### Attention Output Gate
+When `attn_output_gate` is true, the Q output is doubled (Q + gate). After attention, the gate is applied via `infers_attn_output_gate_bf16` to compute `out = attn * sigmoid(gate)`, matching the reference model's `output_gate_type: "swish"` config.
 
-When `attn_output_gate` is true, the Q output is doubled (Q + gate). The GEMM produces `[seq, heads*dim*2]`, split into Q and gate buffers. After attention, `infers_silu_glu_bf16` computes `out = attn * sigmoid(gate)`.
-
+The original implementation used `infers_silu_glu_bf16` which computes `attn * SiLU(gate) = attn * gate * sigmoid(gate)`, amplifying the output by 2-8x depending on gate magnitude. Three bugs were fixed: (1) per-head Q extraction used wrong row stride (`per_gpu_head_dim` instead of `q_out_dim`), causing reads from the gate portion of previous tokens; (2) Q-norm was applied to the entire buffer including gate, whereas the reference model only normalizes Q; (3) the SiLU-based kernel replaced with sigmoid-only. See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]].
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
@@ -492,6 +492,12 @@ group_end()?;
 
 Diagnostic `eprintln!` calls mark group boundaries and layer progress (every 8 layers).
 
+
+### Layer Debug Stats
+
+Per-layer hidden state debugging via `debug_hidden_stats()`. Downloads a `CudaSlice<bf16>` to CPU and computes min/max/mean_abs, emitting to stderr. Gated by environment variables for zero overhead when disabled.
+
+Two modes exist: `INFERS_DEBUG_LAYER0` traces layer 0 (embedding through MLP) and `INFERS_DEBUG_LAYER3` traces layer 3 (first full attention layer) with 8 checkpoints: L3-NORM1, L3-ATTN-RAW, L3-ATTN-AR, L3-RESIDUAL-ATTN, L3-NORM2, L3-MLP-RAW, L3-MLP-AR, L3-RESIDUAL-MLP. Each label includes the GPU index (e.g., `L3-NORM1-GPU0`).
 ### Multi-Dtype Weight Upload
 
 The `upload_weight()` function checks `weight.dtype` and converts to BF16. Handles Bf16 (direct), Fp16 (via f16 cast), and Fp32 (via f32 cast). Returns `CudaSlice<bf16>`.
@@ -639,7 +645,7 @@ QK-norm uses the same `infers_rmsnorm_bf16` CUDA kernel as layer normalization, 
 
 #### When Applied
 
-K-norm normalizes full K before Phase 1 RoPE. Q-norm normalizes each head's Q before per-head RoPE.
+K-norm normalizes full K before Phase 1 RoPE. Q-norm normalizes only the Q portion (not gate) before per-head RoPE. When `attn_output_gate` is true, the output is `[seq, heads*dim*2]`; Q-norm extracts and normalizes just the first half.
 
 Both stages use `weights.q_norm` and `weights.k_norm` (optional `Option<WeightData>`).
 
@@ -1104,6 +1110,16 @@ For example at TP=2 with seq_len=15 and conv_dim=5120:
 - NOT the first 1024 columns of each row, which requires per-row strided copies
 
 See [[crates/backends/native/src/gdn.rs#extract_columns]].
+
+### Attention Q Extraction and Q-norm Fixes
+
+Two bugs in `forward_paged` and `decode_forward_paged` when `attn_output_gate` is true:
+
+1. **Per-head Q extraction used wrong row stride** (CRITICAL): The per-head loop extracted Q with `src_offset = s * per_gpu_head_dim + head_idx * head_dim`, but `q_full` has width `q_out_dim = per_gpu_head_dim * 2`. For token s=1, this read from offset `1*3072 + head_idx*256` — the gate portion of token 0, not the Q portion of token 1. Fixed to `s * q_out_dim + head_idx * head_dim`.
+
+2. **Q-norm applied to entire buffer including gate**: The RMSNorm was applied to the full `q_full` buffer `[seq, heads*dim*2]`, normalizing both Q and gate values. The HuggingFace reference (`self.q_norm(q)`) only normalizes the Q portion. Fixed by extracting just the Q portion (`[seq, heads*dim]`), applying RMSNorm, and writing back.
+
+See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]].
 
 
 ## Dead Code Cleanup

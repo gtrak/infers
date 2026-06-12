@@ -1077,7 +1077,7 @@ pub fn forward_paged(
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
     _add_kernel: &CudaFunction,
-    silu_glu_kernel: &CudaFunction,
+    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -1193,13 +1193,37 @@ pub fn forward_paged(
         seq_len, q_out_dim, hidden_size, group_size,
     )?;
 
-    // --- Q-norm on full Q before RoPE ---
+    // --- Q-norm on Q portion only (not gate) before split ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
-        q_full = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
+        // Normalize only the Q portion [0 .. seq_len * per_gpu_head_dim], not the gate portion.
+        let mut q_only = stream
+            .alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate Q-only buffer for norm: {e}"))?;
+        // Copy Q portion from q_full (first half of each row)
+        for s in 0..seq_len {
+            let src_offset = s * q_out_dim;
+            let dst_offset = s * per_gpu_head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + per_gpu_head_dim);
+            let mut dst_slice = q_only.slice_mut(dst_offset..dst_offset + per_gpu_head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy Q portion for norm failed: {e}"))?;
+        }
+        let q_normed = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
+        // Write normalized Q back into first half of each row of q_full
+        for s in 0..seq_len {
+            let src_offset = s * per_gpu_head_dim;
+            let dst_offset = s * q_out_dim;
+            let src_slice = q_normed.slice(src_offset..src_offset + per_gpu_head_dim);
+            let mut dst_slice = q_full.slice_mut(dst_offset..dst_offset + per_gpu_head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Write normalized Q back failed: {e}"))?;
+        }
     }
 
     // When gate is enabled, split q_full into q_heads and gate_heads.
@@ -1247,7 +1271,7 @@ pub fn forward_paged(
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
         for s in 0..seq_len {
-            let src_offset = s * per_gpu_head_dim + head_idx * head_dim;
+            let src_offset = s * q_out_dim + head_idx * head_dim;
             let dst_offset = s * head_dim;
             let src_slice = q_full.slice(src_offset..src_offset + head_dim);
             let mut dst_slice = q_h.slice_mut(dst_offset..dst_offset + head_dim);
@@ -1404,7 +1428,7 @@ pub fn forward_paged(
         let total_i32 = attn_combined_size as i32;
         unsafe {
             stream
-                .launch_builder(silu_glu_kernel)
+                .launch_builder(attn_output_gate_kernel)
                 .arg(&attn_combined)
                 .arg(gate_heads)
                 .arg(&mut gated)
@@ -1457,7 +1481,7 @@ pub fn decode_forward_paged(
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
     _add_kernel: &CudaFunction,
-    silu_glu_kernel: &CudaFunction,
+    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -1570,28 +1594,20 @@ pub fn decode_forward_paged(
         1, q_out_dim, hidden_size, group_size,
     )?;
 
-    // --- QK-norm on full Q before RoPE ---
-    if let Some(q_norm_w) = weights.q_norm.as_ref() {
-        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
-            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
-        q_full = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
-        )?;
-    }
-
-    // Split into Q and gate when attn_output_gate is enabled
+    // --- Q-norm on Q portion only (not gate) ---
+    // Split first, then normalize only the Q part.
     let (mut q_single, gate_single) = if attn_output_gate {
+        // Extract Q and gate portions from q_full
         let mut q_buf = stream
             .alloc_zeros::<bf16>(per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
-        // Copy first half (Q portion) from q_full
         let src_slice = q_full.slice(..per_gpu_head_dim);
         let mut dst_slice = q_buf.slice_mut(..per_gpu_head_dim);
         stream
             .memcpy_dtod(&src_slice, &mut dst_slice)
             .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
 
-        // Copy second half (gate portion) to separate buffer
+        // Copy gate portion
         let mut gate_buf = stream
             .alloc_zeros::<bf16>(per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
@@ -1605,6 +1621,16 @@ pub fn decode_forward_paged(
     } else {
         (q_full, None)
     };
+
+    // Apply Q-norm only to the Q portion
+    if let Some(q_norm_w) = weights.q_norm.as_ref() {
+        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
+        q_single = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
+        )?;
+    }
+
 
     // Apply RoPE to Q_single only (not gate)
     let mut k_rope_dummy = stream
@@ -1653,7 +1679,7 @@ pub fn decode_forward_paged(
         let total_i32 = per_gpu_head_dim as i32;
         unsafe {
             stream
-                .launch_builder(silu_glu_kernel)
+                .launch_builder(attn_output_gate_kernel)
                 .arg(&attn_output)
                 .arg(gate)
                 .arg(&mut gated)

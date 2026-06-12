@@ -30,6 +30,15 @@ use infers_model::MtpWeights;
 use infers_cuda::{group_end, group_start};
 use crate::sync;
 
+
+#[allow(dead_code)]
+fn debug_hidden_stats(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, label: &str) {
+    let cpu: Vec<half::bf16> = stream.clone_dtoh(buf).expect("dl");
+    let mean_abs = cpu.iter().map(|v| (v.to_f32() as f64).abs()).sum::<f64>() / cpu.len() as f64;
+    let max_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MIN, |a, b| a.max(b));
+    let min_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MAX, |a, b| a.min(b));
+    eprintln!("{}: min={:.4} max={:.4} mean_abs={:.6}", label, min_val, max_val, mean_abs);
+}
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
@@ -56,6 +65,7 @@ struct PerGpuKernels {
     gdn_recurrent_step: CudaFunction,
     conv1d_depthwise: CudaFunction,
     rms_norm_gated: CudaFunction,
+    attn_output_gate: CudaFunction,
 }
 
 /// Central engine for forward-pass inference.
@@ -150,6 +160,7 @@ impl ForwardEngine {
                 gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
                 conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
                 rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
+                attn_output_gate: kernels.get_function("infers_attn_output_gate_bf16")?,
             };
             per_gpu_kernels.push(pk);
         }
@@ -520,6 +531,14 @@ impl ForwardEngine {
             hidden_states.push(h);
         }
 
+        // DEBUG: embedding stats for layer 0 trace
+        if std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-EMB-GPU{}", gpu_idx));
+            }
+        }
+
         // Per-GPU sharded head counts
         let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
         let num_heads_per_gpu = config.num_attention_heads / num_gpus;
@@ -548,6 +567,16 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
+                // DEBUG: norm1 stats for layer 0 trace
+                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L0-NORM1-GPU{}", gpu_idx));
+                }
+
+                // DEBUG: norm1 stats for layer 3 trace
+                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L3-NORM1-GPU{}", gpu_idx));
+                }
+
                 // Attention or GDN with sharded weights
                 let attn_out = match layer_type {
                     LayerType::GatedDeltaNet => {
@@ -571,7 +600,7 @@ impl ForwardEngine {
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].softmax, &self.per_gpu_kernels[gpu_idx].paged_kv_write,
                             &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
-                            &self.per_gpu_kernels[gpu_idx].silu_glu,
+                            &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx], &positions,
@@ -583,6 +612,17 @@ impl ForwardEngine {
                         )?
                     }
                 };
+
+                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &attn_out, &format!("L0-GDN-RAW-GPU{}", gpu_idx));
+                }
+
+
+                // DEBUG: attn raw output stats for layer 3 trace
+                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &attn_out, &format!("L3-ATTN-RAW-GPU{}", gpu_idx));
+                }
+
                 attn_outputs.push(attn_out);
             }
 
@@ -596,6 +636,22 @@ impl ForwardEngine {
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
+            // DEBUG: attn all-reduce stats for layer 0 trace
+            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L0-ATTN-AR-GPU{}", gpu_idx));
+                }
+            }
+
+            // DEBUG: attn all-reduce stats for layer 3 trace
+            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L3-ATTN-AR-GPU{}", gpu_idx));
+                }
+            }
+
             // ================================================================
             // Phase B: Residual add on each GPU
             // ================================================================
@@ -605,6 +661,22 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
                     &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
                 )?;
+            }
+
+            // DEBUG: attn residual add stats for layer 0 trace
+            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-RESIDUAL-ATTN-GPU{}", gpu_idx));
+                }
+            }
+
+            // DEBUG: attn residual add stats for layer 3 trace
+            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L3-RESIDUAL-ATTN-GPU{}", gpu_idx));
+                }
             }
 
             // ================================================================
@@ -625,6 +697,16 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
+
+                // DEBUG: norm2 stats for layer 0 trace
+                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L0-NORM2-GPU{}", gpu_idx));
+                }
+
+                // DEBUG: norm2 stats for layer 3 trace
+                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L3-NORM2-GPU{}", gpu_idx));
+                }
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -672,6 +754,15 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
+                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L0-MLP-RAW-GPU{}", gpu_idx));
+                }
+
+                // DEBUG: MLP down proj stats for layer 3 trace
+                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                    debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L3-MLP-RAW-GPU{}", gpu_idx));
+                }
+
                 mlp_outputs.push(mlp_out);
             }
 
@@ -685,6 +776,22 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
+            // DEBUG: MLP all-reduce stats for layer 0 trace
+            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L0-MLP-AR-GPU{}", gpu_idx));
+                }
+            }
+
+            // DEBUG: MLP all-reduce stats for layer 3 trace
+            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L3-MLP-AR-GPU{}", gpu_idx));
+                }
+            }
+
             // ================================================================
             // Phase D: Residual add on each GPU
             // ================================================================
@@ -695,6 +802,46 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
                 )?;
             }
+
+            // DEBUG: MLP residual add stats for layer 0 trace
+            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-RESIDUAL-MLP-GPU{}", gpu_idx));
+                }
+            }
+
+            // DEBUG: MLP residual add stats for layer 3 trace
+            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L3-RESIDUAL-MLP-GPU{}", gpu_idx));
+                }
+            }
+
+/**/ let _ = std::env::var("INFERS_DEBUG_LAYERS");
+// DEBUG: per-layer hidden state stats
+if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
+    for gpu_idx in 0..num_gpus {
+        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+        let cpu_hidden: Vec<bf16> = gpu_stream.clone_dtoh(&hidden_states[gpu_idx]).expect("download failed");
+        let mut f_min = f64::MAX;
+        let mut f_max = f64::MIN;
+        let mut f_sum_abs = 0.0f64;
+        let mut f_nan = 0usize;
+        for v in cpu_hidden.iter() {
+            let f = v.to_f32() as f64;
+            if f.is_nan() { f_nan += 1; continue; }
+            f_sum_abs += f.abs();
+            if f < f_min { f_min = f; }
+            if f > f_max { f_max = f; }
+        }
+        let mean_abs = f_sum_abs / cpu_hidden.len() as f64;
+        let first5: Vec<String> = cpu_hidden[..5].iter().map(|v| format!("{:.4}", v.to_f32())).collect();
+        eprintln!("LAYER {} GPU{}: min={:.4} max={:.4} mean_abs={:.4} nan={} first5=[{}]",
+            layer_idx, gpu_idx, f_min, f_max, mean_abs, f_nan, first5.join(", "));
+    }
+}
 
             // Debug: dump per-layer hidden states if INFERS_DUMP_LAYER_DIR is set
             if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
@@ -750,6 +897,31 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let sampled = crate::sample::greedy_sample_bf16(
             &final_stream, &self.per_gpu_kernels[0].argmax, &last_row_logits,
         )?;
+
+        // DEBUG: dump top-5 logits for the last token position
+        {
+            let all_logits: Vec<bf16> = final_stream.clone_dtoh(&logits)?;
+            let last_start = (seq_len - 1) * config.vocab_size;
+            let last_logits = &all_logits[last_start..last_start + config.vocab_size];
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate()
+                .map(|(i, &v)| (i, v.to_f32()))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("DEBUG TOP-5 LOGITS (last token):");
+            for (rank, (idx, val)) in indexed.iter().take(5).enumerate() {
+                eprintln!("  #{}: token_id={} logit={:.6}", rank+1, idx, val);
+            }
+            // Also check if expected token 248068 is in top-20
+            if let Some(pos) = indexed.iter().position(|&(idx, _)| idx == 248068) {
+                let (idx, val) = indexed[pos];
+                eprintln!("  Expected token 248068 at rank #{} with logit={:.6}", pos+1, val);
+            } else {
+                eprintln!("  Expected token 248068 NOT found in sorted logits!");
+                if let Some(val) = last_logits.get(248068) {
+                    eprintln!("  Token 248068 raw logit={:.6}", val.to_f32());
+                }
+            }
+        }
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
 
@@ -885,7 +1057,7 @@ for layer_idx in 0..config.num_hidden_layers {
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].paged_kv_write, &self.per_gpu_kernels[gpu_idx].paged_attention_decode,
                             &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
-                            &self.per_gpu_kernels[gpu_idx].silu_glu,
+                            &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
