@@ -908,11 +908,11 @@ BF16 \[N,K\] weights: column-parallel splits dim 0, row-parallel splits dim 1. N
 
 ### INT4 sharding
 
-INT4 packed (K/8,N) qweights swap split dimensions because K and N occupy reversed axes: column-parallel splits dim 1 (N), row-parallel splits dim 0 (K/8). Companion tensors follow the same strategy.
+INT4 qweights swap split dimensions vs BF16: column-parallel splits dim 1 (N), row-parallel splits dim 0 (K/8). Companion tensors do NOT follow the same strategy — scales [N,groups] split dim 0 for column-parallel and last_dim for row-parallel.
 
 ## Shard Type Detection
 
-Tensor names determine sharding type. Projections like Q/K/V/gate/up are column-parallel; O/down are row-parallel. All others are replicated. See [[crates/model/src/sharding.rs#determine_shard_type]].
+Tensor names determine sharding type. Q/K/V/gate/up/GDN are column-parallel; O/down are row-parallel; all others replicated. See [[crates/model/src/sharding.rs#determine_shard_type]].
 
 ## Pipeline Parallelism Split
 
@@ -1024,6 +1024,18 @@ Two bugs fixed in both `gdn_update.cu` and `gdn_prefill.cu`:
 
 1. **Non-power-of-2 reduction** (MINOR): Host wrappers used `hidden_size` directly as block size, causing tree reduction to silently drop tail elements for non-power-of-2 hidden sizes. Fixed by restructuring kernels: `__global__` kernels are now placed inside `extern "C"` with names matching the registry (`infers_gdn_update_bf16`, `infers_gdn_prefill_bf16`), eliminating host wrappers. Rust-side launch configuration computes power-of-2 block sizes. Reduction loops use `tid + stride < blockDim.x` bounds checks.
 2. **Kernel name mismatch** (CRITICAL): `LoadedKernelRegistry` registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
+
+
+### GDN Recurrent Step Kernel
+
+New single-token GDN kernel replacing the faulty `gdn_gated_delta_prefill` that produced wrong results (cosine similarity ~0 vs PyTorch reference). Matches `torch_recurrent_gated_delta_rule`:
+
+- **Removed all `isfinite()` guards** — pure computation without clamping NaN/Inf to zero
+- **L2 normalization inline** — Q/K normalized per-token with eps=1e-6, Q scaled by 1/sqrt(K)
+- **Single-token processing** — each launch handles one token; prefill loops over tokens
+- **g_decay and beta computed internally** — softplus and sigmoid from projections inside kernel
+
+The Rust-side `gdn::forward()` (prefill) extracts per-token slices via `clone_view_to_slice` and launches the step kernel in a loop. `gdn::decode_forward()` uses the same kernel directly. Registered as `infers_gdn_recurrent_step_bf16`. See [[crates/backends/native/src/gdn.rs#forward]].
 
 
 ## Dead Code Cleanup

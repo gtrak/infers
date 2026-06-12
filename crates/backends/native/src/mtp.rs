@@ -83,11 +83,11 @@ pub fn forward_layer_pass(
         LayerType::GatedDeltaNet => {
             let gdn_weights = layer.gdn.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("GDN weights not found for MTP layer {}", layer_idx))?;
-            gdn::decode_forward(
+          gdn::decode_forward(
                 gemm,
                 &kernels.int4_gemm,
                 stream,
-                &kernels.gdn_gated_delta_update,
+                &kernels.gdn_recurrent_step,
                 &kernels.conv1d_depthwise,
                 &kernels.rms_norm_gated,
                 gdn_weights,

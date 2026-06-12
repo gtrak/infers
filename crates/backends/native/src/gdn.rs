@@ -237,7 +237,7 @@ fn repeat_interleave_heads(
 /// * `gemm` — cuBLASLt engine
 /// * `int4_kernel` — INT4 GEMM kernel
 /// * `stream` — CUDA stream
-/// * `gdn_prefill_kernel` — `infers_gdn_gated_delta_prefill_bf16`
+/// * `gdn_recurrent_step_kernel` — `infers_gdn_recurrent_step_bf16` (single-token step)
 /// * `conv1d_kernel` — `infers_conv1d_depthwise_silu_bf16`
 /// * `rms_norm_gated_kernel` — `infers_rms_norm_gated_bf16`
 /// * `weights` — GDN layer weights (includes in_proj_qkv, conv1d, etc.)
@@ -251,11 +251,11 @@ fn repeat_interleave_heads(
 /// # Returns
 /// GDN output `[seq_len × hidden_size]`
 #[allow(unused_assignments, clippy::too_many_arguments)]
-pub fn forward(
+  pub fn forward(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    gdn_prefill_kernel: &CudaFunction,
+    gdn_recurrent_step_kernel: &CudaFunction,
     conv1d_kernel: &CudaFunction,
     rms_norm_gated_kernel: &CudaFunction,
     weights: &GdnWeights,
@@ -483,42 +483,64 @@ pub fn forward(
     debug_tensor_stats_f32(stream, &dt_bias_f32, num_v_heads, "dt_bias_f32");
 
     // =========================================================================
-    // Phase 7: Allocate state and launch gated delta prefill kernel
+    // Phase 7: Sequential recurrent step for each token
     // =========================================================================
     gdn_state.ensure_allocated(stream, num_v_heads, head_k_dim, head_v_dim)?;
     let mut gdn_output = stream.alloc_zeros::<bf16>(seq_len * num_v_heads * head_v_dim)?;
     let state_ref = gdn_state.state.as_mut()
         .ok_or_else(|| anyhow::anyhow!("GDN state not allocated"))?;
 
-    let seq_len_i32 = seq_len as i32;
     let num_v_heads_i32 = num_v_heads as i32;
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
-
     let total_threads = num_v_heads * head_v_dim;
 
-    unsafe {
-        stream.launch_builder(gdn_prefill_kernel)
-            .arg(&query_expanded)   // [S, H, K]
-            .arg(&key_expanded)     // [S, H, K]
-            .arg(&value_flat)       // [S, H, V]
-            .arg(&a_proj)           // [S, H]
-            .arg(&b_proj)           // [S, H]
-            .arg(&a_log_f32)        // [H] float32
-            .arg(&dt_bias_f32)      // [H] float32
-            .arg(state_ref)         // [H, K, V] float32 mutable
-            .arg(&mut gdn_output)   // [S, H, V]
-            .arg(&seq_len_i32)
-            .arg(&num_v_heads_i32)
-            .arg(&head_k_dim_i32)
-            .arg(&head_v_dim_i32)
-            .launch(LaunchConfig {
-                grid_dim: ((total_threads as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("GDN gated delta prefill kernel launch failed: {e}"))?;
+    for t in 0..seq_len {
+        // Extract per-token slices by copying (avoids lifetime issues with CudaView)
+        let q_offset = t * num_v_heads * head_k_dim;
+        let k_offset = t * num_v_heads * head_k_dim;
+        let v_offset = t * num_v_heads * head_v_dim;
+        let a_offset = t * num_v_heads;
+        let b_offset = t * num_v_heads;
+
+        let q_t = clone_view_to_slice(stream, &query_expanded, q_offset..q_offset + num_v_heads * head_k_dim)?;
+        let k_t = clone_view_to_slice(stream, &key_expanded, k_offset..k_offset + num_v_heads * head_k_dim)?;
+        let v_t = clone_view_to_slice(stream, &value_flat, v_offset..v_offset + num_v_heads * head_v_dim)?;
+        let a_t = clone_view_to_slice(stream, &a_proj, a_offset..a_offset + num_v_heads)?;
+        let b_t = clone_view_to_slice(stream, &b_proj, b_offset..b_offset + num_v_heads)?;
+
+        // Output slice for this token: gdn_output[t * H * V .. (t+1) * H * V]
+        let y_offset = t * num_v_heads * head_v_dim;
+        let mut y_t = stream.alloc_zeros::<bf16>(num_v_heads * head_v_dim)?;
+
+        unsafe {
+            stream.launch_builder(gdn_recurrent_step_kernel)
+                .arg(&q_t)         // [H, K] BF16
+                .arg(&k_t)         // [H, K] BF16
+                .arg(&v_t)         // [H, V] BF16
+                .arg(&a_t)         // [H] BF16
+                .arg(&b_t)         // [H] BF16
+                .arg(&a_log_f32)   // [H] float32 (shared across tokens)
+                .arg(&dt_bias_f32) // [H] float32 (shared across tokens)
+               .arg(&mut *state_ref)   // [H, K, V] float32 mutable (shared state) - reborrow each iteration
+                .arg(&mut y_t)     // [H, V] BF16 output for this token
+                .arg(&num_v_heads_i32)
+                .arg(&head_k_dim_i32)
+                .arg(&head_v_dim_i32)
+                .launch(LaunchConfig {
+                    grid_dim: ((total_threads as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed at token {t}: {e}"))?;
+        }
+
+        // Copy y_t into the correct position in gdn_output
+        let mut out_slice = gdn_output.slice_mut(y_offset..y_offset + num_v_heads * head_v_dim);
+        stream.memcpy_dtod(&y_t, &mut out_slice)
+            .map_err(|e| anyhow::anyhow!("Failed to copy step output at token {t}: {e}"))?;
     }
+
     debug_tensor_stats_bf16(stream, &gdn_output, seq_len * num_v_heads * head_v_dim, "gdn_output");
     if do_dump { dump_gdn_intermediate(stream, &gdn_output, "core_attn_out"); }
 
@@ -604,7 +626,7 @@ pub fn decode_forward(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    gdn_update_kernel: &CudaFunction,
+    gdn_recurrent_step_kernel: &CudaFunction,
     conv1d_kernel: &CudaFunction,
     rms_norm_gated_kernel: &CudaFunction,
     weights: &GdnWeights,
@@ -742,17 +764,17 @@ pub fn decode_forward(
     // No shared memory needed — state lives in global memory
     let total_threads = num_v_heads * head_v_dim;
 
-    unsafe {
-        stream.launch_builder(gdn_update_kernel)
-            .arg(&query_expanded)
-            .arg(&key_expanded)
-            .arg(&value_flat)
-            .arg(&a_proj)
-            .arg(&b_proj)
-            .arg(&a_log_f32)
-            .arg(&dt_bias_f32)
-            .arg(state_ref)
-            .arg(&mut gdn_output)
+   unsafe {
+        stream.launch_builder(gdn_recurrent_step_kernel)
+            .arg(&query_expanded)     // [H, K] BF16
+            .arg(&key_expanded)      // [H, K] BF16
+            .arg(&value_flat)        // [H, V] BF16
+            .arg(&a_proj)            // [H] BF16
+            .arg(&b_proj)            // [H] BF16
+            .arg(&a_log_f32)         // [H] float32
+            .arg(&dt_bias_f32)       // [H] float32
+            .arg(state_ref)          // [H, K, V] float32 mutable
+            .arg(&mut gdn_output)    // [H, V] BF16 output
             .arg(&num_v_heads_i32)
             .arg(&head_k_dim_i32)
             .arg(&head_v_dim_i32)
@@ -761,7 +783,7 @@ pub fn decode_forward(
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
-            .map_err(|e| anyhow::anyhow!("GDN gated delta update kernel launch failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed: {e}"))?;
     }
 
     // =========================================================================

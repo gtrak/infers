@@ -32,6 +32,7 @@ pub struct PrefillKernels {
     pub kv_cache_write: CudaFunction,
     pub gdn_prefill: CudaFunction,
     pub gdn_gated_delta_prefill: CudaFunction,
+    pub gdn_recurrent_step: CudaFunction,
     pub conv1d_depthwise: CudaFunction,
     pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
@@ -136,11 +137,11 @@ pub fn prefill(
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                gdn::forward(
+               gdn::forward(
                     gemm,
                     &kernels.int4_gemm,
                     stream,
-                    &kernels.gdn_gated_delta_prefill,
+                    &kernels.gdn_recurrent_step,
                     &kernels.conv1d_depthwise,
                     &kernels.rms_norm_gated,
                     gdn_weights,

@@ -59,12 +59,12 @@ pub fn shard_weights_tp(
                     };
                     shard.registry.tensors.insert(name.clone(), sliced);
 
-                    // Shard INT4 companion weights (scales, qzeros) the same way
+                    // Shard INT4 companion weights — scales [N, groups] and qzeros split along dim 0 (N)
                     if is_int4 {
                         if let Some(companions) = registry.int4_companions.get(name) {
-                            let scaled_scales = slice_weight_last_dim(&companions.scales, gpu_id, num_gpus)
+                            let scaled_scales = slice_weight_dim0(&companions.scales, gpu_id, num_gpus)
                                 .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
-                            let sliced_qzeros = slice_weight_last_dim(&companions.qzeros, gpu_id, num_gpus)
+                            let sliced_qzeros = slice_weight_dim0(&companions.qzeros, gpu_id, num_gpus)
                                 .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
                             shard.registry.int4_companions.insert(
                                 name.clone(),
@@ -91,12 +91,12 @@ pub fn shard_weights_tp(
                     };
                     shard.registry.tensors.insert(name.clone(), sliced);
 
-                    // Shard INT4 companion weights (scales, qzeros) the same way
+                    // Shard INT4 companion weights — scales [N, groups] split along last dim (groups = K/group_size)
                     if is_int4 {
                         if let Some(companions) = registry.int4_companions.get(name) {
-                            let sliced_scales = slice_weight_dim0(&companions.scales, gpu_id, num_gpus)
+                            let sliced_scales = slice_weight_last_dim(&companions.scales, gpu_id, num_gpus)
                                 .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
-                            let sliced_qzeros = slice_weight_dim0(&companions.qzeros, gpu_id, num_gpus)
+                            let sliced_qzeros = slice_weight_last_dim(&companions.qzeros, gpu_id, num_gpus)
                                 .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
                             shard.registry.int4_companions.insert(
                                 name.clone(),
@@ -154,8 +154,11 @@ fn determine_shard_type(name: &str) -> ShardType {
     if name.contains("gate_proj") || name.contains("up_proj") {
         return ShardType::ColumnParallel;
     }
-    // GDN projections
-    if name.contains("in_proj_a") || name.contains("in_proj_b") {
+    // GDN projections — column-parallel (per-head output)
+    if name.contains("in_proj_qkv") || name.contains("in_proj_z")
+        || name.contains("in_proj_a") || name.contains("in_proj_b")
+        || name.contains("conv1d.weight")
+    {
         return ShardType::ColumnParallel;
     }
 
@@ -335,6 +338,21 @@ mod tests {
             ShardType::Replicated
         );
         assert_eq!(determine_shard_type("lm_head.weight"), ShardType::Replicated);
+
+        // GDN QKV and Z projections — column-parallel
+        assert_eq!(
+            determine_shard_type("model.layers.3.gdn.in_proj_qkv.qweight"),
+            ShardType::ColumnParallel
+        );
+        assert_eq!(
+            determine_shard_type("model.layers.7.gdn.in_proj_z.qweight"),
+            ShardType::ColumnParallel
+        );
+        // GDN conv1d weight — column-parallel (split along conv_dim)
+        assert_eq!(
+            determine_shard_type("model.layers.0.gdn.conv1d.weight"),
+            ShardType::ColumnParallel
+        );
     }
 
     #[test]
@@ -522,10 +540,10 @@ mod tests {
             let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
             assert_eq!(w.shape, vec![4, 4]);
 
-            // scales and qzeros should also be sharded along dim 1 → [4, 4]
+            // scales [N, groups] and qzeros — split along dim 0 (N) → [2, 8]
             let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
-            assert_eq!(companions.scales.shape, vec![4, 4], "scales should be sharded on dim 1 for column-parallel");
-            assert_eq!(companions.qzeros.shape, vec![4, 4], "qzeros should be sharded on dim 1 for column-parallel");
+            assert_eq!(companions.scales.shape, vec![2, 8], "scales should be sharded on dim 0 for column-parallel");
+            assert_eq!(companions.qzeros.shape, vec![2, 8], "qzeros should be sharded on dim 0 for column-parallel");
         }
     }
 
@@ -572,10 +590,10 @@ mod tests {
             let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
             assert_eq!(w.shape, vec![2, 8]);
 
-            // scales and qzeros should also be sharded along dim 0 → [2, 8]
+            // scales [N, groups] — split along last_dim (groups) → [4, 4]
             let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
-            assert_eq!(companions.scales.shape, vec![2, 8], "scales should be sharded on dim 0 for row-parallel");
-            assert_eq!(companions.qzeros.shape, vec![2, 8], "qzeros should be sharded on dim 0 for row-parallel");
+            assert_eq!(companions.scales.shape, vec![4, 4], "scales should be sharded on last dim for row-parallel");
+            assert_eq!(companions.qzeros.shape, vec![4, 4], "qzeros should be sharded on last dim for row-parallel");
         }
     }
 

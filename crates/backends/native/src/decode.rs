@@ -31,6 +31,7 @@ pub struct DecodeKernels {
     pub kv_cache_write: CudaFunction,
     pub gdn_update: CudaFunction,
     pub gdn_gated_delta_update: CudaFunction,
+    pub gdn_recurrent_step: CudaFunction,
     pub conv1d_depthwise: CudaFunction,
     pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
@@ -143,11 +144,11 @@ pub fn decode(
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                gdn::decode_forward(
+             gdn::decode_forward(
                     gemm,
                     &kernels.int4_gemm,
                     stream,
-                    &kernels.gdn_gated_delta_update,
+                    &kernels.gdn_recurrent_step,
                     &kernels.conv1d_depthwise,
                     &kernels.rms_norm_gated,
                     gdn_weights,
@@ -388,11 +389,11 @@ pub fn decode_with_hidden(
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for MTP layer {}", layer_idx))?;
-                gdn::decode_forward(
+             gdn::decode_forward(
                     gemm,
                     &kernels.int4_gemm,
                     stream,
-                    &kernels.gdn_gated_delta_update,
+                    &kernels.gdn_recurrent_step,
                     &kernels.conv1d_depthwise,
                     &kernels.rms_norm_gated,
                     gdn_weights,

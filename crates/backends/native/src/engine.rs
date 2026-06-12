@@ -53,6 +53,7 @@ struct PerGpuKernels {
     // New GDN kernels (gated delta rule)
     gdn_gated_delta_prefill: CudaFunction,
     gdn_gated_delta_update: CudaFunction,
+    gdn_recurrent_step: CudaFunction,
     conv1d_depthwise: CudaFunction,
     rms_norm_gated: CudaFunction,
 }
@@ -146,6 +147,7 @@ impl ForwardEngine {
                 int4_gemm: kernels.get_function("int4_gemm_kernel")?,
                 gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
                 gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
+                gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
                 conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
                 rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
             };
@@ -247,6 +249,7 @@ impl ForwardEngine {
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
             gdn_gated_delta_prefill: self.per_gpu_kernels[0].gdn_gated_delta_prefill.clone(),
+            gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
@@ -285,6 +288,7 @@ impl ForwardEngine {
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
             gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
@@ -549,9 +553,9 @@ impl ForwardEngine {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                        crate::gdn::forward(
-                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_gated_delta_prefill,
+  crate::gdn::forward(
+                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                             &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
                             &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
                             &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
                             gdn_weights, &norm1_out,
@@ -863,9 +867,9 @@ for layer_idx in 0..config.num_hidden_layers {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                        crate::gdn::decode_forward(
+                       crate::gdn::decode_forward(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_gated_delta_update,
+                            &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
                             &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
                             &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
                             gdn_weights, &norm1_out,
@@ -1240,7 +1244,7 @@ for layer_idx in 0..config.num_hidden_layers {
         let gpu_id = 0;
         let weights = &self.weights[gpu_id];
 
-        let kernels = crate::decode::DecodeKernels {
+      let kernels = crate::decode::DecodeKernels {
             rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
             silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
             rope: self.per_gpu_kernels[0].rope.clone(),
@@ -1251,6 +1255,7 @@ for layer_idx in 0..config.num_hidden_layers {
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
             gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
@@ -1291,7 +1296,7 @@ for layer_idx in 0..config.num_hidden_layers {
         max_tokens: usize,
         mtp_metrics: &mut infers_mtp::MtpMetrics,
     ) -> Result<Vec<u32>> {
-        let kernels = crate::decode::DecodeKernels {
+       let kernels = crate::decode::DecodeKernels {
             rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
             silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
             rope: self.per_gpu_kernels[0].rope.clone(),
@@ -1302,6 +1307,7 @@ for layer_idx in 0..config.num_hidden_layers {
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
             gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
