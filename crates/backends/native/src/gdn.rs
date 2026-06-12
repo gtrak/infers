@@ -21,10 +21,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use infers_cuda::gemm::GemmEngine;
+use infers_cuda::gemm::{GemmConfig, GemmEngine};
 use infers_model::{GdnWeights, ModelConfig, WeightDtype};
-
-// DEBUG: download a tensor and print statistics (min, max, mean_abs, stddev, first 5).
 fn debug_tensor_stats_bf16(
     stream: &Arc<CudaStream>,
     buf: &CudaSlice<bf16>,
@@ -274,14 +272,15 @@ pub fn forward(
     let do_dump = DUMP_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst)
         && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
 
-    let num_k_heads = config.linear_num_key_heads;       // 16
-    let num_v_heads = config.linear_num_value_heads;     // 48
-    let head_k_dim = config.linear_key_head_dim;         // 128
-    let head_v_dim = config.linear_value_head_dim;       // 128
-    let key_dim = num_k_heads * head_k_dim;               // 2048
-    let value_dim = num_v_heads * head_v_dim;             // 6144
-    let conv_dim = key_dim * 2 + value_dim;               // 10240
-    let kv_ratio = num_v_heads / num_k_heads;              // 3
+    // Compute sharded dimensions from actual weight shapes (TP-aware)
+    let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
+    let kv_ratio = config.linear_num_value_heads / config.linear_num_key_heads;  // 3 (model-level constant)
+    let num_k_heads = num_v_heads / kv_ratio;                  // Per-GPU: e.g. 8 at TP=2, 16 at TP=1
+    let head_k_dim = config.linear_key_head_dim;               // 128
+    let head_v_dim = config.linear_value_head_dim;             // 128
+    let key_dim = num_k_heads * head_k_dim;                    // Per-GPU: e.g. 1024 at TP=2
+    let value_dim = num_v_heads * head_v_dim;                  // Per-GPU: e.g. 3072 at TP=2
+    let conv_dim = key_dim * 2 + value_dim;                    // Matches per-GPU dimensions
 
     // =========================================================================
     // Phase 1: in_proj_qkv projection (if available)
@@ -383,6 +382,14 @@ pub fn forward(
     // a_proj = input @ in_proj_a^T  [seq_len, num_v_heads]
     // b_proj = input @ in_proj_b^T  [seq_len, num_v_heads] (extract from b_dim)
     // =========================================================================
+    // DEBUG: Verify cached in_proj_a weight is valid before GEMM
+    if let Some(crate::gpu_cache::CachedWeight::Bf16(w)) = cache.get(&weights.in_proj_a.name) {
+        debug_tensor_stats_bf16(stream, w, w.len(), "in_proj_a_weight");
+    } else {
+        eprintln!("DEBUG: in_proj_a NOT found as BF16 in cache!");
+    }
+    // DEBUG: Verify input is valid before GEMM
+    debug_tensor_stats_bf16(stream, input, hidden_size, "gdn_input_pre_gemm");
     let mut a_proj = stream.alloc_zeros::<bf16>(seq_len * num_v_heads)?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream, cache,
@@ -391,6 +398,56 @@ pub fn forward(
     )?;
     debug_tensor_stats_bf16(stream, &a_proj, seq_len * num_v_heads, "a_proj");
     if do_dump { dump_gdn_intermediate(stream, &a_proj, "a_proj"); }
+    // DEBUG: Compute same projection on CPU to compare with GPU result
+    if let Some(crate::gpu_cache::CachedWeight::Bf16(w)) = cache.get(&weights.in_proj_a.name) {
+        // Download weight and input
+        let cpu_input: Vec<bf16> = stream.clone_dtoh(input)?;
+        let cpu_w: Vec<bf16> = stream.clone_dtoh(w)?;
+        let cpu_a_proj: Vec<bf16> = stream.clone_dtoh(&a_proj)?;
+        
+        // Compute on CPU: a_proj[i][j] = sum_k input[i][k] * weight[j][k]
+        let k_dim = cpu_w.len() / num_v_heads;  // per-GPU hidden size
+        let m_dim = cpu_input.len() / k_dim;    // should equal seq_len
+        
+        let mut cpu_result = vec![0.0f32; m_dim * num_v_heads];
+        for i in 0..m_dim {
+            for j in 0..num_v_heads {
+                for k in 0..k_dim {
+                    let input_val = cpu_input[i * k_dim + k].to_f32();
+                    let weight_val = cpu_w[j * k_dim + k].to_f32();
+                    cpu_result[i * num_v_heads + j] += input_val * weight_val;
+                }
+            }
+        }
+        
+        // Compare first few values
+        eprintln!("DEBUG a_proj compare (GPU vs CPU, m_dim={}):", m_dim);
+        for idx in 0..5 {
+            let gpu_val = cpu_a_proj[idx].to_f32();
+            let cpu_val = cpu_result[idx];
+            eprintln!("  [{}]: GPU={:.6}, CPU={:.6}, diff={:.6}", idx, gpu_val, cpu_val, (gpu_val - cpu_val).abs());
+        }
+        
+        // Also try the transpose interpretation: a_proj[i][j] = sum_k input[k][i] * weight[j][k]
+        let mut cpu_result2 = vec![0.0f32; m_dim * num_v_heads];
+        for i in 0..m_dim {
+            for j in 0..num_v_heads {
+                for k in 0..k_dim {
+                    // Alternative: input[k][i] means reading columns of input as rows
+                    let input_val = cpu_input[k * m_dim + i].to_f32();
+                    let weight_val = cpu_w[j * k_dim + k].to_f32();
+                    cpu_result2[i * num_v_heads + j] += input_val * weight_val;
+                }
+            }
+        }
+        
+        eprintln!("DEBUG a_proj compare alt (transpose interpretation, m_dim={}):", m_dim);
+        for idx in 0..5 {
+            let gpu_val = cpu_a_proj[idx].to_f32();
+            let cpu_val = cpu_result2[idx];
+            eprintln!("  [{}]: GPU={:.6}, CPU_alt={:.6}", idx, gpu_val, cpu_val);
+        }
+    }
 
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(seq_len * b_dim)?;
@@ -484,6 +541,10 @@ pub fn forward(
             .and_then(|w| cache.get_bf16(&w.name))
             .ok_or_else(|| anyhow::anyhow!("GDN norm weight not in cache"))?;
 
+        // DEBUG: dump norm weight
+        if do_dump { dump_gdn_intermediate(stream, norm_weight, "norm_weight"); }
+
+
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         debug_tensor_stats_bf16(stream, &z_gate_raw, seq_len * z_dim, "z_gate_raw");
         if do_dump { dump_gdn_intermediate(stream, &z_gate_raw, "z_gate"); }
@@ -556,14 +617,15 @@ pub fn decode_forward(
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = 1usize;
 
-    let num_k_heads = config.linear_num_key_heads;
-    let num_v_heads = config.linear_num_value_heads;
-    let head_k_dim = config.linear_key_head_dim;
-    let head_v_dim = config.linear_value_head_dim;
-    let key_dim = num_k_heads * head_k_dim;
-    let value_dim = num_v_heads * head_v_dim;
-    let conv_dim = key_dim * 2 + value_dim;
-    let kv_ratio = num_v_heads / num_k_heads;
+    // Compute sharded dimensions from actual weight shapes (TP-aware)
+    let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
+    let kv_ratio = config.linear_num_value_heads / config.linear_num_key_heads;  // 3 (model-level constant)
+    let num_k_heads = num_v_heads / kv_ratio;                  // Per-GPU: e.g. 8 at TP=2, 16 at TP=1
+    let head_k_dim = config.linear_key_head_dim;               // 128
+    let head_v_dim = config.linear_value_head_dim;             // 128
+    let key_dim = num_k_heads * head_k_dim;                    // Per-GPU: e.g. 1024 at TP=2
+    let value_dim = num_v_heads * head_v_dim;                  // Per-GPU: e.g. 3072 at TP=2
+    let conv_dim = key_dim * 2 + value_dim;                    // Matches per-GPU dimensions
 
     // =========================================================================
     // Phase 1: in_proj_qkv

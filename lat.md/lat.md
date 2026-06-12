@@ -918,6 +918,11 @@ Tensor names determine sharding type. Projections like Q/K/V/gate/up are column-
 
 `split_layers_pp()` divides layers evenly across pipeline stages. For 64 layers and 2 stages: stage 0 gets layers 0-31, stage 1 gets layers 32-63. See [[crates/model/src/sharding.rs#split_layers_pp]].
 
+## GDN Shard-Aware Dimensions
+
+The GDN forward pass derives head counts from actual sharded weight shapes, not config constants.
+
+With TP=2, `in_proj_a` and `in_proj_b` are column-parallel — each GPU has shape [num_v_heads_per_gpu, hidden_size] instead of the full model's [48, hidden_size]. The fix computes `num_v_heads = weight_output_dim(&weights.in_proj_b)` (e.g. 24 at TP=2), then derives `num_k_heads = num_v_heads / kv_ratio` and all downstream dimensions accordingly. See [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 # Tech Debt Fixes
 
 Production hardening changes applied to improve error handling, safety, and code quality.
