@@ -1277,7 +1277,11 @@ Ignored integration tests that validate the full engine with real model weights 
 The `smoke_test_real_model` test in `crates/backends/native/tests/smoke_test.rs` loads a real model (Qwen3.6-27B AutoRound INT4 by default), initializes CUDA runtime, creates `ForwardEngine`, runs prefill + 10 decode steps, and verifies all sampled tokens are within vocab range. Requires GPU with CUDA CC 12.0+ and model weights at `INFERS_TEST_MODEL` env var path (default `~/opt/vllm/models/qwen3.6-27b-autoround-int4/`). Marked `#[ignore]` so it only runs with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test.rs#smoke_test_real_model]].
 ## GDN Reference Tests
 
-HuggingFace-based reference test capturing all GDN intermediates as .npy ground truth. See [[tests/gdn_ref_intermediates.py]].
+HuggingFace-based reference test capturing all GDN intermediates as .npy ground truth at `/tmp/ref_gdn/`. See [[tests/gdn_ref_intermediates.py]].
+
+Rust-side dump capability: `dump_gdn_intermediate()` in gdn.rs writes BF16 tensors to raw binary files when `INFERS_DUMP_GDN_DIR` is set. A static `DUMP_ONCE` AtomicBool ensures only the first GDN forward call produces dumps, preventing later-layer data from overwriting earlier layers. The `do_dump` flag at the top of `forward()` checks both DUMP_ONCE and the env var: `let do_dump = DUMP_ONCE.swap(false) && std::env::var("INFERS_DUMP_GDN_DIR").is_ok()`. Dump calls follow each intermediate computation (mixed_qkv, conv_out, query/key/value, expanded tensors, a_proj, b_proj, core_attn_out, z_gate, norm_output, output). See [[crates/backends/native/src/gdn.rs#dump_gdn_intermediate]].
+
+Comparison script: `scripts/compare_gdn_intermediates.py` loads .raw BF16 files from our dump and .npy f32 reference files, converts BF16 to f32 via `(data.astype(np.uint32) << 16).view(np.float32)`, computes cosine similarity, MSE, max absolute error, MAE, and mean relative error per tensor. Flags any tensor with cos_sim < 0.99 or max_err > 0.1. The reference uses seq_len=7; our engine processes the full prefill (seq_len=15), so the script truncates our data to the first 7 tokens for shape matching.
 
 # Tokenizer
 

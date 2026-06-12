@@ -95,6 +95,28 @@ fn debug_tensor_stats_f32(
     // if f_inf > 0 { panic!("DEBUG INF FOUND: {label} has {f_inf} Inf values"); }
 }
 
+/// Global flag: only dump GDN intermediates on the FIRST forward call.
+static DUMP_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Dump a GPU BF16 tensor to a raw binary file for reference comparison.
+fn dump_gdn_intermediate(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<bf16>,
+    name: &str,
+) {
+    if let Ok(dir) = std::env::var("INFERS_DUMP_GDN_DIR") {
+        use std::fs;
+        let path = format!("{}/{}.raw", dir, name);
+        let cpu: Vec<bf16> = stream.clone_dtoh(buf)
+            .expect("Failed to download for dump");
+        let bytes: Vec<u8> = cpu.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        fs::write(&path, &bytes)
+            .expect("Failed to write GDN dump");
+    }
+}
+
 /// Get the output dimension from a weight tensor.
 fn weight_output_dim(w: &infers_model::WeightData) -> usize {
     if w.dtype == WeightDtype::Int4Packed { w.shape[1] } else { w.shape[0] }
@@ -248,6 +270,9 @@ pub fn forward(
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
     debug_tensor_stats_bf16(stream, input, seq_len * hidden_size, "gdn_input");
+    // Only dump GDN intermediates during the FIRST forward call (first layer).
+    let do_dump = DUMP_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst)
+        && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
 
     let num_k_heads = config.linear_num_key_heads;       // 16
     let num_v_heads = config.linear_num_value_heads;     // 48
@@ -271,6 +296,7 @@ pub fn forward(
         )?;
     }
     debug_tensor_stats_bf16(stream, &mixed_qkv, seq_len * conv_dim, "mixed_qkv");
+    if do_dump { dump_gdn_intermediate(stream, &mixed_qkv, "mixed_qkv"); }
 
     // =========================================================================
     // Phase 2: Depthwise conv1d on mixed_qkv (SiLU activation)
@@ -303,6 +329,7 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
     }
     debug_tensor_stats_bf16(stream, &conv_out, seq_len * conv_dim, "conv_out");
+    if do_dump { dump_gdn_intermediate(stream, &conv_out, "conv_out"); }
 
     // =========================================================================
     // Phase 3: Split conv_out into query, key, value (extract as proper slices)
@@ -319,6 +346,9 @@ pub fn forward(
     debug_tensor_stats_bf16(stream, &query_flat, seq_len * key_dim, "query_flat");
     debug_tensor_stats_bf16(stream, &key_flat, seq_len * key_dim, "key_flat");
     debug_tensor_stats_bf16(stream, &value_flat, seq_len * value_dim, "value_flat");
+    if do_dump { dump_gdn_intermediate(stream, &query_flat, "query"); }
+    if do_dump { dump_gdn_intermediate(stream, &key_flat, "key"); }
+    if do_dump { dump_gdn_intermediate(stream, &value_flat, "value"); }
 
     // =========================================================================
     // Phase 4: Reshape and repeat_interleave query/key for num_v_heads
@@ -338,6 +368,8 @@ pub fn forward(
     } else {
         key_flat
     };
+    if do_dump { dump_gdn_intermediate(stream, &query_expanded, "query_expanded"); }
+    if do_dump { dump_gdn_intermediate(stream, &key_expanded, "key_expanded"); }
 
     // =========================================================================
     // Phase 5: Per-head scalar projections
@@ -358,6 +390,7 @@ pub fn forward(
         seq_len, num_v_heads, hidden_size, group_size,
     )?;
     debug_tensor_stats_bf16(stream, &a_proj, seq_len * num_v_heads, "a_proj");
+    if do_dump { dump_gdn_intermediate(stream, &a_proj, "a_proj"); }
 
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(seq_len * b_dim)?;
@@ -369,6 +402,7 @@ pub fn forward(
     debug_tensor_stats_bf16(stream, &b_proj_raw, seq_len * b_dim, "b_proj_raw");
     // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads)
     let b_proj = b_proj_raw;
+    if do_dump { dump_gdn_intermediate(stream, &b_proj, "b_proj"); }
 
     // =========================================================================
     // Phase 6: Upload A_log and dt_bias as float32
@@ -429,6 +463,7 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("GDN gated delta prefill kernel launch failed: {e}"))?;
     }
     debug_tensor_stats_bf16(stream, &gdn_output, seq_len * num_v_heads * head_v_dim, "gdn_output");
+    if do_dump { dump_gdn_intermediate(stream, &gdn_output, "core_attn_out"); }
 
     // =========================================================================
     // Phase 8: RMSNormGated — norm(gdn_output, z_gate, weight)
@@ -451,6 +486,7 @@ pub fn forward(
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         debug_tensor_stats_bf16(stream, &z_gate_raw, seq_len * z_dim, "z_gate_raw");
+        if do_dump { dump_gdn_intermediate(stream, &z_gate_raw, "z_gate"); }
 
         unsafe {
             stream.launch_builder(rms_norm_gated_kernel)
@@ -474,6 +510,7 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to clone GDN output: {e}"))?
     };
     debug_tensor_stats_bf16(stream, &norm_output, seq_len * num_v_heads * head_v_dim, "norm_output");
+    if do_dump { dump_gdn_intermediate(stream, &norm_output, "norm_output"); }
 
     // =========================================================================
     // Phase 9: Output projection — [seq_len, value_dim] → [seq_len, hidden_size]
@@ -491,6 +528,7 @@ pub fn forward(
         seq_len, hidden_size, value_dim, group_size,
     )?;
     debug_tensor_stats_bf16(stream, &output, seq_len * hidden_size, "output");
+    if do_dump { dump_gdn_intermediate(stream, &output, "output"); }
 
     Ok(output)
 }
