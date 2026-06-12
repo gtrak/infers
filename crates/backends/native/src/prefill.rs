@@ -18,6 +18,7 @@ use crate::gdn::{self, GdnState};
 use crate::gpu_cache::GpuWeightCache;
 use crate::norm;
 use crate::sample;
+use crate::sync;
 
 // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Prefill Path]]
 /// Kernel handles needed for the prefill pass.
@@ -56,13 +57,13 @@ pub struct PrefillKernels {
 /// 5. Sample first token
 ///
 /// # Arguments
-/// * `_nccl` — NCCL communicator (reserved for future TP=2 multi-GPU all-reduce)
+/// * `nccl` — NCCL communicator for TP=2 multi-GPU all-reduce
 /// * `group_size` — INT4 quantization group size (typically 128)
 pub fn prefill(
     gemm: &mut GemmEngine,
     stream: &Arc<CudaStream>,
     kernels: &PrefillKernels,
-    _nccl: &NcclCommunicator,
+    nccl: &NcclCommunicator,
     config: &ModelConfig,
     weights: &WeightRegistry,
     cache: &GpuWeightCache,
@@ -133,7 +134,7 @@ pub fn prefill(
         )?;
 
         // --- Attention / GDN dispatch ---
-        let attn_or_gdn_out = match layer_type {
+        let mut attn_or_gdn_out = match layer_type {
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
@@ -181,6 +182,9 @@ pub fn prefill(
                 )?
             }
         };
+
+        // --- All-reduce after row-parallel projection (TP=2) ---
+        sync::all_reduce_attention(nccl, stream, &mut attn_or_gdn_out)?;
 
         // --- Residual add (attention/GDN output + hidden) ---
         hidden = add::add(stream, &kernels.add, &hidden, &attn_or_gdn_out)?;
@@ -254,6 +258,9 @@ pub fn prefill(
             cache, &mlp_weights.down_proj.name, &silu_out, &mut mlp_out,
             seq_len, hidden_size, intermediate_size, group_size,
         )?;
+
+        // --- All-reduce after row-parallel MLP down projection (TP=2) ---
+        sync::all_reduce_mlp(nccl, stream, &mut mlp_out)?;
 
         // --- Residual add (MLP output + hidden) ---
         hidden = add::add(stream, &kernels.add, &hidden, &mlp_out)?;

@@ -17,7 +17,7 @@ use super::weights::{WeightData, WeightShard};
 // @lat: [[lat#Weight Sharding#Tensor Parallelism Sharding]]
 pub fn shard_weights_tp(
     registry: &super::weights::WeightRegistry,
-    _config: &ModelConfig,
+    config: &ModelConfig,
     num_gpus: usize,
 ) -> Result<Vec<WeightShard>> {
     anyhow::ensure!(num_gpus >= 1, "num_gpus must be >= 1");
@@ -57,8 +57,83 @@ pub fn shard_weights_tp(
         if companion_skip.contains(name) {
             continue;
         }
-        let shard_type = determine_shard_type(name);
         let is_int4 = weight.dtype == super::weights::WeightDtype::Int4Packed;
+
+        // Check if this is a fused QKV projection that needs per-projection sharding
+        let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let qkv_segments: &[(usize, usize)] = &[
+            (0, key_dim),               // Q
+            (key_dim, 2 * key_dim),     // K
+            (2 * key_dim, conv_dim),    // V
+        ];
+
+        if name.contains("in_proj_qkv") {
+            // Shard each sub-projection independently (INT4 column-major layout)
+            let layout = FusedProjectionLayout::ColumnMajor;
+
+            // Scaled segments for qzeros (conv_dim/8 instead of conv_dim)
+            let qzeros_segments: Vec<(usize, usize)> =
+                qkv_segments.iter().map(|&(s, e)| (s / 8, e / 8)).collect();
+
+            for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                let sliced = shard_fused_projection_columns(weight, gpu_id, num_gpus, qkv_segments, layout)
+                    .context(format!("Failed to shard fused QKV projection: {}", name))?;
+                shard.registry.tensors.insert(name.clone(), sliced);
+
+                // Shard INT4 companion weights with the same segment structure (also column-major)
+                if is_int4 && name.ends_with(".qweight") {
+                    let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                    let scales_name = format!("{}.scales", base);
+                    let qzeros_name = format!("{}.qzeros", base);
+
+                    if let Some(scales) = registry.tensors.get(&scales_name)
+                        && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
+                        companion_skip.insert(scales_name.clone());
+                        companion_skip.insert(qzeros_name.clone());
+                        let sliced_scales = shard_fused_projection_columns(
+                            scales,
+                            gpu_id,
+                            num_gpus,
+                            qkv_segments,
+                            layout,
+                        )
+                        .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
+                        // qzeros has last_dim = conv_dim/8, so segments must be scaled by 1/8
+                        let sliced_qzeros = shard_fused_projection_columns(
+                            qzeros,
+                            gpu_id,
+                            num_gpus,
+                            &qzeros_segments,
+                            layout,
+                        )
+                        .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
+                        shard.registry.int4_companions.insert(
+                            name.clone(),
+                            super::weights::Int4Companions {
+                                scales: sliced_scales,
+                                qzeros: sliced_qzeros,
+                            },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        if name.contains("conv1d.weight") {
+            // Shard conv1d weight with row-major layout (BF16)
+            let layout = FusedProjectionLayout::RowMajor;
+            for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                let sliced = shard_fused_projection_columns(weight, gpu_id, num_gpus, qkv_segments, layout)
+                    .context(format!("Failed to shard conv1d weight: {}", name))?;
+                shard.registry.tensors.insert(name.clone(), sliced);
+            }
+            continue;
+        }
+
+        let shard_type = determine_shard_type(name);
 
         match shard_type {
             ShardType::ColumnParallel => {
@@ -280,6 +355,111 @@ fn slice_weight_last_dim(weight: &WeightData, gpu_id: usize, num_gpus: usize) ->
         dtype: weight.dtype,
         name: weight.name.clone(),
     })
+}
+
+/// Layout mode for splitting fused projection weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FusedProjectionLayout {
+    /// INT4 column-major: shape (M, N), split on last dim (N).
+    /// Used by qweight and companion tensors (scales, qzeros) in GPTQ/AutoRound format.
+    ColumnMajor,
+    /// BF16 row-major: shape [N, K], split on first dim (N).
+    /// Used by conv1d.weight (shape [conv_dim, 1, kernel_size]).
+    RowMajor,
+}
+
+// @lat: [[lat#Weight Sharding#Tensor Parallelism Sharding#Fused QKV Projection Sharding]]
+/// Shard a fused projection weight by splitting each sub-projection independently.
+///
+/// For `in_proj_qkv`, the output dimension (last dim for INT4, first dim for BF16)
+/// contains concatenated sub-projections: [Q, K, V]. Each sub-projection must be
+/// independently split across GPUs, then re-concatenated.
+///
+/// `segments` is a list of (start, end) column ranges within the full output dimension.
+/// For in_proj_qkv: [(0, key_dim), (key_dim, 2*key_dim), (2*key_dim, conv_dim)]
+///
+/// `layout` determines which dimension to split: ColumnMajor splits dim -1 (N),
+/// RowMajor splits dim 0 (N). Companion tensors of INT4 weights use ColumnMajor
+/// even if their dtype is BF16.
+fn shard_fused_projection_columns(
+    weight: &WeightData,
+    gpu_id: usize,
+    num_gpus: usize,
+    segments: &[(usize, usize)],
+    layout: FusedProjectionLayout,
+) -> Result<WeightData> {
+    anyhow::ensure!(weight.shape.len() >= 2, "Fused projection weight must be at least 2D");
+
+    match layout {
+        FusedProjectionLayout::ColumnMajor => {
+            // Shape (M, N) — split on last dim (N).
+            // Used by INT4 qweight, scales, and qzeros companions.
+            let rows = weight.shape[0];
+            let full_n = weight.shape[1];
+            let bytes_per_element = weight.data.len() / (rows * full_n);
+
+            let shard_n: usize = segments.iter().map(|&(s, e)| (e - s) / num_gpus).sum();
+            let mut shard_data = Vec::new();
+
+            for row in 0..rows {
+                let row_offset = row * full_n * bytes_per_element;
+
+                for &(start, end) in segments {
+                    let seg_len = end - start;
+                    let shard_size = seg_len / num_gpus;
+                    let shard_start = start + gpu_id * shard_size;
+                    let shard_end = shard_start + shard_size;
+
+                    shard_data.extend_from_slice(
+                        &weight.data[row_offset + shard_start * bytes_per_element
+                            ..row_offset + shard_end * bytes_per_element],
+                    );
+                }
+            }
+
+            let mut new_shape = weight.shape.clone();
+            new_shape[1] = shard_n;
+
+            Ok(WeightData {
+                data: Bytes::from(shard_data),
+                shape: new_shape,
+                dtype: weight.dtype,
+                name: weight.name.clone(),
+            })
+        }
+        FusedProjectionLayout::RowMajor => {
+            // Shape (N, K...) — split on dim 0.
+            // Used by conv1d.weight with BF16 dtype.
+            let full_n = weight.shape[0];
+            let bytes_per_row = weight.data.len() / full_n;
+
+            let mut shard_n: usize = 0;
+            let mut shard_data = Vec::new();
+
+            for &(start, end) in segments {
+                let seg_len = end - start;
+                let shard_size = seg_len / num_gpus;
+                let shard_start = start + gpu_id * shard_size;
+                let shard_end = shard_start + shard_size;
+                shard_n += shard_size;
+
+                // Copy rows [shard_start, shard_end) from this segment
+                let start_byte = shard_start * bytes_per_row;
+                let end_byte = shard_end * bytes_per_row;
+                shard_data.extend_from_slice(&weight.data[start_byte..end_byte]);
+            }
+
+            let mut new_shape = weight.shape.clone();
+            new_shape[0] = shard_n;
+
+            Ok(WeightData {
+                data: Bytes::from(shard_data),
+                shape: new_shape,
+                dtype: weight.dtype,
+                name: weight.name.clone(),
+            })
+        }
+    }
 }
 
 /// Split model layers across pipeline stages for PP=2.
@@ -879,6 +1059,239 @@ mod tests {
                     .get("model.layers.0.mlp.down_proj.qzeros")
                     .is_none(),
                 "GPU {} qzeros should not be in tensors HashMap",
+                gpu_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_fused_projection_columns_int4() {
+        // Simulate in_proj_qkv qweight: INT4 shape (K/8, N) = (5, 12)
+        // Segments: Q=[0,4), K=[4,8), V=[8,12)
+        // TP=2: GPU0 gets Q[0,2)+K[4,6)+V[8,10) = cols 0,2,4 → N=6
+        //        GPU1 gets Q[2,4)+K[6,8)+V[10,12) = cols 5,7,9 → N=6
+        let weight = WeightData {
+            data: Bytes::from(vec![0u8; 5 * 12 * 4]), // u32
+            shape: vec![5, 12],
+            dtype: WeightDtype::Int4Packed,
+            name: "test.in_proj_qkv.qweight".to_string(),
+        };
+        let segments = &[(0, 4), (4, 8), (8, 12)];
+
+        let shard0 = shard_fused_projection_columns(&weight, 0, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard0.shape, vec![5, 6], "GPU 0 should have shape [5, 6]");
+        assert_eq!(shard0.data.len(), 5 * 6 * 4);
+
+        let shard1 = shard_fused_projection_columns(&weight, 1, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard1.shape, vec![5, 6], "GPU 1 should have shape [5, 6]");
+        assert_eq!(shard1.data.len(), 5 * 6 * 4);
+    }
+
+    #[test]
+    fn test_shard_fused_projection_columns_bf16() {
+        // Simulate conv1d.weight: BF16 shape [N, 1, kernel_size] = [12, 1, 3]
+        // Segments: Q=[0,4), K=[4,8), V=[8,12)
+        // TP=2: GPU0 gets rows Q[0,2)+K[4,6)+V[8,10) = 2+2+2=6 rows
+        //        GPU1 gets rows Q[2,4)+K[6,8)+V[10,12) = 2+2+2=6 rows
+        let weight = WeightData {
+            data: Bytes::from(vec![0u8; 12 * 1 * 3 * 2]), // bf16
+            shape: vec![12, 1, 3],
+            dtype: WeightDtype::Bf16,
+            name: "test.conv1d.weight".to_string(),
+        };
+        let segments = &[(0, 4), (4, 8), (8, 12)];
+
+        let shard0 = shard_fused_projection_columns(&weight, 0, 2, segments, FusedProjectionLayout::RowMajor).unwrap();
+        assert_eq!(shard0.shape, vec![6, 1, 3], "GPU 0 should have shape [6, 1, 3]");
+        assert_eq!(shard0.data.len(), 6 * 1 * 3 * 2);
+
+        let shard1 = shard_fused_projection_columns(&weight, 1, 2, segments, FusedProjectionLayout::RowMajor).unwrap();
+        assert_eq!(shard1.shape, vec![6, 1, 3], "GPU 1 should have shape [6, 1, 3]");
+        assert_eq!(shard1.data.len(), 6 * 1 * 3 * 2);
+    }
+
+    #[test]
+    fn test_shard_fused_projection_columns_data_correctness() {
+        // Use distinct values to verify data is extracted from correct segments.
+        // ColumnMajor layout (INT4-style): shape (2, 8), segments: Q=[0,2), K=[2,5), V=[5,8)
+        // TP=2: GPU0 gets Q[0,1)+K[2,3)+V[5,6) → 1 col from each segment = 3 cols
+        //        GPU1 gets Q[1,2)+K[3,4)+V[6,7) → 1 col from each segment = 3 cols
+        // Data layout (1 byte per element): row 0: [0,1,2,3,4,5,6,7], row 1: [10,11,12,13,14,15,16,17]
+        let weight = WeightData {
+            data: Bytes::from(vec![
+                0u8, 1, 2, 3, 4, 5, 6, 7, // row 0
+                10, 11, 12, 13, 14, 15, 16, 17, // row 1
+            ]),
+            shape: vec![2, 8],
+            dtype: WeightDtype::Int4Packed,
+            name: "test.qweight".to_string(),
+        };
+        let segments = &[(0, 2), (2, 5), (5, 8)];
+
+        // The function iterates rows first, then segments within each row.
+        // So data is in (row × segment) order: [row0_Q + row0_K + row0_V, row1_Q + row1_K + row1_V]
+        // GPU 0: col 0 from Q, col 2 from K, col 5 from V
+        // [byte(col0,row0), byte(col2,row0), byte(col5,row0), byte(col0,row1), byte(col2,row1), byte(col5,row1)]
+        // = [0, 2, 5, 10, 12, 15]
+        let shard0 = shard_fused_projection_columns(&weight, 0, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard0.shape, vec![2, 3]);
+        assert_eq!(&shard0.data[..], &[0u8, 2, 5, 10, 12, 15]);
+
+        // GPU 1: col 1 from Q, col 3 from K, col 6 from V
+        // [byte(col1,row0), byte(col3,row0), byte(col6,row0), byte(col1,row1), byte(col3,row1), byte(col6,row1)]
+        // = [1, 3, 6, 11, 13, 16]
+        let shard1 = shard_fused_projection_columns(&weight, 1, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard1.shape, vec![2, 3]);
+        assert_eq!(&shard1.data[..], &[1u8, 3, 6, 11, 13, 16]);
+    }
+
+    #[test]
+    fn test_shard_fused_projection_column_major_row_order() {
+        // Verify ColumnMajor produces row-major layout: each row contains GPU's
+        // portion of all segments contiguously (Q+K+V columns interleaved per row).
+        // 2×12 matrix with values 0..=23, segments Q=[0,4), K=[4,8), V=[8,12).
+        // TP=2: GPU 0 gets cols [0,1] from Q, [4,5] from K, [8,9] from V.
+        // GPU 0 row 0: [0,1, 4,5, 8,9]  GPU 0 row 1: [12,13, 16,17, 20,21]
+        // GPU 1 row 0: [2,3, 6,7, 10,11]  GPU 1 row 1: [14,15, 18,19, 22,23]
+        let weight = WeightData {
+            data: Bytes::from(vec![
+                0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, // row 0
+                12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, // row 1
+            ]),
+            shape: vec![2, 12],
+            dtype: WeightDtype::Int4Packed,
+            name: "test.qweight".to_string(),
+        };
+        let segments = &[(0, 4), (4, 8), (8, 12)];
+
+        let shard0 = shard_fused_projection_columns(&weight, 0, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard0.shape, vec![2, 6]);
+        assert_eq!(&shard0.data[..], &[0u8, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21]);
+
+        let shard1 = shard_fused_projection_columns(&weight, 1, 2, segments, FusedProjectionLayout::ColumnMajor).unwrap();
+        assert_eq!(shard1.shape, vec![2, 6]);
+        assert_eq!(&shard1.data[..], &[2u8, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23]);
+    }
+
+    #[test]
+    fn test_in_proj_qkv_int4_sharding() {
+        // Full integration test: INT4 in_proj_qkv with proper dimensions.
+        // key_dim = 2*16 = 32, value_dim = 4*16 = 64, conv_dim = 32 + 32 + 64 = 128
+        // Segments: Q=[0,32), K=[32,64), V=[64,128)
+        // TP=2: GPU0 gets Q[0,16)+K[32,48)+V[64,96) → N=96
+        //        GPU1 gets Q[16,32)+K[48,64)+V[96,128) → N=96
+        let mut registry = WeightRegistry::new();
+        let qweight_name = "layers.0.linear_attn.in_proj_qkv.qweight".to_string();
+
+        // qweight: shape (K/8, conv_dim) = (4, 128), K=32
+        registry.tensors.insert(
+            qweight_name.clone(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 4 * 128 * 4]),
+                shape: vec![4, 128],
+                dtype: WeightDtype::Int4Packed,
+                name: qweight_name.clone(),
+            },
+        );
+
+        // scales: shape (groups, conv_dim) = (4, 128)
+        registry.tensors.insert(
+            "layers.0.linear_attn.in_proj_qkv.scales".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 4 * 128 * 2]),
+                shape: vec![4, 128],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.linear_attn.in_proj_qkv.scales".to_string(),
+            },
+        );
+
+        // qzeros: shape (groups, conv_dim/8) = (4, 16)
+        registry.tensors.insert(
+            "layers.0.linear_attn.in_proj_qkv.qzeros".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 4 * 16 * 4]),
+                shape: vec![4, 16],
+                dtype: WeightDtype::Int4Packed,
+                name: "layers.0.linear_attn.in_proj_qkv.qzeros".to_string(),
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"linear_num_key_heads":2,"linear_key_head_dim":16,"linear_num_value_heads":4,"linear_value_head_dim":16}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        // Verify dimensions
+        assert_eq!(config.linear_num_key_heads * config.linear_key_head_dim, 32); // key_dim
+        assert_eq!(config.linear_num_value_heads * config.linear_value_head_dim, 64); // value_dim
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        // GPU 0: Q[0,16)+K[32,48)+V[64,96) → N=16+16+32=64
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
+            assert_eq!(
+                w.shape,
+                vec![4, 64],
+                "GPU {} qweight should be [4, 64]",
+                gpu_id
+            );
+
+            let companions = shards[gpu_id]
+                .registry
+                .int4_companions
+                .get(&qweight_name)
+                .unwrap();
+            assert_eq!(
+                companions.scales.shape, vec![4, 64],
+                "GPU {} scales should be [4, 64]",
+                gpu_id
+            );
+            // qzeros with scaled segments: N/8 = 64/8 = 8
+            // Scaled: Q[0,2)+K[4,6)+V[8,16) → 2+2+8=12... wait, let me recalculate.
+            // Full segments for qzeros: scaled by /8
+            // key_dim=32, so scaled: Q=[0,4), K=[4,8), V=[8,16)
+            // GPU 0: Q[0,2)+K[4,6)+V[8,12) → 2+2+4=8
+            assert_eq!(
+                companions.qzeros.shape, vec![4, 8],
+                "GPU {} qzeros should be [4, 8]",
+                gpu_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_conv1d_weight_sharding() {
+        // BF16 conv1d.weight: shape [conv_dim, 1, kernel_size] = [128, 1, 4]
+        // key_dim=32, value_dim=64, conv_dim=128
+        // Segments: Q=[0,32), K=[32,64), V=[64,128)
+        // TP=2: GPU0 gets 16+16+32=64 rows, GPU1 gets 16+16+32=64 rows
+        let mut registry = WeightRegistry::new();
+
+        registry.tensors.insert(
+            "layers.0.linear_attn.conv1d.weight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128 * 1 * 4 * 2]), // bf16
+                shape: vec![128, 1, 4],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.linear_attn.conv1d.weight".to_string(),
+            },
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"linear_num_key_heads":2,"linear_key_head_dim":16,"linear_num_value_heads":4,"linear_value_head_dim":16}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id]
+                .registry
+                .tensors
+                .get("layers.0.linear_attn.conv1d.weight")
+                .unwrap();
+            assert_eq!(
+                w.shape,
+                vec![64, 1, 4],
+                "GPU {} conv1d.weight should be [64, 1, 4]",
                 gpu_id
             );
         }

@@ -180,6 +180,33 @@ fn clone_view_to_slice(
     Ok(dst)
 }
 
+/// Extract columns `col_start..col_end` from a row-major `[seq_len, conv_dim]` tensor.
+///
+/// Each row's slice is copied independently — this is NOT a contiguous flat copy.
+fn extract_columns(
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<bf16>,
+    seq_len: usize,
+    conv_dim: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Result<CudaSlice<bf16>> {
+    let out_width = col_end - col_start;
+    let total = seq_len * out_width;
+    let mut dst = stream.alloc_zeros::<bf16>(total)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate column extract buffer: {e}"))?;
+    for t in 0..seq_len {
+        let src_offset = t * conv_dim + col_start;
+        let dst_offset = t * out_width;
+        let copy_len = out_width;
+        let src_slice = src.slice(src_offset..src_offset + copy_len);
+        let mut dst_slice = dst.slice_mut(dst_offset..dst_offset + copy_len);
+        stream.memcpy_dtod(&src_slice, &mut dst_slice)
+            .map_err(|e| anyhow::anyhow!("Failed to copy row {t}: {e}"))?;
+    }
+    Ok(dst)
+}
+
 fn bf16_to_f32_gpu(
     stream: &Arc<CudaStream>,
     src: &CudaSlice<bf16>,
@@ -338,10 +365,11 @@ fn repeat_interleave_heads(
     //   key   = conv_out[..., key_dim:2*key_dim] [seq_len, key_dim]
     //   value = conv_out[..., 2*key_dim:]      [seq_len, value_dim]
     // =========================================================================
-    // Extract slices by copying from conv_out views into new buffers
-    let query_flat = clone_view_to_slice(stream, &conv_out, 0..seq_len * key_dim)?;
-    let key_flat = clone_view_to_slice(stream, &conv_out, seq_len * key_dim..seq_len * 2 * key_dim)?;
-    let value_flat = clone_view_to_slice(stream, &conv_out, seq_len * 2 * key_dim..seq_len * (2 * key_dim + value_dim))?;
+    // Extract column slices per-row: conv_out is [seq_len, conv_dim] row-major.
+    // query = conv_out[:, :key_dim], key = conv_out[:, key_dim:2*key_dim], value = conv_out[:, 2*key_dim:]
+    let query_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, 0, key_dim)?;
+    let key_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, key_dim, 2 * key_dim)?;
+    let value_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, 2 * key_dim, 2 * key_dim + value_dim)?;
     debug_tensor_stats_bf16(stream, &query_flat, seq_len * key_dim, "query_flat");
     debug_tensor_stats_bf16(stream, &key_flat, seq_len * key_dim, "key_flat");
     debug_tensor_stats_bf16(stream, &value_flat, seq_len * value_dim, "value_flat");

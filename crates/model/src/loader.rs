@@ -492,7 +492,15 @@ fn get_weight_or_int4(
         .remove(&qweight_name)
         .with_context(|| format!("neither '{}' nor '{}' found", bf16_name, qweight_name))?;
 
-    // Extract companion tensors
+   // Extract companion tensors — check int4_companions first (populated by sharding),
+    // then fall back to registry.tensors (non-sharded path).
+    let qweight_name_ref = &qweight_name;
+    if registry.int4_companions.contains_key(qweight_name_ref) {
+        // Sharded path: companions already populated by shard_weights_tp
+        return Ok(qweight);
+    }
+
+    // Non-sharded path: extract from tensors and store in int4_companions
     let qzeros_name = format!("{}.qzeros", int4_base);
     let scales_name = format!("{}.scales", int4_base);
 
@@ -524,14 +532,21 @@ fn get_weight_or_int4_optional(
         return Ok(Some(w));
     }
 
-    // Fall back to INT4 qweight (optional — return None if missing)
+  // Fall back to INT4 qweight (optional — return None if missing)
     let qweight_name = format!("{}.qweight", int4_base);
     let qweight = match registry.tensors.remove(&qweight_name) {
         Some(w) => w,
         None => return Ok(None),
     };
 
-    // Extract companion tensors (required once qweight exists)
+    // Extract companion tensors — check int4_companions first (populated by sharding),
+    // then fall back to registry.tensors (non-sharded path).
+    if registry.int4_companions.contains_key(&qweight_name) {
+        // Sharded path: companions already populated by shard_weights_tp
+        return Ok(Some(qweight));
+    }
+
+    // Non-sharded path: extract from tensors and store in int4_companions
     let qzeros_name = format!("{}.qzeros", int4_base);
     let scales_name = format!("{}.scales", int4_base);
     let qzeros = registry.tensors.remove(&qzeros_name)

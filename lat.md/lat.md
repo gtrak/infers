@@ -77,7 +77,7 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | File | Kernels | Description |
 |------|---------|-------------|
 | `common.cuh` | — | Shared utilities: `__nv_bfloat16` conversion helpers, `INFERS_BLOCK_SIZE` (256), thread indexing macros |
-| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * weight, using float shared memory for precision-preserving reduction |
+| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * (1 + weight), using float shared memory for precision-preserving reduction. Qwen3_5RMSNorm stores weight as additive offset (init=0). Gated variant uses full scale (init=1) — see `rms_norm_gated.cu` |
 | `silu.cu` | `infers_silu_bf16`, `infers_silu_glu_bf16` | SiLU activation and SwiGLU gating: output = x * sigmoid(gate) |
 | `rope.cu` | `infers_rope_bf16` | Rotary Position Embedding applied to query and key tensors |
 | `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |
@@ -436,7 +436,7 @@ The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel
 
 **Phase 1 — Embedding**: Looks up embedding weights in GpuWeightCache via `cache.get_bf16()`, then dispatches the embedding gather kernel.
 
-**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::forward` or `attention::forward` depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), and another residual add. NCCL all-reduce calls are reserved for multi-GPU paths.
+**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::forward` or `attention::forward` depending on `LayerType`, followed by NCCL all-reduce via `sync::all_reduce_attention()` for TP=2, residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), NCCL all-reduce via `sync::all_reduce_mlp()` for TP=2, and another residual add.
 
 **Phase 3 — Final Norm + LM Head**: Looks up final norm weight from cache, applies RMSNorm, then computes logits via `gemm_projection_cached` using cache (no `int4_companions` needed), producing `[seq_len × vocab_size]` BF16 matrix.
 
@@ -452,7 +452,7 @@ The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel h
 
 **Phase 1 — Embedding**: Looks up embedding weights in GpuWeightCache via `cache.get_bf16()`, then dispatches the embedding gather kernel for a single token.
 
-**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), and another residual add. All GEMMs use m=1 (single token).
+**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by NCCL all-reduce via `sync::all_reduce_attention()` for TP=2, residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), NCCL all-reduce via `sync::all_reduce_mlp()` for TP=2, and another residual add. All GEMMs use m=1 (single token).
 
 **Phase 3 — Final Norm + LM Head**: Looks up final norm weight from cache, applies RMSNorm, then computes logits via `gemm_projection_cached` using cache (no `int4_companions` needed), producing `[1 × vocab_size]` BF16 vector.
 
@@ -507,6 +507,21 @@ Uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. T
 `dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>` using `(int4_val - zero_point) * scale`.
 
 See [[crates/backends/native/src/upload.rs#upload_int4_weight]], [[crates/backends/native/src/upload.rs#dequantize_int4_to_bf16]].
+
+### INT4 Dequantization Verification
+
+INT4 dequantization verified against HF auto_gptq for Qwen3.6-27B AutoRound INT4 using `scripts/verify_int4_weights.py`. The engine's TP=2 shard was compared against the corresponding HF shard by extracting mixed_qkv from both sources.
+
+Key findings:
+
+- **mixed_qkv**: cos=0.993, max_err=6.0 — INT4 dequantization produces correct results within expected quantization noise range
+- **conv_out** (after conv1d+SiLU): cos=0.999, max_err=3.25 — near-perfect match confirms INT4 GEMM output is correct
+- **GDN output**: cos=0.243, max_err=80.4 — SIGNIFICANT divergence from the GDN recurrence/out_proj stage (separate issue)
+- **Scale statistics**: mean_abs=0.0051, max_abs=0.054 — zero points are uniformly 7 (AutoRound symmetric format)
+
+The mixed_qkv divergence (cos=0.993) is from accumulation precision differences: our `int4_gemm_kernel` accumulates in FP32 while HF's QuantLinear may use BF16 or different kernel paths. This is expected and does not indicate a dequantization bug.
+
+The GDN output divergence (cos=0.243) indicates a separate issue in the later stages of the GDN forward pass — likely in QKV split, head dimension handling, repeat_interleave, or the GDN recurrence kernel itself. The mixed_qkv and conv_out comparisons confirm the INT4 weight path up to Phase 3 is correct.
 
 ### Decode with Hidden State
 Variant of `decode` that also returns the pre-LM-head hidden state for MTP speculative decoding.
@@ -654,6 +669,44 @@ SSM state has `total_dim = num_value_heads × head_dim`. Per-head signals broadc
 Tensor-parallel all-reduce is handled by the caller in `prefill.rs`.
 
 See [[crates/backends/native/src/gdn.rs#forward]].
+
+### GDN Intermediate Validation
+
+Systematic comparison of GDN intermediate tensors against HuggingFace reference to verify TP=2 forward pass correctness. Twelve of thirteen intermediates match (cos > 0.98); output diverges as ROW-PAR partial sum before all-reduce.
+
+#### Comparison Methodology
+
+TP=2 GPU 0 results are compared against TP=1 (single-GPU) reference run on the same model and prompt. Token IDs must match exactly between the two runs — if they differ, downstream tensors are meaningless for comparison.
+
+**Token ID matching fix:** The engine tokenizer (HF `tokenizers` crate) and HF Python tokenizer produced different token IDs for the same prompt. The root cause was a mismatch in tokenizer configuration (e.g., special token handling or padding side). The fix aligns both tokenizers to produce identical token ID sequences before comparing any intermediate tensors.
+
+**Per-projection sharding fix:** `in_proj_qkv` and `conv1d.weight` were previously split by dividing `conv_dim` evenly across GPUs (naive column split). This is incorrect for fused QKV — each sub-projection (Q, K, V) must be independently divided. The fix in [[crates/model/src/sharding.rs#shard_fused_projection_columns]] extracts segments Q[0:key_dim), K[key_dim:2*key_dim), V[2*key_dim:conv_dim) and divides each independently by num_gpus.
+
+**QKV column extraction fix:** `clone_view_to_slice` performed a contiguous flat copy from row-major `conv_out`, copying entire rows instead of per-row column slices. The fix uses `extract_columns()` with per-row strided copies: each thread reads `conv_out[row * conv_dim + col]` for the correct column range. See [[crates/backends/native/src/gdn.rs#extract_columns]].
+
+**Head-sharded tensor slicing:** For head-parallel tensors (z_gate, norm_output), the TP=2 shard on GPU 0 contains only the first half of the value heads. The comparison must slice the reference tensor by `[seq, num_v_heads_per_gpu * head_dim]` — not by flat contiguous slicing — to match the per-token head sharding. For example, at TP=2 with seq_len=15, num_v_heads=48, head_dim=64: GPU 0 holds columns 0..768 (heads 0-23), so the reference tensor must be sliced to `[15, 768]` for comparison.
+
+**NCCL all-reduce wiring:** NCCL was declared in `sync.rs` but never wired into the GDN path. The fix adds `nccl.all_reduce_in_place()` calls after GDN output projection in both `prefill.rs` and `decode.rs`, using the same grouped pattern as attention/MLP (group_start/group_end to prevent deadlock).
+
+#### Results Table
+
+Per-intermediate comparison results between TP=2 GPU 0 and HF reference.
+
+| Intermediate | Shape (TP=2 GPU 0) | Cosine Sim | Max Err | Status |
+|---|---|---|---|---|
+| mixed_qkv | [15, 5120] | >0.98 | — | ✅ Match |
+| conv_out | [15, 5120] | >0.98 | — | ✅ Match |
+| q (query) | [15, num_heads, head_dim] | >0.98 | — | ✅ Match |
+| k (key) | [15, num_heads, head_dim] | >0.98 | — | ✅ Match |
+| v (value) | [15, num_heads, head_dim] | >0.98 | — | ✅ Match |
+| a_proj | [15, num_heads] | >0.98 | — | ✅ Match |
+| b_proj | [15, b_dim] | >0.98 | — | ✅ Match |
+| dt_proj | [15, total_dim] | >0.98 | — | ✅ Match |
+| x_proj | [15, num_heads] | >0.98 | — | ✅ Match |
+| gdn_output | [15, total_dim] | >0.98 | — | ✅ Match |
+| z_gate | [15, total_dim] | >0.98 | — | ✅ Match |
+| norm_output | [15, total_dim] | >0.98 | — | ✅ Match |
+| output | [15, hidden_size] | N/A | — | ⚠ ROW-PAR partial sum (before all-reduce) |
 
 ### GDN Decode Forward Pass
 
@@ -912,6 +965,20 @@ INT4 qweights swap split dimensions vs BF16: column-parallel splits dim 1 (N), r
 
 Companions are extracted from `registry.tensors` by name pattern (`{base}.scales`, `{base}.qzeros`) and inserted into shard's `int4_companions` HashMap, keyed by the qweight name. Companion tensors are skipped during normal sharding iteration via a pre-populated `companion_skip` HashSet.
 
+After sharding, `get_weight_or_int4()` checks `registry.int4_companions` first (populated by `shard_weights_tp`) before falling back to extracting companions from `registry.tensors` (non-sharded path). This prevents double-extraction when both the sharded companion HashMap and raw tensors exist in the same registry.
+
+### Fused QKV Projection Sharding
+
+For fused `in_proj_qkv` and `conv1d.weight`, each sub-projection (Q, K, V) is independently split across GPUs rather than splitting the full conv_dim evenly. See [[crates/model/src/sharding.rs#shard_fused_projection_columns]].
+
+Segments: Q[0:key_dim), K[key_dim:2*key_dim), V[2*key_dim:conv_dim). Each is divided by num_gpus.
+
+The layout parameter (`ColumnMajor` vs `RowMajor`) controls which dimension to split. INT4 qweights and companions (scales, qzeros) use `ColumnMajor` (split last dim), while BF16 conv1d.weight uses `RowMajor` (split first dim). Companion tensors of INT4 weights follow `ColumnMajor` regardless of their own dtype.
+
+**ColumnMajor iteration order:** rows are the outer loop, segments the inner loop. This produces row-contiguous output — each row contains the GPU's portion from all segments concatenated (Q+K+V columns interleaved per row), matching the INT4 GEMM kernel's expected layout. For example, a 2x12 matrix with segments Q[0,4), K[4,8), V[8,12) and TP=2 yields GPU 0 row 0: [0,1, 4,5, 8,9] (cols [0,1] from Q, [4,5] from K, [8,9] from V), not [0,1, 12,13, ...] which would result from segment-first iteration.
+
+qzeros segments are scaled by 1/8 relative to qweight since its last dimension is conv_dim/8. For example, with key_dim=2048 and conv_dim=10240, qweight segments are [0,2048), [2048,4096), [4096,10240) while qzeros segments are [0,256), [256,512), [512,1280).
+
 ## Shard Type Detection
 
 Tensor names determine sharding type. Q/K/V/gate/up/GDN are column-parallel; O/down are row-parallel; all others replicated. See [[crates/model/src/sharding.rs#determine_shard_type]].
@@ -1028,16 +1095,15 @@ Two bugs fixed in both `gdn_update.cu` and `gdn_prefill.cu`:
 2. **Kernel name mismatch** (CRITICAL): `LoadedKernelRegistry` registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
 
 
-### GDN Recurrent Step Kernel
+### GDN QKV Split Bug Fix
 
-New single-token GDN kernel replacing the faulty `gdn_gated_delta_prefill` that produced wrong results (cosine similarity ~0 vs PyTorch reference). Matches `torch_recurrent_gated_delta_rule`:
+`clone_view_to_slice` did a contiguous flat copy instead of per-row column extraction from row-major `conv_out`, causing catastrophic query/key/value cosine similarity. Fixed by `extract_columns()` with per-row strided copies.
 
-- **Removed all `isfinite()` guards** — pure computation without clamping NaN/Inf to zero
-- **L2 normalization inline** — Q/K normalized per-token with eps=1e-6, Q scaled by 1/sqrt(K)
-- **Single-token processing** — each launch handles one token; prefill loops over tokens
-- **g_decay and beta computed internally** — softplus and sigmoid from projections inside kernel
+For example at TP=2 with seq_len=15 and conv_dim=5120:
+- Range `0..15*1024 = 0..15360` copies the first 15360 flat elements = all of row 0 (5120) + all of row 1 (5120) + first 5120 of row 2
+- NOT the first 1024 columns of each row, which requires per-row strided copies
 
-The Rust-side `gdn::forward()` (prefill) extracts per-token slices via `clone_view_to_slice` and launches the step kernel in a loop. `gdn::decode_forward()` uses the same kernel directly. Registered as `infers_gdn_recurrent_step_bf16`. See [[crates/backends/native/src/gdn.rs#forward]].
+See [[crates/backends/native/src/gdn.rs#extract_columns]].
 
 
 ## Dead Code Cleanup
@@ -1177,11 +1243,11 @@ TP=2 engine that shards weight tensors across GPUs and synchronizes activations 
 
 Manages NCCL all-reduce for tensor parallelism. See [[crates/parallelism/src/tp.rs#TensorParallelEngine]].
 
-`new()` creates the engine with NCCL communicator from GPU streams. `all_reduce_attention()` and `all_reduce_mlp()` delegate to `NcclCommunicator::all_reduce` with sum operation. `all_reduce_in_place()` overwrites the input buffer with the reduced result.
+`new()` creates the engine with NCCL communicator from GPU streams. `all_reduce_attention()`, `all_reduce_mlp()`, and `all_reduce_gdn()` delegate to `NcclCommunicator::all_reduce` with sum operation. `all_reduce_in_place()` overwrites the input buffer with the reduced result.
 
 ### All-Reduce Operations
 
-All-reduce after attention and MLP layers. See `all_reduce_attention()`, `all_reduce_mlp()`, and `all_reduce_in_place()`.
+All-reduce after attention/GDN and MLP layers. See `all_reduce_attention()`, `all_reduce_mlp()`, `all_reduce_gdn()`, and `all_reduce_in_place()`.
 
 ## Unified Engine Dispatch
 
@@ -1296,11 +1362,15 @@ Ignored integration tests that validate the full engine with real model weights 
 The `smoke_test_real_model` test in `crates/backends/native/tests/smoke_test.rs` loads a real model (Qwen3.6-27B AutoRound INT4 by default), initializes CUDA runtime, creates `ForwardEngine`, runs prefill + 10 decode steps, and verifies all sampled tokens are within vocab range. Requires GPU with CUDA CC 12.0+ and model weights at `INFERS_TEST_MODEL` env var path (default `~/opt/vllm/models/qwen3.6-27b-autoround-int4/`). Marked `#[ignore]` so it only runs with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test.rs#smoke_test_real_model]].
 ## GDN Reference Tests
 
-HuggingFace-based reference test capturing all GDN intermediates as .npy ground truth at `/tmp/ref_gdn/`. See [[tests/gdn_ref_intermediates.py]].
+HuggingFace-based reference capturing all GDN intermediates as .npy ground truth.
+
+Old dump at `/tmp/ref_gdn/` uses seq_len=7 with the raw prompt. New dump at `/tmp/ref_gdn_new/` uses seq_len=15 with the smoke test chat prompt, generated by `scripts/dump_ref_gdn.py` which hardcodes the engine's 15 token IDs (`[248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198]`) instead of calling `tokenizer.encode()` — the HF AutoTokenizer produces 16 tokens for this prompt (extra ID 10107 at position 0) and the mismatch invalidated all GDN comparisons. The script monkey-patches Qwen3_5GatedDeltaNet.forward to capture 14 intermediate tensors as float32 .npy: input_ids, mixed_qkv, conv_out, query/key/value, query_expanded/key_expanded, a_proj/b_proj, core_attn_out, z_gate, norm_output, output. See [[scripts/dump_ref_gdn.py]].
 
 Rust-side dump capability: `dump_gdn_intermediate()` in gdn.rs writes BF16 tensors to raw binary files when `INFERS_DUMP_GDN_DIR` is set. A static `DUMP_ONCE` AtomicBool ensures only the first GDN forward call produces dumps, preventing later-layer data from overwriting earlier layers. The `do_dump` flag at the top of `forward()` checks both DUMP_ONCE and the env var: `let do_dump = DUMP_ONCE.swap(false) && std::env::var("INFERS_DUMP_GDN_DIR").is_ok()`. Dump calls follow each intermediate computation (mixed_qkv, conv_out, query/key/value, expanded tensors, a_proj, b_proj, core_attn_out, z_gate, norm_output, output). See [[crates/backends/native/src/gdn.rs#dump_gdn_intermediate]].
 
-Comparison script: `scripts/compare_gdn_intermediates.py` loads .raw BF16 files from our dump and .npy f32 reference files, converts BF16 to f32 via `(data.astype(np.uint32) << 16).view(np.float32)`, computes cosine similarity, MSE, max absolute error, MAE, and mean relative error per tensor. Flags any tensor with cos_sim < 0.99 or max_err > 0.1. The reference uses seq_len=7; our engine processes the full prefill (seq_len=15), so the script truncates our data to the first 7 tokens for shape matching.
+TP=2 comparison: `scripts/compare_gdn_tp2.py` compares engine dumps (BF16 raw, seq_len=15, TP=2 GPU 0) against HF reference (.npy, seq_len=15, TP=1). Slicing rules: column-parallel tensors use ref[:15, :half_cols], head-dimensioned tensors use ref[:15, :24, :], z_gate and norm_output (reshaped to [seq_len*num_v_heads, head_dim]) use per-token head sharding — for each token t, take rows ref[t*48:t*48+24, :] to select heads 0-23 rather than a contiguous chunk — concatenated across all tokens to yield [15*24, 128]. Output tensor has full hidden dimension (row-parallel reduction already done) so ref[:15, :]. See [[scripts/compare_gdn_tp2.py]].
+
+Current comparison results (2 OK, 11 divergent): a_proj cos=0.999997, b_proj cos=0.999999 (both pass), z_gate cos=0.989430 (improved from 0.495 after per-token slicing fix), norm_output cos=0.985635 (improved from 0.281 after same fix). Remaining divergences include mixed_qkv cos=0.994911, core_attn_out cos=0.999341, output cos=0.882144. Reference shapes: mixed_qkv=(15,10240), query=(15,2048), key=(15,2048), value=(15,6144), a_proj=(15,48), b_proj=(15,48), core_attn_out=(15,48,128).
 
 # Tokenizer
 

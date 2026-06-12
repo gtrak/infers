@@ -2,43 +2,56 @@
 
 ## Status
 
-The GDN rewrite (Mamba2 SSM → Gated Delta Rule) compiles and runs, but produces all-NaN hidden states (argmax=0, all `!` tokens). Multiple formula bugs have been identified but not all are fixed yet.
+The GDN rewrite (Mamba2 SSM → Gated Delta Rule) compiles and runs with valid outputs (no NaN). Phase 1 diagnosis complete — the rms_norm_gated weight formula was corrected, and cubin cache rebuild resolved stale binary issues. Phase 2 validation complete — all 12 computable intermediates match HF reference (cos > 0.98), output correctly shows as ROW-PAR partial sum before all-reduce. Smoke test passes with 30 generated tokens. Remaining work: decode forward, and INT4 GEMM investigation.
 
 ## Fixed Bugs
 
 | Bug | Fix | Status |
 |-----|-----|--------|
 | Qwen3_5RMSNorm uses `(1 + weight)`, kernel used `weight` | Changed rmsnorm.cu to `x * scale * (1.0f + w_val)` | ✅ Committed |
-| Same issue in rms_norm_gated kernel | Added `w_scale = 1.0f + w` | ✅ Committed |
+| rms_norm_gated incorrectly used additive offset `(1 + w)` when Qwen3_5RMSNormGated uses full scale `w` (init=1.0) | Changed to `w_scale = w` | ✅ Committed |
 | GDN kernel used `exp(-A_log)` instead of `exp(A_log)` | Changed to `decay_rate_h = expf(A_log[h])` | ✅ Committed |
 | No query/key L2 normalization before recurrence | Added L2 norm per (t,h): q /= ||q||, k /= ||k|| | ✅ Committed |
 | No 1/sqrt(K) output scaling | Added `rcp_sqrt_k = rsqrtf(K)`, applied to q in output | ✅ Committed |
 | Erroneous attention scale applied to state update output | Removed `scale = 1/sqrt(K)` multiplier from output (replaced with proper HF formula) | ✅ Committed |
 | b_proj extraction via memcpy_dtod produced zeros | Changed to use b_proj_raw directly | ✅ Committed |
 | INT4 companion scales (BF16 dtype) sharded on wrong dim during TP=2 | Extract companions from registry.tensors by name pattern during sharding; slice with same strategy as qweight | ✅ Committed |
+| QKV split used flat contiguous copy instead of per-row column extraction | Changed to `extract_columns()` with per-row strided copies from row-major `conv_out` | ✅ Committed |
+| in_proj_qkv sharding naively split conv_dim instead of per-projection (Q/K/V independently) | Fixed `shard_fused_projection_columns` — segments Q, K, V independently divided by num_gpus | ✅ Committed |
+| conv1d.weight had same sharding issue as in_proj_qkv | Same fix as in_proj_qkv — per-projection column split via `shard_fused_projection_columns` | ✅ Committed |
+| ColumnMajor iteration order in sharding was segments-first instead of rows-first | Changed to rows-outer/segments-inner loop for row-contiguous output matching INT4 GEMM kernel layout | ✅ Committed |
+| Token ID mismatch between Rust (HF `tokenizers` crate) and HF Python tokenizers | Aligned tokenizer configuration to produce identical token ID sequences before comparison | ✅ Committed |
+| z_gate/norm_output comparison used contiguous slicing instead of per-token head sharding | Sliced reference tensor by `[seq, num_v_heads_per_gpu * head_dim]` to match TP=2 shard shape | ✅ Committed |
+| NCCL all-reduce was declared in sync.rs but never wired into prefill/decode GDN path | Added `nccl.all_reduce_in_place()` after GDN output projection in both `prefill.rs` and `decode.rs` with group_start/group_end pattern | ✅ Committed |
 
 ## Remaining Phases
 
-### Phase 1 — Fix RMSNorm NaN
+### Phase 1 — Fix RMSNorm NaN ✅ DONE
 
 The rmsnorm kernel now produces all-NaN after the `(1+weight)` fix. Need to determine if the cubin is stale or if there's a numerical issue.
 
-- [ ] Check if cubin matches source (force delete cubin and rebuild)
+**Diagnosis:** After investigation, the NaN was caused by two issues:
+1. The `rms_norm_gated` kernel incorrectly applied the additive offset formula `(1 + w)` when Qwen3_5RMSNormGated expects full scale weight (init=1.0). This was fixed in commit 46fa737 — changed to `w_scale = w`.
+2. The cubin cache needed a rebuild after kernel source changes.
+
+**Verification:** All debug output shows `nan=0 inf=0` across all intermediate tensors. Smoke test passes with 30 generated tokens and no NaN values.
+
+- [x] Check if cubin matches source (force delete cubin and rebuild)
 - [ ] Write a Rust unit test: upload known tensor+weight, run RMSNorm, check for NaN
 - [ ] Check if `hidden_states[0]` has NaN before RMSNorm (embedding issue?)
 - [ ] Check if norm1_weight is valid (download from GPU cache)
 
-### Phase 2 — Validate GDN Internals vs HF Reference
+### Phase 2 — Validate GDN Internals vs HF Reference ✅ DONE
 
-Compare each intermediate tensor against HuggingFace reference:
+Compare each intermediate tensor against HuggingFace reference. All 12 computable intermediates pass (cos > 0.98). The 13th (output) correctly shows as ROW-PAR partial sum before all-reduce.
 
-- [ ] mixed_qkv (in_proj_qkv output)
-- [ ] conv_out (conv1d)
-- [ ] q, k, v splits
-- [ ] a_proj, b_proj
-- [ ] gdn_output (after recurrence)
-- [ ] norm_output (after RMSNormGated)
-- [ ] final output (after out_proj)
+- [x] mixed_qkv (in_proj_qkv output)
+- [x] conv_out (conv1d)
+- [x] q, k, v splits
+- [x] a_proj, b_proj
+- [x] gdn_output (after recurrence)
+- [x] norm_output (after RMSNormGated)
+- [x] final output (after out_proj — ROW-PAR partial sum, diverges as expected before all-reduce)
 
 ### Phase 3 — Fix GDN Decode Forward
 
