@@ -15,6 +15,7 @@ The GDN rewrite (Mamba2 SSM → Gated Delta Rule) compiles and runs, but produce
 | No 1/sqrt(K) output scaling | Added `rcp_sqrt_k = rsqrtf(K)`, applied to q in output | ✅ Committed |
 | Erroneous attention scale applied to state update output | Removed `scale = 1/sqrt(K)` multiplier from output (replaced with proper HF formula) | ✅ Committed |
 | b_proj extraction via memcpy_dtod produced zeros | Changed to use b_proj_raw directly | ✅ Committed |
+| INT4 companion scales (BF16 dtype) sharded on wrong dim during TP=2 | Extract companions from registry.tensors by name pattern during sharding; slice with same strategy as qweight | ✅ Committed |
 
 ## Remaining Phases
 

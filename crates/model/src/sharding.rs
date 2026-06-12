@@ -3,6 +3,8 @@
 //! TP=2: column-parallel for Q/K/V/gate/up projections, row-parallel for O/down.
 //! PP=2: split layers into two stages (0-31, 32-63).
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use super::config::ModelConfig;
@@ -40,7 +42,21 @@ pub fn shard_weights_tp(
     // and slice accordingly. INT4 weights (GPTQ/AutoRound) store qweights as
     // (K/8, N) — swapped relative to BF16's [N, K] — so the split dimension
     // differs between formats.
+
+    // Pre-scan: companion tensors (.scales, .qzeros) are skipped during sharding
+    // since they are processed together with their qweight parent.
+    let mut companion_skip: HashSet<String> = HashSet::new();
+    for name in registry.tensors.keys() {
+        if name.ends_with(".scales") || name.ends_with(".qzeros") {
+            companion_skip.insert(name.clone());
+        }
+    }
+
     for (name, weight) in &registry.tensors {
+        // Skip companion tensors that were already processed with their qweight.
+        if companion_skip.contains(name) {
+            continue;
+        }
         let shard_type = determine_shard_type(name);
         let is_int4 = weight.dtype == super::weights::WeightDtype::Int4Packed;
 
@@ -59,17 +75,24 @@ pub fn shard_weights_tp(
                     };
                     shard.registry.tensors.insert(name.clone(), sliced);
 
-                    // Shard INT4 companion weights — scales [N, groups] and qzeros split along dim 0 (N)
-                    if is_int4 {
-                        if let Some(companions) = registry.int4_companions.get(name) {
-                            let scaled_scales = slice_weight_dim0(&companions.scales, gpu_id, num_gpus)
-                                .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
-                            let sliced_qzeros = slice_weight_dim0(&companions.qzeros, gpu_id, num_gpus)
-                                .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
+                    // Shard INT4 companion weights — extract from registry.tensors by name pattern.
+                    if is_int4 && name.ends_with(".qweight") {
+                        let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                        let scales_name = format!("{}.scales", base);
+                        let qzeros_name = format!("{}.qzeros", base);
+
+                        if let Some(scales) = registry.tensors.get(&scales_name)
+                            && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
+                            companion_skip.insert(scales_name.clone());
+                            companion_skip.insert(qzeros_name.clone());
+                            let sliced_scales = slice_weight_last_dim(scales, gpu_id, num_gpus)
+                                .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
+                            let sliced_qzeros = slice_weight_last_dim(qzeros, gpu_id, num_gpus)
+                                .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
                             shard.registry.int4_companions.insert(
                                 name.clone(),
                                 super::weights::Int4Companions {
-                                    scales: scaled_scales,
+                                    scales: sliced_scales,
                                     qzeros: sliced_qzeros,
                                 },
                             );
@@ -91,13 +114,20 @@ pub fn shard_weights_tp(
                     };
                     shard.registry.tensors.insert(name.clone(), sliced);
 
-                    // Shard INT4 companion weights — scales [N, groups] split along last dim (groups = K/group_size)
-                    if is_int4 {
-                        if let Some(companions) = registry.int4_companions.get(name) {
-                            let sliced_scales = slice_weight_last_dim(&companions.scales, gpu_id, num_gpus)
-                                .with_context(|| format!("Failed to shard INT4 scales: {}", name))?;
-                            let sliced_qzeros = slice_weight_last_dim(&companions.qzeros, gpu_id, num_gpus)
-                                .with_context(|| format!("Failed to shard INT4 qzeros: {}", name))?;
+                    // Shard INT4 companion weights — extract from registry.tensors by name pattern.
+                    if is_int4 && name.ends_with(".qweight") {
+                        let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                        let scales_name = format!("{}.scales", base);
+                        let qzeros_name = format!("{}.qzeros", base);
+
+                        if let Some(scales) = registry.tensors.get(&scales_name)
+                            && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
+                            companion_skip.insert(scales_name.clone());
+                            companion_skip.insert(qzeros_name.clone());
+                            let sliced_scales = slice_weight_dim0(scales, gpu_id, num_gpus)
+                                .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
+                            let sliced_qzeros = slice_weight_dim0(qzeros, gpu_id, num_gpus)
+                                .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
                             shard.registry.int4_companions.insert(
                                 name.clone(),
                                 super::weights::Int4Companions {
@@ -114,12 +144,22 @@ pub fn shard_weights_tp(
                 for shard in shards.iter_mut() {
                     shard.registry.tensors.insert(name.clone(), weight.clone());
 
-                    // Replicate INT4 companion weights as well
-                    if is_int4 {
-                        if let Some(companions) = registry.int4_companions.get(name) {
+                    // Replicate INT4 companion weights — extract from registry.tensors by name pattern.
+                    if is_int4 && name.ends_with(".qweight") {
+                        let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                        let scales_name = format!("{}.scales", base);
+                        let qzeros_name = format!("{}.qzeros", base);
+
+                        if let Some(scales) = registry.tensors.get(&scales_name)
+                            && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
+                            companion_skip.insert(scales_name.clone());
+                            companion_skip.insert(qzeros_name.clone());
                             shard.registry.int4_companions.insert(
                                 name.clone(),
-                                companions.clone(),
+                                super::weights::Int4Companions {
+                                    scales: scales.clone(),
+                                    qzeros: qzeros.clone(),
+                                },
                             );
                         }
                     }
@@ -499,6 +539,9 @@ mod tests {
     #[test]
     fn test_shard_weights_tp_int4_companions_column_parallel() {
         // Verify companion weights (scales, qzeros) are also sharded correctly.
+        // For transposed INT4 format: qweight [K/8, N], scales [K/group_size, N].
+        // Column-parallel splits N on the last dim (same as qweight).
+        // Companions must be present as separate tensors in registry.tensors.
         let mut registry = WeightRegistry::new();
         let qweight_name = "layers.0.mlp.gate_proj.qweight".to_string();
         registry.tensors.insert(
@@ -511,22 +554,23 @@ mod tests {
             },
         );
 
-        // Scales: same shape as (K/group_size, N) — here [4, 8]
-        registry.int4_companions.insert(
-            qweight_name.clone(),
-            crate::weights::Int4Companions {
-                scales: WeightData {
-                    data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
-                    shape: vec![4, 8],
-                    dtype: WeightDtype::Bf16,
-                    name: "layers.0.mlp.gate_proj.scales".to_string(),
-                },
-                qzeros: WeightData {
-                    data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
-                    shape: vec![4, 8],
-                    dtype: WeightDtype::Int4Packed,
-                    name: "layers.0.mlp.gate_proj.qzeros".to_string(),
-                },
+        // Scales and qzeros must be in registry.tensors (not int4_companions)
+        registry.tensors.insert(
+            "layers.0.mlp.gate_proj.scales".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.mlp.gate_proj.scales".to_string(),
+            },
+        );
+        registry.tensors.insert(
+            "layers.0.mlp.gate_proj.qzeros".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "layers.0.mlp.gate_proj.qzeros".to_string(),
             },
         );
 
@@ -540,16 +584,19 @@ mod tests {
             let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
             assert_eq!(w.shape, vec![4, 4]);
 
-            // scales [N, groups] and qzeros — split along dim 0 (N) → [2, 8]
+            // scales [K/group_size, N] and qzeros — split along last dim (N) → [4, 4]
             let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
-            assert_eq!(companions.scales.shape, vec![2, 8], "scales should be sharded on dim 0 for column-parallel");
-            assert_eq!(companions.qzeros.shape, vec![2, 8], "qzeros should be sharded on dim 0 for column-parallel");
+            assert_eq!(companions.scales.shape, vec![4, 4], "scales should be sharded on last dim for column-parallel (transposed format)");
+            assert_eq!(companions.qzeros.shape, vec![4, 4], "qzeros should be sharded on last dim for column-parallel (transposed format)");
         }
     }
 
     #[test]
     fn test_shard_weights_tp_int4_companions_row_parallel() {
         // Verify companion weights are sharded correctly for row-parallel.
+        // For transposed INT4 format: qweight [K/8, N], scales [K/group_size, N].
+        // Row-parallel splits K/group_size on dim 0 (same as qweight splits K/8 on dim 0).
+        // Companions must be present as separate tensors in registry.tensors.
         let mut registry = WeightRegistry::new();
         let qweight_name = "layers.0.mlp.down_proj.qweight".to_string();
         registry.tensors.insert(
@@ -562,21 +609,23 @@ mod tests {
             },
         );
 
-        registry.int4_companions.insert(
-            qweight_name.clone(),
-            crate::weights::Int4Companions {
-                scales: WeightData {
-                    data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
-                    shape: vec![4, 8],
-                    dtype: WeightDtype::Bf16,
-                    name: "layers.0.mlp.down_proj.scales".to_string(),
-                },
-                qzeros: WeightData {
-                    data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
-                    shape: vec![4, 8],
-                    dtype: WeightDtype::Int4Packed,
-                    name: "layers.0.mlp.down_proj.qzeros".to_string(),
-                },
+        // Scales and qzeros must be in registry.tensors (not int4_companions)
+        registry.tensors.insert(
+            "layers.0.mlp.down_proj.scales".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]), // shape [4, 8] * 2 bytes (BF16)
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "layers.0.mlp.down_proj.scales".to_string(),
+            },
+        );
+        registry.tensors.insert(
+            "layers.0.mlp.down_proj.qzeros".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]), // shape [4, 8] * 4 bytes (u32)
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "layers.0.mlp.down_proj.qzeros".to_string(),
             },
         );
 
@@ -590,10 +639,10 @@ mod tests {
             let w = shards[gpu_id].registry.tensors.get(&qweight_name).unwrap();
             assert_eq!(w.shape, vec![2, 8]);
 
-            // scales [N, groups] — split along last_dim (groups) → [4, 4]
+            // scales [K/group_size, N] — split along dim 0 (groups) → [2, 8]
             let companions = shards[gpu_id].registry.int4_companions.get(&qweight_name).unwrap();
-            assert_eq!(companions.scales.shape, vec![4, 4], "scales should be sharded on last dim for row-parallel");
-            assert_eq!(companions.qzeros.shape, vec![4, 4], "qzeros should be sharded on last dim for row-parallel");
+            assert_eq!(companions.scales.shape, vec![2, 8], "scales should be sharded on dim 0 for row-parallel (transposed format)");
+            assert_eq!(companions.qzeros.shape, vec![2, 8], "qzeros should be sharded on dim 0 for row-parallel (transposed format)");
         }
     }
 
@@ -662,6 +711,176 @@ mod tests {
         for gpu_id in 0..2 {
             let w = shards[gpu_id].registry.tensors.get("lm_head.qweight").unwrap();
             assert_eq!(w.shape, vec![4, 8], "INT4 replicated weight should not be split");
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_companions_from_tensors_column_parallel() {
+        // Verify companion weights extracted from registry.tensors (not int4_companions)
+        // are sharded correctly for column-parallel. Companion tensors must be separate
+        // entries in registry.tensors, not pre-populated in int4_companions.
+        let mut registry = WeightRegistry::new();
+
+        // qweight: shape [4, 8] (K/8=4, N=8) — column-parallel splits dim 1 → [4, 4]
+        registry.tensors.insert(
+            "model.layers.0.mlp.gate_proj.qweight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "model.layers.0.mlp.gate_proj.qweight".to_string(),
+            },
+        );
+
+        // scales: shape [4, 8] (K/group_size=4, N=8) — should be split along last dim → [4, 4]
+        registry.tensors.insert(
+            "model.layers.0.mlp.gate_proj.scales".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "model.layers.0.mlp.gate_proj.scales".to_string(),
+            },
+        );
+
+        // qzeros: shape [4, 8] — should be split along last dim → [4, 4]
+        registry.tensors.insert(
+            "model.layers.0.mlp.gate_proj.qzeros".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "model.layers.0.mlp.gate_proj.qzeros".to_string(),
+            },
+        );
+
+        // Ensure int4_companions is empty — companions must come from registry.tensors
+        assert!(registry.int4_companions.is_empty());
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        for gpu_id in 0..2 {
+            // qweight sharded along last dim → [4, 4]
+            let w = shards[gpu_id].registry.tensors.get("model.layers.0.mlp.gate_proj.qweight").unwrap();
+            assert_eq!(w.shape, vec![4, 4], "GPU {} qweight should be [4,4]", gpu_id);
+
+            // Companions extracted from registry.tensors and sharded along last dim → [4, 4]
+            let companions = shards[gpu_id]
+                .registry
+                .int4_companions
+                .get("model.layers.0.mlp.gate_proj.qweight")
+                .unwrap_or_else(|| panic!("GPU {} should have companions in int4_companions", gpu_id));
+            assert_eq!(companions.scales.shape, vec![4, 4], "GPU {} scales should be [4,4]", gpu_id);
+            assert_eq!(companions.qzeros.shape, vec![4, 4], "GPU {} qzeros should be [4,4]", gpu_id);
+
+            // Companion tensors should NOT appear in shards[gpu_id].registry.tensors (skipped)
+            assert!(
+                shards[gpu_id]
+                    .registry
+                    .tensors
+                    .get("model.layers.0.mlp.gate_proj.scales")
+                    .is_none(),
+                "GPU {} scales should not be in tensors HashMap",
+                gpu_id
+            );
+            assert!(
+                shards[gpu_id]
+                    .registry
+                    .tensors
+                    .get("model.layers.0.mlp.gate_proj.qzeros")
+                    .is_none(),
+                "GPU {} qzeros should not be in tensors HashMap",
+                gpu_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_weights_tp_int4_companions_from_tensors_row_parallel() {
+        // Verify companion weights extracted from registry.tensors (not int4_companions)
+        // are sharded correctly for row-parallel. Companion tensors must be separate
+        // entries in registry.tensors, not pre-populated in int4_companions.
+        let mut registry = WeightRegistry::new();
+
+        // qweight: shape [4, 8] (K/8=4, N=8) — row-parallel splits dim 0 → [2, 8]
+        registry.tensors.insert(
+            "model.layers.0.mlp.down_proj.qweight".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "model.layers.0.mlp.down_proj.qweight".to_string(),
+            },
+        );
+
+        // scales: shape [4, 8] — should be split along dim 0 → [2, 8]
+        registry.tensors.insert(
+            "model.layers.0.mlp.down_proj.scales".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 64]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Bf16,
+                name: "model.layers.0.mlp.down_proj.scales".to_string(),
+            },
+        );
+
+        // qzeros: shape [4, 8] — should be split along dim 0 → [2, 8]
+        registry.tensors.insert(
+            "model.layers.0.mlp.down_proj.qzeros".to_string(),
+            WeightData {
+                data: Bytes::from(vec![0u8; 128]),
+                shape: vec![4, 8],
+                dtype: WeightDtype::Int4Packed,
+                name: "model.layers.0.mlp.down_proj.qzeros".to_string(),
+            },
+        );
+
+        // Ensure int4_companions is empty — companions must come from registry.tensors
+        assert!(registry.int4_companions.is_empty());
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10]}"#;
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        for gpu_id in 0..2 {
+            // qweight sharded along dim 0 → [2, 8]
+            let w = shards[gpu_id].registry.tensors.get("model.layers.0.mlp.down_proj.qweight").unwrap();
+            assert_eq!(w.shape, vec![2, 8], "GPU {} qweight should be [2,8]", gpu_id);
+
+            // Companions extracted from registry.tensors and sharded along dim 0 → [2, 8]
+            let companions = shards[gpu_id]
+                .registry
+                .int4_companions
+                .get("model.layers.0.mlp.down_proj.qweight")
+                .unwrap_or_else(|| panic!("GPU {} should have companions in int4_companions", gpu_id));
+            assert_eq!(companions.scales.shape, vec![2, 8], "GPU {} scales should be [2,8]", gpu_id);
+            assert_eq!(companions.qzeros.shape, vec![2, 8], "GPU {} qzeros should be [2,8]", gpu_id);
+
+            // Companion tensors should NOT appear in shards[gpu_id].registry.tensors (skipped)
+            assert!(
+                shards[gpu_id]
+                    .registry
+                    .tensors
+                    .get("model.layers.0.mlp.down_proj.scales")
+                    .is_none(),
+                "GPU {} scales should not be in tensors HashMap",
+                gpu_id
+            );
+            assert!(
+                shards[gpu_id]
+                    .registry
+                    .tensors
+                    .get("model.layers.0.mlp.down_proj.qzeros")
+                    .is_none(),
+                "GPU {} qzeros should not be in tensors HashMap",
+                gpu_id
+            );
         }
     }
 }

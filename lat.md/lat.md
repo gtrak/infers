@@ -908,7 +908,9 @@ BF16 \[N,K\] weights: column-parallel splits dim 0, row-parallel splits dim 1. N
 
 ### INT4 sharding
 
-INT4 qweights swap split dimensions vs BF16: column-parallel splits dim 1 (N), row-parallel splits dim 0 (K/8). Companion tensors do NOT follow the same strategy — scales [N,groups] split dim 0 for column-parallel and last_dim for row-parallel.
+INT4 qweights swap split dimensions vs BF16: column-parallel splits dim 1 (N), row-parallel splits dim 0 (K/8). Companion tensors follow the same strategy as their parent qweight.
+
+Companions are extracted from `registry.tensors` by name pattern (`{base}.scales`, `{base}.qzeros`) and inserted into shard's `int4_companions` HashMap, keyed by the qweight name. Companion tensors are skipped during normal sharding iteration via a pre-populated `companion_skip` HashSet.
 
 ## Shard Type Detection
 
