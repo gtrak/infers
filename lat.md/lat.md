@@ -1275,6 +1275,9 @@ The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` â€
 Ignored integration tests that validate the full engine with real model weights and GPU hardware.
 
 The `smoke_test_real_model` test in `crates/backends/native/tests/smoke_test.rs` loads a real model (Qwen3.6-27B AutoRound INT4 by default), initializes CUDA runtime, creates `ForwardEngine`, runs prefill + 10 decode steps, and verifies all sampled tokens are within vocab range. Requires GPU with CUDA CC 12.0+ and model weights at `INFERS_TEST_MODEL` env var path (default `~/opt/vllm/models/qwen3.6-27b-autoround-int4/`). Marked `#[ignore]` so it only runs with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test.rs#smoke_test_real_model]].
+## GDN Reference Tests
+
+HuggingFace-based reference test capturing all GDN intermediates as .npy ground truth. See [[tests/gdn_ref_intermediates.py]].
 
 # Tokenizer
 
