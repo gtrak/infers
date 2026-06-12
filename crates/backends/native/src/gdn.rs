@@ -445,9 +445,9 @@ pub fn forward(
         let n_rows = seq_len * num_v_heads;
         let norm_dim = head_v_dim;
 
-        let ones_cpu: Vec<bf16> = vec![bf16::from_f32(1.0f32); norm_dim];
-        let norm_weight = stream.clone_htod(&ones_cpu)
-            .map_err(|e| anyhow::anyhow!("Failed to upload norm weight: {e}"))?;
+        let norm_weight = weights.norm.as_ref()
+            .and_then(|w| cache.get_bf16(&w.name))
+            .ok_or_else(|| anyhow::anyhow!("GDN norm weight not in cache"))?;
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         debug_tensor_stats_bf16(stream, &z_gate_raw, seq_len * z_dim, "z_gate_raw");
@@ -456,7 +456,7 @@ pub fn forward(
             stream.launch_builder(rms_norm_gated_kernel)
                 .arg(&gdn_output)
                 .arg(&z_gate_raw)
-                .arg(&norm_weight)
+                .arg(norm_weight)
                 .arg(&mut norm_out)
                 .arg(&(n_rows as i32))
                 .arg(&(norm_dim as i32))
@@ -679,16 +679,16 @@ pub fn decode_forward(
         let n_rows = num_v_heads;
         let norm_dim = head_v_dim;
 
-        let ones_cpu: Vec<bf16> = vec![bf16::from_f32(1.0f32); norm_dim];
-        let norm_weight = stream.clone_htod(&ones_cpu)
-            .map_err(|e| anyhow::anyhow!("Failed to upload norm weight: {e}"))?;
+        let norm_weight = weights.norm.as_ref()
+            .and_then(|w| cache.get_bf16(&w.name))
+            .ok_or_else(|| anyhow::anyhow!("GDN norm weight not in cache"))?;
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         unsafe {
             stream.launch_builder(rms_norm_gated_kernel)
                 .arg(&gdn_output)
                 .arg(&z_gate_raw)
-                .arg(&norm_weight)
+                .arg(norm_weight)
                 .arg(&mut norm_out)
                 .arg(&(n_rows as i32))
                 .arg(&(norm_dim as i32))
