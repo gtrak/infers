@@ -31,6 +31,9 @@ pub struct PrefillKernels {
     pub softmax: CudaFunction,
     pub kv_cache_write: CudaFunction,
     pub gdn_prefill: CudaFunction,
+    pub gdn_gated_delta_prefill: CudaFunction,
+    pub conv1d_depthwise: CudaFunction,
+    pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
     pub int4_gemm: CudaFunction,
 }
@@ -137,7 +140,9 @@ pub fn prefill(
                     gemm,
                     &kernels.int4_gemm,
                     stream,
-                    &kernels.gdn_prefill,
+                    &kernels.gdn_gated_delta_prefill,
+                    &kernels.conv1d_depthwise,
+                    &kernels.rms_norm_gated,
                     gdn_weights,
                     &norm1_out,
                     &mut gdn_states[layer_idx],

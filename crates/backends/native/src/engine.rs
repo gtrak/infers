@@ -50,6 +50,11 @@ struct PerGpuKernels {
     fp8_quantize: CudaFunction,
     fp8_dequantize: CudaFunction,
     int4_gemm: CudaFunction,
+    // New GDN kernels (gated delta rule)
+    gdn_gated_delta_prefill: CudaFunction,
+    gdn_gated_delta_update: CudaFunction,
+    conv1d_depthwise: CudaFunction,
+    rms_norm_gated: CudaFunction,
 }
 
 /// Central engine for forward-pass inference.
@@ -139,6 +144,10 @@ impl ForwardEngine {
                 fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
                 fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
                 int4_gemm: kernels.get_function("int4_gemm_kernel")?,
+                gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
+                gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
+                conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
+                rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
             };
             per_gpu_kernels.push(pk);
         }
@@ -237,6 +246,9 @@ impl ForwardEngine {
             softmax: self.per_gpu_kernels[0].softmax.clone(),
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
+            gdn_gated_delta_prefill: self.per_gpu_kernels[0].gdn_gated_delta_prefill.clone(),
+            conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
+            rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
@@ -272,6 +284,9 @@ impl ForwardEngine {
             softmax: self.per_gpu_kernels[0].softmax.clone(),
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
+            rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
@@ -536,7 +551,10 @@ impl ForwardEngine {
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
                         crate::gdn::forward(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_prefill, gdn_weights, &norm1_out,
+                            &self.per_gpu_kernels[gpu_idx].gdn_gated_delta_prefill,
+                            &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
+                            &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
+                            gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
@@ -672,6 +690,22 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
                     &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
                 )?;
+            }
+
+            // Debug: dump per-layer hidden states if INFERS_DUMP_LAYER_DIR is set
+            if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                for gpu_idx in 0..num_gpus {
+                    let fname = format!("{}/layer_{}_gpu{}.raw", dump_dir, layer_idx, gpu_idx);
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    let data: Vec<bf16> = gpu_stream
+                        .clone_dtoh(&hidden_states[gpu_idx])
+                        .map_err(|e| anyhow::anyhow!("Failed to copy layer dump: {}", e))?;
+                    let bytes: Vec<u8> = data.iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    std::fs::write(&fname, &bytes)
+                        .map_err(|e| anyhow::anyhow!("Failed to write layer dump: {}", e))?;
+                }
             }
         }
 
@@ -831,7 +865,10 @@ for layer_idx in 0..config.num_hidden_layers {
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
                         crate::gdn::decode_forward(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_update, gdn_weights, &norm1_out,
+                            &self.per_gpu_kernels[gpu_idx].gdn_gated_delta_update,
+                            &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
+                            &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
+                            gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
@@ -1213,6 +1250,9 @@ for layer_idx in 0..config.num_hidden_layers {
             softmax: self.per_gpu_kernels[0].softmax.clone(),
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
+            rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
@@ -1261,6 +1301,9 @@ for layer_idx in 0..config.num_hidden_layers {
             softmax: self.per_gpu_kernels[0].softmax.clone(),
             kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_update: self.per_gpu_kernels[0].gdn_update.clone(),
+            gdn_gated_delta_update: self.per_gpu_kernels[0].gdn_gated_delta_update.clone(),
+            conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
+            rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 

@@ -1,7 +1,8 @@
 // @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
 /// RMSNorm kernel — Root Mean Square Layer Normalization for BF16 tensors.
 ///
-/// Computes: output = x * rsqrt(mean(x^2) + eps) * weight
+/// Qwen3_5 uses: output = x * rsqrt(mean(x^2) + eps) * (1 + weight)
+/// (weight is an additive offset, like LayerNorm's bias in normalized space)
 ///
 /// Grid: one block per row. Each block cooperatively computes the RMS
 /// normalization for a single row using shared memory for reduction.
@@ -59,7 +60,7 @@ __global__ void infers_rmsnorm_bf16(
     for (int i = tid; i < hidden; i += total_threads) {
         float x_val = __bfloat162float(x[row * hidden + i]);
         float w_val = __bfloat162float(weight[i]);
-        output[row * hidden + i] = __float2bfloat16(x_val * scale * w_val);
+        output[row * hidden + i] = __float2bfloat16(x_val * scale * (1.0f + w_val));
     }
 }
 

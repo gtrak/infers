@@ -87,6 +87,18 @@ pub struct ModelConfig {
     #[serde(default = "default_linear_value_head_dim")]
     pub linear_value_head_dim: usize,
 
+    /// Number of key heads for GDN linear attention (Qwen3.6: 16).
+    #[serde(default = "default_linear_num_key_heads")]
+    pub linear_num_key_heads: usize,
+
+    /// Per-head key dimension for GDN linear attention (Qwen3.6: 128).
+    #[serde(default = "default_linear_key_head_dim")]
+    pub linear_key_head_dim: usize,
+
+    /// Conv1d kernel dimension for GDN linear attention (Qwen3.6: 4).
+    #[serde(default = "default_linear_conv_kernel_dim")]
+    pub linear_conv_kernel_dim: usize,
+
     /// Number of MTP hidden layers (defaults to 0).
     #[serde(default)]
     pub mtp_num_hidden_layers: usize,
@@ -116,6 +128,9 @@ const FULL_ATTENTION_INTERVAL: usize = 4;
 
 const fn default_linear_num_value_heads() -> usize { 1 }
 const fn default_linear_value_head_dim() -> usize { 1 }
+const fn default_linear_num_key_heads() -> usize { 1 }
+const fn default_linear_key_head_dim() -> usize { 1 }
+const fn default_linear_conv_kernel_dim() -> usize { 4 }
 
 /// Shallow-merge `text_config` into the root object.
 ///
