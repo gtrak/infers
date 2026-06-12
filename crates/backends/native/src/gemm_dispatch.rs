@@ -49,10 +49,30 @@ pub fn gemm_projection_cached(
 ) -> Result<CudaSlice<bf16>> {
     match cache.get(weight_name) {
         Some(crate::gpu_cache::CachedWeight::Bf16(weight_gpu)) => {
+            // cuBLASLt uses column-major storage convention.
+            // Our input/weight are row-major [M,K] and [N,K].
+            //
+            // The naive approach would be:
+            //   gemm.matmul_bf16(config(m,n,k, transa=true,transb=false), input, weight, output)
+            // which computes: C = input^T @ weight = (input[M,K] as [K,M])^T @ (weight[N,K] as [K,N])
+            // = [M,K] @ [K,N] = [M,N]. This is correct MATHEMATICALLY.
+            //
+            // BUT cuBLASLt writes C in COLUMN-major: C(m,n) at offset m + n*M.
+            // Our code reads the flat output buffer as ROW-major: C[m][n] at offset m*N + n.
+            // These only agree at (0,0) — all other elements are WRONG.
+            //
+            // The fix: swap arguments AND swap output dimensions.
+            //   gemm.matmul_bf16(config(m=N,n=M,k=K, transa=true,transb=false), weight, input, output)
+            // This computes: C' = weight^T @ input = [N,K]^T @ [M,K]^T = (weight[N,K] as [K,N])^T @ (input[M,K] as [K,M])
+            // = [K,N]^T @ [K,M] = [N,K] @ [K,M] = [N,M]
+            // C'(n,m) = sum_k weight[n][k] * input[m][k] = sum_k input[m][k] * weight[n][k] = C[m][n]
+            //
+            // cuBLASLt writes C' in column-major [N,M] with ldc=C'(row=n at offset C'(n,m) at offset n + m*N.
+            // Reading row-major [M,N]: buffer[m*N + n] = n + m*N = C'(n,m) = C[m][n]. ✓
             gemm.matmul_bf16(
                 &GemmConfig {
-                    m,
-                    n,
+                    m: n,
+                    n: m,
                     k,
                     transa: true,
                     transb: false,
@@ -63,8 +83,8 @@ pub fn gemm_projection_cached(
                     ldc: None,
                     activation: None,
                 },
-                input,
-                weight_gpu,
+                weight_gpu,  // FIRST arg — transposed view: [K, N] → op(A) = [N, K]
+                input,       // SECOND arg — transposed view: [K, M] → op(B) = [K, M]
                 output,
             )?;
         }

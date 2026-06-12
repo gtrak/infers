@@ -420,32 +420,30 @@ fn repeat_interleave_heads(
             }
         }
         
-        // Compare first few values
-        eprintln!("DEBUG a_proj compare (GPU vs CPU, m_dim={}):", m_dim);
-        for idx in 0..5 {
-            let gpu_val = cpu_a_proj[idx].to_f32();
-            let cpu_val = cpu_result[idx];
-            eprintln!("  [{}]: GPU={:.6}, CPU={:.6}, diff={:.6}", idx, gpu_val, cpu_val, (gpu_val - cpu_val).abs());
+        // Compute full cosine similarity
+        let mut sum_prod = 0.0f64;
+        let mut sum_sq_gpu = 0.0f64;
+        let mut sum_sq_cpu = 0.0f64;
+        let total_elems = m_dim * num_v_heads;
+        for idx in 0..total_elems {
+            let gv = cpu_a_proj[idx].to_f32() as f64;
+            let cv = cpu_result[idx] as f64;
+            sum_prod += gv * cv;
+            sum_sq_gpu += gv * gv;
+            sum_sq_cpu += cv * cv;
         }
+        let cos_sim = sum_prod / ((sum_sq_gpu * sum_sq_cpu).sqrt() + 1e-30);
+        eprintln!("DEBUG a_proj FULL: cos_sim={:.6} total_elems={} m_dim={} num_v_heads={}",
+            cos_sim, total_elems, m_dim, num_v_heads);
         
-        // Also try the transpose interpretation: a_proj[i][j] = sum_k input[k][i] * weight[j][k]
-        let mut cpu_result2 = vec![0.0f32; m_dim * num_v_heads];
-        for i in 0..m_dim {
-            for j in 0..num_v_heads {
-                for k in 0..k_dim {
-                    // Alternative: input[k][i] means reading columns of input as rows
-                    let input_val = cpu_input[k * m_dim + i].to_f32();
-                    let weight_val = cpu_w[j * k_dim + k].to_f32();
-                    cpu_result2[i * num_v_heads + j] += input_val * weight_val;
-                }
-            }
-        }
-        
-        eprintln!("DEBUG a_proj compare alt (transpose interpretation, m_dim={}):", m_dim);
-        for idx in 0..5 {
-            let gpu_val = cpu_a_proj[idx].to_f32();
-            let cpu_val = cpu_result2[idx];
-            eprintln!("  [{}]: GPU={:.6}, CPU_alt={:.6}", idx, gpu_val, cpu_val);
+        // Print ALL heads for token 0
+        eprintln!("DEBUG a_proj token0 ALL heads (GPU vs CPU):");
+        for j in 0..num_v_heads {
+            let gv = cpu_a_proj[j].to_f32();
+            let cv = cpu_result[j];
+            let d = (gv - cv).abs();
+            let marker = if d < 0.5 { " <---" } else { "" };
+            eprintln!("  head[{:2}]: GPU={:.6}, CPU={:.6}, diff={:.6}{}", j, gv, cv, d, marker);
         }
     }
 
