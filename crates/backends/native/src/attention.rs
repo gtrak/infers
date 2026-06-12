@@ -620,7 +620,7 @@ pub fn forward(
                 k: head_dim,
                 transa: true,
                 transb: false,
-                alpha: 1.0,
+                alpha: 1.0 / (head_dim as f32).sqrt(),
                 beta: 0.0,
                 lda: None,
                 ldb: None,
@@ -637,7 +637,6 @@ pub fn forward(
             .alloc_zeros::<bf16>(scores_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
 
-        // Block size: next power of 2 up to seq_len, capped at 256
         let block_size = {
             let mut sz = 1usize;
             while sz < seq_len && sz < 256 {
@@ -645,6 +644,7 @@ pub fn forward(
             }
             sz
         };
+
         let shared_mem_bytes = block_size * std::mem::size_of::<f32>();
 
         let softmax_config = LaunchConfig {
@@ -960,7 +960,7 @@ pub fn decode_forward(
                 k: head_dim,
                 transa: true,
                 transb: false,
-                alpha: 1.0,
+                alpha: 1.0 / (head_dim as f32).sqrt(),
                 beta: 0.0,
                 lda: None,
                 ldb: None,
@@ -1300,6 +1300,7 @@ pub fn forward_paged(
         )?;
 
         // --- Attention scores: Q_h @ K_h^T → [seq_len × seq_len] ---
+        // Scale by 1/sqrt(head_dim) for stable softmax (standard attention scaling).
         let scores_size = seq_len * seq_len;
         let mut scores_h = stream
             .alloc_zeros::<bf16>(scores_size)
@@ -1311,7 +1312,7 @@ pub fn forward_paged(
                 k: head_dim,
                 transa: true,
                 transb: false,
-                alpha: 1.0,
+                alpha: 1.0 / (head_dim as f32).sqrt(),
                 beta: 0.0,
                 lda: None,
                 ldb: None,

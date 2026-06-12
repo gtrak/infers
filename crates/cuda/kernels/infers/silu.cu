@@ -28,7 +28,7 @@ __global__ void infers_silu_bf16(
     }
 }
 
-/// SwiGLU kernel: output[i] = x[i] * sigmoid(gate[i])
+/// SwiGLU kernel: output[i] = x[i] * SiLU(gate[i]) = x[i] * gate[i] * sigmoid(gate[i])
 ///
 /// # Launch configuration
 /// * grid: `(total_elements + block_size - 1) / block_size`
@@ -47,7 +47,8 @@ __global__ void infers_silu_glu_bf16(
         float x_val = __bfloat162float(x[i]);
         float g_val = __bfloat162float(gate[i]);
         float sig = 1.0f / (1.0f + expf(-g_val));
-        output[i] = __float2bfloat16(x_val * sig);
+        // x * SiLU(gate) = x * gate * sigmoid(gate)
+        output[i] = __float2bfloat16(x_val * g_val * sig);
     }
 }
 

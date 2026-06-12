@@ -28,21 +28,22 @@ __global__ void infers_rope_bf16(
     const int* __restrict__ positions,
     int total_tokens,
     int num_heads,
-    int head_dim
+    int head_dim,
+    int rotary_dim
 ) {
     int idx = INFERS_THREAD_IDX;
     int stride = blockDim.x * gridDim.x;
-    int half_dim = head_dim / 2;
-    int pairs_per_token = num_heads * half_dim;
+    int half_rotary = rotary_dim / 2;
+    int pairs_per_token = num_heads * half_rotary;
 
     for (int t = idx; t < total_tokens * pairs_per_token; t += stride) {
         int token_idx = t / pairs_per_token;
         int remainder = t % pairs_per_token;
-        int head_idx = remainder / half_dim;
-        int dim_pair = remainder % half_dim;
+        int head_idx = remainder / half_rotary;
+        int dim_pair = remainder % half_rotary;
         int pos = positions[token_idx];
 
-        int cos_idx = pos * half_dim + dim_pair;
+        int cos_idx = pos * half_rotary + dim_pair;
         float cos_val = cos[cos_idx];
         float sin_val = sin[cos_idx];
 

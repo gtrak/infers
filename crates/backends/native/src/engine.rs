@@ -740,17 +740,30 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         position: u32,
         seq_id: infers_kv::SequenceId,
     ) -> Result<u32> {
-        let manager = self.paged_kv_manager.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
         let num_gpus = self.weights.len();
         let config = &self.config;
-        let page_size = manager.page_size();
         let head_dim = config.head_dim;
-        let num_cached_tokens = manager.num_tokens(seq_id)? as i32;
 
-        // Upload block table and position to ALL GPUs
-        let block_table = manager.block_table(seq_id)?;
-        let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
+        // Dynamically allocate pages as needed for the target position,
+        // then read the (possibly updated) block table and cached-token count.
+        // Use a scope to drop the mutable borrow before using `self` again.
+        let (page_size, num_cached_tokens, block_table_i32): (usize, i32, Vec<i32>) = {
+            let mgr = self.paged_kv_manager.as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
+            let ps = mgr.page_size();
+
+            // Allocate pages up to the page index that `position` falls in.
+            let needed_pages = (position as usize / ps) + 1;
+            let current_pages = mgr.block_table(seq_id)?.len();
+            for _ in current_pages..needed_pages {
+                mgr.append_page(seq_id)
+                    .map_err(|e| anyhow::anyhow!("Failed to allocate KV page for decode: {:?}", e))?;
+            }
+
+            let cached = mgr.num_tokens(seq_id)? as i32;
+            let bt: Vec<i32> = mgr.block_table(seq_id)?.iter().map(|p| *p as i32).collect();
+            (ps, cached, bt)
+        };
         let position_i32 = vec![position as i32];
 
         let mut block_tables_gpu: Vec<CudaSlice<i32>> = Vec::new();
@@ -909,12 +922,12 @@ for layer_idx in 0..config.num_hidden_layers {
                     self.group_size,
                 )?;
 
-                // SiLU(gate) * up (elementwise on sharded_intermediate)
+                // up * SiLU(gate) = SwiGLU (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
                 let elem_i32 = sharded_intermediate as i32;
                 unsafe {
                     gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
-                        .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                        .arg(&up).arg(&gate).arg(&mut silu_out).arg(&elem_i32)
                         .launch(infers_cuda::LaunchConfig {
                             grid_dim: ((sharded_intermediate as u32).div_ceil(256), 1, 1),
                             block_dim: (256, 1, 1),
@@ -993,6 +1006,13 @@ for layer_idx in 0..config.num_hidden_layers {
         let sampled = crate::sample::greedy_sample_bf16(
             &final_stream, &self.per_gpu_kernels[0].argmax, &logits.as_view(),
         )?;
+
+        // Record the new token in the KV manager so the next decode step
+        // sees the correct block table and cached-token count.
+        if let Some(mgr) = self.paged_kv_manager.as_mut() {
+            mgr.add_token(seq_id)
+                .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
+        }
 
         Ok(sampled)
     }

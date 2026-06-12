@@ -101,15 +101,16 @@ pub fn apply_rope(
     let total_tokens = positions.len() as i32;
     let head_dim_i32 = head_dim as i32;
 
-    // Calculate grid size based on total_tokens * num_heads * half_dim work items
+    // Calculate grid size based on total_tokens * num_heads * half_rotary work items
     let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
-    let half_dim = rotary_dim / 2;
-    let total_pairs = positions.len() * num_heads as usize * half_dim;
+    let half_rotary = rotary_dim / 2;
+    let total_pairs = positions.len() * num_heads as usize * half_rotary;
     let config = LaunchConfig {
         grid_dim: ((total_pairs as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
+    let rotary_dim_i32 = rotary_dim as i32;
 
     unsafe {
         stream
@@ -122,6 +123,7 @@ pub fn apply_rope(
             .arg(&total_tokens)    // total_tokens
             .arg(&num_heads)       // num_heads
             .arg(&head_dim_i32)   // head_dim
+            .arg(&rotary_dim_i32) // rotary_dim (may be < head_dim for partial RoPE)
             .launch(config)
             .map_err(|e| anyhow::anyhow!("RoPE kernel launch failed: {e}"))?;
     }
