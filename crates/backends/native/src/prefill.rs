@@ -38,6 +38,8 @@ pub struct PrefillKernels {
     pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
     pub int4_gemm: CudaFunction,
+    /// Gate application kernel for attention output gating.
+    pub attn_output_gate: CudaFunction,
 }
 
 // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Prefill Path]]
@@ -165,6 +167,7 @@ pub fn prefill(
                     &kernels.kv_cache_write,
                     &kernels.rope,
                     &kernels.rmsnorm,
+                    &kernels.attn_output_gate,
                     attn_weights,
                     &norm1_out,
                     &mut kv_caches[layer_idx],
@@ -179,6 +182,7 @@ pub fn prefill(
                     rms_norm_eps,
                     group_size,
                     cache,
+                    config.attn_output_gate,
                 )?
             }
         };

@@ -264,6 +264,7 @@ impl ForwardEngine {
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
+            attn_output_gate: self.per_gpu_kernels[0].attn_output_gate.clone(),
         };
 
         crate::prefill::prefill(
@@ -303,6 +304,7 @@ impl ForwardEngine {
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
+            attn_output_gate: self.per_gpu_kernels[0].attn_output_gate.clone(),
         };
 
         crate::decode::decode(
@@ -539,6 +541,18 @@ impl ForwardEngine {
             }
         }
 
+        // Dump embedding output (before layer 0) for comparison with reference
+        if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
+            let gpu_stream = self.streams.get(0).unwrap().clone();
+            let hidden_cpu: Vec<half::bf16> = gpu_stream.clone_dtoh(&hidden_states[0]).expect("dl");
+            let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
+            let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
+            eprintln!("DUMP-HIDDEN layer=-1 (embed): mean_abs={:.6}", mean_abs);
+            let _ = std::fs::create_dir_all("/tmp/engine_hidden");
+            let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write("/tmp/engine_hidden/layer_-1.f32", bytes);
+        }
+
         // Per-GPU sharded head counts
         let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
         let num_heads_per_gpu = config.num_attention_heads / num_gpus;
@@ -609,6 +623,8 @@ impl ForwardEngine {
                             config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx],
                             config.hidden_size,
                             config.attn_output_gate,
+                            layer_idx,
+                            gpu_idx,
                         )?
                     }
                 };
@@ -819,6 +835,19 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 }
             }
 
+            // Dump per-layer hidden state for comparison with reference
+            if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
+                let gpu_stream = self.streams.get(0).unwrap().clone();
+                let hidden_cpu: Vec<half::bf16> = gpu_stream.clone_dtoh(&hidden_states[0]).expect("dl");
+                let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
+                let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
+                eprintln!("DUMP-HIDDEN layer={}: mean_abs={:.6}", layer_idx, mean_abs);
+                let _ = std::fs::create_dir_all("/tmp/engine_hidden");
+                let path = format!("/tmp/engine_hidden/layer_{}.f32", layer_idx);
+                let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(&path, bytes);
+            }
+
 /**/ let _ = std::env::var("INFERS_DEBUG_LAYERS");
 // DEBUG: per-layer hidden state stats
 if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
@@ -876,6 +905,16 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
             &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
+
+        // Dump post-final-norm hidden state for comparison with reference
+        if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
+            let hidden_cpu: Vec<half::bf16> = final_stream.clone_dtoh(&final_hidden).expect("dl");
+            let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
+            let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
+            eprintln!("DUMP-HIDDEN layer=final: mean_abs={:.6}", mean_abs);
+            let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write("/tmp/engine_hidden/layer_final.f32", bytes);
+        }
 
         // LM head
         let lm_head_weight = final_weights.lm_head.as_ref()
@@ -1431,6 +1470,7 @@ for layer_idx in 0..config.num_hidden_layers {
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
+            attn_output_gate: self.per_gpu_kernels[0].attn_output_gate.clone(),
         };
 
         crate::decode::decode_with_hidden(
@@ -1483,6 +1523,7 @@ for layer_idx in 0..config.num_hidden_layers {
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
+            attn_output_gate: self.per_gpu_kernels[0].attn_output_gate.clone(),
         };
 
         use std::cell::Cell;

@@ -93,7 +93,7 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | `paged_kv_read.cu` | `infers_paged_kv_read_bf16` | Paged KV cache read using block-table address translation: gathers K and V from interleaved per-page layout into contiguous output buffers via strided thread loops, eliminating CPU round-trips during decode |
 | `paged_attention_decode.cu` | `infers_paged_attention_decode_bf16` | Paged attention decode: computes single-token attention over paged KV cache using two-pass online softmax and weighted V accumulation, one block per KV head — Phase 1 uses strided dot-product computation, Phase 2 loops over all tokens per thread |
 | `fp8_quantize.cu` | `infers_fp8_quantize_bf16`, `infers_fp8_dequantize_bf16` | FP8 quantize (BF16→FP8) and dequantize (FP8→BF16) for KV cache quantization, supporting both E4M3 (mode=0) and E5M2 (mode=1) formats — one thread per element, 256 threads per block |
-| `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers and native transposed [K/8, N] layout support via `transposed` flag: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - zero) * scale` on-the-fly during inner loop, accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
+| `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers and native transposed [K/8, N] layout support via `transposed` flag: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - (zero + 1)) * scale` on-the-fly during inner loop (AutoRound uses biased zero points — stored `z` represents actual zero point `z+1`), accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
 
 ### Build Script
 Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
@@ -322,7 +322,7 @@ Types, tests, and attention.rs rewrite shipped for Phase 4.6 paged KV foundation
 - `paged_kv_write.cu` + `.cubin`: Paged KV cache write with block-table address translation, K+V interleaved per-page layout
 - `paged_kv_read.cu` + `.cubin`: Paged KV cache read with block-table address translation, gathers K and V into contiguous output buffers
 - `paged_attention_decode.cu` + `.cubin`: Paged attention decode with two-pass online softmax and weighted V accumulation — Phase 1 uses strided cooperative dot-product computation for softmax stats, Phase 2 loops over all tokens per output dimension. Supports GQA via outer loop over `num_query_heads / num_kv_heads` query heads per block.
-- `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection; supports GQA with `num_query_heads` param), `forward_paged` (paged KV write + per-head GEMM attention; supports GQA via `head_idx % num_kv_heads` for K/V weight extraction), `fp8_quantize_and_write` and `fp8_dequantize_and_read` (GPU-native FP8 quantize/dequantize using CUDA kernels — no CPU round-trip)
+- `attention.rs`: `PagedKvCache` struct, three kernel dispatch functions (`paged_kv_write`, `paged_kv_read`, `paged_attention_decode`), `decode_forward_paged` (zero CPU round-trips, single GEMM O-projection; supports GQA with `num_query_heads` param), `forward_paged` (paged KV write + per-head GEMM attention; supports GQA via `head_idx / (num_heads / num_kv_heads)` block mapping for K/V weight extraction), `fp8_quantize_and_write` and `fp8_dequantize_and_read` (GPU-native FP8 quantize/dequantize using CUDA kernels — no CPU round-trip)
 - `infers-backend-native` now depends on `infers-kv` crate
 - `MemoryBudget`: `PagedKvEstimate`, `estimate_paged_kv_cache_bytes` for block-aware KV estimation, 5 unit tests
 - Engine integration: `ForwardEngine` has 19 kernel handles (including `fp8_quantize_kernel`, `fp8_dequantize_kernel`, `gdn_mamba2_update_kernel`), `Option<PagedKvManager>`, `Vec<PagedKvCache>`, `init_paged()`, `prefill_paged()`, `decode_paged()`, `fp8_quantize_and_write()`, `fp8_dequantize_and_read()`
@@ -364,12 +364,14 @@ Computes single-token K/V via GEMM, applies RoPE, writes to paged cache, compute
 
 Prefill with paged KV cache write and GQA support. See [[crates/backends/native/src/attention.rs#forward_paged]].
 
-Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once). For GQA, K and V weight extraction uses `head_idx % num_kv_heads` so multiple query heads share the same KV head.
+Same K/V computation and RoPE as original `forward`, but writes to paged cache via `paged_kv_write` instead of flat buffer. Attention computation still uses per-head GEMMs (prefill benefits less from paged decode kernel since all tokens are processed at once). For GQA, K and V head extraction uses block mapping `head_idx / (num_heads / num_kv_heads)` so consecutive query heads share the same KV head, matching HuggingFace's `repeat_interleave(n_rep, dim=1)` semantics. Previously used interleaved `head_idx % num_kv_heads` which assigned wrong K/V to half the Q heads at TP > 2 or when num_kv_heads_per_gpu > 1.
 
 ### Attention Output Gate
 When `attn_output_gate` is true, the Q output is doubled (Q + gate). After attention, the gate is applied via `infers_attn_output_gate_bf16` to compute `out = attn * sigmoid(gate)`, matching the reference model's `output_gate_type: "swish"` config.
 
-The original implementation used `infers_silu_glu_bf16` which computes `attn * SiLU(gate) = attn * gate * sigmoid(gate)`, amplifying the output by 2-8x depending on gate magnitude. Three bugs were fixed: (1) per-head Q extraction used wrong row stride (`per_gpu_head_dim` instead of `q_out_dim`), causing reads from the gate portion of previous tokens; (2) Q-norm was applied to the entire buffer including gate, whereas the reference model only normalizes Q; (3) the SiLU-based kernel replaced with sigmoid-only. See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]].
+The Qwen3.6 model's q_proj output uses a **per-head interleaved layout**: `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` per row — NOT contiguous `[Q_all, Gate_all]`. This is because HuggingFace reshapes q_proj output as `[batch, seq, heads, head_dim*2]` before splitting Q and gate via `torch.chunk(2, dim=-1)`. The sharding code must preserve this interleaved layout by using a simple column split (GPU 0 gets columns 0..N/2, GPU 1 gets N/2..N) rather than splitting Q and gate segments independently.
+
+Five bugs were fixed: (1) per-head Q extraction used wrong row stride (`per_gpu_head_dim` instead of `q_out_dim`), causing reads from the gate portion of previous tokens; (2) Q-norm was applied to the entire buffer including gate, whereas the reference model only normalizes Q; (3) the SiLU-based kernel replaced with sigmoid-only; (4) q_proj sharding used fused Q+gate segments that assumed contiguous layout, giving GPU 0 heads 0-5+12-17 instead of 0-11 — fixed by using simple ColumnParallel split; (5) Q-norm and gate extraction assumed contiguous halves but must extract per-head from interleaved offsets (`h * (head_dim * 2)` for Q, `h * (head_dim * 2) + head_dim` for gate). See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]].
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
@@ -510,13 +512,14 @@ Uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. T
 
 `upload_int4_weight()` returns `(qweight_gpu, scales_gpu, qzeros_gpu)` for `int4_gemm_kernel` on-the-fly dequantization. Both standard [N, K/8] and transposed [K/8, N] layouts are supported via the kernel's `transposed` flag.
 
-`dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>` using `(int4_val - zero_point) * scale`.
-
+`dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>`. **BUG**: it uses `(int4_val - zero_point) * scale` without the +1 offset that HF requires (correct formula: `(w_int4 - (zero + 1)) * scale`). This function is only used in tests, not in production inference paths — the GPU kernel `int4_gemm_kernel` applies the correct +1 offset.
 See [[crates/backends/native/src/upload.rs#upload_int4_weight]], [[crates/backends/native/src/upload.rs#dequantize_int4_to_bf16]].
 
 ### INT4 Dequantization Verification
 
 INT4 dequantization verified against HF auto_gptq for Qwen3.6-27B AutoRound INT4 using `scripts/verify_int4_weights.py`. The engine's TP=2 shard was compared against the corresponding HF shard by extracting mixed_qkv from both sources.
+
+The zero-point bias (+1) was independently verified by inspecting HF's Triton kernel (`dequant_kernel_248` in `auto_round_extension/triton/triton_utils_zp/dequant.py`), which applies `zeros = zeros + 1` before subtraction — confirming the formula `(w_int4 - (zero + 1)) * scale` used by our `int4_gemm_kernel`. Weight-level dequantization matches HF exactly (e.g., weight[0,0]: dequantized -0.012943 with +1 vs HF -0.012943; without +1: -0.008629). GEMM-level comparison (HF forward vs dequant248+matmul): cosine similarity = 0.99999690.
 
 Key findings:
 
@@ -985,6 +988,10 @@ The layout parameter (`ColumnMajor` vs `RowMajor`) controls which dimension to s
 
 qzeros segments are scaled by 1/8 relative to qweight since its last dimension is conv_dim/8. For example, with key_dim=2048 and conv_dim=10240, qweight segments are [0,2048), [2048,4096), [4096,10240) while qzeros segments are [0,256), [256,512), [512,1280).
 
+### Fused Q+gate Projection Sharding
+When `attn_output_gate=true`, self_attn q_proj is a fused Q+gate projection. Each GPU receives half of both Q and gate sub-projections rather than splitting them across GPUs.
+
+Segments: Q[0:q_dim), Gate[q_dim:2*q_dim). INT4 uses `ColumnMajor` layout; BF16 uses `RowMajor`. Companion weights (scales, qzeros) follow the same pattern as in_proj_qkv. Falls through to standard column-parallel sharding when `attn_output_gate=false`.
 ## Shard Type Detection
 
 Tensor names determine sharding type. Q/K/V/gate/up/GDN are column-parallel; O/down are row-parallel; all others replicated. See [[crates/model/src/sharding.rs#determine_shard_type]].
@@ -1041,6 +1048,16 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 ## GEMM Leading Dimension Fix
 
 `GemmConfig` to `MatmulConfig` conversion in `gemm_impl` had incorrect column-major leading dimension defaults. Fixed `lda` branches (transa=true→k, transa=false→m) and `ldc` default (m, not n) to match cuBLASLt column-major convention. See [[crates/cuda/src/gemm.rs#gemm_impl]].
+
+## cuBLAS Column-Major Output Fix in Attention GEMMs
+
+cuBLAS writes GEMM output in column-major order, but downstream code reads buffers as row-major. The bug was already fixed for projection GEMMs but persisted in per-head attention loop GEMMs:
+
+**Scores GEMM**: `Q @ K^T = scores[i,j]` — cuBLAS output in column-major means softmax reads transposed scores (`Q[j]·K[i]` instead of `Q[m]·K[n]`). Fix: swap `q_h` and `k_h` arguments; dot product is commutative so `K(n)·Q(m) = Q(m)·K(n)` after the column-to-row-major read.
+
+**Attention output GEMM**: `softmax @ V` — cuBLAS output in column-major means downstream reads transposed. Fix: swap m/n dimensions, change `transa`/`transb` to false, and swap `v_h` with `softmax_out_h`. Computes `V^T @ S^T = [head_dim × seq_len]` in column-major; reading as row-major `[seq_len × head_dim]` gives correct layout because offset `m*head_dim + k = k + m*head_dim` matches column-major offset `k + m*head_dim`.
+
+Fixed in 4 GEMM calls across non-paged and paged prefill paths. The decode path uses `m=1` so column-major and row-major are identical for single-row output — correct by coincidence. See [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#forward_paged]].
 
 ## SSE Constant Usage
 
@@ -1113,11 +1130,13 @@ See [[crates/backends/native/src/gdn.rs#extract_columns]].
 
 ### Attention Q Extraction and Q-norm Fixes
 
-Two bugs in `forward_paged` and `decode_forward_paged` when `attn_output_gate` is true:
+Three bugs in `forward_paged` and `decode_forward_paged` when `attn_output_gate` is true:
 
 1. **Per-head Q extraction used wrong row stride** (CRITICAL): The per-head loop extracted Q with `src_offset = s * per_gpu_head_dim + head_idx * head_dim`, but `q_full` has width `q_out_dim = per_gpu_head_dim * 2`. For token s=1, this read from offset `1*3072 + head_idx*256` — the gate portion of token 0, not the Q portion of token 1. Fixed to `s * q_out_dim + head_idx * head_dim`.
 
 2. **Q-norm applied to entire buffer including gate**: The RMSNorm was applied to the full `q_full` buffer `[seq, heads*dim*2]`, normalizing both Q and gate values. The HuggingFace reference (`self.q_norm(q)`) only normalizes the Q portion. Fixed by extracting just the Q portion (`[seq, heads*dim]`), applying RMSNorm, and writing back.
+
+3. **q_full extraction assumed contiguous layout** (CRITICAL): The q_proj GEMM output uses per-head interleaved layout `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` per row (matching HuggingFace's `repeat_interleave` semantics). The engine assumed contiguous `[Q_all(3072), G_all(3072)]`. This caused Q-norm extraction, gate extraction, and per-head Q extraction in the attention loop to read from wrong offsets. Fixed by using per-head interleaved extraction with stride `head_dim * 2` for all three operations: (a) Q-norm copies Q from `h * (head_dim * 2)` instead of first half of row; (b) gate copies G from `h * (head_dim * 2) + head_dim`; (c) per-head attention loop uses `head_stride = head_dim * 2` for Q offset calculation. The same fix was applied to `decode_forward_paged` (m=1, no seq_len loop).
 
 See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]].
 
@@ -1388,6 +1407,13 @@ TP=2 comparison: `scripts/compare_gdn_tp2.py` compares engine dumps (BF16 raw, s
 
 Current comparison results (2 OK, 11 divergent): a_proj cos=0.999997, b_proj cos=0.999999 (both pass), z_gate cos=0.989430 (improved from 0.495 after per-token slicing fix), norm_output cos=0.985635 (improved from 0.281 after same fix). Remaining divergences include mixed_qkv cos=0.994911, core_attn_out cos=0.999341, output cos=0.882144. Reference shapes: mixed_qkv=(15,10240), query=(15,2048), key=(15,2048), value=(15,6144), a_proj=(15,48), b_proj=(15,48), core_attn_out=(15,48,128).
 
+
+## Full-Attention Reference Tests (Layer 3)
+
+HuggingFace-based reference capturing full-attention (Qwen3_5Attention) intermediates at layer 3 as .npy ground truth, using the engine's 15 token IDs.
+
+Script [[scripts/dump_ref_attn_l3.py]] monkey-patches layer 3 self_attn.forward to dump Q/K/V projections, RoPE-embedded tensors, head-0 scores/softmax/output, and gated output as float32 .npy in `/tmp/ref_attn_l3/`. Layer 3 is full attention (not GDN): num_heads=24, num_kv_heads=4, head_dim=256, partial_rotary_factor=0.25. The q_proj output uses per-head interleaved layout `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` — the engine now matches this layout correctly (fixed from contiguous `[Q_all, G_all]`). Engine comparison: softmax matches exactly (ratio=1.000), V values differ 51-66% (INT4 GEMM scaling?), Q/K differ 6-10%.
+
 # Tokenizer
 
 HF `tokenizers` crate wrapper for encoding prompts into token IDs and decoding IDs back to text.
@@ -1548,3 +1574,38 @@ If the model path exists on disk, `load_model()` reads `config.json` and safeten
 When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for wiring validation.
 
 When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelConfig` for Qwen3.6-27B wiring validation: 48 layers, 5120 hidden size, 13888 intermediate size, 152064 vocab, 40 attention heads, 40 KV heads, 128 head dim, 262144 max position embeddings, silu activation, rope_theta=10000000, partial_rotary=0.25, mRoPE interleaved, no MTP, linear_num_value_heads=48, linear_value_head_dim=128. Empty `WeightRegistry` is used — engine wiring succeeds without actual weights since kernels won't be dispatched.
+# Debugging: Per-Layer Comparison with HF Reference
+Systematic per-layer hidden state comparison between the infers engine and HuggingFace reference model to identify the source of output divergence.
+
+## Test Setup
+Both models use the same 15-token prompt (engine IDs, not HF tokenizer). Reference is dumped via `scripts/dump_ref_hidden.py`. Engine dumps with `INFERS_DUMP_HIDDEN=1` to `/tmp/engine_hidden/layer_N.f32`.
+
+## Key Finding: Divergence at L3 (First Full-Attention Layer)
+Embedding matches perfectly (cosine sim = 1.000). GDN layers L0-L2 are close but slightly diverging. The first major divergence occurs at **layer 3**, the first full-attention layer, where the ratio jumps to 2.144x.
+
+## Per-Layer Mean Absolute Value Ratio
+The engine's mean_abs is compared against HF reference. Ratio > 1 means the engine produces larger values than reference; ratio < 1 means smaller values.
+
+| Layer | Type | REF mean_abs | ENG mean_abs | Ratio | CosSim | Note |
+|-------|------|-------------|-------------|-------|--------|------|
+| embed | — | 0.007143 | 0.007143 | 1.000 | 1.000000 | Perfect match |
+| L0 | GDN | 0.033458 | 0.030597 | 0.914 | 0.999619 | Slight underflow |
+| L1 | GDN | 0.046476 | 0.041240 | 0.887 | 0.998595 | |
+| L2 | GDN | 0.059484 | 0.050421 | 0.848 | 0.997050 | |
+| L3 | **FullAttn** | 0.072689 | 0.155820 | **2.144** | 0.920083 | First divergence |
+| L7 | FullAttn | 0.126871 | 0.256387 | 2.021 | 0.933345 | Repeated spike |
+| L11 | FullAttn | 0.191040 | 0.374711 | 1.961 | 0.915241 | |
+| L27 | FullAttn | 0.426400 | 0.682866 | 1.601 | 0.681240 | CosSim degrades |
+| L31 | FullAttn | 0.473977 | 0.923527 | 1.948 | 0.468349 | Nearly orthogonal |
+| L51 | FullAttn | 0.879271 | 1.918030 | 2.181 | 0.000446 | Orthogonal |
+| L59 | FullAttn | 1.792051 | 7.178924 | 4.006 | -0.000815 | Negative correlation |
+| L63 | FullAttn | 1.294677 | 17.206020 | 13.290 | 0.062290 | Catastrophic |
+
+## Pattern: Alternating Amplification and Damping
+Each full-attention layer injects a spike (ratio 1.6-2.1x). GDN layers between them partially dampen the error but do not fully correct it. Absolute values grow monotonically in the engine.
+
+## Cosine Similarity Collapse
+Cosine similarity at last token position shows directional drift. By L31 (60% through the model), cosine sim drops to 0.468 — the engine's hidden state is nearly orthogonal to reference by mid-model.
+
+## Conclusion
+The bug is localized to **full-attention layers** (every 4th layer: L3, L7, L11, ...). GDN layers are largely correct (ratio ~0.85-0.95). Attention produces values approximately 2x larger than reference, compounding across all 16 full-attention layers.

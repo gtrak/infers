@@ -90,8 +90,9 @@ __global__ void int4_gemm_kernel(
                 int shift = w * 4;
                 int8_t w_int4 = (int8_t)((packed >> shift) & 0xF);
 
-                // Dequantize on-the-fly in registers: (w_int4 - zero) * scale
-                float w_fp32 = ((float)(w_int4 - zero)) * scale;
+                // Dequantize on-the-fly: (w_int4 - (zero + 1)) * scale
+                // AutoRound uses biased zero points — stored z represents actual zero point z+1
+                float w_fp32 = ((float)(w_int4 - (zero + 1))) * scale;
 
                 // Load activation (BF16 → float)
                 float a_val = __bfloat162float(input[row * K + k + kk + w]);

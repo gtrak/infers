@@ -110,6 +110,7 @@ pub fn forward_layer_pass(
                 &kernels.kv_cache_write,
                 &kernels.rope,
                 &kernels.rmsnorm,
+                &kernels.attn_output_gate,
                 attn_weights,
                 &norm1_out,
                 &mut kv_caches[layer_idx],
@@ -123,6 +124,7 @@ pub fn forward_layer_pass(
                 rms_norm_eps,
                 group_size,
                 cache,
+                config.attn_output_gate,
             )?
         }
     };

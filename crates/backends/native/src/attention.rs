@@ -411,6 +411,7 @@ pub fn forward(
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
+    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -425,6 +426,7 @@ pub fn forward(
     rms_norm_eps: f32,
     group_size: usize,
     cache: &GpuWeightCache,
+    attn_output_gate: bool,
 ) -> Result<CudaSlice<bf16>> {
     let kv_dim = num_kv_heads * head_dim;
     let seq_len = positions.len();
@@ -524,24 +526,71 @@ pub fn forward(
     let buf_size = seq_len * hidden_size;
     let per_gpu_head_dim = num_heads * head_dim;
 
-    // q_full = GEMM(input, q_proj^T)  [seq_len × per_gpu_head_dim]
+    // When attn_output_gate is true, the Q projection produces doubled output:
+    // [Q_head_0, G_head_0, Q_head_1, G_head_1, ...] per row (per-head interleaved).
+    let q_out_dim = per_gpu_head_dim * if attn_output_gate { 2 } else { 1 };
+
+    // q_full = GEMM(input, q_proj^T)  [seq_len × q_out_dim]
     let mut q_full = stream
-        .alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
+        .alloc_zeros::<bf16>(seq_len * q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
-        seq_len, per_gpu_head_dim, hidden_size, group_size,
+        seq_len, q_out_dim, hidden_size, group_size,
     )?;
 
-    // --- Q-norm on full Q before RoPE ---
+    // --- Q-norm on Q portion only (not gate) before RoPE ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
-        q_full = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_full, &q_norm_gpu, rms_norm_eps, head_dim,
+        // Extract Q per-head from interleaved layout for norm
+        let mut q_only = stream.alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate Q-only buffer for norm: {e}"))?;
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                let src_offset = s * q_out_dim + h * (head_dim * 2);
+                let dst_offset = s * per_gpu_head_dim + h * head_dim;
+                let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = q_only.slice_mut(dst_offset..dst_offset + head_dim);
+                stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Copy Q portion for norm failed: {e}"))?;
+            }
+        }
+        let q_normed = crate::norm::rms_norm(
+            stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
+        // Write normalized Q back into interleaved positions
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                let src_offset = s * per_gpu_head_dim + h * head_dim;
+                let dst_offset = s * q_out_dim + h * (head_dim * 2);
+                let src_slice = q_normed.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = q_full.slice_mut(dst_offset..dst_offset + head_dim);
+                stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Write normalized Q back failed: {e}"))?;
+            }
+        }
     }
+
+    // --- Gate extraction from interleaved layout ---
+    let gate_heads = if attn_output_gate {
+        let mut gate_buf = stream.alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                let src_offset = s * q_out_dim + h * (head_dim * 2) + head_dim;
+                let dst_offset = s * per_gpu_head_dim + h * head_dim;
+                let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
+                stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Copy gate data from q_full failed: {e}"))?;
+            }
+        }
+        Some(gate_buf)
+    } else {
+        None
+    };
 
     // --- Combined attention output buffer [seq_len x per_gpu_head_dim] ---
     let attn_combined_size = seq_len * per_gpu_head_dim;
@@ -549,14 +598,16 @@ pub fn forward(
         .alloc_zeros::<bf16>(attn_combined_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate attn_combined buffer: {e}"))?;
     for head_idx in 0..num_heads {
-        let kv_head_idx = head_idx % num_kv_heads;
+        let kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
         // --- Extract per-head Q from q_full via GPU copy ---
+        // q_full has per-head interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...] when gate enabled
+        let head_stride = if attn_output_gate { head_dim * 2 } else { head_dim };
         let mut q_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
         for s in 0..seq_len {
-            let src_offset = s * per_gpu_head_dim + head_idx * head_dim;
+            let src_offset = s * q_out_dim + head_idx * head_stride;
             let dst_offset = s * head_dim;
             let src_slice = q_full.slice(src_offset..src_offset + head_dim);
             let mut dst_slice = q_h.slice_mut(dst_offset..dst_offset + head_dim);
@@ -627,8 +678,8 @@ pub fn forward(
                 ldc: None,
                 activation: None,
             },
-            &q_h,
             &k_h,
+            &q_h,
             &mut scores_h,
         )?;
 
@@ -673,11 +724,11 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: seq_len,
-                n: head_dim,
+                m: head_dim,
+                n: seq_len,
                 k: seq_len,
-                transa: true,
-                transb: true,
+                transa: false,
+                transb: false,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -685,8 +736,8 @@ pub fn forward(
                 ldc: None,
                 activation: None,
             },
-            &softmax_out_h,
             &v_h,
+            &softmax_out_h,
             &mut attn_out_h,
         )?;
 
@@ -703,14 +754,39 @@ pub fn forward(
     }
 
     // =========================================================================
-    // O-projection using combined attention output
+    // Gate application: attn_output = attn_output * sigmoid(gate)
+    // =========================================================================
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+    let gated_attn = if let Some(ref gate_heads) = gate_heads {
+        let mut gated = stream.alloc_zeros::<bf16>(attn_combined_size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
+        unsafe {
+            stream.launch_builder(attn_output_gate_kernel)
+                .arg(&attn_combined)
+                .arg(gate_heads)
+                .arg(&mut gated)
+                .arg(&(attn_combined_size as i32))
+                .launch(LaunchConfig {
+                    grid_dim: ((attn_combined_size as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
+        }
+        gated
+    } else {
+        attn_combined
+    };
+
+    // =========================================================================
+    // O-projection using gated attention output
     // =========================================================================
     let mut output = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        cache, &weights.o_proj.name, &attn_combined, &mut output,
+        cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
 
@@ -759,6 +835,7 @@ pub fn decode_forward(
     kv_cache_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
+    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -772,6 +849,7 @@ pub fn decode_forward(
     rms_norm_eps: f32,
     group_size: usize,
     cache: &GpuWeightCache,
+    attn_output_gate: bool,
 ) -> Result<CudaSlice<bf16>> {
     let hidden_size = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -881,17 +959,51 @@ pub fn decode_forward(
     let buf_size = hidden_size;
     let per_gpu_head_dim = num_heads * head_dim;
 
-    // q_single = GEMM(input, q_proj^T)  [1 × per_gpu_head_dim]
-    let mut q_single = stream
-        .alloc_zeros::<bf16>(per_gpu_head_dim)
+    // When attn_output_gate is true, the Q projection produces doubled output (per-head interleaved).
+    let q_out_dim = per_gpu_head_dim * if attn_output_gate { 2 } else { 1 };
+
+    // q_full = GEMM(input, q_proj^T)  [1 × q_out_dim]
+    let mut q_full = stream
+        .alloc_zeros::<bf16>(q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        cache, &weights.q_proj.name, input, &mut q_single,
-        1, per_gpu_head_dim, hidden_size, group_size,
+        cache, &weights.q_proj.name, input, &mut q_full,
+        1, q_out_dim, hidden_size, group_size,
     )?;
 
-    // --- Q-norm on full Q before RoPE ---
+    // --- Split Q and gate from interleaved layout, apply Q-norm to Q only ---
+    let (mut q_single, gate_single) = if attn_output_gate {
+        // Extract Q portion from interleaved layout [Q_h0, G_h0, Q_h1, G_h1, ...]
+        let mut q_buf = stream.alloc_zeros::<bf16>(per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
+        for h in 0..num_heads {
+            let src_offset = h * (head_dim * 2);
+            let dst_offset = h * head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = q_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
+        }
+
+        // Extract gate portion
+        let mut gate_buf = stream.alloc_zeros::<bf16>(per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
+        for h in 0..num_heads {
+            let src_offset = h * (head_dim * 2) + head_dim;
+            let dst_offset = h * head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
+        }
+
+        (q_buf, Some(gate_buf))
+    } else {
+        (q_full, None)
+    };
+
+    // --- Q-norm on Q portion only ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
@@ -1040,14 +1152,40 @@ pub fn decode_forward(
     }
 
     // =========================================================================
-    // O-projection using combined attention output
+    // Gate application: attn_output = attn_output * sigmoid(gate)
+    // =========================================================================
+    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+    let gated_attn = if let Some(ref gate) = gate_single {
+        let mut gated = stream.alloc_zeros::<bf16>(per_gpu_head_dim)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
+        let total_i32 = per_gpu_head_dim as i32;
+        unsafe {
+            stream.launch_builder(attn_output_gate_kernel)
+                .arg(&attn_combined)
+                .arg(gate)
+                .arg(&mut gated)
+                .arg(&total_i32)
+                .launch(LaunchConfig {
+                    grid_dim: ((per_gpu_head_dim as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
+        }
+        gated
+    } else {
+        attn_combined
+    };
+
+    // =========================================================================
+    // O-projection using gated attention output
     // =========================================================================
     let mut output = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, int4_kernel, stream,
-        cache, &weights.o_proj.name, &attn_combined, &mut output,
+        cache, &weights.o_proj.name, &gated_attn, &mut output,
         1, hidden_size, per_gpu_head_dim, group_size,
     )?;
 
@@ -1068,6 +1206,15 @@ pub fn decode_forward(
 /// - Phase 1: Same K/V computation + RoPE
 /// - Phase 2: Writes to paged cache via `infers_paged_kv_write_bf16` instead of flat buffer
 /// - Phase 3: Same per-head attention using the already-computed K/V buffers
+fn debug_hidden_stats(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, label: &str) {
+    let cpu: Vec<bf16> = stream.clone_dtoh(buf).expect("dl");
+    let mean_abs = cpu.iter().map(|v| (v.to_f32() as f64).abs()).sum::<f64>() / cpu.len() as f64;
+    let max_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MIN, |a, b| a.max(b));
+    let min_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MAX, |a, b| a.min(b));
+    eprintln!("{}: min={:.4} max={:.4} mean_abs={:.6}", label, min_val, max_val, mean_abs);
+}
+
+/// Paged prefill attention: writes K/V to paged cache, uses per-head GEMM.
 pub fn forward_paged(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
@@ -1095,6 +1242,8 @@ pub fn forward_paged(
     cache: &GpuWeightCache,
     hidden_size: usize,
     attn_output_gate: bool,
+    layer_idx: usize,
+    gpu_idx: usize,
 ) -> Result<CudaSlice<bf16>> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1105,6 +1254,8 @@ pub fn forward_paged(
         "num_heads {} must be divisible by num_kv_heads {} for GQA",
         num_heads, num_kv_heads
     );
+    let debug_attn = std::env::var("INFERS_DEBUG_LAYER3").is_ok();
+    if debug_attn { eprintln!("ATTN-SCALE: 1/sqrt({}) = {}", head_dim, 1.0f32/(head_dim as f32).sqrt()); }
 
     // =========================================================================
     // Phase 1: Full K, V computation + RoPE
@@ -1129,6 +1280,7 @@ pub fn forward_paged(
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
+    if debug_attn { debug_hidden_stats(stream, &v_full, "ATTN-V-FULL"); }
 
     // --- K-norm on full K before Phase 1 RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
@@ -1154,6 +1306,7 @@ pub fn forward_paged(
         rope_theta,
         partial_rotary_factor,
     )?;
+    if debug_attn { debug_hidden_stats(stream, &k_full, "ATTN-K-FULL"); }
 
     // =========================================================================
     // Phase 2: Paged KV write
@@ -1193,6 +1346,40 @@ pub fn forward_paged(
         seq_len, q_out_dim, hidden_size, group_size,
     )?;
 
+    // Debug dump: raw q_proj output (before Q-norm and gate split) for layer 3
+    if debug_attn && layer_idx == 3 {
+        let qfull_cpu: Vec<bf16> = stream.clone_dtoh(&q_full).expect("dl");
+        let qfull_f32: Vec<f32> = qfull_cpu.iter().map(|v| v.to_f32()).collect();
+        let mean: f32 = qfull_f32.iter().map(|v| v.abs()).sum::<f32>() / qfull_f32.len() as f32;
+        eprintln!("ATTN-Q-FULL-RAW: mean_abs={:.6} len={}", mean, qfull_f32.len());
+        
+        // Separate Q and Gate from interleaved layout
+        let mut q_only_mean: f32 = 0.0;
+        let mut gate_only_mean: f32 = 0.0;
+        let mut q_count = 0usize;
+        let mut g_count = 0usize;
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                let base = s * q_out_dim + h * (head_dim * 2);
+                for j in 0..head_dim {
+                    q_only_mean += qfull_f32[base + j].abs();
+                    gate_only_mean += qfull_f32[base + head_dim + j].abs();
+                }
+                q_count += head_dim;
+                g_count += head_dim;
+            }
+        }
+        q_only_mean /= q_count as f32;
+        gate_only_mean /= g_count as f32;
+        eprintln!("ATTN-Q-FULL-RAW: Q_portion_mean={:.6} Gate_portion_mean={:.6}", q_only_mean, gate_only_mean);
+        // Save raw f32 for comparison (GPU 0 only)
+        if gpu_idx == 0 {
+            let path = "/tmp/engine_attn/q_full_raw.f32";
+            let _ = std::fs::create_dir_all("/tmp/engine_attn");
+            let bytes: Vec<u8> = qfull_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(path, bytes);
+        }
+    }
     // --- Q-norm on Q portion only (not gate) before split ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
@@ -1201,28 +1388,32 @@ pub fn forward_paged(
         let mut q_only = stream
             .alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate Q-only buffer for norm: {e}"))?;
-        // Copy Q portion from q_full (first half of each row)
+        // Copy Q portion from q_full (per-head interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...])
         for s in 0..seq_len {
-            let src_offset = s * q_out_dim;
-            let dst_offset = s * per_gpu_head_dim;
-            let src_slice = q_full.slice(src_offset..src_offset + per_gpu_head_dim);
-            let mut dst_slice = q_only.slice_mut(dst_offset..dst_offset + per_gpu_head_dim);
-            stream
-                .memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Copy Q portion for norm failed: {e}"))?;
+            for h in 0..num_heads {
+                let src_offset = s * q_out_dim + h * (head_dim * 2);
+                let dst_offset = s * per_gpu_head_dim + h * head_dim;
+                let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = q_only.slice_mut(dst_offset..dst_offset + head_dim);
+                stream
+                    .memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Copy Q portion for norm failed: {e}"))?;
+            }
         }
         let q_normed = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
-        // Write normalized Q back into first half of each row of q_full
+        // Write normalized Q back into q_full (per-head interleaved)
         for s in 0..seq_len {
-            let src_offset = s * per_gpu_head_dim;
-            let dst_offset = s * q_out_dim;
-            let src_slice = q_normed.slice(src_offset..src_offset + per_gpu_head_dim);
-            let mut dst_slice = q_full.slice_mut(dst_offset..dst_offset + per_gpu_head_dim);
-            stream
-                .memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Write normalized Q back failed: {e}"))?;
+            for h in 0..num_heads {
+                let src_offset = s * per_gpu_head_dim + h * head_dim;
+                let dst_offset = s * q_out_dim + h * (head_dim * 2);
+                let src_slice = q_normed.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = q_full.slice_mut(dst_offset..dst_offset + head_dim);
+                stream
+                    .memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Write normalized Q back failed: {e}"))?;
+            }
         }
     }
 
@@ -1230,25 +1421,29 @@ pub fn forward_paged(
     // q_heads has shape [seq_len, per_gpu_head_dim] (first half of each row)
     // gate_heads has shape [seq_len, per_gpu_head_dim] (second half of each row)
     let gate_heads = if attn_output_gate {
-        // Allocate and copy the gate portion from the second half of q_full
+        // Allocate and copy the gate portion (per-head interleaved layout)
         let mut gate_buf = stream
             .alloc_zeros::<bf16>(seq_len * per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
 
-        // Copy per-row: row s of gate_heads comes from offset s*total + per_gpu_head_dim
+        // Copy per-head gate from interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...]
         for s in 0..seq_len {
-            let src_offset = s * q_out_dim + per_gpu_head_dim;
-            let dst_offset = s * per_gpu_head_dim;
-            let src_slice = q_full.slice(src_offset..src_offset + per_gpu_head_dim);
-            let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + per_gpu_head_dim);
-            stream
-                .memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Copy gate data from q_full failed: {e}"))?;
+            for h in 0..num_heads {
+                let src_offset = s * q_out_dim + h * (head_dim * 2) + head_dim;
+                let dst_offset = s * per_gpu_head_dim + h * head_dim;
+                let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+                let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
+                stream
+                    .memcpy_dtod(&src_slice, &mut dst_slice)
+                    .map_err(|e| anyhow::anyhow!("Copy gate data from q_full failed: {e}"))?;
+            }
         }
         Some(gate_buf)
     } else {
         None
     };
+    if debug_attn { debug_hidden_stats(stream, &q_full, "ATTN-Q-FULL"); }
+    if debug_attn { if let Some(ref g) = gate_heads { debug_hidden_stats(stream, g, "ATTN-GATE-HEADS"); } }
 
     // =========================================================================
     // Phase 3: Per-head attention — extract K/V from full buffers (GPU copies)
@@ -1262,16 +1457,16 @@ pub fn forward_paged(
         .map_err(|e| anyhow::anyhow!("Failed to allocate attn_combined buffer: {e}"))?;
     for head_idx in 0..num_heads {
         // --- Extract and upload per-head weight slices ---
-        let kv_head_idx = head_idx % num_kv_heads;
+        let kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
         // --- Q projection: copy from precomputed q_full ---
-        // q_full has shape [seq_len, per_gpu_head_dim] (or [seq_len, per_gpu_head_dim * 2] with gate)
-        // Per-head Q is at columns [head_idx*head_dim .. (head_idx+1)*head_dim] of each row
+        // q_full has per-head interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...] when gate enabled
+        let head_stride = if attn_output_gate { head_dim * 2 } else { head_dim };
         let mut q_h = stream
             .alloc_zeros::<bf16>(seq_len * head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate q_h buffer: {e}"))?;
         for s in 0..seq_len {
-            let src_offset = s * q_out_dim + head_idx * head_dim;
+            let src_offset = s * q_out_dim + head_idx * head_stride;
             let dst_offset = s * head_dim;
             let src_slice = q_full.slice(src_offset..src_offset + head_dim);
             let mut dst_slice = q_h.slice_mut(dst_offset..dst_offset + head_dim);
@@ -1279,6 +1474,7 @@ pub fn forward_paged(
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy per-head Q from q_full failed: {e}"))?;
         }
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &q_h, "ATTN-Q-H0"); }
 
         // --- Extract per-head K from k_full (already has RoPE applied from Phase 1) ---
         let mut k_h = stream
@@ -1293,6 +1489,7 @@ pub fn forward_paged(
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy per-head K from k_full failed: {e}"))?;
         }
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &k_h, "ATTN-K-H0"); }
 
         // --- Extract per-head V from v_full ---
         let mut v_h = stream
@@ -1307,6 +1504,7 @@ pub fn forward_paged(
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy per-head V from v_full failed: {e}"))?;
         }
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &v_h, "ATTN-V-H0"); }
 
         // --- RoPE (per-head, num_heads=1) — apply only to q_h (k_h already has RoPE from Phase 1) ---
         let mut k_h_dummy = stream.alloc_zeros::<bf16>(seq_len * head_dim)
@@ -1322,6 +1520,7 @@ pub fn forward_paged(
             rope_theta,
             partial_rotary_factor,
         )?;
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &q_h, "ATTN-Q-ROPE-H0"); }
 
         // --- Attention scores: Q_h @ K_h^T → [seq_len × seq_len] ---
         // Scale by 1/sqrt(head_dim) for stable softmax (standard attention scaling).
@@ -1343,8 +1542,8 @@ pub fn forward_paged(
                 ldc: None,
                 activation: None,
             },
-            &q_h,
             &k_h,
+            &q_h,
             &mut scores_h,
         )?;
 
@@ -1381,6 +1580,36 @@ pub fn forward_paged(
                 .launch(softmax_config)
                 .map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
         }
+        if debug_attn && head_idx == 0 {
+            // Download softmax output for head 0 to check attention pattern
+            let softmax_cpu: Vec<bf16> = stream.clone_dtoh(&softmax_out_h).expect("dl");
+
+            // Print row 0 (token 0 attending to tokens 0..0 only, causal)
+            let row0: Vec<String> = softmax_cpu[..seq_len.min(5)].iter()
+                .map(|v| format!("{:.4}", v.to_f32())).collect();
+            eprintln!("ATTN-SOFTMAX-H0-ROW0: [{}] (first 5 of {})", row0.join(", "), seq_len);
+
+            // Print row 14 (last token attending to all 15 tokens)
+            let row14_start = 14 * seq_len;
+            let row14: Vec<String> = softmax_cpu[row14_start..row14_start+seq_len.min(15)].iter()
+                .map(|v| format!("{:.4}", v.to_f32())).collect();
+            eprintln!("ATTN-SOFTMAX-H0-ROW14: [{}] (all 15)", row14.join(", "));
+
+            // Print max weight per row for head 0
+            let mut max_weights = Vec::new();
+            for r in 0..seq_len.min(5) {
+                let row_start = r * seq_len;
+                let mut max_w = 0.0f32;
+                let mut max_j = 0;
+                for j in 0..seq_len {
+                    let val = softmax_cpu[row_start + j].to_f32();
+                    if val > max_w { max_w = val; max_j = j; }
+                }
+                max_weights.push(format!("row{}: max={:.4}@pos{}", r, max_w, max_j));
+            }
+            eprintln!("ATTN-SOFTMAX-H0-MAX: {}", max_weights.join(", "));
+        }
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &softmax_out_h, "ATTN-SOFTMAX-H0"); }
 
         // --- Attention output: softmax_out_h @ V_h → [seq_len × head_dim] ---
         let mut attn_out_h = stream
@@ -1388,11 +1617,11 @@ pub fn forward_paged(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: seq_len,
-                n: head_dim,
+                m: head_dim,
+                n: seq_len,
                 k: seq_len,
-                transa: true,
-                transb: true,
+                transa: false,
+                transb: false,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -1400,10 +1629,11 @@ pub fn forward_paged(
                 ldc: None,
                 activation: None,
             },
-            &softmax_out_h,
             &v_h,
+            &softmax_out_h,
             &mut attn_out_h,
         )?;
+        if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &attn_out_h, "ATTN-OUT-H0"); }
 
         // --- Copy attention output to combined buffer at correct head offset ---
         for s in 0..seq_len {
@@ -1415,6 +1645,18 @@ pub fn forward_paged(
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy attn_out_h to combined buffer failed: {e}"))?;
         }
+    }
+
+    // Debug dump: combined attention output (before gate) for layer 3
+    if debug_attn {
+        let combined_cpu: Vec<bf16> = stream.clone_dtoh(&attn_combined).expect("dl");
+        let combined_f32: Vec<f32> = combined_cpu.iter().map(|v| v.to_f32()).collect();
+        let mean: f32 = combined_f32.iter().map(|v| v.abs()).sum::<f32>() / combined_f32.len() as f32;
+        eprintln!("ATTN-COMBINED-BEFORE-GATE: mean_abs={:.6} shape=[{}, {}]", mean, seq_len, per_gpu_head_dim);
+        let path = "/tmp/engine_attn/attn_combined_before_gate.f32";
+        let _ = std::fs::create_dir_all("/tmp/engine_attn");
+        let bytes: Vec<u8> = combined_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
     }
 
     // =========================================================================
@@ -1444,7 +1686,18 @@ pub fn forward_paged(
     } else {
         attn_combined
     };
+    if debug_attn { debug_hidden_stats(stream, &gated_attn, "ATTN-GATED"); }
 
+    // Debug dump: gated attention output (after gate, before O-proj) for layer 3
+    if debug_attn {
+        let gated_cpu: Vec<bf16> = stream.clone_dtoh(&gated_attn).expect("dl");
+        let gated_f32: Vec<f32> = gated_cpu.iter().map(|v| v.to_f32()).collect();
+        let mean: f32 = gated_f32.iter().map(|v| v.abs()).sum::<f32>() / gated_f32.len() as f32;
+        eprintln!("ATTN-GATED-BEFORE-OPROJ: mean_abs={:.6} shape=[{}, {}]", mean, seq_len, per_gpu_head_dim);
+        let path = "/tmp/engine_attn/gated_attn_before_oproj.f32";
+        let bytes: Vec<u8> = gated_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
 
     // =========================================================================
     // O-projection using gated attention output
@@ -1457,6 +1710,18 @@ pub fn forward_paged(
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
+    if debug_attn { debug_hidden_stats(stream, &output, "ATTN-O-PROJ"); }
+
+    // Debug dump: O-proj output (before all-reduce) for layer 3
+    if debug_attn {
+        let oproj_cpu: Vec<bf16> = stream.clone_dtoh(&output).expect("dl");
+        let oproj_f32: Vec<f32> = oproj_cpu.iter().map(|v| v.to_f32()).collect();
+        let mean: f32 = oproj_f32.iter().map(|v| v.abs()).sum::<f32>() / oproj_f32.len() as f32;
+        eprintln!("ATTN-OPROJ-BEFORE-AR: mean_abs={:.6} shape=[{}, {}]", mean, seq_len, hidden_size);
+        let path = "/tmp/engine_attn/oproj_output_before_ar.f32";
+        let bytes: Vec<u8> = oproj_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
 
     Ok(output)
 }
@@ -1597,25 +1862,32 @@ pub fn decode_forward_paged(
     // --- Q-norm on Q portion only (not gate) ---
     // Split first, then normalize only the Q part.
     let (mut q_single, gate_single) = if attn_output_gate {
-        // Extract Q and gate portions from q_full
+        // Extract Q and gate portions from q_full (per-head interleaved layout)
         let mut q_buf = stream
             .alloc_zeros::<bf16>(per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
-        let src_slice = q_full.slice(..per_gpu_head_dim);
-        let mut dst_slice = q_buf.slice_mut(..per_gpu_head_dim);
-        stream
-            .memcpy_dtod(&src_slice, &mut dst_slice)
-            .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
+        for h in 0..num_heads {
+            let src_offset = h * (head_dim * 2);
+            let dst_offset = h * head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = q_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
+        }
 
-        // Copy gate portion
         let mut gate_buf = stream
             .alloc_zeros::<bf16>(per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
-        let src_slice = q_full.slice(per_gpu_head_dim..q_out_dim);
-        let mut dst_slice = gate_buf.slice_mut(..per_gpu_head_dim);
-        stream
-            .memcpy_dtod(&src_slice, &mut dst_slice)
-            .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
+        for h in 0..num_heads {
+            let src_offset = h * (head_dim * 2) + head_dim;
+            let dst_offset = h * head_dim;
+            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            stream
+                .memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
+        }
 
         (q_buf, Some(gate_buf))
     } else {

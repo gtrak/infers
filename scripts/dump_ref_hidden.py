@@ -55,14 +55,10 @@ def main():
         print(f"Device map: {gpu_layers} GPU layers", flush=True)
     print(f"Model device: {model.device}", flush=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    inputs = tokenizer(PROMPT, return_tensors="pt")
-    input_ids = inputs["input_ids"]
-
-    # Move inputs to model device
-    for k, v in inputs.items():
-        if hasattr(v, "to"):
-            inputs[k] = v.to(model.device)
+    # Use engine's exact 15 token IDs instead of HF tokenizer
+    TOKEN_IDS = [248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198]
+    input_ids = torch.tensor([TOKEN_IDS], dtype=torch.long, device=model.device)
+    inputs = {"input_ids": input_ids}
 
     print(f"Input IDs ({input_ids.shape}): {input_ids[0].tolist()}", flush=True)
     torch.save(input_ids[0].cpu(), f"{OUTPUT_DIR}/input_ids.pt")
