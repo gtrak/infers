@@ -1417,6 +1417,31 @@ pub fn forward_paged(
         }
     }
 
+    // Debug dump: q_full after Q-norm write-back for layer 3
+    if debug_attn && layer_idx == 3 && gpu_idx == 0 {
+        let qfull_cpu: Vec<bf16> = stream.clone_dtoh(&q_full).expect("dl");
+        let qfull_f32: Vec<f32> = qfull_cpu.iter().map(|v| v.to_f32()).collect();
+        // Separate Q and Gate from interleaved layout
+        let mut q_only_mean: f32 = 0.0;
+        let mut gate_only_mean: f32 = 0.0;
+        let mut q_count = 0usize;
+        let mut g_count = 0usize;
+        for s in 0..seq_len {
+            for h in 0..num_heads {
+                let base = s * q_out_dim + h * (head_dim * 2);
+                for j in 0..head_dim {
+                    q_only_mean += qfull_f32[base + j].abs();
+                    gate_only_mean += qfull_f32[base + head_dim + j].abs();
+                }
+                q_count += head_dim;
+                g_count += head_dim;
+            }
+        }
+        q_only_mean /= q_count as f32;
+        gate_only_mean /= g_count as f32;
+        eprintln!("ATTN-Q-FULL-AFTER-NORM: Q_mean_abs={:.6} Gate_mean_abs={:.6}", q_only_mean, gate_only_mean);
+    }
+
     // When gate is enabled, split q_full into q_heads and gate_heads.
     // q_heads has shape [seq_len, per_gpu_head_dim] (first half of each row)
     // gate_heads has shape [seq_len, per_gpu_head_dim] (second half of each row)
@@ -1664,6 +1689,17 @@ pub fn forward_paged(
     // =========================================================================
     // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
     let gated_attn = if let Some(ref gate_heads) = gate_heads {
+        // Debug dump: gate_heads buffer content for layer 3
+        if debug_attn && layer_idx == 3 && gpu_idx == 0 {
+            let gate_cpu: Vec<bf16> = stream.clone_dtoh(gate_heads).expect("dl");
+            let gate_f32: Vec<f32> = gate_cpu.iter().map(|v| v.to_f32()).collect();
+            let mean: f32 = gate_f32.iter().map(|v| v.abs()).sum::<f32>() / gate_f32.len() as f32;
+            let gate_mean: f32 = gate_f32.iter().map(|v| v).sum::<f32>() / gate_f32.len() as f32;
+            eprintln!("ATTN-GATE-BUF: mean_abs={:.6} mean={:.6} min={:.4} max={:.4}", mean, gate_mean, gate_f32.iter().cloned().fold(f32::INFINITY, f32::min), gate_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+            let path = "/tmp/engine_attn/gate_heads_buffer.f32";
+            let bytes: Vec<u8> = gate_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(path, bytes);
+        }
         let mut gated = stream
             .alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;

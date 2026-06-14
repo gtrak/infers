@@ -182,6 +182,9 @@ async fn run() -> Result<()> {
             attn_output_gate: true,
             quantization_config: None,
             layer_types: None,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 1,
+            linear_conv_kernel_dim: 4,
             linear_num_value_heads: 48,
             linear_value_head_dim: 128,
         };
