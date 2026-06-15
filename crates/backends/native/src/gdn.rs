@@ -177,6 +177,8 @@ fn clone_view_to_slice(
     Ok(dst)
 }
 
+
+
 /// Extract columns `col_start..col_end` from a row-major `[seq_len, conv_dim]` tensor.
 ///
 /// Each row's slice is copied independently — this is NOT a contiguous flat copy.
@@ -204,6 +206,9 @@ fn extract_columns(
     Ok(dst)
 }
 
+/// Upload a small BF16 GPU buffer as a float32 GPU buffer.
+
+/// Used for A_log and dt_bias (small per-head constant arrays).
 fn bf16_to_f32_gpu(
     stream: &Arc<CudaStream>,
     src: &CudaSlice<bf16>,
@@ -216,7 +221,6 @@ fn bf16_to_f32_gpu(
         .map_err(|e| anyhow::anyhow!("Failed to upload f32 buffer: {e}"))?;
     Ok(dst)
 }
-
 // ──────────────────────────────────────────────
 // Small helper kernel: repeat_interleave for q/k
 // ──────────────────────────────────────────────
@@ -261,7 +265,7 @@ fn repeat_interleave_heads(
 /// * `gemm` — cuBLASLt engine
 /// * `int4_kernel` — INT4 GEMM kernel
 /// * `stream` — CUDA stream
-/// * `gdn_recurrent_step_kernel` — `infers_gdn_recurrent_step_bf16` (single-token step)
+/// * `gdn_recurrent_step_kernel` — `infers_gdn_recurrent_step_bf16` (single-token step, bf16 inputs)
 /// * `conv1d_kernel` — `infers_conv1d_depthwise_silu_bf16`
 /// * `rms_norm_gated_kernel` — `infers_rms_norm_gated_bf16`
 /// * `weights` — GDN layer weights (includes in_proj_qkv, conv1d, etc.)
@@ -511,12 +515,14 @@ fn repeat_interleave_heads(
     debug_tensor_stats_f32(stream, &dt_bias_f32, num_v_heads, "dt_bias_f32");
 
     // =========================================================================
-    // Phase 7: Sequential recurrent step for each token
+    // Phase 7: Sequential recurrent step for each token (fp32 inputs)
     // =========================================================================
     gdn_state.ensure_allocated(stream, num_v_heads, head_k_dim, head_v_dim)?;
     let mut gdn_output = stream.alloc_zeros::<bf16>(seq_len * num_v_heads * head_v_dim)?;
     let state_ref = gdn_state.state.as_mut()
         .ok_or_else(|| anyhow::anyhow!("GDN state not allocated"))?;
+
+    // Per-token bf16 extraction for the recurrent step kernel
 
     let num_v_heads_i32 = num_v_heads as i32;
     let head_k_dim_i32 = head_k_dim as i32;
@@ -524,7 +530,7 @@ fn repeat_interleave_heads(
     let total_threads = num_v_heads * head_v_dim;
 
     for t in 0..seq_len {
-        // Extract per-token slices by copying (avoids lifetime issues with CudaView)
+        // Extract per-token bf16 slices
         let q_offset = t * num_v_heads * head_k_dim;
         let k_offset = t * num_v_heads * head_k_dim;
         let v_offset = t * num_v_heads * head_v_dim;
@@ -786,7 +792,7 @@ pub fn decode_forward(
     };
 
     // =========================================================================
-    // Phase 7: Gated delta update kernel
+    // Phase 7: Gated delta update kernel (bf16 inputs, fp32 state)
     // =========================================================================
     gdn_state.ensure_allocated(stream, num_v_heads, head_k_dim, head_v_dim)?;
     let mut gdn_output = stream.alloc_zeros::<bf16>(num_v_heads * head_v_dim)?;

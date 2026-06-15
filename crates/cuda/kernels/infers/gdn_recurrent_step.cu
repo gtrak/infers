@@ -16,7 +16,7 @@
 
 extern "C" {
 
-/// Single-token Gated Delta Rule step.
+/// Single-token Gated Delta Rule step (bf16 inputs, fp32 state).
 ///
 /// # Arguments
 /// * query   — [H, K] BF16 — raw (un-normalized) query for this token
@@ -124,7 +124,7 @@ __global__ void infers_gdn_recurrent_step_bf16(
     for (int k = 0; k < K; k++) {
         float s_val = state[state_base + k * V];
         // query is L2-normalized and scaled by 1/sqrt(K)
-        float q_val = __bfloat162float(query[h * K + k]) * q_rcp * rcp_sqrt_k;
+        float q_val = (__bfloat162float(query[h * K + k]) * q_rcp) * rcp_sqrt_k;
         y_val += s_val * q_val;
     }
 

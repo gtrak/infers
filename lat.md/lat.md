@@ -1645,10 +1645,22 @@ All of these were verified correct during investigation:
 - **Weight sharding**: fused QKV projections split correctly per GPU
 - **NCCL all-reduce**: working correctly (norm ratios ≈ 1.0, not 0.5)
 - **Conv1d kernel**: causal depthwise with SiLU, correct padding
-- **GDN recurrent step kernel**: matches PyTorch reference exactly
+- **GDN recurrent step kernel** (`infers_gdn_recurrent_step_fp32`): receives Q/K/V/a_proj/b_proj in fp32 (converted once before the token loop), L2-normalizes and accumulates entirely in fp32 with no bf16 round-trip. State remains in fp32, output is bf16
 - **Embedding lookup**: cos=1.0 with reference
 
-## Debugging Infrastructure
+## bf16 Normalization Fix (Q/K rounding)
+
+PyTorch normalizes Q and K in bf16: `key / sqrt(sum(key^2) + eps)` is computed in bf16 and rounded to bf16, then promoted to fp32. The original kernel normalized purely in fp32 without the intermediate bf16 rounding step.
+
+The fix wraps each normalized value with a bf16 round-trip: `__bfloat162float(__float2bfloat16(__bfloat162float(key[i]) * k_rcp))`. This computes the normalization in fp32, rounds to bf16 (losing precision as PyTorch does), then converts back to fp32 for accumulation. Applied to all three key uses (kv_mem, state update) and the query use (output computation).
+
+The difference is subtle: fp32 normalization produces slightly different floating-point results than bf16-rounded normalization because bf16 has only 7 significand bits vs fp32's 23. This affects the per-layer cosine when comparing against a PyTorch reference that normalizes in bf16.
+
+## fp32 Input Conversion for Recurrent Step
+
+Q, K, V, a_proj, and b_proj are converted from bf16 to fp32 once before the token loop, and the kernel (`infers_gdn_recurrent_step_fp32`) operates entirely in fp32 with no bf16 round-trip on normalized values.
+
+The recurrent state remains in fp32, per-token output is bf16. This matches PyTorch's `.to(torch.float32)` behavior within chunked prefill, where all computation within a chunk uses fp32 accumulation. Expected token 248068 ranks at position #13489 with logit=1.9375 (chat-format tokens) — still not top-ranked, indicating further precision improvements are needed.
 
 Environment variables for per-layer debugging:
 
@@ -1664,3 +1676,24 @@ Key diagnostic scripts:
 - `/tmp/verify_sharding.py` — verify INT4 weight sharding for in_proj_qkv
 - `/tmp/test_int4_gemm_cpu.py` — CPU-side INT4 GEMM verification
 - `/tmp/compare_L13_gdn.py` — compare GDN intermediates at a given layer
+- `/tmp/dump_ref_gdn_L0.py` — dump layer 0 GDN reference intermediates (CPU, manual dequantization)
+- `/tmp/compare_gdn_L0.py` — compare engine vs reference dumps for L0 GDN
+
+## Layer-0 GDN Reference Dump (TP=4 Comparison)
+
+Comparison between vLLM engine GDN intermediates (GPU1, TP=4) and CPU reference via manual GPTQ dequantization. Reference covers in_proj_qkv through conv1d and QKV split; the GDN recurrent step requires CUDA + FLA kernels.
+
+- **Reference dump**: `/tmp/dump_ref_gdn_L0.py` — generates reference GDN intermediates for layer 0 using manual GPTQ dequantization + CPU forward pass through in_proj_qkv, conv1d, and QKV split
+- **Comparison script**: `/tmp/compare_gdn_L0.py` — compares engine dumps (`/tmp/gdn_debug/`) against reference (`/tmp/ref_gdn_L0/`) via cosine similarity and norm ratios
+
+Engine dump confirmed as TP=4 (not TP=2): mixed_qkv has 38400 elements per GPU vs 153600 full model (ratio = 1/4). Head sharding: 4 K-attention heads + 12 V-attention heads per GPU.
+
+Key findings from norm ratio analysis:
+- **a_proj/b_proj**: eng/ref norm ratios 0.52 and 0.46 vs expected 0.50 (within ~4%, minor dequantization variance)
+- **z_gate**: norm ratio 0.504 vs expected 0.500 — very close, z projection working correctly
+- **mixed_qkv**: norm ratio 0.534 vs expected 0.500 — **6.8% deviation**, indicates excess energy in GPU1's shard
+- **conv_out**: norm ratio 0.553 vs expected 0.500 — **10.5% deviation**, divergence amplifies through conv1d
+
+The increasing deviation from mixed_qkv (6.8%) to conv_out (10.5%) suggests the GEMM or dequantization introduces excess energy that cascades through the causal convolution. The z_gate ratio being nearly exact confirms the issue is specific to in_proj_qkv/conv1d, not the input activation.
+
+Limitations: engine dump starts at mixed_qkv (no layer_input/norm1_out), so pre-GEMM divergence cannot be determined. GDN recurrent step not available on CPU reference (needs CUDA + FLA kernels).
