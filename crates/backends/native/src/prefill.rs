@@ -154,6 +154,7 @@ pub fn prefill(
                     config,
                     group_size,
                     cache,
+                    layer_idx,
                 )?
             }
             LayerType::FullAttention => {

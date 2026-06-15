@@ -93,9 +93,6 @@ fn debug_tensor_stats_f32(
     // if f_inf > 0 { panic!("DEBUG INF FOUND: {label} has {f_inf} Inf values"); }
 }
 
-/// Global flag: only dump GDN intermediates on the FIRST forward call.
-static DUMP_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 /// Dump a GPU BF16 tensor to a raw binary file for reference comparison.
 fn dump_gdn_intermediate(
     stream: &Arc<CudaStream>,
@@ -292,12 +289,16 @@ fn repeat_interleave_heads(
     config: &ModelConfig,
     group_size: usize,
     cache: &crate::gpu_cache::GpuWeightCache,
+    layer_idx: usize,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
     debug_tensor_stats_bf16(stream, input, seq_len * hidden_size, "gdn_input");
-    // Only dump GDN intermediates during the FIRST forward call (first layer).
-    let do_dump = DUMP_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst)
-        && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
+    // Dump GDN intermediates when layer_idx matches INFERS_DUMP_GDN_LAYER env var.
+    let dump_layer = std::env::var("INFERS_DUMP_GDN_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let do_dump = layer_idx == dump_layer && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
     let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
@@ -315,6 +316,7 @@ fn repeat_interleave_heads(
     // =========================================================================
     let mut mixed_qkv = stream.alloc_zeros::<bf16>(seq_len * conv_dim)?;
     if let Some(ref qkv_weight) = weights.in_proj_qkv {
+        eprintln!("DEBUG GDN L{}: in_proj_qkv name='{}' dtype={:?} shape={:?}", layer_idx, qkv_weight.name, qkv_weight.dtype, qkv_weight.shape);
         crate::gemm_dispatch::gemm_projection_cached(
             gemm, int4_kernel, stream, cache,
             &qkv_weight.name, input, &mut mixed_qkv,
@@ -662,8 +664,15 @@ pub fn decode_forward(
     config: &ModelConfig,
     group_size: usize,
     cache: &crate::gpu_cache::GpuWeightCache,
+    layer_idx: usize,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = 1usize;
+    // Dump GDN intermediates when layer_idx matches INFERS_DUMP_GDN_LAYER env var.
+    let dump_layer = std::env::var("INFERS_DUMP_GDN_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let do_dump = layer_idx == dump_layer && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
     let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1

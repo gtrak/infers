@@ -161,6 +161,7 @@ pub fn decode(
                     config,
                     group_size,
                     cache,
+                    layer_idx,
                 )?
             }
             LayerType::FullAttention => {
@@ -414,6 +415,7 @@ pub fn decode_with_hidden(
                     config,
                     group_size,
                     cache,
+                    layer_idx,
                 )?
             }
             LayerType::FullAttention => {

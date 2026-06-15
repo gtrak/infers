@@ -97,6 +97,7 @@ pub fn forward_layer_pass(
                 config,
                 group_size,
                 cache,
+                layer_idx,
             )?
         }
         LayerType::FullAttention => {

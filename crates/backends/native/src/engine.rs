@@ -605,6 +605,7 @@ impl ForwardEngine {
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
+                            layer_idx,
                         )?
                     }
                     LayerType::FullAttention => {
@@ -1087,6 +1088,7 @@ for layer_idx in 0..config.num_hidden_layers {
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
+                            layer_idx,
                         )?
                     }
                     LayerType::FullAttention => {

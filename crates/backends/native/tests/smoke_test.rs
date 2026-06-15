@@ -139,7 +139,12 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         String::new()
     };
-    let token_ids: Vec<u32> = if let Some(ref tok) = tokenizer {
+    let token_ids: Vec<u32> = if let Ok(ids_str) = std::env::var("INFERS_TEST_TOKEN_IDS") {
+        // Override token IDs from environment variable (comma-separated)
+        ids_str.split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    } else if let Some(ref tok) = tokenizer {
         tok.encode(&prompt)?
     } else {
         vec![151644u32]

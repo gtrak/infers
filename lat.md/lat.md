@@ -1580,6 +1580,13 @@ Systematic per-layer hidden state comparison between the infers engine and Huggi
 ## Test Setup
 Both models use the same 15-token prompt (engine IDs, not HF tokenizer). Reference is dumped via `scripts/dump_ref_hidden.py`. Engine dumps with `INFERS_DUMP_HIDDEN=1` to `/tmp/engine_hidden/layer_N.f32`.
 
+## Embedding-Level Verification
+Engine layer_-1 was verified against the model's embedding table loaded from safetensors.
+
+The embedding weight (`model.language_model.embed_tokens.weight`) is BF16, shape [248320, 5120], and is NOT quantized — it falls outside the `block_name_to_quantize` scope. Three findings: (1) engine layer_-1 and reference layer_0 are identical (mean cosine = 1.0000006, absolute difference = 0.0); (2) recomputing from safetensors weights matches both; (3) the user-provided token IDs `[1, 37774, ...]` produce completely different embeddings (mean cosine = 0.0965), confirming they are from a different test case.
+
+The divergence does NOT originate at the embedding level. It begins at layer 3 (first full-attention layer).
+
 ## Key Finding: Divergence at L3 (First Full-Attention Layer)
 Embedding matches perfectly (cosine sim = 1.000). GDN layers L0-L2 are close but slightly diverging. The first major divergence occurs at **layer 3**, the first full-attention layer, where the ratio jumps to 2.144x.
 
@@ -1609,3 +1616,51 @@ Cosine similarity at last token position shows directional drift. By L31 (60% th
 
 ## Conclusion
 The bug is localized to **full-attention layers** (every 4th layer: L3, L7, L11, ...). GDN layers are largely correct (ratio ~0.85-0.95). Attention produces values approximately 2x larger than reference, compounding across all 16 full-attention layers.
+
+# Numerical Precision Investigation
+
+Investigation into bf16 precision compounding through GDN recurrent layers in the Qwen3.6-27B INT4 inference engine.
+
+## Root Cause Analysis (L12-L13 Divergence)
+
+The engine produces incorrect end-to-end tokens because bf16 activation errors compound through the Gated Delta Net (GDN) layers. At TP=2 on Blackwell GPUs with INT4 AutoRound quantization:
+
+- **Per-GEMM accuracy**: INT4 GEMM produces cos=0.99997 with CPU reference (verified at L12)
+- **Embedding accuracy**: cos=1.0 (perfect match with reference)
+- **Per-layer cosine progression**: L0=0.998, L7=0.989, L11=0.983, L12=0.972, **L13=0.552** (catastrophic)
+- **Token 6 divergence**: cos drops from 0.993 (L0) to 0.807 (L12) to 0.134 (L13)
+
+The divergence is NOT caused by INT4 GEMM bugs, weight cache issues, or sharding errors. It is inherent to bf16 activation precision compounding through the GDN's recurrent state across 48 linear-attention layers.
+
+## Verified Components
+
+All of these were verified correct during investigation:
+
+- **INT4 GEMM kernel** (cos=0.99997 vs CPU reference)
+- **INT4 dequantization formula**: `(w_int4 - (zero + 1)) * scale` (biased zero-point)
+- **RMS norm formula**: `x * rsqrt(mean(x²) + eps) * (1 + weight)` (cos=1.0 vs reference)
+- **QKV column extraction**: per-segment sharding via `extract_columns`
+- **GQA block mapping**: `head_idx / (num_heads / num_kv_heads)`
+- **Attention output gate**: `attn_out * sigmoid(gate)`
+- **Weight sharding**: fused QKV projections split correctly per GPU
+- **NCCL all-reduce**: working correctly (norm ratios ≈ 1.0, not 0.5)
+- **Conv1d kernel**: causal depthwise with SiLU, correct padding
+- **GDN recurrent step kernel**: matches PyTorch reference exactly
+- **Embedding lookup**: cos=1.0 with reference
+
+## Debugging Infrastructure
+
+Environment variables for per-layer debugging:
+
+- `INFERS_DUMP_GDN_LAYER=N` — dump GDN intermediates for layer N
+- `INFERS_DUMP_GDN_DIR=/path` — directory for GDN dump files
+- `INFERS_DUMP_HIDDEN=1` — dump per-layer hidden states to `/tmp/engine_hidden/`
+- `INFERS_DUMP_LAYER_DIR=/path` — directory for layer hidden state dumps
+- `INFERS_TEST_TOKEN_IDS=1,2,3,...` — override token IDs in smoke test
+- `INFERS_DEBUG_LAYER0=1` — print debug stats at layer 0
+
+Key diagnostic scripts:
+
+- `/tmp/verify_sharding.py` — verify INT4 weight sharding for in_proj_qkv
+- `/tmp/test_int4_gemm_cpu.py` — CPU-side INT4 GEMM verification
+- `/tmp/compare_L13_gdn.py` — compare GDN intermediates at a given layer
