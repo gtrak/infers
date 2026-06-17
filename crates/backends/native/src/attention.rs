@@ -726,11 +726,11 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: seq_len,
-                n: head_dim,
+                m: head_dim,
+                n: seq_len,
                 k: seq_len,
-                transa: true,
-                transb: true,
+                transa: false,
+                transb: false,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -738,8 +738,8 @@ pub fn forward(
                 ldc: None,
                 activation: None,
             },
-            &softmax_out_h,
             &v_h,
+            &softmax_out_h,
             &mut attn_out_h,
         )?;
 
@@ -1162,11 +1162,11 @@ pub fn forward_paged(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: seq_len,
-                n: head_dim,
+                m: head_dim,
+                n: seq_len,
                 k: seq_len,
-                transa: true,
-                transb: true,
+                transa: false,
+                transb: false,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -1174,8 +1174,8 @@ pub fn forward_paged(
                 ldc: None,
                 activation: None,
             },
-            &softmax_out_h,
             &v_h,
+            &softmax_out_h,
             &mut attn_out_h,
         )?;
 

@@ -161,20 +161,20 @@ def _scaled_dot_product_attention(
     Returns [S, num_heads, head_dim].
     """
     scale = 1.0 / math.sqrt(head_dim)
-    # Q @ K^T: [S, H, D] @ [S, H, D]^T -> [S, H, S]
-    scores = torch.einsum("sah,sbh->sab", q.float(), k.float()) * scale
+    # Q @ K^T: [S, H, D] @ [S, H, D] -> [S, H, S] (per-head attention scores)
+    scores = torch.einsum("sah,tah->sat", q.float(), k.float()) * scale
 
     # Apply causal mask for prefill (seq_len > 1)
     # Each position can only attend to itself and previous positions
     if scores.shape[-1] > 1:
         seq_len = scores.shape[-1]
-        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device), diagonal=1)
+        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device), diagonal=1).unsqueeze(1)
         scores = scores.masked_fill(mask, float("-inf"))
 
     # Softmax over key dimension (last dim)
     attn_weights = F.softmax(scores, dim=-1)
-    # @V: [S, H, S] @ [S, H, D] -> [S, H, D]
-    return torch.einsum("sab,sbd->sad", attn_weights.float(), v.float())
+    # @V: [S, H, S] @ [S, H, D] -> [S, H, D] (per-head attention output)
+    return torch.einsum("sat,tad->sad", attn_weights.float(), v.float()).contiguous()
 
 
 class Norm1InputStage(Stage):
