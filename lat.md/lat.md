@@ -542,6 +542,15 @@ Workflow: loads engine dump files, computes reference norm1/norm2/RMSNorm output
 
 See [[tests/ref_intermediates.py]].
 
+### Compare Framework
+
+Shared Python infrastructure extracted from duplicated code in `ref_intermediates.py` and `gdn_layer_compare.py`. All stage modules import from the `tests.compare` package with five submodules.
+- **io.py**: bf16 raw I/O (`load_raw_bf16`, `save_raw_bf16`), metadata loading (`load_meta`), and dump discovery (`discover_dumps`, `discover_final_dumps`).
+- **dequant.py**: INT4 dequantization with the correct reshape-via-permute fix (`unpack_int4`, `dequantize_int4_autogptq`). Reshape pattern: `[K_packed, N*8] -> [K_packed, N, 8] -> permute(0,2,1) -> [K_packed, 8, N] -> [K, N]`.
+- **weight_loader.py**: TP-aware `WeightLoader` class. Handles safetensors loading (keeps int dtypes intact for INT4 packed data), config.json parsing with `text_config` sub-key support, and column-parallel / row-parallel sharding for attention and MLP projections.
+- **cos.py**: Comparison functions — `cos_sim`, `l2_error`, `element_stats`.
+- **config.py**: `DumpConfig` dataclass reading the engine's `config.json`. Provides `get_layer_type()` to determine full-attention vs GDN layers.
+
 ### Multi-Dtype Weight Upload
 
 The `upload_weight()` function checks `weight.dtype` and converts to BF16. Handles Bf16 (direct), Fp16 (via f16 cast), and Fp32 (via f32 cast). Returns `CudaSlice<bf16>`.
