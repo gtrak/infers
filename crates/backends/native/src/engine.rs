@@ -665,6 +665,7 @@ impl ForwardEngine {
                                 dump_bf16_tensor(&gpu_stream, &norm1_out, &layer_dump_dir, &format!("attn_norm1_gpu{}", gpu_idx));
                             }
                             dump_bf16_tensor(&gpu_stream, &attn_out, &layer_dump_dir, &format!("attn_output_raw_gpu{}", gpu_idx));
+                            dump_bf16_tensor(&gpu_stream, &attn_out, &layer_dump_dir, &format!("attn_o_proj_gpu{}", gpu_idx));
                         }
                     }
                 }

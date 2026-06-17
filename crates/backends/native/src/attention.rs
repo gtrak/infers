@@ -1221,6 +1221,17 @@ fn debug_hidden_stats(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, label: &s
     eprintln!("{}: min={:.4} max={:.4} mean_abs={:.6}", label, min_val, max_val, mean_abs);
 }
 
+/// Dump a BF16 GPU buffer to a raw binary file for reference comparison.
+#[allow(dead_code)]
+fn dump_bf16_tensor(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, dir: &str, name: &str) {
+    let cpu: Vec<bf16> = stream.clone_dtoh(buf).expect("dump_bf16_tensor clone_dtoh failed");
+    let bytes: Vec<u8> = cpu.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let path = format!("{}/{}.raw", dir, name);
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("WARN: failed to write dump {}: {}", path, e);
+    }
+}
+
 /// Paged prefill attention: writes K/V to paged cache, uses per-head GEMM.
 pub fn forward_paged(
     gemm: &mut GemmEngine,
@@ -1522,6 +1533,17 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy per-head K from k_full failed: {e}"))?;
         }
         if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &k_h, "ATTN-K-H0"); }
+        // DEBUG: k_h at specific layer via INFERS_DEBUG_LAYER (head 0 only)
+        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+            if dl.as_str() == &format!("{}", layer_idx) && head_idx == 0 {
+                debug_hidden_stats(stream, &k_h, &format!("ATTN-K-H0-L{}", layer_idx));
+                if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                    let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                    let _ = std::fs::create_dir_all(&layer_dump_dir);
+                    dump_bf16_tensor(stream, &k_h, &layer_dump_dir, &format!("attn_k_h0_gpu{}", gpu_idx));
+                }
+            }
+        }
 
         // --- Extract per-head V from v_full ---
         let mut v_h = stream
@@ -1537,6 +1559,17 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy per-head V from v_full failed: {e}"))?;
         }
         if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &v_h, "ATTN-V-H0"); }
+        // DEBUG: v_h at specific layer via INFERS_DEBUG_LAYER (head 0 only)
+        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+            if dl.as_str() == &format!("{}", layer_idx) && head_idx == 0 {
+                debug_hidden_stats(stream, &v_h, &format!("ATTN-V-H0-L{}", layer_idx));
+                if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                    let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                    let _ = std::fs::create_dir_all(&layer_dump_dir);
+                    dump_bf16_tensor(stream, &v_h, &layer_dump_dir, &format!("attn_v_h0_gpu{}", gpu_idx));
+                }
+            }
+        }
 
         // --- RoPE (per-head, num_heads=1) — apply only to q_h (k_h already has RoPE from Phase 1) ---
         let mut k_h_dummy = stream.alloc_zeros::<bf16>(seq_len * head_dim)
@@ -1578,6 +1611,17 @@ pub fn forward_paged(
             &k_h,
             &mut scores_h,
         )?;
+        // DEBUG: scores before softmax at specific layer via INFERS_DEBUG_LAYER (head 0 only)
+        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+            if dl.as_str() == &format!("{}", layer_idx) && head_idx == 0 {
+                debug_hidden_stats(stream, &scores_h, &format!("ATTN-SCORES-H0-L{}", layer_idx));
+                if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                    let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                    let _ = std::fs::create_dir_all(&layer_dump_dir);
+                    dump_bf16_tensor(stream, &scores_h, &layer_dump_dir, &format!("attn_scores_h0_gpu{}", gpu_idx));
+                }
+            }
+        }
 
         // --- Softmax with causal masking ---
         let mut softmax_out_h = stream
@@ -1642,6 +1686,17 @@ pub fn forward_paged(
             eprintln!("ATTN-SOFTMAX-H0-MAX: {}", max_weights.join(", "));
         }
         if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &softmax_out_h, "ATTN-SOFTMAX-H0"); }
+        // DEBUG: softmax_out_h at specific layer via INFERS_DEBUG_LAYER (head 0 only)
+        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+            if dl.as_str() == &format!("{}", layer_idx) && head_idx == 0 {
+                debug_hidden_stats(stream, &softmax_out_h, &format!("ATTN-SOFTMAX-H0-L{}", layer_idx));
+                if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                    let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                    let _ = std::fs::create_dir_all(&layer_dump_dir);
+                    dump_bf16_tensor(stream, &softmax_out_h, &layer_dump_dir, &format!("attn_softmax_h0_gpu{}", gpu_idx));
+                }
+            }
+        }
 
         // --- Attention output: softmax_out_h @ V_h → [seq_len × head_dim] ---
         let mut attn_out_h = stream
@@ -1689,6 +1744,18 @@ pub fn forward_paged(
         let _ = std::fs::create_dir_all("/tmp/engine_attn");
         let bytes: Vec<u8> = combined_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
         let _ = std::fs::write(path, bytes);
+    }
+
+    // DEBUG: attn_combined (before gate) at specific layer via INFERS_DEBUG_LAYER
+    if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+        if dl.as_str() == &format!("{}", layer_idx) {
+            debug_hidden_stats(stream, &attn_combined, &format!("ATTN-COMBINED-GPU{}-L{}", gpu_idx, layer_idx));
+            if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                let _ = std::fs::create_dir_all(&layer_dump_dir);
+                dump_bf16_tensor(stream, &attn_combined, &layer_dump_dir, &format!("attn_combined_gpu{}", gpu_idx));
+            }
+        }
     }
 
     // =========================================================================
@@ -1742,6 +1809,18 @@ pub fn forward_paged(
         let _ = std::fs::write(path, bytes);
     }
 
+    // DEBUG: gated_attn at specific layer via INFERS_DEBUG_LAYER
+    if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+        if dl.as_str() == &format!("{}", layer_idx) {
+            debug_hidden_stats(stream, &gated_attn, &format!("ATTN-GATED-GPU{}-L{}", gpu_idx, layer_idx));
+            if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                let _ = std::fs::create_dir_all(&layer_dump_dir);
+                dump_bf16_tensor(stream, &gated_attn, &layer_dump_dir, &format!("attn_gated_gpu{}", gpu_idx));
+            }
+        }
+    }
+
     // =========================================================================
     // O-projection using gated attention output
     // =========================================================================
@@ -1754,6 +1833,17 @@ pub fn forward_paged(
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
     if debug_attn { debug_hidden_stats(stream, &output, "ATTN-O-PROJ"); }
+    // DEBUG: O-projection result at specific layer via INFERS_DEBUG_LAYER
+    if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+        if dl.as_str() == &format!("{}", layer_idx) {
+            debug_hidden_stats(stream, &output, &format!("ATTN-O-PROJ-GPU{}-L{}", gpu_idx, layer_idx));
+            if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                let _ = std::fs::create_dir_all(&layer_dump_dir);
+                dump_bf16_tensor(stream, &output, &layer_dump_dir, &format!("attn_o_proj_gpu{}", gpu_idx));
+            }
+        }
+    }
 
     // Debug dump: O-proj output (before all-reduce) for layer 3
     if debug_attn {
