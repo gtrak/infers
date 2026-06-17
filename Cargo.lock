@@ -1043,6 +1043,8 @@ dependencies = [
  "infers-model",
  "infers-mtp",
  "infers-tokenizer",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

@@ -25,6 +25,7 @@ pub mod eviction;
 pub mod quant;
 pub mod gemm_dispatch;
 pub mod gpu_cache;
+pub mod probe;
 
 pub use engine::ForwardEngine;
 pub use eviction::BackendEvictionStore;

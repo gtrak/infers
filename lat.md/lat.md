@@ -509,6 +509,25 @@ Dumps are written at every phase checkpoint in `prefill_paged`:
 - **Phase D (Residual Add)**: `mlp_residual_gpu{N}` — final hidden state after MLP residual
 
 Combined with the existing `INFERS_DUMP_HIDDEN` path that dumps per-layer f32 files to `/tmp/engine_hidden/`, this provides both statistical and binary-level debugging capabilities.
+### General Instrumentation Probe
+
+General-purpose forward-pass instrumentation via the `probe` module. Controlled by environment variables with layer+stage filtering and optional stats output for reference comparison.
+
+| Variable | Description | Default |
+|---|---|---|
+| `INFERS_DUMP_DIR` | Output directory (must be set for any dumping) | disabled |
+| `INFERS_DUMP_LAYERS` | Comma-separated layer indices, or `all` | all layers |
+| `INFERS_DUMP_STAGES` | Comma-separated stage prefixes (e.g., `attn,mlp`) | all stages |
+| `INFERS_DUMP_STATS` | `1` to print min/max/mean_abs to stderr | off |
+
+`ProbeConfig::from_env()` parses these variables. `should_dump(layer, stage)` checks both layer and stage filters — stage matching uses prefix check (e.g., `attn` matches `attn.norm1`, `attn.q_proj`). See [[crates/backends/native/src/probe.rs#ProbeConfig]].
+
+`dump(stream, config, layer, gpu, stage, tensor, shape)` writes `{dir}/layer_{layer}/{stage}_gpu{gpu}.raw` (bf16 LE bytes) and `.meta` JSON sidecar. When `stats` is enabled, prints min/max/mean_abs to stderr. See [[crates/backends/native/src/probe.rs#dump]].
+
+`stats(stream, config, layer, gpu, stage, tensor)` prints stats only — no file I/O overhead for quick debugging. See [[crates/backends/native/src/probe.rs#stats]].
+
+`dump_config(model_config, num_gpus, group_size)` writes `config.json` to the dump directory with model parameters (hidden_size, attention heads, layer types, etc.) needed by the Python comparison framework. See [[crates/backends/native/src/probe.rs#dump_config]].
+
 ### PyTorch Reference Intermediates
 
 Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.
