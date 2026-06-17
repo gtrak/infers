@@ -929,8 +929,8 @@ pub fn forward_paged(
     // =========================================================================
 
     // When attn_output_gate is true, the Q projection produces doubled output:
-    // [Q_head_0, ..., Q_head_n, gate_head_0, ..., gate_head_n] per row.
-    // We compute it as a single GEMM and then split into q_heads and gate_heads.
+    // [Q_head_0, G_head_0, Q_head_1, G_head_1, ...] per row (per-head interleaved).
+    // We compute it as a single GEMM and then extract Q/gate from interleaved positions.
     let q_out_dim = per_gpu_head_dim * if attn_output_gate { 2 } else { 1 };
 
     let mut q_full = stream

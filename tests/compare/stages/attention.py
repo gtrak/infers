@@ -4,7 +4,7 @@ Port of the HuggingFace Qwen3.5 attention forward (modeling_qwen3_5.py lines 657
 
 Forward pass summary:
     1. Q projection: norm1_out @ q_proj → [S, num_heads * head_dim * 2] (doubled for gate)
-    2. Split Q+gate: chunk(q_proj_out, 2, dim=-1) → query_states + gate
+    2. Split Q+gate from interleaved layout [Q_h0, G_h0, Q_h1, G_h1, ...] → query_states + gate
     3. Q-norm: per-head RMSNorm(query_states)
     4. K projection: norm1_out @ k_proj → [S, num_kv_heads * head_dim]
     5. K-norm: per-head RMSNorm(key_states)
@@ -205,10 +205,15 @@ class QNormStage(Stage):
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         head_dim = config.head_dim
 
-        # Split into Q and gate halves
-        # Shape: [S, per_gpu_heads * head_dim * 2] -> two [S, per_gpu_heads * head_dim]
-        mid = q_proj_raw.shape[-1] // 2
-        query_flat = q_proj_raw[..., :mid]
+        # Extract Q from interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...]
+        # Each head's Q block is at offset h * (head_dim * 2) within the row.
+        query_flat = torch.zeros(
+            q_proj_raw.shape[0], num_heads_per_gpu * head_dim, device=q_proj_raw.device
+        )
+        for h in range(num_heads_per_gpu):
+            src_start = h * (head_dim * 2)
+            dst_start = h * head_dim
+            query_flat[..., dst_start:dst_start + head_dim] = q_proj_raw[..., src_start:src_start + head_dim]
 
         # Reshape for per-head norm: [S, num_heads_per_gpu, head_dim]
         query = query_flat.view(-1, num_heads_per_gpu, head_dim)
@@ -225,9 +230,20 @@ class GateStage(Stage):
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         q_proj_raw = inputs["attn.q_proj_raw"]
-        # Gate is the second half of the Q projection output
-        mid = q_proj_raw.shape[-1] // 2
-        return q_proj_raw[..., mid:]
+        num_heads_per_gpu = config.num_attention_heads // config.num_gpus
+        head_dim = config.head_dim
+
+        # Extract gate from interleaved layout: [Q_h0, G_h0, Q_h1, G_h1, ...]
+        # Each head's gate block is at offset h * (head_dim * 2) + head_dim.
+        gate_flat = torch.zeros(
+            q_proj_raw.shape[0], num_heads_per_gpu * head_dim, device=q_proj_raw.device
+        )
+        for h in range(num_heads_per_gpu):
+            src_start = h * (head_dim * 2) + head_dim
+            dst_start = h * head_dim
+            gate_flat[..., dst_start:dst_start + head_dim] = q_proj_raw[..., src_start:src_start + head_dim]
+
+        return gate_flat
 
 
 class KProjStage(Stage):
