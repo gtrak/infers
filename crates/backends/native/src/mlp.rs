@@ -106,8 +106,8 @@ pub fn mlp_forward(
     unsafe {
         stream
             .launch_builder(silu_kernel)
-            .arg(&gate)
             .arg(&up)
+            .arg(&gate)
             .arg(&mut silu_out)
             .arg(&elem_count_i32)
             .launch(config)

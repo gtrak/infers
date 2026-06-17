@@ -250,8 +250,8 @@ pub fn decode(
             unsafe {
                 stream
                     .launch_builder(&kernels.silu_glu)
-                    .arg(&gate)
                     .arg(&up)
+                    .arg(&gate)
                     .arg(&mut silu_out)
                     .arg(&elem_count_i32)
                     .launch(config)
@@ -504,8 +504,8 @@ pub fn decode_with_hidden(
             unsafe {
                 stream
                     .launch_builder(&kernels.silu_glu)
-                    .arg(&gate)
                     .arg(&up)
+                    .arg(&gate)
                     .arg(&mut silu_out)
                     .arg(&elem_count_i32)
                     .launch(config)

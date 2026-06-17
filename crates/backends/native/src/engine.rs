@@ -772,7 +772,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let elem_i32 = (seq_len * sharded_intermediate) as i32;
                 unsafe {
                     gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
-                        .arg(&gate).arg(&up).arg(&mut silu_out).arg(&elem_i32)
+                        .arg(&up).arg(&gate).arg(&mut silu_out).arg(&elem_i32)
                         .launch(infers_cuda::LaunchConfig {
                             grid_dim: (((seq_len * sharded_intermediate) as u32).div_ceil(256), 1, 1),
                             block_dim: (256, 1, 1),
@@ -897,8 +897,10 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
 
             // Debug: dump per-layer hidden states if INFERS_DUMP_LAYER_DIR is set
             if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                let _ = std::fs::create_dir_all(&layer_dump_dir);
                 for gpu_idx in 0..num_gpus {
-                    let fname = format!("{}/layer_{}_gpu{}.raw", dump_dir, layer_idx, gpu_idx);
+                    let fname = format!("{}/final_gpu{}.raw", layer_dump_dir, gpu_idx);
                     let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                     let data: Vec<bf16> = gpu_stream
                         .clone_dtoh(&hidden_states[gpu_idx])
