@@ -4,6 +4,7 @@
 //! embedding lookup, layer dispatch (GDN vs full attention), MLP, normalization,
 //! and sampling. It holds references to CUDA resources, model weights, and kernels.
 
+use crate::probe;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -31,25 +32,6 @@ use infers_cuda::{group_end, group_start};
 use crate::sync;
 
 
-#[allow(dead_code)]
-fn debug_hidden_stats(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, label: &str) {
-    let cpu: Vec<half::bf16> = stream.clone_dtoh(buf).expect("dl");
-    let mean_abs = cpu.iter().map(|v| (v.to_f32() as f64).abs()).sum::<f64>() / cpu.len() as f64;
-    let max_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MIN, |a, b| a.max(b));
-    let min_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MAX, |a, b| a.min(b));
-    eprintln!("{}: min={:.4} max={:.4} mean_abs={:.6}", label, min_val, max_val, mean_abs);
-}
-
-/// Dump a BF16 GPU buffer to a raw binary file for reference comparison.
-#[allow(dead_code)]
-fn dump_bf16_tensor(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, dir: &str, name: &str) {
-    let cpu: Vec<bf16> = stream.clone_dtoh(buf).expect("dump_bf16_tensor clone_dtoh failed");
-    let bytes: Vec<u8> = cpu.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let path = format!("{}/{}.raw", dir, name);
-    if let Err(e) = std::fs::write(&path, &bytes) {
-        eprintln!("WARN: failed to write dump {}: {}", path, e);
-    }
-}
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
@@ -460,6 +442,10 @@ impl ForwardEngine {
         let head_dim = config.head_dim;
         let seq_len = token_ids.len();
 
+        // Probe instrumentation
+        let probe = probe::ProbeConfig::from_env();
+        probe::dump_config(&self.config, num_gpus, self.group_size);
+
         // Allocate pages for the sequence
         let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
         for _ in 0..num_pages_needed {
@@ -501,29 +487,8 @@ impl ForwardEngine {
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, token_ids, &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
+            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[seq_len, config.hidden_size]);
             hidden_states.push(h);
-        }
-
-        // DEBUG: embedding stats when layer 0 is debug target
-        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-            if dl == "0" {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-EMB-GPU{}", gpu_idx));
-                }
-            }
-        }
-
-        // Dump embedding output (before layer 0) for comparison with reference
-        if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
-            let gpu_stream = self.streams.get(0).unwrap().clone();
-            let hidden_cpu: Vec<half::bf16> = gpu_stream.clone_dtoh(&hidden_states[0]).expect("dl");
-            let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
-            let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
-            eprintln!("DUMP-HIDDEN layer=-1 (embed): mean_abs={:.6}", mean_abs);
-            let _ = std::fs::create_dir_all("/tmp/engine_hidden");
-            let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = std::fs::write("/tmp/engine_hidden/layer_-1.f32", bytes);
         }
 
         // Per-GPU sharded head counts
@@ -535,22 +500,18 @@ impl ForwardEngine {
         for layer_idx in 0..config.num_hidden_layers {
             tracing::info!("Layer {}/{} (phase A)", layer_idx + 1, config.num_hidden_layers);
 
+            let stage_prefix = match config.get_layer_type(layer_idx) {
+                LayerType::FullAttention => "attn",
+                LayerType::GatedDeltaNet => "gdn",
+            };
+
             // Dump hidden input at start of layer for reference comparison
-            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                if dl.as_str() == &format!("{}", layer_idx) {
-                    if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                        for gpu_idx in 0..num_gpus {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            let _ = std::fs::create_dir_all(&layer_dump_dir);
-                            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("hidden_input_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
             }
-            // ================================================================
+
             // Phase A: Attention/GDN on each GPU
-            // ================================================================
             let mut attn_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
             for gpu_idx in 0..num_gpus {
@@ -558,7 +519,6 @@ impl ForwardEngine {
                 let gemm = &mut self.gemm_engines[gpu_idx];
                 let w = &self.weights[gpu_idx];
                 let layer = &w.layers[layer_idx];
-                let layer_type = config.get_layer_type(layer_idx);
 
                 // Norm1
                 let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
@@ -568,21 +528,16 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                // DEBUG: norm1 at any layer via INFERS_DEBUG_LAYER
-                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                    if dl.as_str() == &format!("{}", layer_idx) {
-                        debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L{}-NORM1-GPU{}", layer_idx, gpu_idx));
-                    }
-                }
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[seq_len, config.hidden_size]);
 
                 // Attention or GDN with sharded weights
-                let attn_out = match layer_type {
+                let attn_out = match config.get_layer_type(layer_idx) {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-  crate::gdn::forward(
-                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                             &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
+                        crate::gdn::forward(
+                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                            &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
                             &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
                             &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
                             gdn_weights, &norm1_out,
@@ -610,27 +565,12 @@ impl ForwardEngine {
                             config.attn_output_gate,
                             layer_idx,
                             gpu_idx,
-                            // TODO(phase 13.4): wire ProbeConfig from engine config
-                            &crate::probe::ProbeConfig::disabled(),
+                            &probe,
                         )?
                     }
                 };
 
-                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                    if dl.as_str() == &format!("{}", layer_idx) {
-                        debug_hidden_stats(&gpu_stream, &attn_out, &format!("L{}-ATTN-RAW-GPU{}", layer_idx, gpu_idx));
-                        // Dump FullAttention/GDN intermediates
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            let _ = std::fs::create_dir_all(&layer_dump_dir);
-                            if matches!(layer_type, LayerType::FullAttention) {
-                                dump_bf16_tensor(&gpu_stream, &norm1_out, &layer_dump_dir, &format!("attn_norm1_gpu{}", gpu_idx));
-                            }
-                            dump_bf16_tensor(&gpu_stream, &attn_out, &layer_dump_dir, &format!("attn_output_raw_gpu{}", gpu_idx));
-                            dump_bf16_tensor(&gpu_stream, &attn_out, &layer_dump_dir, &format!("attn_o_proj_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[seq_len, config.hidden_size]);
 
                 attn_outputs.push(attn_out);
             }
@@ -643,24 +583,13 @@ impl ForwardEngine {
                     &self.nccl, &gpu_stream, &mut attn_outputs[gpu_idx],
                 )?;
             }
-group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
+            group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                if dl.as_str() == &format!("{}", layer_idx) {
-                    for gpu_idx in 0..num_gpus {
-                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                        debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L{}-ATTN-AR-GPU{}", layer_idx, gpu_idx));
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            dump_bf16_tensor(&gpu_stream, &attn_outputs[gpu_idx], &layer_dump_dir, &format!("attn_ar_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[seq_len, config.hidden_size]);
             }
-
-            // ================================================================
             // Phase B: Residual add on each GPU
-            // ================================================================
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
@@ -669,17 +598,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 )?;
             }
 
-            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                if dl.as_str() == &format!("{}", layer_idx) {
-                    for gpu_idx in 0..num_gpus {
-                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                        debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-ATTN-GPU{}", layer_idx, gpu_idx));
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("residual_attn_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
             }
 
             // ================================================================
@@ -701,12 +622,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                // DEBUG: norm2 at any layer via INFERS_DEBUG_LAYER
-                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                    if dl.as_str() == &format!("{}", layer_idx) {
-                        debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L{}-NORM2-GPU{}", layer_idx, gpu_idx));
-                    }
-                }
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[seq_len, config.hidden_size]);
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -719,6 +635,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[seq_len, config.intermediate_size / num_gpus]);
+
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
@@ -729,6 +647,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     seq_len, sharded_intermediate, config.hidden_size,
                     self.group_size,
                 )?;
+
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[seq_len, config.intermediate_size / num_gpus]);
 
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -743,6 +663,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                         })?;
                 }
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[seq_len, config.intermediate_size / num_gpus]);
+
                 // Down projection (row-parallel: full hidden_size output, sharded_intermediate inner dim)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
                 crate::gemm_dispatch::gemm_projection_cached(
@@ -754,22 +676,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
-                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                    if dl.as_str() == &format!("{}", layer_idx) {
-                        debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L{}-MLP-RAW-GPU{}", layer_idx, gpu_idx));
-                        // Dump MLP intermediates as raw binary files for reference comparison
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            let _ = std::fs::create_dir_all(&layer_dump_dir);
-                            dump_bf16_tensor(&gpu_stream, &norm2_out, &layer_dump_dir, &format!("mlp_norm2_gpu{}", gpu_idx));
-                            dump_bf16_tensor(&gpu_stream, &gate, &layer_dump_dir, &format!("mlp_gate_gpu{}", gpu_idx));
-                            dump_bf16_tensor(&gpu_stream, &up, &layer_dump_dir, &format!("mlp_up_gpu{}", gpu_idx));
-                            dump_bf16_tensor(&gpu_stream, &silu_out, &layer_dump_dir, &format!("mlp_silu_gpu{}", gpu_idx));
-                            // mlp_out (before all-reduce) — already dumped as MLP-RAW
-                            dump_bf16_tensor(&gpu_stream, &mlp_out, &layer_dump_dir, &format!("mlp_down_raw_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[seq_len, config.hidden_size]);
 
                 mlp_outputs.push(mlp_out);
             }
@@ -784,22 +691,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                if dl.as_str() == &format!("{}", layer_idx) {
-                    for gpu_idx in 0..num_gpus {
-                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                        debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L{}-MLP-AR-GPU{}", layer_idx, gpu_idx));
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            dump_bf16_tensor(&gpu_stream, &mlp_outputs[gpu_idx], &layer_dump_dir, &format!("mlp_down_ar_gpu{}", gpu_idx));
-                        }
-                    }
-                }
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[seq_len, config.hidden_size]);
             }
 
-            // ================================================================
             // Phase D: Residual add on each GPU
-            // ================================================================
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
@@ -808,72 +705,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 )?;
             }
 
-            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
-                if dl.as_str() == &format!("{}", layer_idx) {
-                    for gpu_idx in 0..num_gpus {
-                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                        debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-MLP-GPU{}", layer_idx, gpu_idx));
-                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("mlp_residual_gpu{}", gpu_idx));
-                        }
-                    }
-                }
-            }
-
-            // Dump per-layer hidden state for comparison with reference
-            if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
-                let gpu_stream = self.streams.get(0).unwrap().clone();
-                let hidden_cpu: Vec<half::bf16> = gpu_stream.clone_dtoh(&hidden_states[0]).expect("dl");
-                let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
-                let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
-                eprintln!("DUMP-HIDDEN layer={}: mean_abs={:.6}", layer_idx, mean_abs);
-                let _ = std::fs::create_dir_all("/tmp/engine_hidden");
-                let path = format!("/tmp/engine_hidden/layer_{}.f32", layer_idx);
-                let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let _ = std::fs::write(&path, bytes);
-            }
-
-/**/ let _ = std::env::var("INFERS_DEBUG_LAYERS");
-// DEBUG: per-layer hidden state stats
-if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
-    for gpu_idx in 0..num_gpus {
-        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-        let cpu_hidden: Vec<bf16> = gpu_stream.clone_dtoh(&hidden_states[gpu_idx]).expect("download failed");
-        let mut f_min = f64::MAX;
-        let mut f_max = f64::MIN;
-        let mut f_sum_abs = 0.0f64;
-        let mut f_nan = 0usize;
-        for v in cpu_hidden.iter() {
-            let f = v.to_f32() as f64;
-            if f.is_nan() { f_nan += 1; continue; }
-            f_sum_abs += f.abs();
-            if f < f_min { f_min = f; }
-            if f > f_max { f_max = f; }
-        }
-        let mean_abs = f_sum_abs / cpu_hidden.len() as f64;
-        let first5: Vec<String> = cpu_hidden[..5].iter().map(|v| format!("{:.4}", v.to_f32())).collect();
-        eprintln!("LAYER {} GPU{}: min={:.4} max={:.4} mean_abs={:.4} nan={} first5=[{}]",
-            layer_idx, gpu_idx, f_min, f_max, mean_abs, f_nan, first5.join(", "));
-    }
-}
-
-            // Debug: dump per-layer hidden states if INFERS_DUMP_LAYER_DIR is set
-            if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
-                let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
-                let _ = std::fs::create_dir_all(&layer_dump_dir);
-                for gpu_idx in 0..num_gpus {
-                    let fname = format!("{}/final_gpu{}.raw", layer_dump_dir, gpu_idx);
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    let data: Vec<bf16> = gpu_stream
-                        .clone_dtoh(&hidden_states[gpu_idx])
-                        .map_err(|e| anyhow::anyhow!("Failed to copy layer dump: {}", e))?;
-                    let bytes: Vec<u8> = data.iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect();
-                    std::fs::write(&fname, &bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to write layer dump: {}", e))?;
-                }
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
             }
         }
 
@@ -894,15 +728,7 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
             config.rms_norm_eps, config.hidden_size,
         )?;
 
-        // Dump post-final-norm hidden state for comparison with reference
-        if std::env::var("INFERS_DUMP_HIDDEN").is_ok() {
-            let hidden_cpu: Vec<half::bf16> = final_stream.clone_dtoh(&final_hidden).expect("dl");
-            let hidden_f32: Vec<f32> = hidden_cpu.iter().map(|v| v.to_f32()).collect();
-            let mean_abs: f32 = hidden_f32.iter().map(|v| v.abs()).sum::<f32>() / hidden_f32.len() as f32;
-            eprintln!("DUMP-HIDDEN layer=final: mean_abs={:.6}", mean_abs);
-            let bytes: Vec<u8> = hidden_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = std::fs::write("/tmp/engine_hidden/layer_final.f32", bytes);
-        }
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size]);
 
         // LM head
         let lm_head_weight = final_weights.lm_head.as_ref()
@@ -917,6 +743,8 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
             seq_len, config.vocab_size, config.hidden_size,
             self.group_size,
         )?;
+
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[seq_len, config.vocab_size]);
 
         // Sample: last row argmax
         let last_row_start = (seq_len - 1) * config.vocab_size;
@@ -981,6 +809,10 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
         let config = &self.config;
         let head_dim = config.head_dim;
 
+        // Probe instrumentation
+        let probe = probe::ProbeConfig::from_env();
+        probe::dump_config(&self.config, num_gpus, self.group_size);
+
         // Dynamically allocate pages as needed for the target position,
         // then read the (possibly updated) block table and cached-token count.
         // Use a scope to drop the mutable borrow before using `self` again.
@@ -1031,7 +863,8 @@ if std::env::var("INFERS_DEBUG_LAYERS").is_ok() {
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, &[token_id], &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
-hidden_states.push(h);
+            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[1, config.hidden_size]);
+            hidden_states.push(h);
         }
 
         // Per-GPU sharded head counts
@@ -1040,10 +873,19 @@ hidden_states.push(h);
         let sharded_intermediate = config.intermediate_size / num_gpus;
 
         // Layer loop
-for layer_idx in 0..config.num_hidden_layers {
-            // ================================================================
+        for layer_idx in 0..config.num_hidden_layers {
+            let stage_prefix = match config.get_layer_type(layer_idx) {
+                LayerType::FullAttention => "attn",
+                LayerType::GatedDeltaNet => "gdn",
+            };
+
+            // Dump hidden input at start of layer
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size]);
+            }
+
             // Phase A: Attention/GDN on each GPU
-            // ================================================================
             let mut attn_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
             for gpu_idx in 0..num_gpus {
@@ -1051,7 +893,6 @@ for layer_idx in 0..config.num_hidden_layers {
                 let gemm = &mut self.gemm_engines[gpu_idx];
                 let w = &self.weights[gpu_idx];
                 let layer = &w.layers[layer_idx];
-                let layer_type = config.get_layer_type(layer_idx);
 
                 // Norm1
                 let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
@@ -1061,12 +902,14 @@ for layer_idx in 0..config.num_hidden_layers {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[1, config.hidden_size]);
+
                 // Attention or GDN (decode versions)
-                let attn_out = match layer_type {
+                let attn_out = match config.get_layer_type(layer_idx) {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                       crate::gdn::decode_forward(
+                        crate::gdn::decode_forward(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
                             &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
@@ -1097,11 +940,13 @@ for layer_idx in 0..config.num_hidden_layers {
                             config.attn_output_gate,
                             layer_idx,
                             gpu_idx,
-                            // TODO(phase 13.4): wire ProbeConfig from engine config
-                            &crate::probe::ProbeConfig::disabled(),
+                            &probe,
                         )?
                     }
                 };
+
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[1, config.hidden_size]);
+
                 attn_outputs.push(attn_out);
             }
 
@@ -1115,9 +960,12 @@ for layer_idx in 0..config.num_hidden_layers {
             }
             group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[1, config.hidden_size]);
+            }
+
             // Phase B: Residual add on each GPU
-            // ================================================================
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
@@ -1126,9 +974,12 @@ for layer_idx in 0..config.num_hidden_layers {
                 )?;
             }
 
-            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[1, config.hidden_size]);
+            }
+
             // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
-            // ================================================================
             let mut mlp_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
             for gpu_idx in 0..num_gpus {
@@ -1145,6 +996,8 @@ for layer_idx in 0..config.num_hidden_layers {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[1, config.hidden_size]);
+
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
@@ -1156,6 +1009,8 @@ for layer_idx in 0..config.num_hidden_layers {
                     self.group_size,
                 )?;
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[1, config.intermediate_size / num_gpus]);
+
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
@@ -1166,6 +1021,8 @@ for layer_idx in 0..config.num_hidden_layers {
                     1, sharded_intermediate, config.hidden_size,
                     self.group_size,
                 )?;
+
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[1, config.intermediate_size / num_gpus]);
 
                 // up * SiLU(gate) = SwiGLU (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
@@ -1180,6 +1037,8 @@ for layer_idx in 0..config.num_hidden_layers {
                         })?;
                 }
 
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[1, config.intermediate_size / num_gpus]);
+
                 // Down projection (row-parallel: full hidden_size output)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
                 crate::gemm_dispatch::gemm_projection_cached(
@@ -1190,6 +1049,8 @@ for layer_idx in 0..config.num_hidden_layers {
                     1, config.hidden_size, sharded_intermediate,
                     self.group_size,
                 )?;
+
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[1, config.hidden_size]);
 
                 mlp_outputs.push(mlp_out);
             }
@@ -1204,15 +1065,23 @@ for layer_idx in 0..config.num_hidden_layers {
             }
             group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // ================================================================
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[1, config.hidden_size]);
+            }
+
             // Phase D: Residual add on each GPU
-            // ================================================================
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
                     &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
                 )?;
+            }
+
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[1, config.hidden_size]);
             }
         }
 
@@ -1233,6 +1102,8 @@ for layer_idx in 0..config.num_hidden_layers {
             config.rms_norm_eps, config.hidden_size,
         )?;
 
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size]);
+
         // LM head
         let lm_head_weight = final_weights.lm_head.as_ref()
             .or_else(|| final_weights.embedding.as_ref())
@@ -1246,6 +1117,8 @@ for layer_idx in 0..config.num_hidden_layers {
             1, config.vocab_size, config.hidden_size,
             self.group_size,
         )?;
+
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size]);
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::greedy_sample_bf16(

@@ -487,28 +487,6 @@ group_end()?;
 Diagnostic `eprintln!` calls mark group boundaries and layer progress (every 8 layers).
 
 
-### Layer Debug Stats
-
-Per-layer hidden state debugging via `debug_hidden_stats()`. Downloads a `CudaSlice<bf16>` to CPU and computes min/max/mean_abs, emitting to stderr. Gated by environment variables for zero overhead when disabled.
-
-Two modes exist: `INFERS_DEBUG_LAYER0` traces layer 0 (embedding through MLP) and `INFERS_DEBUG_LAYER3` traces layer 3 (first full attention layer) with 8 checkpoints: L3-NORM1, L3-ATTN-RAW, L3-ATTN-AR, L3-RESIDUAL-ATTN, L3-NORM2, L3-MLP-RAW, L3-MLP-AR, L3-RESIDUAL-MLP. Each label includes the GPU index (e.g., `L3-NORM1-GPU0`).
-
-### Raw Tensor Dumps
-
-Per-suboperation raw binary dumps of intermediate GPU tensors for reference comparison against PyTorch or CPU baselines. Gated by `INFERS_DEBUG_LAYER` and `INFERS_DUMP_LAYER_DIR` environment variables.
-
-`INFERS_DEBUG_LAYER` selects the target layer (e.g., `3`). `INFERS_DUMP_LAYER_DIR` specifies the output directory (e.g., `/tmp/dump`). Both must be set; dumps trigger only for the debugged layer, yielding zero overhead otherwise.
-The `dump_bf16_tensor()` helper copies a `CudaSlice<bf16>` to CPU via `clone_dtoh`, flattens to little-endian bytes, and writes to `{dir}/layer_{N}/{name}.raw`. Failures emit warnings to stderr rather than failing the pipeline. See [[crates/backends/native/src/engine.rs#dump_bf16_tensor]].
-
-Dumps are written at every phase checkpoint in `prefill_paged`:
-
-- **Layer input**: `hidden_input_gpu{N}` — hidden state before any processing
-- **Phase A (Attention)**: For FullAttention layers, `attn_norm1_gpu{N}` (norm1 output) and `attn_output_raw_gpu{N}` (pre-AR attention). GDN layers dump `attn_output_raw_gpu{N}` only. After all-reduce: `attn_ar_gpu{N}`.
-- **Phase B (Residual Add)**: `residual_attn_gpu{N}` — hidden state after attention residual
-- **Phase C (MLP)**: `mlp_norm2_gpu{N}`, `mlp_gate_gpu{N}`, `mlp_up_gpu{N}`, `mlp_silu_gpu{N}`, `mlp_down_raw_gpu{N}` (pre-AR down projection), and after all-reduce: `mlp_down_ar_gpu{N}`.
-- **Phase D (Residual Add)**: `mlp_residual_gpu{N}` — final hidden state after MLP residual
-
-Combined with the existing `INFERS_DUMP_HIDDEN` path that dumps per-layer f32 files to `/tmp/engine_hidden/`, this provides both statistical and binary-level debugging capabilities.
 ### General Instrumentation Probe
 
 General-purpose forward-pass instrumentation via the `probe` module. Controlled by environment variables with layer+stage filtering and optional stats output for reference comparison.
@@ -527,6 +505,28 @@ General-purpose forward-pass instrumentation via the `probe` module. Controlled 
 `stats(stream, config, layer, gpu, stage, tensor)` prints stats only — no file I/O overhead for quick debugging. See [[crates/backends/native/src/probe.rs#stats]].
 
 `dump_config(model_config, num_gpus, group_size)` writes `config.json` to the dump directory with model parameters (hidden_size, attention heads, layer types, etc.) needed by the Python comparison framework. See [[crates/backends/native/src/probe.rs#dump_config]].
+
+**Engine-level wiring**: The probe module is now wired into both `prefill_paged()` and `decode_paged()` in the engine. Old ad-hoc debug code (`INFERS_DEBUG_LAYER`, `INFERS_DUMP_HIDDEN`, `INFERS_DUMP_LAYER_DIR`, `debug_hidden_stats()`, `dump_bf16_tensor()`) has been replaced entirely with structured probe::dump() calls.
+
+Each call site creates a `ProbeConfig::from_env()` at the top of the function and calls `dump_config()` to write model config. The stage prefix is determined by layer type: FullAttention layers use `attn.*` stages, GDN layers use `gdn.*` stages.
+
+Engine-level dump stages in `prefill_paged` and `decode_paged`:
+
+- **Embedding**: `embed.output` (layer=-1 via usize::MAX)
+- **Per-layer input**: `{prefix}.norm1_input` — hidden state before norm1
+- **Norm1 output**: `{prefix}.norm1` — after RMS norm on attention path
+- **Attention/GDN output**: `{prefix}.o_proj` (FullAttention) or `gdn.output` (GDN) — raw output before AR
+- **After all-reduce**: `{prefix}.after_ar` — post-all-reduce attention/GDN output
+- **Residual (attn)**: `residual.attn` — hidden state after attention residual add
+- **Norm2 output**: `mlp.norm2` — after RMS norm on MLP path
+- **Gate projection**: `mlp.gate_proj` — column-parallel gate GEMM output
+- **Up projection**: `mlp.up_proj` — column-parallel up GEMM output
+- **SiLU gating**: `mlp.silu` — SiLU(gate) * up elementwise result
+- **Down raw**: `mlp.down_raw` — row-parallel down GEMM output before AR
+- **After MLP all-reduce**: `mlp.down_ar` — post-all-reduce MLP output
+- **Residual (MLP)**: `residual.mlp` — final hidden state after MLP residual add
+- **Final norm**: `final.norm` — after RMS norm on GPU 0
+- **Logits**: `final.logits` — LM head GEMM output
 
 The `forward_paged` function in [[crates/backends/native/src/attention.rs#forward_paged]] has been wired to use probe::dump() for all internal attention intermediates, replacing the old ad-hoc `debug_attn` and `INFERS_DEBUG_LAYER` code paths. Attention stages include: `attn.k_proj`, `attn.v_proj`, `attn.k_norm`, `attn.q_proj_raw`, `attn.q_norm` (only when Q-norm weights exist), `attn.gate` (only when attn_output_gate is enabled), `attn.combined`, `attn.gated`, and `attn.o_proj`. Per-head intermediates are opt-in via `INFERS_DUMP_STAGES=attn.heads`: `attn.q_h0`, `attn.k_h0`, `attn.v_h0`, `attn.scores_h0`, `attn.softmax_h0` (all head 0 only).
 
@@ -1657,7 +1657,7 @@ When the model path doesn't exist, `main.rs` creates a hardcoded default `ModelC
 Systematic per-layer hidden state comparison between the infers engine and HuggingFace reference model to identify the source of output divergence.
 
 ## Test Setup
-Both models use the same 15-token prompt (engine IDs, not HF tokenizer). Reference is dumped via `scripts/dump_ref_hidden.py`. Engine dumps with `INFERS_DUMP_HIDDEN=1` to `/tmp/engine_hidden/layer_N.f32`.
+Both models use the same 15-token prompt (engine IDs, not HF tokenizer). Reference is dumped via `scripts/dump_ref_hidden.py`. Engine dumps via `INFERS_DUMP_DIR=/path/to/dump` using the probe module (see [[lat.md/lat#Phase 4 Deliverables#Forward Engine#General Instrumentation Probe]]).
 
 ## Embedding-Level Verification
 Engine layer_-1 was verified against the model's embedding table loaded from safetensors.
@@ -1743,12 +1743,12 @@ The recurrent state remains in fp32, per-token output is bf16. This matches PyTo
 
 Environment variables for per-layer debugging:
 
-- `INFERS_DUMP_GDN_LAYER=N` — dump GDN intermediates for layer N
-- `INFERS_DUMP_GDN_DIR=/path` — directory for GDN dump files
-- `INFERS_DUMP_HIDDEN=1` — dump per-layer hidden states to `/tmp/engine_hidden/`
-- `INFERS_DUMP_LAYER_DIR=/path` — directory for layer hidden state dumps
+- `INFERS_DUMP_DIR=/path` — output directory for all probe dumps (gate for engine-level + attention-level instrumentation)
+- `INFERS_DUMP_LAYERS=0,3,10` — comma-separated layer filter, or `all` for all layers
+- `INFERS_DUMP_STAGES=attn,mlp,residual` — comma-separated stage prefix filter
+- `INFERS_DUMP_STATS=1` — print min/max/mean_abs stats to stderr
+- `INFERS_DUMP_GDN_LAYER=N` — dump GDN-specific intermediates for layer N (GDN module internal)
 - `INFERS_TEST_TOKEN_IDS=1,2,3,...` — override token IDs in smoke test
-- `INFERS_DEBUG_LAYER0=1` — print debug stats at layer 0
 
 Key diagnostic scripts:
 
