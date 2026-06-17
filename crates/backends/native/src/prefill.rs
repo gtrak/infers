@@ -155,6 +155,8 @@ pub fn prefill(
                     group_size,
                     cache,
                     layer_idx,
+                    0, // gpu_idx: single-GPU prefill path
+                    &crate::probe::ProbeConfig::disabled(),
                 )?
             }
             LayerType::FullAttention => {

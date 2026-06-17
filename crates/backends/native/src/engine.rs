@@ -545,6 +545,8 @@ impl ForwardEngine {
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
                             layer_idx,
+                            gpu_idx,
+                            &probe,
                         )?
                     }
                     LayerType::FullAttention => {
@@ -919,6 +921,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
                             layer_idx,
+                            gpu_idx,
+                            &probe,
                         )?
                     }
                     LayerType::FullAttention => {
