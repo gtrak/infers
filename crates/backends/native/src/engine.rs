@@ -39,6 +39,17 @@ fn debug_hidden_stats(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, label: &s
     let min_val = cpu.iter().map(|v| v.to_f32()).fold(f32::MAX, |a, b| a.min(b));
     eprintln!("{}: min={:.4} max={:.4} mean_abs={:.6}", label, min_val, max_val, mean_abs);
 }
+
+/// Dump a BF16 GPU buffer to a raw binary file for reference comparison.
+#[allow(dead_code)]
+fn dump_bf16_tensor(stream: &Arc<CudaStream>, buf: &CudaSlice<bf16>, dir: &str, name: &str) {
+    let cpu: Vec<bf16> = stream.clone_dtoh(buf).expect("dump_bf16_tensor clone_dtoh failed");
+    let bytes: Vec<u8> = cpu.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let path = format!("{}/{}.raw", dir, name);
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("WARN: failed to write dump {}: {}", path, e);
+    }
+}
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
@@ -563,6 +574,20 @@ impl ForwardEngine {
         // Layer loop
         for layer_idx in 0..config.num_hidden_layers {
             tracing::info!("Layer {}/{} (phase A)", layer_idx + 1, config.num_hidden_layers);
+
+            // Dump hidden input at start of layer for reference comparison
+            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                if dl.as_str() == &format!("{}", layer_idx) {
+                    if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                        for gpu_idx in 0..num_gpus {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            let _ = std::fs::create_dir_all(&layer_dump_dir);
+                            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("hidden_input_gpu{}", gpu_idx));
+                        }
+                    }
+                }
+            }
             // ================================================================
             // Phase A: Attention/GDN on each GPU
             // ================================================================
@@ -632,6 +657,15 @@ impl ForwardEngine {
                 if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
                     if dl.as_str() == &format!("{}", layer_idx) {
                         debug_hidden_stats(&gpu_stream, &attn_out, &format!("L{}-ATTN-RAW-GPU{}", layer_idx, gpu_idx));
+                        // Dump FullAttention/GDN intermediates
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            let _ = std::fs::create_dir_all(&layer_dump_dir);
+                            if matches!(layer_type, LayerType::FullAttention) {
+                                dump_bf16_tensor(&gpu_stream, &norm1_out, &layer_dump_dir, &format!("attn_norm1_gpu{}", gpu_idx));
+                            }
+                            dump_bf16_tensor(&gpu_stream, &attn_out, &layer_dump_dir, &format!("attn_output_raw_gpu{}", gpu_idx));
+                        }
                     }
                 }
 
@@ -653,6 +687,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     for gpu_idx in 0..num_gpus {
                         let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                         debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L{}-ATTN-AR-GPU{}", layer_idx, gpu_idx));
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            dump_bf16_tensor(&gpu_stream, &attn_outputs[gpu_idx], &layer_dump_dir, &format!("attn_ar_gpu{}", gpu_idx));
+                        }
                     }
                 }
             }
@@ -673,6 +711,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     for gpu_idx in 0..num_gpus {
                         let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                         debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-ATTN-GPU{}", layer_idx, gpu_idx));
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("residual_attn_gpu{}", gpu_idx));
+                        }
                     }
                 }
             }
@@ -752,6 +794,17 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
                     if dl.as_str() == &format!("{}", layer_idx) {
                         debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L{}-MLP-RAW-GPU{}", layer_idx, gpu_idx));
+                        // Dump MLP intermediates as raw binary files for reference comparison
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            let _ = std::fs::create_dir_all(&layer_dump_dir);
+                            dump_bf16_tensor(&gpu_stream, &norm2_out, &layer_dump_dir, &format!("mlp_norm2_gpu{}", gpu_idx));
+                            dump_bf16_tensor(&gpu_stream, &gate, &layer_dump_dir, &format!("mlp_gate_gpu{}", gpu_idx));
+                            dump_bf16_tensor(&gpu_stream, &up, &layer_dump_dir, &format!("mlp_up_gpu{}", gpu_idx));
+                            dump_bf16_tensor(&gpu_stream, &silu_out, &layer_dump_dir, &format!("mlp_silu_gpu{}", gpu_idx));
+                            // mlp_out (before all-reduce) — already dumped as MLP-RAW
+                            dump_bf16_tensor(&gpu_stream, &mlp_out, &layer_dump_dir, &format!("mlp_down_raw_gpu{}", gpu_idx));
+                        }
                     }
                 }
 
@@ -773,6 +826,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     for gpu_idx in 0..num_gpus {
                         let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                         debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L{}-MLP-AR-GPU{}", layer_idx, gpu_idx));
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            dump_bf16_tensor(&gpu_stream, &mlp_outputs[gpu_idx], &layer_dump_dir, &format!("mlp_down_ar_gpu{}", gpu_idx));
+                        }
                     }
                 }
             }
@@ -793,6 +850,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     for gpu_idx in 0..num_gpus {
                         let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                         debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-MLP-GPU{}", layer_idx, gpu_idx));
+                        if let Ok(ref dump_dir) = std::env::var("INFERS_DUMP_LAYER_DIR") {
+                            let layer_dump_dir = format!("{}/layer_{}", dump_dir, layer_idx);
+                            dump_bf16_tensor(&gpu_stream, &hidden_states[gpu_idx], &layer_dump_dir, &format!("mlp_residual_gpu{}", gpu_idx));
+                        }
                     }
                 }
             }

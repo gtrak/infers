@@ -502,6 +502,31 @@ Diagnostic `eprintln!` calls mark group boundaries and layer progress (every 8 l
 Per-layer hidden state debugging via `debug_hidden_stats()`. Downloads a `CudaSlice<bf16>` to CPU and computes min/max/mean_abs, emitting to stderr. Gated by environment variables for zero overhead when disabled.
 
 Two modes exist: `INFERS_DEBUG_LAYER0` traces layer 0 (embedding through MLP) and `INFERS_DEBUG_LAYER3` traces layer 3 (first full attention layer) with 8 checkpoints: L3-NORM1, L3-ATTN-RAW, L3-ATTN-AR, L3-RESIDUAL-ATTN, L3-NORM2, L3-MLP-RAW, L3-MLP-AR, L3-RESIDUAL-MLP. Each label includes the GPU index (e.g., `L3-NORM1-GPU0`).
+
+### Raw Tensor Dumps
+
+Per-suboperation raw binary dumps of intermediate GPU tensors for reference comparison against PyTorch or CPU baselines. Gated by `INFERS_DEBUG_LAYER` and `INFERS_DUMP_LAYER_DIR` environment variables.
+
+`INFERS_DEBUG_LAYER` selects the target layer (e.g., `3`). `INFERS_DUMP_LAYER_DIR` specifies the output directory (e.g., `/tmp/dump`). Both must be set; dumps trigger only for the debugged layer, yielding zero overhead otherwise.
+The `dump_bf16_tensor()` helper copies a `CudaSlice<bf16>` to CPU via `clone_dtoh`, flattens to little-endian bytes, and writes to `{dir}/layer_{N}/{name}.raw`. Failures emit warnings to stderr rather than failing the pipeline. See [[crates/backends/native/src/engine.rs#dump_bf16_tensor]].
+
+Dumps are written at every phase checkpoint in `prefill_paged`:
+
+- **Layer input**: `hidden_input_gpu{N}` — hidden state before any processing
+- **Phase A (Attention)**: For FullAttention layers, `attn_norm1_gpu{N}` (norm1 output) and `attn_output_raw_gpu{N}` (pre-AR attention). GDN layers dump `attn_output_raw_gpu{N}` only. After all-reduce: `attn_ar_gpu{N}`.
+- **Phase B (Residual Add)**: `residual_attn_gpu{N}` — hidden state after attention residual
+- **Phase C (MLP)**: `mlp_norm2_gpu{N}`, `mlp_gate_gpu{N}`, `mlp_up_gpu{N}`, `mlp_silu_gpu{N}`, `mlp_down_raw_gpu{N}` (pre-AR down projection), and after all-reduce: `mlp_down_ar_gpu{N}`.
+- **Phase D (Residual Add)**: `mlp_residual_gpu{N}` — final hidden state after MLP residual
+
+Combined with the existing `INFERS_DUMP_HIDDEN` path that dumps per-layer f32 files to `/tmp/engine_hidden/`, this provides both statistical and binary-level debugging capabilities.
+### PyTorch Reference Intermediates
+
+Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.
+
+Workflow: loads engine dump files, computes reference norm1/norm2/RMSNorm outputs, dequantizes INT4 gate_proj/up_proj/down_proj weights, performs FP32 GEMM on CPU, and saves reference as `.raw` bf16 files. Compares each stage against corresponding engine dump.
+
+See [[tests/ref_intermediates.py]].
+
 ### Multi-Dtype Weight Upload
 
 The `upload_weight()` function checks `weight.dtype` and converts to BF16. Handles Bf16 (direct), Fp16 (via f16 cast), and Fp32 (via f32 cast). Returns `CudaSlice<bf16>`.
