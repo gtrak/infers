@@ -402,9 +402,17 @@ def main():
     # Find the root dump directory (where config.json lives)
     root_dump_dir = str(config_path.parent)
 
+    # Build the actual dump directory path.
+    # If dump_dir is a layer_N directory, append phase directly.
+    # If dump_dir is a root directory (not layer_N), insert layer_{N}/{phase}.
+    if dump_dir.name.startswith("layer_"):
+        actual_dump_dir = str(dump_dir / args.phase)
+    else:
+        actual_dump_dir = str(dump_dir / f"layer_{layer_idx}" / args.phase)
+
     print("=" * 70)
     print(f"Compare — Layer {layer_idx}, Phase: {args.phase}, Model: {args.model_dir}")
-    print(f"  Dump dir: {dump_dir}/{args.phase}")
+    print(f"  Dump dir: {actual_dump_dir}")
     print(f"  Config:   {config_path}")
     print("=" * 70)
 
@@ -442,8 +450,6 @@ def main():
     print(f"\n  Running {len(stages)} stages...")
 
     # Compute and compare
-    phase = args.phase
-    actual_dump_dir = str(dump_dir / phase)
     results = _compute_and_compare_layer(layer_idx, actual_dump_dir, weights, config, stages, args.verbose)
 
     if results is None:

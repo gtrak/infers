@@ -61,12 +61,13 @@ def discover_dumps(dump_dir: str) -> Dict[int, List[dict]]:
         layer_idx = None
 
     if layer_idx is not None:
-        # The path IS a layer directory — scan .meta files directly
-        metas = [load_meta(str(mp)) for mp in sorted(root.glob("*.meta"))]
+        # The path IS a layer directory — scan .meta files recursively
+        # (handles prefill/ and decode/ subdirectories)
+        metas = [load_meta(str(mp)) for mp in sorted(root.glob("**/*.meta"))]
         if metas:
             result[layer_idx] = metas
     else:
-        # The path is a parent directory — scan layer_N subdirectories
+        # The path is a parent directory — scan layer_N subdirectories recursively
         for layer_dir in sorted(root.iterdir()):
             if not layer_dir.is_dir():
                 continue
@@ -75,7 +76,7 @@ def discover_dumps(dump_dir: str) -> Dict[int, List[dict]]:
             except (ValueError, IndexError):
                 continue
 
-            metas = [load_meta(str(mp)) for mp in sorted(layer_dir.glob("*.meta"))]
+            metas = [load_meta(str(mp)) for mp in sorted(layer_dir.glob("**/*.meta"))]
             if metas:
                 result[lidx] = metas
 
