@@ -678,8 +678,8 @@ pub fn forward(
                 ldc: None,
                 activation: None,
             },
-            &k_h,
             &q_h,
+            &k_h,
             &mut scores_h,
         )?;
 
@@ -724,11 +724,11 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: head_dim,
-                n: seq_len,
+                m: seq_len,
+                n: head_dim,
                 k: seq_len,
-                transa: false,
-                transb: false,
+                transa: true,
+                transb: true,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -736,8 +736,8 @@ pub fn forward(
                 ldc: None,
                 activation: None,
             },
-            &v_h,
             &softmax_out_h,
+            &v_h,
             &mut attn_out_h,
         )?;
 
@@ -1570,8 +1570,8 @@ pub fn forward_paged(
                 ldc: None,
                 activation: None,
             },
-            &k_h,
             &q_h,
+            &k_h,
             &mut scores_h,
         )?;
 
@@ -1645,11 +1645,11 @@ pub fn forward_paged(
             .map_err(|e| anyhow::anyhow!("Failed to allocate attn_out_h buffer: {e}"))?;
         gemm.matmul_bf16(
             &GemmConfig {
-                m: head_dim,
-                n: seq_len,
+                m: seq_len,
+                n: head_dim,
                 k: seq_len,
-                transa: false,
-                transb: false,
+                transa: true,
+                transb: true,
                 alpha: 1.0,
                 beta: 0.0,
                 lda: None,
@@ -1657,8 +1657,8 @@ pub fn forward_paged(
                 ldc: None,
                 activation: None,
             },
-            &v_h,
             &softmax_out_h,
+            &v_h,
             &mut attn_out_h,
         )?;
         if debug_attn && head_idx == 0 { debug_hidden_stats(stream, &attn_out_h, "ATTN-OUT-H0"); }
