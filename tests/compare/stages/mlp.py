@@ -41,13 +41,15 @@ class Norm1Stage(Stage):
 
 
 class Norm2Stage(Stage):
-    """RMSNorm of attn.after_ar with norm2_weight."""
+    """RMSNorm of (hidden_input + attn.after_ar) with norm2_weight."""
 
     name = "mlp.norm2"
     threshold = _MLP_THRESHOLDS["mlp.norm2"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        residual_attn = _get_input(inputs, "attn.after_ar", 0)
+        hidden_input = inputs["hidden_input"]
+        attn_after_ar = _get_input(inputs, "attn.after_ar", 0)
+        residual_attn = hidden_input + attn_after_ar
         norm2_w = weights.load_norm2(layer_idx)
         return _rms_norm(residual_attn, norm2_w, config.rms_norm_eps)
 
