@@ -1095,6 +1095,10 @@ for layer_idx in 0..config.num_hidden_layers {
                             config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx],
                             config.hidden_size,
                             config.attn_output_gate,
+                            layer_idx,
+                            gpu_idx,
+                            // TODO(phase 13.4): wire ProbeConfig from engine config
+                            &crate::probe::ProbeConfig::disabled(),
                         )?
                     }
                 };

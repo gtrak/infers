@@ -530,6 +530,8 @@ General-purpose forward-pass instrumentation via the `probe` module. Controlled 
 
 The `forward_paged` function in [[crates/backends/native/src/attention.rs#forward_paged]] has been wired to use probe::dump() for all internal attention intermediates, replacing the old ad-hoc `debug_attn` and `INFERS_DEBUG_LAYER` code paths. Attention stages include: `attn.k_proj`, `attn.v_proj`, `attn.k_norm`, `attn.q_proj_raw`, `attn.q_norm` (only when Q-norm weights exist), `attn.gate` (only when attn_output_gate is enabled), `attn.combined`, `attn.gated`, and `attn.o_proj`. Per-head intermediates are opt-in via `INFERS_DUMP_STAGES=attn.heads`: `attn.q_h0`, `attn.k_h0`, `attn.v_h0`, `attn.scores_h0`, `attn.softmax_h0` (all head 0 only).
 
+The `decode_forward_paged` function in [[crates/backends/native/src/attention.rs#decode_forward_paged]] has been wired with the same probe::dump() instrumentation. Decode-specific shapes use `seq_len=1`: `attn.k_proj`, `attn.v_proj`, `attn.k_norm` (only when K-norm weights exist), `attn.q_proj_raw`, `attn.q_norm` (only when Q-norm weights exist), `attn.gate` (only when attn_output_gate is enabled), `attn.combined`, `attn.gated`, and `attn.o_proj`. No per-head dumps since decode path has no per-head extraction loop.
+
 ### PyTorch Reference Intermediates
 
 Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.

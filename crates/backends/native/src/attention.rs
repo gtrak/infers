@@ -1277,6 +1277,9 @@ pub fn decode_forward_paged(
     cache: &GpuWeightCache,
     hidden_size: usize,
     attn_output_gate: bool,
+    layer_idx: usize,
+    gpu_idx: usize,
+    probe: &ProbeConfig,
 ) -> Result<CudaSlice<bf16>> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1300,6 +1303,7 @@ pub fn decode_forward_paged(
         cache, &weights.k_proj.name, input, &mut k_single,
         1, kv_dim, hidden_size, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_single, &[1, kv_dim]);
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
@@ -1310,6 +1314,7 @@ pub fn decode_forward_paged(
         cache, &weights.v_proj.name, input, &mut v_single,
         1, kv_dim, hidden_size, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_single, &[1, kv_dim]);
 
     // --- K-norm on full K before RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
@@ -1318,6 +1323,7 @@ pub fn decode_forward_paged(
         k_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_single, &[1, kv_dim]);
     }
 
     // Apply RoPE to K_single
@@ -1370,6 +1376,7 @@ pub fn decode_forward_paged(
         cache, &weights.q_proj.name, input, &mut q_full,
         1, q_out_dim, hidden_size, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[1, q_out_dim]);
 
     // --- Q-norm on Q portion only (not gate) ---
     // Split first, then normalize only the Q part.
@@ -1401,6 +1408,7 @@ pub fn decode_forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
         }
 
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[1, per_gpu_head_dim]);
         (q_buf, Some(gate_buf))
     } else {
         (q_full, None)
@@ -1413,6 +1421,7 @@ pub fn decode_forward_paged(
         q_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_single, &[1, per_gpu_head_dim]);
     }
 
 
@@ -1452,6 +1461,7 @@ pub fn decode_forward_paged(
         page_size,
         kv_dim,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_output, &[1, per_gpu_head_dim]);
 
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
@@ -1476,9 +1486,10 @@ pub fn decode_forward_paged(
                 .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         }
         gated
-    } else {
+     } else {
         attn_output
     };
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[1, per_gpu_head_dim]);
 
     // =========================================================================
     // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
@@ -1496,6 +1507,7 @@ pub fn decode_forward_paged(
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         1, hidden_size, per_gpu_head_dim, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[1, hidden_size]);
 
     Ok(output)
 }
