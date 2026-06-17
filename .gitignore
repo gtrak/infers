@@ -2,3 +2,5 @@
 .opencode
 *.cubin
 *.d
+tests/compare/__pycache__/
+*.pyc

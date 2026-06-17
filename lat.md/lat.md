@@ -550,6 +550,15 @@ Shared Python infrastructure extracted from duplicated code in `ref_intermediate
 - **weight_loader.py**: TP-aware `WeightLoader` class. Handles safetensors loading (keeps int dtypes intact for INT4 packed data), config.json parsing with `text_config` sub-key support, and column-parallel / row-parallel sharding for attention and MLP projections.
 - **cos.py**: Comparison functions — `cos_sim`, `l2_error`, `element_stats`.
 - **config.py**: `DumpConfig` dataclass reading the engine's `config.json`. Provides `get_layer_type()` to determine full-attention vs GDN layers.
+- **compare.py**: CLI entry point for stage-by-stage comparison. Discovers engine dumps, loads DumpConfig, creates WeightLoader, and chains stages together computing reference outputs from `inputs` dict (each stage feeds the next). Filters by layer type (full-attention vs GDN) and category (`--stages attn mlp gdn final`). Returns exit code 0 if all pass, 1 if any fail.
+
+Stage modules under `tests/compare/stages/`:
+
+- **base.py**: `Stage` abstract class with `compute(inputs, weights, config, layer_idx, gpu_idx)` and `compare(dump_dir, ref, layer_idx, gpu_idx)` methods. The `inputs` dict carries previously computed reference outputs so stages can chain.
+- **mlp.py**: MLP stages — Norm1, Norm2, GateProj, UpProj, Silu, DownRaw (pre-AR), DownAr (post-AR all-reduce), ResidualAttn, ResidualMlp. Thresholds from ref_intermediates.py: norm 0.99, gate/up 0.995, silu 0.999, down/residual 0.99.
+- **attention.py**: Full-attention stages — QProjRaw (doubled for gate), QNorm (per-head RMSNorm), Gate (extracted from q_proj_raw), KProj, KNorm, VProj, AttentionCombined (RoPE + GQA expand + SDPA), Gated (combined * sigmoid(gate)), OProj. Includes helpers: `_apply_rope`, `_build_rope_cache`, `_gqa_repeat_kv`, `_scaled_dot_product_attention`.
+- **gdn.py**: Stub with GDN stage names and thresholds from gdn_layer_compare.py. Full implementation deferred since GDN cos≈1.0 is already verified.
+- **final.py**: FinalNorm (RMSNorm of last layer output) and Logits (lm_head GEMM, column-parallel TP sharded).
 
 ### Multi-Dtype Weight Upload
 
