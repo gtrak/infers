@@ -610,6 +610,8 @@ impl ForwardEngine {
                             config.attn_output_gate,
                             layer_idx,
                             gpu_idx,
+                            // TODO(phase 13.4): wire ProbeConfig from engine config
+                            &crate::probe::ProbeConfig::disabled(),
                         )?
                     }
                 };

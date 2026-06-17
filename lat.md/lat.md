@@ -528,6 +528,8 @@ General-purpose forward-pass instrumentation via the `probe` module. Controlled 
 
 `dump_config(model_config, num_gpus, group_size)` writes `config.json` to the dump directory with model parameters (hidden_size, attention heads, layer types, etc.) needed by the Python comparison framework. See [[crates/backends/native/src/probe.rs#dump_config]].
 
+The `forward_paged` function in [[crates/backends/native/src/attention.rs#forward_paged]] has been wired to use probe::dump() for all internal attention intermediates, replacing the old ad-hoc `debug_attn` and `INFERS_DEBUG_LAYER` code paths. Attention stages include: `attn.k_proj`, `attn.v_proj`, `attn.k_norm`, `attn.q_proj_raw`, `attn.q_norm` (only when Q-norm weights exist), `attn.gate` (only when attn_output_gate is enabled), `attn.combined`, `attn.gated`, and `attn.o_proj`. Per-head intermediates are opt-in via `INFERS_DUMP_STAGES=attn.heads`: `attn.q_h0`, `attn.k_h0`, `attn.v_h0`, `attn.scores_h0`, `attn.softmax_h0` (all head 0 only).
+
 ### PyTorch Reference Intermediates
 
 Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.
