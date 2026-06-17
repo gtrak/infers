@@ -540,11 +540,11 @@ Computes per-suboperation reference intermediates on CPU using manual INT4 dequa
 
 Workflow: loads engine dump files, computes reference norm1/norm2/RMSNorm outputs, dequantizes INT4 gate_proj/up_proj/down_proj weights, performs FP32 GEMM on CPU, and saves reference as `.raw` bf16 files. Compares each stage against corresponding engine dump.
 
-See [[tests/ref_intermediates.py]].
+See [[tests/compare/compare.py]].
 
 ### Compare Framework
 
-Shared Python infrastructure extracted from duplicated code in `ref_intermediates.py` and `gdn_layer_compare.py`. All stage modules import from the `tests.compare` package with five submodules.
+All stage modules import from the `tests.compare` package with five submodules.
 - **io.py**: bf16 raw I/O (`load_raw_bf16`, `save_raw_bf16`), metadata loading (`load_meta`), and dump discovery (`discover_dumps`, `discover_final_dumps`).
 - **dequant.py**: INT4 dequantization with the correct reshape-via-permute fix (`unpack_int4`, `dequantize_int4_autogptq`). Reshape pattern: `[K_packed, N*8] -> [K_packed, N, 8] -> permute(0,2,1) -> [K_packed, 8, N] -> [K, N]`.
 - **weight_loader.py**: TP-aware `WeightLoader` class. Handles safetensors loading (keeps int dtypes intact for INT4 packed data), config.json parsing with `text_config` sub-key support, and column-parallel / row-parallel sharding for attention and MLP projections.
@@ -555,9 +555,9 @@ Shared Python infrastructure extracted from duplicated code in `ref_intermediate
 Stage modules under `tests/compare/stages/`:
 
 - **base.py**: `Stage` abstract class with `compute(inputs, weights, config, layer_idx, gpu_idx)` and `compare(dump_dir, ref, layer_idx, gpu_idx)` methods. The `inputs` dict carries previously computed reference outputs so stages can chain.
-- **mlp.py**: MLP stages — Norm1, Norm2, GateProj, UpProj, Silu, DownRaw (pre-AR), DownAr (post-AR all-reduce), ResidualAttn, ResidualMlp. Thresholds from ref_intermediates.py: norm 0.99, gate/up 0.995, silu 0.999, down/residual 0.99.
+- **mlp.py**: MLP stages — Norm1, Norm2, GateProj, UpProj, Silu, DownRaw (pre-AR), DownAr (post-AR all-reduce), ResidualAttn, ResidualMlp. Thresholds: norm 0.99, gate/up 0.995, silu 0.999, down/residual 0.99.
 - **attention.py**: Full-attention stages — QProjRaw (doubled for gate), QNorm (per-head RMSNorm), Gate (extracted from q_proj_raw), KProj, KNorm, VProj, AttentionCombined (RoPE + GQA expand + SDPA), Gated (combined * sigmoid(gate)), OProj. Includes helpers: `_apply_rope`, `_build_rope_cache`, `_gqa_repeat_kv`, `_scaled_dot_product_attention`.
-- **gdn.py**: Stub with GDN stage names and thresholds from gdn_layer_compare.py. Full implementation deferred since GDN cos≈1.0 is already verified.
+- **gdn.py**: Stub with GDN stage names and thresholds. Full implementation deferred since GDN cos≈1.0 is already verified.
 - **final.py**: FinalNorm (RMSNorm of last layer output) and Logits (lm_head GEMM, column-parallel TP sharded).
 
 ### Multi-Dtype Weight Upload
@@ -1440,11 +1440,11 @@ Current comparison results (2 OK, 11 divergent): a_proj cos=0.999997, b_proj cos
 
 ### GDN Layer Compare Script
 
-Script at `tests/gdn_layer_compare.py` provides two comparison modes for verifying GDN kernel correctness against engine dumps for a specific layer (default: layer 18, TP=2 GPU 0).
+The `tests/compare/` framework (see [[tests/compare/compare.py]] and [[tests/compare/stages/gdn.py]]) provides stage-by-stage comparison for verifying GDN kernel correctness against engine dumps for a specific layer (default: layer 18, TP=2 GPU 0).
 
-**Mode 1 — Full Pipeline**: Computes all stages from hidden_input using dequantized INT4 weights. All stages fail because INT4 dequantization error propagates through the entire chain, and even BF16 GEMM stages diverge (likely due to weight sharding differences between engine and safetensors loading).
+**Full Pipeline**: Computes all stages from hidden_input using dequantized INT4 weights. All stages fail because INT4 dequantization error propagates through the entire chain, and even BF16 GEMM stages diverge (likely due to weight sharding differences between engine and safetensors loading).
 
-**Mode 2 — Kernel-Only**: Uses engine's dumped intermediates as inputs, avoiding INT4 dequantization entirely. Only BF16 weights are needed: conv1d weight loaded from engine dump, A_log/dt_bias/norm.weight from safetensors. Three kernel stages verified:
+**Kernel-Only**: Uses engine's dumped intermediates as inputs, avoiding INT4 dequantization entirely. Only BF16 weights are needed: conv1d weight loaded from engine dump, A_log/dt_bias/norm.weight from safetensors. Three kernel stages verified:
 - **conv_out** (cos=0.999998): depthwise conv1d with SiLU using engine's mixed_qkv input and engine's conv1d_weight
 - **core_attn_out** (cos=1.000000): GDN recurrent step matching CUDA kernel `gdn_recurrent_step.cu` exactly — L2 normalization, softplus-clamped decay, sigmoid beta, state update with outer product
 - **norm_output** (cos=1.000000): RMSNormGated using correct formula from `Qwen3_5RMSNormGated` — multiplicative weight (not 1+weight), SiLU gate (not sigmoid)
