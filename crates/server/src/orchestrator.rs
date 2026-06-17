@@ -203,7 +203,8 @@ impl InferenceOrchestrator {
                 position
             );
 
-            let sampled = self.engine.decode(&self.stream, token_id, position)?;
+            let sampled = self.engine.decode_paged(&self.stream, token_id, position, seq_id)?;
+
 
             // Update session
             if let Some(session) = self

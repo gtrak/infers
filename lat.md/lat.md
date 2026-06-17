@@ -157,8 +157,9 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 - `attention.rs` wired: per-head weight slicing, QKV/RoPE/KV cache/scores/softmax/O-proj/all-reduce (prefill + decode)
 - `gdn.rs` wired: Mamba2 projection GEMMs (x_proj, b_proj, dt_proj, z_gate), column alignment to ssm_dim, kernel dispatch, output projection (prefill + decode)
 - `prefill.rs` wired: embed → layer loop (norm1 → GDN/attention → residual → norm2 → MLP → residual) → final norm → LM head → sample
-- `decode.rs` wired: embed single token → layer loop (decode variants) → final norm → LM head → sample
-- `engine.rs`: 11 cached CudaFunction handles, per-layer kv_caches and gdn_states, prefill/decode delegation
+- `decode.rs`: removed — legacy non-paged decode path eliminated in favor of paged `decode_paged()` only
+- `engine.rs`: cached CudaFunction handles, per-layer kv_caches and gdn_states, prefill/decode_paged delegation
+
 - Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
 - `lat check` passes
 
@@ -373,7 +374,8 @@ When `attn_output_gate` is true, the Q output is doubled (Q + gate). After atten
 
 The Qwen3.6 model's q_proj output uses a **per-head interleaved layout**: `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` per row — NOT contiguous `[Q_all, Gate_all]`. This is because HuggingFace reshapes q_proj output as `[batch, seq, heads, head_dim*2]` before splitting Q and gate via `torch.chunk(2, dim=-1)`. The sharding code must preserve this interleaved layout by using a simple column split (GPU 0 gets columns 0..N/2, GPU 1 gets N/2..N) rather than splitting Q and gate segments independently.
 
-Five bugs were fixed: (1) per-head Q extraction used wrong row stride (`per_gpu_head_dim` instead of `q_out_dim`), causing reads from the gate portion of previous tokens; (2) Q-norm was applied to the entire buffer including gate, whereas the reference model only normalizes Q; (3) the SiLU-based kernel replaced with sigmoid-only; (4) q_proj sharding used fused Q+gate segments that assumed contiguous layout, giving GPU 0 heads 0-5+12-17 instead of 0-11 — fixed by using simple ColumnParallel split; (5) Q-norm and gate extraction assumed contiguous halves but must extract per-head from interleaved offsets (`h * (head_dim * 2)` for Q, `h * (head_dim * 2) + head_dim` for gate). See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]].
+Five bugs were fixed: (1) per-head Q extraction used wrong row stride (`per_gpu_head_dim` instead of `q_out_dim`), causing reads from the gate portion of previous tokens; (2) Q-norm was applied to the entire buffer including gate, whereas the reference model only normalizes Q; (3) the SiLU-based kernel replaced with sigmoid-only; (4) q_proj sharding used fused Q+gate segments that assumed contiguous layout, giving GPU 0 heads 0-5+12-17 instead of 0-11 — fixed by using simple ColumnParallel split; (5) Q-norm and gate extraction assumed contiguous halves but must extract per-head from interleaved offsets (`h * (head_dim * 2)` for Q, `h * (head_dim * 2) + head_dim` for gate). See [[crates/backends/native/src/attention.rs#forward_paged]], [[crates/backends/native/src/attention.rs#decode_forward_paged]], [[crates/backends/native/src/attention.rs#forward]].
+
 ## Remaining
 
 Future deliverables for Phase 4.6 completion.
@@ -403,7 +405,8 @@ Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 - Engine call sites updated to pass `&self.weight_caches[gpu_idx]`
 - Phase 3 per-head K/V GEMMs in `forward_paged`: removed redundant CPU dequantization, weight extraction, and GEMM calls; replaced with GPU-to-GPU copies from k_full/v_full buffers (RoPE and K-norm already applied in Phase 1); removed `int4_companions` parameter from both `forward_paged` and `decode_forward_paged` signatures
 - GDN `forward` and `decode_forward`: replaced all `gemm_projection` calls with `gemm_projection_cached`, replaced SSM parameter uploads (a_log, dt_bias) with cache lookups, removed `int4_companions` parameter in favor of `&GpuWeightCache`
-- Updated prefill.rs/decode.rs/mtp.rs call sites to pass weight cache through GDN functions
+- Updated prefill.rs/decode.rs/mtp.rs call sites to pass weight cache through GDN functions (note: decode.rs and mtp.rs have since been removed as legacy paths)
+
 - Flat-cache `forward`: replaced all `gemm_projection` calls with `gemm_projection_cached`, replaced norm uploads with cache lookups, removed per-head CPU dequantization and GEMM calls for Q/K/V in favor of GPU-to-GPU copies from full projections (q_full, k_full, v_full), replaced alternating accumulation with combined attention buffer + single O-proj cached GEMM, removed `int4_companions` and `add_kernel` parameters
 - Flat-cache `decode_forward`: same migration as `forward` — replaced all `gemm_projection` calls with cached variants, norm uploads with cache lookups, per-head Q GEMMs with GPU copy from q_single, combined attention buffer + single O-proj cached GEMM, removed dead code (`upload_bf16_slice`, `extract_head_weight_slice`, `extract_o_proj_head_slice`, `attention_weight_to_bf16_vec`, `weight_to_bf16_wd`) and unused imports
 
@@ -417,12 +420,14 @@ Future tasks to complete the Phase 4.7 GPU weight cache migration end-to-end.
 Phase 4 (Forward Pass) implements the core inference engine with hybrid GDN/full-attention dispatch, cuBLASLt GEMM, and NCCL tensor parallelism.
 
 ## Forward Engine
-Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode inference. `prefill()` and `decode()` delegate to module-level functions with cached kernel handles and per-layer KV/GDN state vectors.
+Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode inference. The legacy non-paged `decode()` path was removed in favor of the paged `decode_paged()` path which supports tensor parallelism.
+
 
 ### Engine Structure
 `ForwardEngine` holds config, weights, a `Vec<PerGpuKernels>` (one set of 16 `CudaFunction` handles per GPU since kernel handles are context-bound), per-GPU GEMM engines, NcclCommunicator, StreamPool, and paged KV fields.
 
-The struct owns `Option<PagedKvManager>` for the paged system, plus per-GPU, per-layer paged caches (`paged_kv_caches: Vec<Vec<PagedKvCache>>`), legacy flat caches (`kv_caches: Vec<Vec<KvCache>>`), and GDN states (`gdn_states: Vec<Vec<GdnState>>`). It also holds `weight_caches: Vec<GpuWeightCache>` — one cache per GPU, built in parallel during construction: each GPU spawns a thread that uploads all weights from its `WeightRegistry` via `GpuWeightCache::new()` (cloning the registry is cheap since inner `Bytes` are Arc-based). Threads join and results are placed by GPU index. The `weights: Vec<WeightRegistry>` field is retained for weight name resolution and metadata access. Kernels are loaded on each GPU's context independently at init — `LoadedKernelRegistry::load_all()` is called per-GPU inside a loop over `contexts`, producing one `PerGpuKernels` instance per GPU. In non-paged paths (`prefill`, `decode`) kernel handles come from `per_gpu_kernels[0]`. In paged paths (`prefill_paged`, `decode_paged`), the per-GPU layer loop uses `per_gpu_kernels[gpu_idx]`, while the final norm/LM head outside the loop uses `per_gpu_kernels[0]`. One `GemmEngine` is created per GPU stream. `init_paged()` creates the manager and caches, computing per-GPU kv_dim as `(num_kv_heads / num_gpus) * head_dim`. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+The struct owns `Option<PagedKvManager>` for the paged system, plus per-GPU, per-layer paged caches (`paged_kv_caches: Vec<Vec<PagedKvCache>>`), legacy flat caches (`kv_caches: Vec<Vec<KvCache>>`), and GDN states (`gdn_states: Vec<Vec<GdnState>>`). It also holds `weight_caches: Vec<GpuWeightCache>` — one cache per GPU, built in parallel during construction: each GPU spawns a thread that uploads all weights from its `WeightRegistry` via `GpuWeightCache::new()` (cloning the registry is cheap since inner `Bytes` are Arc-based). Threads join and results are placed by GPU index. The `weights: Vec<WeightRegistry>` field is retained for weight name resolution and metadata access. Kernels are loaded on each GPU's context independently at init — `LoadedKernelRegistry::load_all()` is called per-GPU inside a loop over `contexts`, producing one `PerGpuKernels` instance per GPU. In non-paged paths (`prefill`) kernel handles come from `per_gpu_kernels[0]`. In paged paths (`prefill_paged`, `decode_paged`), the per-GPU layer loop uses `per_gpu_kernels[gpu_idx]`, while the final norm/LM head outside the loop uses `per_gpu_kernels[0]`. One `GemmEngine` is created per GPU stream.
+ `init_paged()` creates the manager and caches, computing per-GPU kv_dim as `(num_kv_heads / num_gpus) * head_dim`. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Eviction Integration
 
@@ -448,23 +453,8 @@ The `prefill` function accepts a `PrefillKernels` struct holding all CUDA kernel
 
 See [[crates/backends/native/src/prefill.rs#prefill]], [[crates/backends/native/src/prefill.rs#PrefillKernels]].
 
-### Decode Path
-
-Embeds a single token, loops through layers dispatching GDN recurrent steps or single-token attention over cached KV, applies final norm + LM head, samples next token via greedy argmax.
-
-The `decode` function accepts a `DecodeKernels` struct holding all CUDA kernel handles (`rmsnorm`, `silu_glu`, `rope`, `embedding`, `add`, `argmax`, `softmax`, `kv_cache_write`, `gdn_update`), a `GemmEngine`, CUDA stream, `NcclCommunicator`, `ModelConfig`, `WeightRegistry`, a single `token_id`, `position`, and mutable vectors of `KvCache` and `GdnState` for each layer.
-
-**Phase 1 — Embedding**: Looks up embedding weights in GpuWeightCache via `cache.get_bf16()`, then dispatches the embedding gather kernel for a single token.
-
-**Phase 2 — Layer Loop**: For each layer, looks up norm1 and norm2 weights from cache (`cache.get_bf16()`), dispatches `norm::rms_norm` (norm1), then either `gdn::decode_forward` (recurrent state update) or `attention::decode_forward` (single-token attention over cached KV) depending on `LayerType`, followed by NCCL all-reduce via `sync::all_reduce_attention()` for TP=2, residual add, `norm::rms_norm` (norm2), MLP gate/up/down projections via `gemm_projection_cached` (using cache, no `int4_companions` argument needed), NCCL all-reduce via `sync::all_reduce_mlp()` for TP=2, and another residual add. All GEMMs use m=1 (single token).
-
-**Phase 3 — Final Norm + LM Head**: Looks up final norm weight from cache, applies RMSNorm, then computes logits via `gemm_projection_cached` using cache (no `int4_companions` needed), producing `[1 × vocab_size]` BF16 vector.
-
-**Phase 4 — Sampling**: Dispatches `sample::greedy_sample_bf16` with `infers_argmax_bf16` kernel directly on BF16 logits via `CudaSlice::as_view()` — zero CPU round-trip. Unlike prefill, no row extraction is needed since logits are already `[1 × vocab_size]`.
-
-See [[crates/backends/native/src/decode.rs#decode]], [[crates/backends/native/src/decode.rs#DecodeKernels]].
-
 ### Paged Prefill Path
+
 
 Full prefill pipeline using paged KV cache instead of flat buffers. See [[crates/backends/native/src/engine.rs#ForwardEngine#prefill_paged]].
 
@@ -578,46 +568,13 @@ The verification method:
 - The kernel uses raw uint4 values (0-15) directly with `(w_int4 - (zero + 1)) * scale` — applying signed int4 conversion (`out[out > 7] -= 16`) before dequantization was incorrect
 
 This confirms the z_gate deviation from PyTorch (cos ~0.988 in end-to-end comparison) is NOT a bug in our INT4 GEMM kernel. The engine's INT4 GEMM is correct at the per-layer level. The small remaining difference when comparing against PyTorch's full forward pass comes from accumulation precision differences and/or other layers.
-
-### Decode with Hidden State
-Variant of `decode` that also returns the pre-LM-head hidden state for MTP speculative decoding.
-
-Identical to `decode` except after the final RMSNorm it clones the hidden state tensor (`mtp_hidden`) before LM head projection. Returns `(sampled_token, mtp_hidden)` where `mtp_hidden` is `[hidden_size]` BF16 output of the final RMSNorm. Used by MTP draft heads that need the last layer's hidden state as input rather than token IDs.
-
-See [[crates/backends/native/src/decode.rs#decode_with_hidden]].
-
-### MTP Integration Methods
-
-Three `ForwardEngine` methods provide MTP speculative decoding support.
-
-#### init_mtp
-
-Creates an `MtpEngine` from `MtpWeights`, uploading weight data to GPU. Takes `num_draft_tokens` (1-4, 2 recommended) and a CUDA stream for weight uploads. Returns a new `MtpEngine` ready for draft generation and verification.
-
-See [[crates/backends/native/src/engine.rs#ForwardEngine#init_mtp]].
-
-#### decode_with_hidden
-
-Returns the sampled token and pre-LM-head hidden state. Clones the hidden tensor after final RMSNorm before LM head projection, yielding `(sampled_token, hidden_state)`.
-
-See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_hidden]].
-
-#### decode_with_mtp
-
-Full MTP speculative decoding loop. For each iteration:
-
-1. Calls `decode_with_hidden` to get the main model's hidden state and sampled token
-2. Generates draft tokens via `mtp.generate_drafts` using the MTP head
-3. Verifies drafts against the main model via `mtp.verify_drafts`
-4. Records metrics and accepts the longest valid prefix
-5. Extends output tokens and updates position tracking
-
-Uses `MtpOperations` callbacks (embed, rms_norm, forward_layer, lm_head, sample, full_forward) wrapped with raw pointers inside `Arc` to satisfy `Fn` trait requirements while accessing mutable engine state (`kv_caches`, `gdn_states`). Position tracking uses `Cell<u32>` for interior mutability across closure boundaries.
-
-See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_with_mtp]].
-
 ## Module Structure
-Fifteen modules cover forward-pass operations, including GPU weight caching for Phase 4.7: engine, prefill, decode, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction, gemm_dispatch, gpu_cache.
+
+Thirteen modules cover forward-pass operations including GPU weight caching for Phase 4.7.
+
+Legacy `decode.rs` and `mtp.rs` have been removed — the paged decode path (`engine.decode_paged`) is now the only decode implementation. Remaining modules: engine, prefill, gdn, attention, mlp, norm, rope, sample, embedding, sync, add, upload, eviction, gemm_dispatch, gpu_cache.
+
+
 
 ### Layer Operations
 Per-layer CUDA kernel dispatch for transformer operations.
@@ -668,26 +625,8 @@ Odd number of heads leaves result in `accum_a`, even in `accum_b`.
 
 See [[crates/backends/native/src/attention.rs#forward]].
 
-### Decode Attention Forward Pass
-
-Single-token decode attention with per-head weight slicing. Full K/V projections use INT4-aware `gemm_projection`; per-head Q and O slices use dequantization.
-
-#### Architecture
-
-**Phase 1 — Full K/V for cache**: Computes full K and V via `gemm_projection` (INT4-aware), applies RoPE to K (dummy Q buffer), writes RoPE'd K/V to KV cache at current position.
-
-**Phase 2 — Per-head cache extraction**: Downloads full KV cache from GPU to CPU, extracts per-head K and V buffers by striding through the flat `[max_seq_len × kv_dim]` layout.
-
-**Phase 3 — Per-head attention**: For each head, computes Q_h via sliced weights, applies RoPE, computes attention scores against cached K_h via GEMM, applies softmax (no causal mask — single query attends all cache), produces partial output via O-projection. Per-head weight slicing now supports INT4: `weight_to_bf16_wd(k)` dequantizes Q and O projection weights once before the head loop using the GEMM inner dimension `k` to detect transposed [K/8, N] layout via `shape[0] * 8 == k`, producing BF16 `WeightData` for `extract_head_weight_slice` and `extract_o_proj_head_slice`.
-
-Same alternating accumulation pattern as prefill: even-indexed heads add to `accum_b`, odd-indexed to `accum_a`.
-
-Unlike prefill, the softmax uses `use_causal=0` because a single query token can attend to all previously cached positions.
-
-See [[crates/backends/native/src/attention.rs#decode_forward]].
-
-
 ### QK-Normalization
+
 
 RMSNorm applied per-head to Q and K before RoPE in full attention layers.
 
@@ -742,7 +681,8 @@ TP=2 GPU 0 results are compared against TP=1 (single-GPU) reference run on the s
 
 **Head-sharded tensor slicing:** For head-parallel tensors (z_gate, norm_output), the TP=2 shard on GPU 0 contains only the first half of the value heads. The comparison must slice the reference tensor by `[seq, num_v_heads_per_gpu * head_dim]` — not by flat contiguous slicing — to match the per-token head sharding. For example, at TP=2 with seq_len=15, num_v_heads=48, head_dim=64: GPU 0 holds columns 0..768 (heads 0-23), so the reference tensor must be sliced to `[15, 768]` for comparison.
 
-**NCCL all-reduce wiring:** NCCL was declared in `sync.rs` but never wired into the GDN path. The fix adds `nccl.all_reduce_in_place()` calls after GDN output projection in both `prefill.rs` and `decode.rs`, using the same grouped pattern as attention/MLP (group_start/group_end to prevent deadlock).
+**NCCL all-reduce wiring:** NCCL was declared in `sync.rs` but never wired into the GDN path. The fix adds `nccl.all_reduce_in_place()` calls after GDN output projection in both `prefill.rs` and the paged decode path, using the same grouped pattern as attention/MLP (group_start/group_end to prevent deadlock).
+
 
 #### Results Table
 
@@ -780,7 +720,8 @@ Gated DeltaNet decode: Mamba2 SSM recurrent single-token state update with sigmo
 
 1D convolution is skipped, same as prefill.
 
-Tensor-parallel all-reduce is handled by the caller in `decode.rs`.
+Tensor-parallel all-reduce is handled by the paged decode path in `engine.rs`.
+
 
 See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
@@ -788,7 +729,8 @@ See [[crates/backends/native/src/gdn.rs#decode_forward]].
 `SamplingStrategy` enum and `SamplingConfig` for token selection. `greedy_sample_bf16()` dispatches `infers_argmax_bf16` directly on BF16 logits (no CPU round-trip). See [[crates/backends/native/src/sample.rs#SamplingStrategy]], [[crates/backends/native/src/sample.rs#greedy_sample_bf16]].
 
 ### Kernel Dispatch
-Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#decode_forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
+Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
+
 
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.

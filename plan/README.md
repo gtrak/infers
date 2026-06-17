@@ -63,6 +63,7 @@ CUDA Kernels
 | [Phase 10](phase-10-server-orchestration.md) | PARTIAL | 1.5 weeks | Server orchestration — wire everything together | **Mock model only**. Not wired to real inference engine. |
 | [Phase 11](phase-11-model-integration.md) | PARTIAL | 3–4 weeks | Model integration — real model loading and inference | Real model loads and produces tokens. **Performance 200× off.** |
 | [Phase 12](phase-12-get-it-working.md) | PARTIAL | 3–4 weeks | End-to-end real model inference | Smoke test passes. **Server unwired. No HF reference.** |
+| [Phase 13](phase-13-instrumentation.md) | NOT DONE | 2 weeks | General-purpose instrumentation + bug hunt | Replace ad-hoc debug with structured probe. Find and fix garbage output bug. |
 
 **Critical Path**: Phase 4.7 (GPU Weight Cache) → Phase 4 (hit 20 tok/s) → Phase 6 (continuous batching) → Phase 7 (MTP) → Phase 10 (wire server)
 
