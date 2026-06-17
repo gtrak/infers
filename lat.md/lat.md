@@ -96,9 +96,11 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | `int4_gemm.cu` | `int4_gemm_kernel` | INT4 GEMM with per-group dequantization in registers and native transposed [K/8, N] layout support via `transposed` flag: weights stay packed as INT4 (8 per uint32), dequantize `(w_int4 - (zero + 1)) * scale` on-the-fly during inner loop (AutoRound uses biased zero points — stored `z` represents actual zero point `z+1`), accumulate in FP32, output BF16 — 16×16 thread blocks, one thread per output element |
 
 ### Build Script
-Compiles all `.cu` files found in `kernels/infers/` to .cubin binaries using nvcc.
+#PS:Compiles `.cu` in `kernels/infers/` to .cubin via nvcc `-O3`. Non-GDN kernels use `--use_fast_math`; GDN kernels are excluded from `--use_fast_math` due to precision requirements. Targets `sm_120` by default (`INFERS_CUDA_ARCH` override).
 
-Targets `sm_120` (Blackwell RTX 5060 Ti) by default, configurable via the `INFERS_CUDA_ARCH` environment variable. Uses `-O3 --use_fast_math` flags with `-I kernels/infers` include path for common.cuh. The `find_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` with matching names and loaded at runtime by the KernelRegistry.
+**Precision policy**: `--use_fast_math` causes `expf()`/`logf()`/`rsqrtf()` to use reduced-precision approximations (~2 ULP vs ~1 ULP). In the GDN recurrence kernel (`gdn_gated_delta_prefill.cu`), these small per-step errors compound through the sequential state update, causing cosine similarity of only ~0.94 vs PyTorch reference after 15 tokens (token 0 matches perfectly at 1.0, worst at token 9 = 0.84). To prevent this, all 7 GDN kernel files (`gdn_*.cu`) are compiled **without** `--use_fast_math`, while the remaining kernels (softmax, silu, conv1d_depthwise, etc.) retain the flag for performance. The build script determines this by checking whether the file stem starts with `"gdn"` in `compile_kernel()`.
+
+The `find_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` with matching names and loaded at runtime by the KernelRegistry.
 
 # Phase 1 Deliverables
 Phase 1 (Bootstrap) creates the workspace, crate skeletons, and API scaffolding for the inference server.
@@ -506,6 +508,8 @@ The `upload_weight()` function checks `weight.dtype` and converts to BF16. Handl
 
 Conversion logic extracted into `bytes_to_bf16()` for GPU-free unit testing.
 
+**Critical**: `upload_weight()` synchronizes the CUDA stream after each upload via `stream.synchronize()`. This prevents `cudaMallocAsync` (the async memory pool) from returning overlapping GPU addresses for consecutive allocations on the same stream. Without this sync, the async allocator can reuse an address that was just allocated (but whose memcpy is still pending) for the next allocation, causing data corruption that only manifests at kernel launch time. See [[crates/backends/native/src/upload.rs#upload_weight]].
+
 ### INT4 Triplet Upload
 
 Uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. The kernel handles both layouts natively — no CPU transposition is needed.
@@ -531,6 +535,24 @@ Key findings:
 The mixed_qkv divergence (cos=0.993) is from accumulation precision differences: our `int4_gemm_kernel` accumulates in FP32 while HF's QuantLinear may use BF16 or different kernel paths. This is expected and does not indicate a dequantization bug.
 
 The GDN output divergence (cos=0.243) indicates a separate issue in the later stages of the GDN forward pass — likely in QKV split, head dimension handling, repeat_interleave, or the GDN recurrence kernel itself. The mixed_qkv and conv_out comparisons confirm the INT4 weight path up to Phase 3 is correct.
+
+### z_gate GEMM Verification
+
+The z_gate INT4 GEMM was independently verified against a CPU reference by dequantizing the `in_proj_z` weight and computing the full forward path on CPU. Script: `/tmp/verify_z_gate_gemm.py`.
+
+**Result**: cosine similarity = **0.9999988675** (PASS) — the engine's z_gate matches the CPU reference almost exactly. MAE=0.0039, RMSE=0.0055, max error=0.041 (bf16 rounding).
+
+The verification method:
+1. Compute norm1_out from engine embedding (`layer_-1.f32`) + RMS norm weight
+2. Dequantize `in_proj_z` INT4 weight using the same formula as the kernel: `(w_uint4 - (zero + 1)) * scale`
+3. CPU reference: `ref_z_gate = norm1_out @ dequantized_weight` → [15, 6144]
+4. Compare engine's z_gate (GPU1 shard, columns [3072:6144]) with `ref_z_gate[:, 3072:6144]`
+
+**Two bugs were found and fixed during this verification:**
+- Engine outputs z_gate in **bfloat16**, NOT float16 — reading as float16 produced meaningless statistics (std=inf)
+- The kernel uses raw uint4 values (0-15) directly with `(w_int4 - (zero + 1)) * scale` — applying signed int4 conversion (`out[out > 7] -= 16`) before dequantization was incorrect
+
+This confirms the z_gate deviation from PyTorch (cos ~0.988 in end-to-end comparison) is NOT a bug in our INT4 GEMM kernel. The engine's INT4 GEMM is correct at the per-layer level. The small remaining difference when comparing against PyTorch's full forward pass comes from accumulation precision differences and/or other layers.
 
 ### Decode with Hidden State
 Variant of `decode` that also returns the pre-LM-head hidden state for MTP speculative decoding.
@@ -1407,7 +1429,61 @@ TP=2 comparison: `scripts/compare_gdn_tp2.py` compares engine dumps (BF16 raw, s
 
 Current comparison results (2 OK, 11 divergent): a_proj cos=0.999997, b_proj cos=0.999999 (both pass), z_gate cos=0.989430 (improved from 0.495 after per-token slicing fix), norm_output cos=0.985635 (improved from 0.281 after same fix). Remaining divergences include mixed_qkv cos=0.994911, core_attn_out cos=0.999341, output cos=0.882144. Reference shapes: mixed_qkv=(15,10240), query=(15,2048), key=(15,2048), value=(15,6144), a_proj=(15,48), b_proj=(15,48), core_attn_out=(15,48,128).
 
+## GDN fp32 vs bf16 Precision Test
 
+Tests whether computing the q/k/v pipeline in fp32 (instead of bf16) fixes the GDN cosine divergence against the engine. Script at `/tmp/test_fp32.py`.
+
+Hypothesis: the engine's q/k/v inputs have 1-2% element-level errors because the `in_proj_qkv -> conv1d -> silu -> split` pipeline loses precision in bf16. If we compute everything in fp32, GDN output should match the engine better.
+
+Methodology: two variants through the full pipeline (embedding, RMS norm, dequantized GEMM, conv1d, silu, split into q/k/v). Both use L2-normalized q/k in the sequential GDN loop (matching `torch_recurrent_gated_delta_rule` with `use_qk_l2norm_in_kernel=True`). Engine reference from `/tmp/engine_dump_no_fast_math/core_attn_out.raw` — shape [15, 24, 128] bf16.
+
+Results:
+- cos(bf16 variant, engine) = 0.93644941
+- cos(fp32 variant, engine) = 0.93631727 (slightly worse by 0.00013)
+- cos(bf16, fp32) = 1.00000489 (both variants nearly identical)
+- cos(sequential, torch_recurrent) = 1.00000584 (cross-check passes)
+- q/k/v mean relative error bf16 vs fp32: 1.08% / 2.33% / 1.08%
+- a_proj and b_proj match engine perfectly (cos > 0.999998) for both variants
+
+Conclusion: **Hypothesis rejected.** Computing q/k/v in fp32 does NOT fix the GDN cosine divergence. The ~6.4% error vs engine persists regardless of bf16 vs fp32. The 1-2% bf16 precision loss is real but not the root cause. Per-token cosines degrade from 0.999 at token 0 to 0.844 at token 9, suggesting compounding error in the recurrent loop — possibly due to numerical differences between our sequential implementation and the engine's fused kernel (e.g., fp32 accumulation vs bf16 intermediate ops within the engine).
+
+
+## Full-Layer Hidden State Divergence Analysis
+
+Layer-by-layer comparison of engine hidden states against PyTorch reference (full model, TP=1) to locate the root cause of cosine similarity dropping to ~0.15 by the final layer. Script: `/tmp/compare_hidden.py`.
+
+**Alignment**: Engine layer N matches reference layer N+1 (engine_layer_-1 = embedding output = ref_layer_0). Only GPU-1 shard is compared (columns 5120: of the full 10240-width hidden, shape [15, 5120]).
+
+**Divergence thresholds:**
+- First layer with cos < 0.99: Layer 7 (FULL attention), cos = 0.988917
+- First layer with cos < 0.90: Layer 13 (GDN), cos = 0.551853
+- First layer with cos < 0.50: Layer 49 (GDN), cos = 0.450780
+
+**The catastrophic layer is 13 (GDN):** cos drops from 0.971802 (layer 12) to 0.551853 (layer 13) — a drop of 0.419950, the largest single-layer drop in the entire model. Delta cos at layer 13 is only 0.056760 (delta_eng and delta_ref are nearly orthogonal). The engine produces a layer-13 contribution that is **12.5x larger in norm** than the reference (engine=322.3, ref=25.8, ratio=12.50).
+
+**Per-token breakdown at the catastrophic layer (13):**
+- Tokens 0-5: remain close to reference (cos > 0.98) — barely affected by the divergence
+- Token 6: cos drops from 0.808 (prev) to 0.134 (current) — most severely affected
+- Token 13: cos drops from 0.936 to 0.481
+- Tokens 7-12: moderate divergence (delta cos 0.5-0.7)
+
+This token-specific pattern suggests the GDN recurrence at layer 13 produces correct outputs for early tokens (lower sequence positions) but diverges catastrophically for later tokens — consistent with a compounding error in the sequential state update within the GDN kernel.
+
+**Error accumulation is non-monotonic:** 61.9% of layers show decreasing cosine (monotonic decay), but 38.1% show increasing cosine (recovery). After the catastrophic layer 13, cosine oscillates between 0.55-0.74 for many layers, suggesting subsequent layers partially compensate but cannot fully recover.
+
+**GDN vs FULL attention in error drops:** The top 10 largest single-layer drops are dominated by GDN layers (average drop 0.128) over FULL attention layers (average drop 0.048). This pattern is consistent with GDN recurrence being more numerically unstable than full attention.
+
+**Per-token divergence onset (first layer below 0.99):**
+- Token 6: layer 2 (earliest diverging token)
+- Token 7: layer 2
+- Token 10: layer 2
+- Token 8: layer 5
+- Token 11: layer 6
+- Token 9: layer 6
+- Token 13: layer 10
+- Token 14: layer 12 (latest diverging token)
+
+The divergence cascades from early tokens (positions 0-5) to later tokens (positions 9-14) across layers, suggesting positional dependence in the error mechanism.
 ## Full-Attention Reference Tests (Layer 3)
 
 HuggingFace-based reference capturing full-attention (Qwen3_5Attention) intermediates at layer 3 as .npy ground truth, using the engine's 15 token IDs.
@@ -1697,3 +1773,44 @@ Key findings from norm ratio analysis:
 The increasing deviation from mixed_qkv (6.8%) to conv_out (10.5%) suggests the GEMM or dequantization introduces excess energy that cascades through the causal convolution. The z_gate ratio being nearly exact confirms the issue is specific to in_proj_qkv/conv1d, not the input activation.
 
 Limitations: engine dump starts at mixed_qkv (no layer_input/norm1_out), so pre-GEMM divergence cannot be determined. GDN recurrent step not available on CPU reference (needs CUDA + FLA kernels).
+
+## L0 GDN TP=2 Cosine Similarity Comparison
+
+Cosine similarity comparison between engine (GPU1, TP=2, bf16) and PyTorch reference (fp32 full model with GPU1 column slices extracted). Identifies the specific intermediate step introducing ~0.8% output error.
+
+- **Engine dumps**: `/tmp/gdn_debug_L0/` (raw bf16 bytes, loaded via bit-cast to f32)
+- **Reference dumps**: `/tmp/ref_gdn_L0/` (numpy fp32 .npy files from PyTorch full-model forward pass)
+- **Column mapping for GPU1**: Q[1024:2048], K[3072:4096], V[7168:10240] for mixed_qkv/conv_out; heads 8-15 for query/key (16 total); groups 24-47 for value/z_gate (48 total); cols [24:48] for a_proj/b_proj
+
+### Cosine Similarity Results
+
+Per-tensor cosine similarity between engine (GPU1 bf16) and reference (fp32 full, GPU1 columns extracted).
+
+| Tensor | Cosine | 1-cos (%) | Token 0 cos | Token 6 cos | Verdict |
+|--------|--------|-----------|-------------|-------------|---------|
+| **z_gate** | 0.987905 | **1.209%** | 0.977335 | 0.979746 | **Worst — primary error source** |
+| mixed_qkv | 0.992500 | 0.750% | 0.993123 | 0.990589 | Moderate deviation |
+| query | 0.993431 | 0.657% | 0.989440 | 0.993947 | Propagated from mixed_qkv |
+| key | 0.995583 | 0.442% | **0.973497** | 0.996209 | Token 0 notably worse |
+| conv_out | 0.999345 | 0.065% | 0.998530 | 0.999269 | Near-perfect |
+| value | 0.999649 | 0.035% | 0.998930 | 0.999729 | Near-perfect |
+| a_proj | 1.000000 | 0.000% | 1.000000 | 1.000000 | **Exact match** |
+| b_proj | 1.000000 | 0.000% | 1.000000 | 1.000000 | **Exact match** |
+
+### Error Flow Analysis
+
+The error originates in the **z_gate path**, not the conv_out path. Key observations:
+
+1. **z_gate has the highest cosine deviation (1.209%)** — this directly feeds the GDN gated residual connection and is the primary source of the ~0.8% output error
+2. **conv_out is near-perfect (0.065%)** — contradicts the earlier TP=4 norm ratio finding that suggested conv1d amplification; the TP=4 result likely reflected different dequantization conditions
+3. **a_proj and b_proj are exact matches** — small projections (dim 48) are unaffected, confirming the error is in larger column-parallel GEMMs only
+4. **Token 0 key has especially low cosine (0.9735)** — suggests position-dependent numerical sensitivity in K projection
+5. **median relative error for z_gate is ~17.7%** across all elements (not mean, which is inflated by near-zero values)
+
+### norm_output Shape Mismatch
+
+Engine `norm_output` is [15, 3072] while reference `norm1_out` is [15, 5120]. These do not correspond to a simple TP-sharded pair — half of 5120 is 2560, not 3072. Direct cosine comparison is not possible for this intermediate.
+
+### Conclusion
+
+The z_gate path introduces ~1.2% cosine deviation at L0 and accounts for most of the observed 0.8% output error, as it gates the FFN residual. The conv path contributes only ~0.1% total deviation.

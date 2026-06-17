@@ -30,9 +30,49 @@ pub fn upload_weight(
     weight: &WeightData,
 ) -> Result<CudaSlice<bf16>> {
     let bf16_vec = bytes_to_bf16(&weight.data, weight.dtype)?;
-    stream
+
+    // Debug: dump conv1d weight bytes just before GPU upload
+    if weight.name.contains("conv1d.weight") {
+        let debug_dir = "/tmp/weight_debug";
+        let _ = std::fs::create_dir_all(debug_dir);
+        // Extract layer number from name like "layers.0.linear_attn.conv1d.weight"
+        let layer_tag = weight.name
+            .strip_prefix("layers.")
+            .and_then(|s| s.split('.').next())
+            .unwrap_or("unknown");
+        let path = format!("{}/conv1d_before_upload_layer{}.raw", debug_dir, layer_tag);
+        std::fs::write(&path, &weight.data).expect("Failed to write pre-upload debug");
+        eprintln!("  Dumped conv1d weight before upload: {} ({} bytes) name={}", path, weight.data.len(), weight.name);
+    }
+
+    // Also dump after conversion to bf16 vector
+    if weight.name.contains("conv1d.weight") {
+        let debug_dir = "/tmp/weight_debug";
+        let layer_tag = weight.name
+            .strip_prefix("layers.")
+            .and_then(|s| s.split('.').next())
+            .unwrap_or("unknown");
+        let path = format!("{}/conv1d_converted_layer{}.raw", debug_dir, layer_tag);
+        let bf16_bytes: Vec<u8> = bf16_vec.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        std::fs::write(&path, &bf16_bytes).expect("Failed to write post-convert debug");
+        eprintln!("  Dumped converted conv1d layer{}: {} ({} bytes)", layer_tag, path, bf16_bytes.len());
+    }
+
+    let gpu_slice = stream
         .clone_htod(&bf16_vec)
-        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))
+        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))?;
+
+    // CRITICAL FIX: Synchronize the stream after each upload to prevent cudaMallocAsync
+    // from returning the same GPU address for consecutive allocations on this stream.
+    // The async memory pool can return overlapping addresses if prior allocations are
+    // still pending (copy not yet completed) when the next allocation is made.
+    stream
+        .synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after uploading '{}': {}", weight.name, e))?;
+
+    Ok(gpu_slice)
 }
 
 /// Convert raw bytes to a `Vec<bf16>` based on the declared dtype.
@@ -122,12 +162,24 @@ pub fn upload_int4_weight(
     let qweight_gpu = stream
         .clone_htod(&qweight_u32)
         .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", qweight.name, e))?;
+    // CRITICAL: Sync after each upload to prevent cudaMallocAsync
+    // from returning overlapping addresses on the same stream.
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after qweight '{}': {}", qweight.name, e))?;
+
     let scales_gpu = stream
         .clone_htod(&scales_vec)
         .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", scales.name, e))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after scales '{}': {}", scales.name, e))?;
+
     let qzeros_gpu = stream
         .clone_htod(&qzeros_u32)
         .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", qzeros.name, e))?;
+    // Final sync not strictly needed since nothing follows in this function,
+    // but good practice for callers that immediately launch kernels.
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after qzeros '{}': {}", qzeros.name, e))?;
 
     Ok((qweight_gpu, scales_gpu, qzeros_gpu))
 }

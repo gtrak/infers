@@ -42,12 +42,17 @@ fn main() {
         let output_name = format!("{}.cubin", stem);
         let output_path = compiled_dir.join(&output_name);
 
-        match compile_kernel(&nvcc_path, &src_path, &output_path, &arch_str, &source_dir) {
+        // GDN kernels use expf(), logf(), rsqrtf() which are precision-critical.
+        // Skip --use_fast_math for these to avoid precision loss.
+        let use_fast_math = !stem.starts_with("gdn");
+
+        match compile_kernel(&nvcc_path, &src_path, &output_path, &arch_str, &source_dir, use_fast_math) {
             Ok(()) => {
                 println!(
-                    "cargo:warning=Compiled {} -> {}",
+                    "cargo:warning=Compiled {} -> {} (fast_math={})",
                     src_path.display(),
-                    output_path.display()
+                    output_path.display(),
+                    use_fast_math
                 );
             }
             Err(e) => {
@@ -81,19 +86,24 @@ fn compile_kernel(
     output: &Path,
     arch: &str,
     include_dir: &Path,
+    use_fast_math: bool,
 ) -> Result<(), String> {
+    let mut args = vec![
+        String::from("-cubin"),
+        format!("-arch={}", arch),
+        String::from("-O3"),
+    ];
+    if use_fast_math {
+        args.push(String::from("--use_fast_math"));
+    }
+    args.push(String::from("-I"));
+    args.push(include_dir.to_string_lossy().to_string());
+    args.push(src.to_string_lossy().to_string());
+    args.push(String::from("-o"));
+    args.push(output.to_string_lossy().to_string());
+
     let status = Command::new(nvcc)
-        .args([
-            "-cubin",
-            &format!("-arch={}", arch),
-            "-O3",
-            "--use_fast_math",
-            "-I",
-            include_dir.to_string_lossy().as_ref(),
-            src.to_string_lossy().as_ref(),
-            "-o",
-            output.to_string_lossy().as_ref(),
-        ])
+        .args(args)
         .status()
         .map_err(|e| format!("nvcc failed to execute: {}", e))?;
 

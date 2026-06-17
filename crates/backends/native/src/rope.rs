@@ -91,12 +91,22 @@ pub fn apply_rope(
     let positions_gpu = stream
         .clone_htod(positions)
         .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
+    // CRITICAL: Sync after each upload to prevent cudaMallocAsync
+    // from returning overlapping addresses on the same stream.
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after positions: {e}"))?;
+
     let cos_gpu = stream
         .clone_htod(&cos_table)
         .map_err(|e| anyhow::anyhow!("Failed to copy cos table to device: {e}"))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after cos table: {e}"))?;
+
     let sin_gpu = stream
         .clone_htod(&sin_table)
         .map_err(|e| anyhow::anyhow!("Failed to copy sin table to device: {e}"))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after sin table: {e}"))?;
 
     let total_tokens = positions.len() as i32;
     let head_dim_i32 = head_dim as i32;

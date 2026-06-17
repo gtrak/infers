@@ -533,11 +533,13 @@ impl ForwardEngine {
             hidden_states.push(h);
         }
 
-        // DEBUG: embedding stats for layer 0 trace
-        if std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-            for gpu_idx in 0..num_gpus {
-                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-EMB-GPU{}", gpu_idx));
+        // DEBUG: embedding stats when layer 0 is debug target
+        if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+            if dl == "0" {
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-EMB-GPU{}", gpu_idx));
+                }
             }
         }
 
@@ -581,14 +583,11 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                // DEBUG: norm1 stats for layer 0 trace
-                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L0-NORM1-GPU{}", gpu_idx));
-                }
-
-                // DEBUG: norm1 stats for layer 3 trace
-                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L3-NORM1-GPU{}", gpu_idx));
+                // DEBUG: norm1 at any layer via INFERS_DEBUG_LAYER
+                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                    if dl.as_str() == &format!("{}", layer_idx) {
+                        debug_hidden_stats(&gpu_stream, &norm1_out, &format!("L{}-NORM1-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
 
                 // Attention or GDN with sharded weights
@@ -630,14 +629,10 @@ impl ForwardEngine {
                     }
                 };
 
-                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &attn_out, &format!("L0-GDN-RAW-GPU{}", gpu_idx));
-                }
-
-
-                // DEBUG: attn raw output stats for layer 3 trace
-                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &attn_out, &format!("L3-ATTN-RAW-GPU{}", gpu_idx));
+                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                    if dl.as_str() == &format!("{}", layer_idx) {
+                        debug_hidden_stats(&gpu_stream, &attn_out, &format!("L{}-ATTN-RAW-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
 
                 attn_outputs.push(attn_out);
@@ -653,19 +648,12 @@ impl ForwardEngine {
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // DEBUG: attn all-reduce stats for layer 0 trace
-            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L0-ATTN-AR-GPU{}", gpu_idx));
-                }
-            }
-
-            // DEBUG: attn all-reduce stats for layer 3 trace
-            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L3-ATTN-AR-GPU{}", gpu_idx));
+            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                if dl.as_str() == &format!("{}", layer_idx) {
+                    for gpu_idx in 0..num_gpus {
+                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                        debug_hidden_stats(&gpu_stream, &attn_outputs[gpu_idx], &format!("L{}-ATTN-AR-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
             }
 
@@ -680,19 +668,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 )?;
             }
 
-            // DEBUG: attn residual add stats for layer 0 trace
-            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-RESIDUAL-ATTN-GPU{}", gpu_idx));
-                }
-            }
-
-            // DEBUG: attn residual add stats for layer 3 trace
-            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L3-RESIDUAL-ATTN-GPU{}", gpu_idx));
+            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                if dl.as_str() == &format!("{}", layer_idx) {
+                    for gpu_idx in 0..num_gpus {
+                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                        debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-ATTN-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
             }
 
@@ -715,14 +696,11 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                // DEBUG: norm2 stats for layer 0 trace
-                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L0-NORM2-GPU{}", gpu_idx));
-                }
-
-                // DEBUG: norm2 stats for layer 3 trace
-                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L3-NORM2-GPU{}", gpu_idx));
+                // DEBUG: norm2 at any layer via INFERS_DEBUG_LAYER
+                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                    if dl.as_str() == &format!("{}", layer_idx) {
+                        debug_hidden_stats(&gpu_stream, &norm2_out, &format!("L{}-NORM2-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
@@ -771,13 +749,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
-                if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L0-MLP-RAW-GPU{}", gpu_idx));
-                }
-
-                // DEBUG: MLP down proj stats for layer 3 trace
-                if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                    debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L3-MLP-RAW-GPU{}", gpu_idx));
+                if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                    if dl.as_str() == &format!("{}", layer_idx) {
+                        debug_hidden_stats(&gpu_stream, &mlp_out, &format!("L{}-MLP-RAW-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
 
                 mlp_outputs.push(mlp_out);
@@ -793,19 +768,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
-            // DEBUG: MLP all-reduce stats for layer 0 trace
-            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L0-MLP-AR-GPU{}", gpu_idx));
-                }
-            }
-
-            // DEBUG: MLP all-reduce stats for layer 3 trace
-            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L3-MLP-AR-GPU{}", gpu_idx));
+            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                if dl.as_str() == &format!("{}", layer_idx) {
+                    for gpu_idx in 0..num_gpus {
+                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                        debug_hidden_stats(&gpu_stream, &mlp_outputs[gpu_idx], &format!("L{}-MLP-AR-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
             }
 
@@ -820,19 +788,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 )?;
             }
 
-            // DEBUG: MLP residual add stats for layer 0 trace
-            if layer_idx == 0 && std::env::var("INFERS_DEBUG_LAYER0").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L0-RESIDUAL-MLP-GPU{}", gpu_idx));
-                }
-            }
-
-            // DEBUG: MLP residual add stats for layer 3 trace
-            if layer_idx == 3 && std::env::var("INFERS_DEBUG_LAYER3").is_ok() {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L3-RESIDUAL-MLP-GPU{}", gpu_idx));
+            if let Ok(ref dl) = std::env::var("INFERS_DEBUG_LAYER") {
+                if dl.as_str() == &format!("{}", layer_idx) {
+                    for gpu_idx in 0..num_gpus {
+                        let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                        debug_hidden_stats(&gpu_stream, &hidden_states[gpu_idx], &format!("L{}-RESIDUAL-MLP-GPU{}", layer_idx, gpu_idx));
+                    }
                 }
             }
 

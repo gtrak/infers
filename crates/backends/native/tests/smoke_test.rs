@@ -64,11 +64,12 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Build structured layers for each shard
     let mut weight_registries: Vec<infers_model::WeightRegistry> = Vec::new();
     for shard in shards {
+        let gpu_id = shard.gpu_id;
         let mut registry = shard.registry;
         build_main_layers(&mut registry, &config)?;
         eprintln!(
             "Shard {}: layers={}, embedding={}, norm={}, lm_head={}",
-            shard.gpu_id,
+            gpu_id,
             registry.layers.len(),
             registry.embedding.is_some(),
             registry.norm.is_some(),

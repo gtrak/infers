@@ -97,19 +97,19 @@ fn debug_tensor_stats_f32(
 fn dump_gdn_intermediate(
     stream: &Arc<CudaStream>,
     buf: &CudaSlice<bf16>,
+    dump_dir: Option<&str>,
     name: &str,
 ) {
-    if let Ok(dir) = std::env::var("INFERS_DUMP_GDN_DIR") {
-        use std::fs;
-        let path = format!("{}/{}.raw", dir, name);
-        let cpu: Vec<bf16> = stream.clone_dtoh(buf)
-            .expect("Failed to download for dump");
-        let bytes: Vec<u8> = cpu.iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        fs::write(&path, &bytes)
-            .expect("Failed to write GDN dump");
-    }
+    let Some(dir) = dump_dir else { return; };
+    use std::fs;
+    let path = format!("{}/{}.raw", dir, name);
+    let cpu: Vec<bf16> = stream.clone_dtoh(buf)
+        .expect("Failed to download for dump");
+    let bytes: Vec<u8> = cpu.iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    fs::write(&path, &bytes)
+        .expect("Failed to write GDN dump");
 }
 
 /// Get the output dimension from a weight tensor.
@@ -296,13 +296,28 @@ fn repeat_interleave_heads(
     layer_idx: usize,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
-    debug_tensor_stats_bf16(stream, input, seq_len * hidden_size, "gdn_input");
-    // Dump GDN intermediates when layer_idx matches INFERS_DUMP_GDN_LAYER env var.
-    let dump_layer = std::env::var("INFERS_DUMP_GDN_LAYER")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let do_dump = layer_idx == dump_layer && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
+    // Dump GDN intermediates — INFERS_DUMP_GDN_LAYER=all or =N.
+    // Per-layer subdirectories under INFERS_DUMP_GDN_DIR.
+    let dump_spec = std::env::var("INFERS_DUMP_GDN_LAYER");
+    let has_gdn_dir = std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
+    let do_dump = match &dump_spec {
+        Ok(s) if s == "all" => has_gdn_dir,
+        Ok(s) => {
+            s.parse::<usize>().ok().map_or(false, |n| layer_idx == n && has_gdn_dir)
+        }
+        _ => false,
+    };
+    let layer_dump_dir: Option<String> = if do_dump {
+        let dir = std::env::var("INFERS_DUMP_GDN_DIR").unwrap();
+        let layer_path = format!("{}/layer_{}", dir, layer_idx);
+        std::fs::create_dir_all(&layer_path).ok();
+        Some(layer_path)
+    } else {
+        None
+    };
+
+    // Dump the layer input hidden state for reference comparison
+    dump_gdn_intermediate(stream, input, layer_dump_dir.as_deref(), "hidden_input");
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
     let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
@@ -328,7 +343,7 @@ fn repeat_interleave_heads(
         )?;
     }
     debug_tensor_stats_bf16(stream, &mixed_qkv, seq_len * conv_dim, "mixed_qkv");
-    if do_dump { dump_gdn_intermediate(stream, &mixed_qkv, "mixed_qkv"); }
+    dump_gdn_intermediate(stream, &mixed_qkv, layer_dump_dir.as_deref(), "mixed_qkv");
 
     // =========================================================================
     // Phase 2: Depthwise conv1d on mixed_qkv (SiLU activation)
@@ -337,6 +352,8 @@ fn repeat_interleave_heads(
     // conv1d_weight is always present for Qwen3.6
     let conv1d_gpu = cache.get_bf16(&weights.conv1d_weight.name)
         .ok_or_else(|| anyhow::anyhow!("conv1d weight '{}' not in cache", weights.conv1d_weight.name))?;
+
+    dump_gdn_intermediate(stream, conv1d_gpu, layer_dump_dir.as_deref(), "conv1d_weight");
     let batch_i32 = 1i32;
     let conv_dim_i32 = conv_dim as i32;
     let seq_len_i32 = seq_len as i32;
@@ -361,7 +378,7 @@ fn repeat_interleave_heads(
             .map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
     }
     debug_tensor_stats_bf16(stream, &conv_out, seq_len * conv_dim, "conv_out");
-    if do_dump { dump_gdn_intermediate(stream, &conv_out, "conv_out"); }
+    dump_gdn_intermediate(stream, &conv_out, layer_dump_dir.as_deref(), "conv_out");
 
     // =========================================================================
     // Phase 3: Split conv_out into query, key, value (extract as proper slices)
@@ -379,9 +396,9 @@ fn repeat_interleave_heads(
     debug_tensor_stats_bf16(stream, &query_flat, seq_len * key_dim, "query_flat");
     debug_tensor_stats_bf16(stream, &key_flat, seq_len * key_dim, "key_flat");
     debug_tensor_stats_bf16(stream, &value_flat, seq_len * value_dim, "value_flat");
-    if do_dump { dump_gdn_intermediate(stream, &query_flat, "query"); }
-    if do_dump { dump_gdn_intermediate(stream, &key_flat, "key"); }
-    if do_dump { dump_gdn_intermediate(stream, &value_flat, "value"); }
+    dump_gdn_intermediate(stream, &query_flat, layer_dump_dir.as_deref(), "query");
+    dump_gdn_intermediate(stream, &key_flat, layer_dump_dir.as_deref(), "key");
+    dump_gdn_intermediate(stream, &value_flat, layer_dump_dir.as_deref(), "value");
 
     // =========================================================================
     // Phase 4: Reshape and repeat_interleave query/key for num_v_heads
@@ -401,8 +418,8 @@ fn repeat_interleave_heads(
     } else {
         key_flat
     };
-    if do_dump { dump_gdn_intermediate(stream, &query_expanded, "query_expanded"); }
-    if do_dump { dump_gdn_intermediate(stream, &key_expanded, "key_expanded"); }
+    dump_gdn_intermediate(stream, &query_expanded, layer_dump_dir.as_deref(), "query_expanded");
+    dump_gdn_intermediate(stream, &key_expanded, layer_dump_dir.as_deref(), "key_expanded");
 
     // =========================================================================
     // Phase 5: Per-head scalar projections
@@ -431,7 +448,7 @@ fn repeat_interleave_heads(
         seq_len, num_v_heads, hidden_size, group_size,
     )?;
     debug_tensor_stats_bf16(stream, &a_proj, seq_len * num_v_heads, "a_proj");
-    if do_dump { dump_gdn_intermediate(stream, &a_proj, "a_proj"); }
+    dump_gdn_intermediate(stream, &a_proj, layer_dump_dir.as_deref(), "a_proj");
     // DEBUG: Compute same projection on CPU to compare with GPU result
     if let Some(crate::gpu_cache::CachedWeight::Bf16(w)) = cache.get(&weights.in_proj_a.name) {
         // Download weight and input
@@ -491,7 +508,7 @@ fn repeat_interleave_heads(
     debug_tensor_stats_bf16(stream, &b_proj_raw, seq_len * b_dim, "b_proj_raw");
     // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads)
     let b_proj = b_proj_raw;
-    if do_dump { dump_gdn_intermediate(stream, &b_proj, "b_proj"); }
+    dump_gdn_intermediate(stream, &b_proj, layer_dump_dir.as_deref(), "b_proj");
 
     // =========================================================================
     // Phase 6: Upload A_log and dt_bias as float32
@@ -576,7 +593,7 @@ fn repeat_interleave_heads(
     }
 
     debug_tensor_stats_bf16(stream, &gdn_output, seq_len * num_v_heads * head_v_dim, "gdn_output");
-    if do_dump { dump_gdn_intermediate(stream, &gdn_output, "core_attn_out"); }
+    dump_gdn_intermediate(stream, &gdn_output, layer_dump_dir.as_deref(), "core_attn_out");
 
     // =========================================================================
     // Phase 8: RMSNormGated — norm(gdn_output, z_gate, weight)
@@ -598,12 +615,12 @@ fn repeat_interleave_heads(
             .ok_or_else(|| anyhow::anyhow!("GDN norm weight not in cache"))?;
 
         // DEBUG: dump norm weight
-        if do_dump { dump_gdn_intermediate(stream, norm_weight, "norm_weight"); }
+        dump_gdn_intermediate(stream, norm_weight, layer_dump_dir.as_deref(), "norm_weight");
 
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         debug_tensor_stats_bf16(stream, &z_gate_raw, seq_len * z_dim, "z_gate_raw");
-        if do_dump { dump_gdn_intermediate(stream, &z_gate_raw, "z_gate"); }
+        dump_gdn_intermediate(stream, &z_gate_raw, layer_dump_dir.as_deref(), "z_gate");
 
         unsafe {
             stream.launch_builder(rms_norm_gated_kernel)
@@ -627,7 +644,7 @@ fn repeat_interleave_heads(
             .map_err(|e| anyhow::anyhow!("Failed to clone GDN output: {e}"))?
     };
     debug_tensor_stats_bf16(stream, &norm_output, seq_len * num_v_heads * head_v_dim, "norm_output");
-    if do_dump { dump_gdn_intermediate(stream, &norm_output, "norm_output"); }
+    dump_gdn_intermediate(stream, &norm_output, layer_dump_dir.as_deref(), "norm_output");
 
     // =========================================================================
     // Phase 9: Output projection — [seq_len, value_dim] → [seq_len, hidden_size]
@@ -645,7 +662,7 @@ fn repeat_interleave_heads(
         seq_len, hidden_size, value_dim, group_size,
     )?;
     debug_tensor_stats_bf16(stream, &output, seq_len * hidden_size, "output");
-    if do_dump { dump_gdn_intermediate(stream, &output, "output"); }
+    dump_gdn_intermediate(stream, &output, layer_dump_dir.as_deref(), "output");
 
     Ok(output)
 }
@@ -673,12 +690,8 @@ pub fn decode_forward(
     layer_idx: usize,
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = 1usize;
-    // Dump GDN intermediates when layer_idx matches INFERS_DUMP_GDN_LAYER env var.
-    let dump_layer = std::env::var("INFERS_DUMP_GDN_LAYER")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let do_dump = layer_idx == dump_layer && std::env::var("INFERS_DUMP_GDN_DIR").is_ok();
+    // Dump GDN intermediates from decode is not supported (single token).
+    // Use forward() prefill path with INFERS_DUMP_GDN_DIR + INFERS_DUMP_GDN_LAYER instead.
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
     let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
