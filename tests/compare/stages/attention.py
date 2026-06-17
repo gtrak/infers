@@ -26,13 +26,13 @@ from tests.compare.stages.base import Stage
 
 # Attention thresholds — tighter for elementwise/norm stages, looser for INT4 GEMM
 _ATTN_THRESHOLDS = {
-    "norm1": 0.99,
-    "q_proj_raw": 0.995,
-    "q_norm": 0.999,
-    "gate": 0.995,
-    "k_proj": 0.995,
-    "k_norm": 0.999,
-    "v_proj": 0.995,
+    "attn.norm1": 0.99,
+    "attn.q_proj_raw": 0.995,
+    "attn.q_norm": 0.999,
+    "attn.gate": 0.995,
+    "attn.k_proj": 0.995,
+    "attn.k_norm": 0.999,
+    "attn.v_proj": 0.995,
     "attn.combined": 0.99,     # INT4 GEMM through attention kernel
     "attn.gated": 0.99,
     "attn.o_proj": 0.99,
@@ -43,10 +43,10 @@ def _per_head_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     """Per-head RMSNorm over the last dimension (head_dim).
 
     Expects x shape [S, num_heads, head_dim] and weight shape [head_dim].
-    Uses additive weight style: output = x * rsqrt(rms^2 + eps) * (1 + weight).
+    Uses multiplicative weight style: output = x * rsqrt(rms^2 + eps) * weight.
     """
     rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).sqrt()
-    return (x / rms) * (1.0 + weight.float().unsqueeze(0).unsqueeze(0))
+    return (x / rms) * weight.float().unsqueeze(0).unsqueeze(0)
 
 
 def _apply_rope(
@@ -71,8 +71,9 @@ def _apply_rope(
 
     # cos_cache and sin_cache have shape [1, 1, S, head_dim]
     # We need to broadcast against [S, num_heads, dim]
-    cos = cos_cache[:, :, :x.shape[0], :dim].expand_as(x_rot)
-    sin = sin_cache[:, :, :x.shape[0], :dim].expand_as(x_rot)
+    # Squeeze batch dims [1,1,S,dim] → [S,dim], then add head broadcast dim → [S,1,dim]
+    cos = cos_cache.squeeze(0).squeeze(0)[:, :dim].unsqueeze(1).expand_as(x_rot)
+    sin = sin_cache.squeeze(0).squeeze(0)[:, :dim].unsqueeze(1).expand_as(x_rot)
 
     # Rotate: x_rot_out = rotate_half(x_rot) * sin + x_rot * cos
     x1, x2 = x_rot.chunk(2, dim=-1)
@@ -145,49 +146,62 @@ def _scaled_dot_product_attention(
     Returns [S, num_heads, head_dim].
     """
     scale = 1.0 / math.sqrt(head_dim)
-    # Q @ K^T: [S, H, D] @ [S, D, H] -> [S, H, H]
-    scores = torch.einsum("shd,sdh->shh", q.float(), k.float()) * scale
+    # Q @ K^T: [S, H, D] @ [S, H, D]^T -> [S, H, H]
+    scores = torch.einsum("sah,sbh->sab", q.float(), k.float()) * scale
     # Softmax over key dimension (last dim)
     attn_weights = F.softmax(scores, dim=-1)
     # @V: [S, H, H] @ [S, H, D] -> [S, H, D]
-    return torch.einsum("shh,shd->shd", attn_weights.float(), v.float())
+    return torch.einsum("sab,sbd->sad", attn_weights.float(), v.float())
 
 
 class Norm1InputStage(Stage):
     """Load the engine's hidden_input as reference input for attention stages."""
 
-    name = "hidden_input"
-    threshold = _ATTN_THRESHOLDS["norm1"]
+    name = "attn.norm1_input"
+    threshold = _ATTN_THRESHOLDS["attn.norm1"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         # Already loaded by the CLI — just pass through
         return inputs["hidden_input"]
 
 
+class Norm1Stage(Stage):
+    """RMSNorm of hidden_input with norm1_weight (attention path)."""
+
+    name = "attn.norm1"
+    threshold = _ATTN_THRESHOLDS["attn.norm1"]
+
+    def compute(self, inputs, weights, config, layer_idx, gpu_idx):
+        from tests.compare.stages.mlp import _rms_norm
+        hidden_input = inputs["hidden_input"]
+        norm1_w = weights.load_norm1(layer_idx)
+        return _rms_norm(hidden_input, norm1_w, config.rms_norm_eps)
+
+
 class QProjRawStage(Stage):
-    """norm1_out @ q_proj_dequant (TP-sharded).
+    """attn.norm1 @ q_proj_dequant (TP-sharded).
 
     Full output includes both Q and gate dimensions:
         [S, num_heads * head_dim * 2] split as [S, per_gpu_heads * head_dim * 2].
     """
 
-    name = "q_proj_raw"
-    threshold = _ATTN_THRESHOLDS["q_proj_raw"]
+    name = "attn.q_proj_raw"
+    threshold = _ATTN_THRESHOLDS["attn.q_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["norm1"]
+        norm1_out = inputs["attn.norm1"]
         W_q = weights.load_q_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_q.float()
 
 
 class QNormStage(Stage):
-    """Extract Q portion from q_proj_raw, apply per-head RMSNorm."""
+    """Extract Q portion from attn.q_proj_raw, apply per-head RMSNorm."""
 
-    name = "q_norm"
-    threshold = _ATTN_THRESHOLDS["q_norm"]
+    name = "attn.q_norm"
+    threshold = _ATTN_THRESHOLDS["attn.q_norm"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        q_proj_raw = inputs["q_proj_raw"]
+        q_proj_raw = inputs["attn.q_proj_raw"]
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         head_dim = config.head_dim
 
@@ -204,26 +218,26 @@ class QNormStage(Stage):
 
 
 class GateStage(Stage):
-    """Extract gate portion from q_proj_raw."""
+    """Extract gate portion from attn.q_proj_raw."""
 
-    name = "gate"
-    threshold = _ATTN_THRESHOLDS["gate"]
+    name = "attn.gate"
+    threshold = _ATTN_THRESHOLDS["attn.gate"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        q_proj_raw = inputs["q_proj_raw"]
+        q_proj_raw = inputs["attn.q_proj_raw"]
         # Gate is the second half of the Q projection output
         mid = q_proj_raw.shape[-1] // 2
         return q_proj_raw[..., mid:]
 
 
 class KProjStage(Stage):
-    """norm1_out @ k_proj_dequant (TP-sharded)."""
+    """attn.norm1 @ k_proj_dequant (TP-sharded)."""
 
-    name = "k_proj"
-    threshold = _ATTN_THRESHOLDS["k_proj"]
+    name = "attn.k_proj"
+    threshold = _ATTN_THRESHOLDS["attn.k_proj"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["norm1"]
+        norm1_out = inputs["attn.norm1"]
         W_k = weights.load_k_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_k.float()
 
@@ -231,11 +245,11 @@ class KProjStage(Stage):
 class KNormStage(Stage):
     """Apply per-head RMSNorm to K."""
 
-    name = "k_norm"
-    threshold = _ATTN_THRESHOLDS["k_norm"]
+    name = "attn.k_norm"
+    threshold = _ATTN_THRESHOLDS["attn.k_norm"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        k_proj_raw = inputs["k_proj"]
+        k_proj_raw = inputs["attn.k_proj"]
         num_kv_heads_per_gpu = config.num_key_value_heads // config.num_gpus
         head_dim = config.head_dim
 
@@ -245,13 +259,13 @@ class KNormStage(Stage):
 
 
 class VProjStage(Stage):
-    """norm1_out @ v_proj_dequant (TP-sharded)."""
+    """attn.norm1 @ v_proj_dequant (TP-sharded)."""
 
-    name = "v_proj"
-    threshold = _ATTN_THRESHOLDS["v_proj"]
+    name = "attn.v_proj"
+    threshold = _ATTN_THRESHOLDS["attn.v_proj"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["norm1"]
+        norm1_out = inputs["attn.norm1"]
         W_v = weights.load_v_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_v.float()
 
@@ -269,9 +283,9 @@ class AttentionCombinedStage(Stage):
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         seq_len = inputs["hidden_input"].shape[0]
-        q_normed = inputs["q_norm"]
-        k_normed = inputs["k_norm"]
-        v_proj_raw = inputs["v_proj"]
+        q_normed = inputs["attn.q_norm"]
+        k_normed = inputs["attn.k_norm"]
+        v_proj_raw = inputs["attn.v_proj"]
 
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         num_kv_heads_per_gpu = config.num_key_value_heads // config.num_gpus
@@ -310,7 +324,7 @@ class GatedStage(Stage):
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         combined = inputs["attn.combined"]
-        gate_flat = inputs["gate"]
+        gate_flat = inputs["attn.gate"]
 
         # Reshape gate to match attention output: [S, num_heads_per_gpu, head_dim]
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
@@ -340,3 +354,23 @@ class OProjStage(Stage):
 
         W_o = weights.load_o_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return gated_flat @ W_o.float()  # [S, hidden_size] — row-parallel partial output
+
+class AfterArStage(Stage):
+    """Sum of both GPUs' attn.o_proj — post all-reduce (only computed on GPU 0)."""
+    name = "attn.after_ar"
+    threshold = _ATTN_THRESHOLDS["attn.o_proj"]
+
+    def compute(self, inputs, weights, config, layer_idx, gpu_idx):
+        if gpu_idx != 0:
+            raise ValueError("AfterArStage should only be computed on GPU 0")
+        result = None
+        for g in range(config.num_gpus):
+            key = f"attn.o_proj_gpu{g}" if g > 0 else "attn.o_proj"
+            if key in inputs:
+                if result is None:
+                    result = inputs[key]
+                else:
+                    result = result + inputs[key]
+        if result is None:
+            raise ValueError("No attn.o_proj inputs found for all-reduce")
+        return result

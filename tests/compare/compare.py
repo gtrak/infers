@@ -40,9 +40,12 @@ from tests.compare.stages.base import Stage
 def _get_attention_stages() -> List[Stage]:
     """Return the sequence of attention reference stages."""
     from tests.compare.stages.attention import (
+        AfterArStage,
         GatedStage,
         KNormStage,
         KProjStage,
+        Norm1InputStage,
+        Norm1Stage,
         OProjStage,
         QNormStage,
         QProjRawStage,
@@ -51,6 +54,8 @@ def _get_attention_stages() -> List[Stage]:
         GateStage,
     )
     return [
+        Norm1InputStage(),
+        Norm1Stage(),
         QProjRawStage(),
         QNormStage(),
         GateStage(),
@@ -60,6 +65,7 @@ def _get_attention_stages() -> List[Stage]:
         AttentionCombinedStage(),
         GatedStage(),
         OProjStage(),
+        AfterArStage(),
     ]
 
 
@@ -69,7 +75,6 @@ def _get_mlp_stages() -> List[Stage]:
         DownArStage,
         DownRawStage,
         GateProjStage,
-        Norm1Stage,
         Norm2Stage,
         ResidualAttnStage,
         ResidualMlpStage,
@@ -77,7 +82,7 @@ def _get_mlp_stages() -> List[Stage]:
         UpProjStage,
     )
     return [
-        Norm1Stage(),
+        Norm2Stage(),
         GateProjStage(),
         UpProjStage(),
         SiluStage(),
@@ -122,27 +127,31 @@ _STAGE_CATEGORIES = {
     "final": _get_final_stages,
 }
 
-# Mapping from engine dump file stem to reference stage name
+# Mapping from engine dump file stem (with dot prefix) to reference stage name
 _DUMP_TO_STAGE = {
     # Attention stages
-    "q_proj_raw": "q_proj_raw",
-    "q_norm": "q_norm",
-    "gate": "gate",
-    "k_proj": "k_proj",
-    "k_norm": "k_norm",
-    "v_proj": "v_proj",
+    "attn.norm1_input": "hidden_input",
+    "attn.norm1": "norm1",
+    "attn.q_proj_raw": "q_proj_raw",
+    "attn.q_norm": "q_norm",
+    "attn.gate": "gate",
+    "attn.k_proj": "k_proj",
+    "attn.k_norm": "k_norm",
+    "attn.v_proj": "v_proj",
     "attn.combined": "attn.combined",
     "attn.gated": "attn.gated",
     "attn.o_proj": "attn.o_proj",
     # MLP stages
-    "norm1": "norm1",
-    "gate_proj_raw": "gate_proj_raw",
-    "up_proj_raw": "up_proj_raw",
-    "silu": "silu",
-    "down_raw": "down_raw",
-    "down_ar": "down_ar",
-    "residual_attn": "residual_attn",
-    "residual_mlp": "residual_mlp",
+    "mlp.norm1": "norm1",
+    "mlp.norm2": "norm2",
+    "mlp.gate_proj": "gate_proj_raw",
+    "mlp.up_proj": "up_proj_raw",
+    "mlp.silu": "silu",
+    "mlp.down_raw": "down_raw",
+    "mlp.down_ar": "down_ar",
+    # Residual stages
+    "residual.attn": "residual_attn",
+    "residual.mlp": "residual_mlp",
     # Final stages
     "final_norm": "final_norm",
     "logits": "logits",
@@ -193,12 +202,28 @@ def _resolve_stages_for_layer(
 def _load_hidden_input(dump_dir: str, hidden_size: int) -> Optional[torch.Tensor]:
     """Load hidden_input from the dump directory.
 
+    Tries multiple possible filenames in order:
+      1. hidden_input.raw (legacy naming)
+      2. attn.norm1_input_gpu0.raw (attention layer naming)
+      3. gdn.norm1_input_gpu0.raw (GDN layer naming)
+
     Determines seq_len from file size. Returns None if not found.
     """
     from tests.compare import io
 
-    raw_path = Path(dump_dir) / "hidden_input.raw"
-    if not raw_path.exists():
+    candidates = [
+        "hidden_input.raw",
+        "attn.norm1_input_gpu0.raw",
+        "gdn.norm1_input_gpu0.raw",
+    ]
+    raw_path: Optional[Path] = None
+    for name in candidates:
+        candidate = Path(dump_dir) / name
+        if candidate.exists():
+            raw_path = candidate
+            break
+
+    if raw_path is None:
         return None
 
     n_bf16 = os.path.getsize(raw_path) // 2

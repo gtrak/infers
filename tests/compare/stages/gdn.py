@@ -28,7 +28,7 @@ _GDN_THRESHOLDS = {
 class GdnMixedQkvStage(Stage):
     """hidden_input @ in_proj_qkv_dequant (INT4 GEMM)."""
 
-    name = "mixed_qkv"
+    name = "gdn.mixed_qkv"
     threshold = _GDN_THRESHOLDS["mixed_qkv"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
@@ -38,7 +38,7 @@ class GdnMixedQkvStage(Stage):
 class GdnConvOutStage(Stage):
     """depthwise_conv1d_silu(mixed_qkv)."""
 
-    name = "conv_out"
+    name = "gdn.conv_out"
     threshold = _GDN_THRESHOLDS["conv_out"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
@@ -48,7 +48,7 @@ class GdnConvOutStage(Stage):
 class GdnCoreAttnOutStage(Stage):
     """GDN recurrent step (query_expanded, key_expanded, value, a_proj, b_proj)."""
 
-    name = "core_attn_out"
+    name = "gdn.core_attn_out"
     threshold = _GDN_THRESHOLDS["core_attn_out"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
@@ -58,7 +58,7 @@ class GdnCoreAttnOutStage(Stage):
 class GdnNormOutputStage(Stage):
     """RMSNormGated(core_attn_out, z_gate, norm_weight)."""
 
-    name = "norm_output"
+    name = "gdn.norm_output"
     threshold = _GDN_THRESHOLDS["norm_output"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
@@ -68,7 +68,7 @@ class GdnNormOutputStage(Stage):
 class GdnOutputStage(Stage):
     """norm_output @ out_proj_dequant (INT4 GEMM)."""
 
-    name = "output"
+    name = "gdn.output"
     threshold = _GDN_THRESHOLDS["output"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):

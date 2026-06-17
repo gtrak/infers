@@ -66,9 +66,9 @@ class Stage(ABC):
         """
         from tests.compare import io
 
-        # Build expected filename — e.g. "norm1_gpu0.raw" or "mlp_gate.raw"
-        gpu_suffix = f"_gpu{gpu_idx}" if gpu_idx > 0 else ""
-        raw_path = Path(dump_dir) / f"{self.name}{gpu_suffix}.raw"
+        # Build expected filename — e.g. "attn.norm1_gpu0.raw" or "mlp.down_ar_gpu0.raw"
+        # Engine always includes _gpu{idx} suffix, even for GPU 0
+        raw_path = Path(dump_dir) / f"{self.name}_gpu{gpu_idx}.raw"
 
         if not raw_path.exists():
             return {
@@ -76,7 +76,7 @@ class Stage(ABC):
                 "l2_err": 1.0,
                 "max_diff": -1.0,
                 "passed": False,
-                "error": f"missing_engine_dump ({self.name}{gpu_suffix}.raw)",
+                "error": f"missing_engine_dump ({self.name}_gpu{gpu_idx}.raw)",
             }
 
         engine_flat = io.load_raw_bf16(str(raw_path), (-1,))

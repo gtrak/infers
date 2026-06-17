@@ -77,7 +77,7 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | File | Kernels | Description |
 |------|---------|-------------|
 | `common.cuh` | — | Shared utilities: `__nv_bfloat16` conversion helpers, `INFERS_BLOCK_SIZE` (256), thread indexing macros |
-| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * (1 + weight), using float shared memory for precision-preserving reduction. Qwen3_5RMSNorm stores weight as additive offset (init=0). Gated variant uses full scale (init=1) — see `rms_norm_gated.cu` |
+| `rmsnorm.cu` | `infers_rmsnorm_bf16` | RMS Layer Normalization: output = x * rsqrt(mean(x²) + eps) * weight, using float shared memory for precision-preserving reduction. Qwen3_5RMSNorm stores multiplicative scale weight (init=1). Gated variant uses full scale — see `rms_norm_gated.cu` |
 | `silu.cu` | `infers_silu_bf16`, `infers_silu_glu_bf16` | SiLU activation and SwiGLU gating: output = x * sigmoid(gate) |
 | `rope.cu` | `infers_rope_bf16` | Rotary Position Embedding applied to query and key tensors |
 | `embedding.cu` | `infers_embedding_gather_bf16` | Token embedding gather: gather rows from weight matrix by token ID |

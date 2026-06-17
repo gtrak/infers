@@ -10,29 +10,29 @@ from tests.compare.stages.base import Stage
 
 # Thresholds from ref_intermediates.py STAGE_THRESHOLDS
 _MLP_THRESHOLDS = {
-    "norm1": 0.99,
-    "norm2": 0.99,
-    "gate_proj_raw": 0.995,
-    "up_proj_raw": 0.995,
-    "silu": 0.999,
-    "down_raw": 0.99,
-    "down_ar": 0.99,
-    "residual_attn": 0.99,
-    "residual_mlp": 0.99,
+    "mlp.norm1": 0.99,
+    "mlp.norm2": 0.99,
+    "mlp.gate_proj_raw": 0.995,
+    "mlp.up_proj_raw": 0.995,
+    "mlp.silu": 0.999,
+    "mlp.down_raw": 0.99,
+    "mlp.down_ar": 0.99,
+    "residual.attn": 0.99,
+    "residual.mlp": 0.99,
 }
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm with additive weight (Qwen style: output = x * rsqrt(rms^2 + eps) * (1 + weight))."""
+    """RMSNorm with multiplicative weight (Qwen style: output = x * rsqrt(rms^2 + eps) * weight)."""
     rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).sqrt()
-    return (x / rms) * (1.0 + weight.float().unsqueeze(0))
+    return (x / rms) * weight.float().unsqueeze(0)
 
 
 class Norm1Stage(Stage):
-    """RMSNorm of hidden_input with norm1_weight."""
+    """RMSNorm of hidden_input with norm1_weight (MLP path)."""
 
-    name = "norm1"
-    threshold = _MLP_THRESHOLDS["norm1"]
+    name = "mlp.norm1"
+    threshold = _MLP_THRESHOLDS["mlp.norm1"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         hidden_input = inputs["hidden_input"]
@@ -41,37 +41,37 @@ class Norm1Stage(Stage):
 
 
 class Norm2Stage(Stage):
-    """RMSNorm of residual_attn with norm2_weight."""
+    """RMSNorm of attn.after_ar with norm2_weight."""
 
-    name = "norm2"
-    threshold = _MLP_THRESHOLDS["norm2"]
+    name = "mlp.norm2"
+    threshold = _MLP_THRESHOLDS["mlp.norm2"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        residual_attn = inputs["residual_attn"]
+        residual_attn = inputs["attn.after_ar"]
         norm2_w = weights.load_norm2(layer_idx)
         return _rms_norm(residual_attn, norm2_w, config.rms_norm_eps)
 
 
 class GateProjStage(Stage):
-    """norm2 @ gate_proj_dequant (TP-sharded column-parallel)."""
+    """mlp.norm2 @ gate_proj_dequant (TP-sharded column-parallel)."""
 
-    name = "gate_proj_raw"
-    threshold = _MLP_THRESHOLDS["gate_proj_raw"]
+    name = "mlp.gate_proj"
+    threshold = _MLP_THRESHOLDS["mlp.gate_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm2_out = inputs["norm2"]
+        norm2_out = inputs["mlp.norm2"]
         W_gate = weights.load_gate_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm2_out @ W_gate.float()  # [S, hidden] @ [hidden, sharded_int]
 
 
 class UpProjStage(Stage):
-    """norm2 @ up_proj_dequant (TP-sharded column-parallel)."""
+    """mlp.norm2 @ up_proj_dequant (TP-sharded column-parallel)."""
 
-    name = "up_proj_raw"
-    threshold = _MLP_THRESHOLDS["up_proj_raw"]
+    name = "mlp.up_proj"
+    threshold = _MLP_THRESHOLDS["mlp.up_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm2_out = inputs["norm2"]
+        norm2_out = inputs["mlp.norm2"]
         W_up = weights.load_up_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm2_out @ W_up.float()
 
@@ -79,40 +79,40 @@ class UpProjStage(Stage):
 class SiluStage(Stage):
     """silu(gate) * up."""
 
-    name = "silu"
-    threshold = _MLP_THRESHOLDS["silu"]
+    name = "mlp.silu"
+    threshold = _MLP_THRESHOLDS["mlp.silu"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        gate = inputs["gate_proj_raw"]
-        up = inputs["up_proj_raw"]
+        gate = inputs["mlp.gate_proj"]
+        up = inputs["mlp.up_proj"]
         return F.silu(gate.float()) * up.float()
 
 
 class DownRawStage(Stage):
-    """silu_out @ down_proj_dequant — pre-AR, single GPU."""
+    """mlp.silu @ down_proj_dequant — pre-AR, single GPU."""
 
-    name = "down_raw"
-    threshold = _MLP_THRESHOLDS["down_raw"]
+    name = "mlp.down_raw"
+    threshold = _MLP_THRESHOLDS["mlp.down_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        silu_out = inputs["silu"]
+        silu_out = inputs["mlp.silu"]
         W_down = weights.load_down_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return silu_out @ W_down.float()  # [S, sharded_int] @ [sharded_int, hidden]
 
 
 class DownArStage(Stage):
-    """Sum of both GPUs' down_raw — post-AR (only computed on GPU 0)."""
+    """Sum of both GPUs' mlp.down_raw — post-AR (only computed on GPU 0)."""
 
-    name = "down_ar"
-    threshold = _MLP_THRESHOLDS["down_ar"]
+    name = "mlp.down_ar"
+    threshold = _MLP_THRESHOLDS["mlp.down_ar"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         if gpu_idx != 0:
             raise ValueError("DownArStage should only be computed on GPU 0")
-        # Sum all GPUs' down_raw outputs
+        # Sum all GPUs' mlp.down_raw outputs
         result = None
         for g in range(config.num_gpus):
-            key = f"down_raw_gpu{g}"
+            key = f"mlp.down_raw_gpu{g}" if g > 0 else "mlp.down_raw"
             if key in inputs:
                 if result is None:
                     result = inputs[key]
@@ -124,28 +124,28 @@ class DownArStage(Stage):
 
 
 class ResidualAttnStage(Stage):
-    """input + attn_ar — combines hidden_input with attention output."""
+    """hidden_input + attn.after_ar — combines hidden_input with attention output."""
 
-    name = "residual_attn"
-    threshold = _MLP_THRESHOLDS["residual_attn"]
+    name = "residual.attn"
+    threshold = _MLP_THRESHOLDS["residual.attn"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         # This stage is the sum of hidden_input and attention output.
-        # We expect both to be available from previous stages.
+        # attn.after_ar comes from the AfterArStage (all-reduce of attn.o_proj).
         hidden_input = inputs["hidden_input"]
-        attn_ar = inputs.get("attn_o_proj")  # After all-reduce from attention path
+        attn_ar = inputs.get("attn.after_ar")  # After all-reduce from attention path
         if attn_ar is None:
-            raise ValueError("attn_o_proj not found for residual_attn computation")
+            raise ValueError("attn.after_ar not found for residual_attn computation")
         return hidden_input + attn_ar
 
 
 class ResidualMlpStage(Stage):
-    """residual_attn + mlp_ar — final MLP residual."""
+    """residual.attn + mlp.down_ar — final MLP residual."""
 
-    name = "residual_mlp"
-    threshold = _MLP_THRESHOLDS["residual_mlp"]
+    name = "residual.mlp"
+    threshold = _MLP_THRESHOLDS["residual.mlp"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        residual_attn = inputs["residual_attn"]
-        mlp_down = inputs["down_ar"]
+        residual_attn = inputs["residual.attn"]
+        mlp_down = inputs["mlp.down_ar"]
         return residual_attn + mlp_down

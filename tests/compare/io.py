@@ -44,6 +44,7 @@ def discover_dumps(dump_dir: str) -> Dict[int, List[dict]]:
     """Scan a dump directory for all .meta files, organized by layer number.
 
     Walks `layer_N/` subdirectories looking for `.meta` JSON sidecar files.
+    Also handles the case where the given path IS a layer_N directory itself.
 
     Returns:
         {layer_idx: [meta_dict, ...]}
@@ -53,19 +54,30 @@ def discover_dumps(dump_dir: str) -> Dict[int, List[dict]]:
     if not root.exists():
         return result
 
-    for layer_dir in sorted(root.iterdir()):
-        if not layer_dir.is_dir():
-            continue
-        try:
-            layer_idx = int(layer_dir.name.split("_", 1)[1])
-        except (ValueError, IndexError):
-            continue
+    # Check if the given path itself is a layer_N directory
+    try:
+        layer_idx = int(root.name.split("_", 1)[1])
+    except (ValueError, IndexError):
+        layer_idx = None
 
-        metas = []
-        for meta_path in sorted(layer_dir.glob("*.meta")):
-            metas.append(load_meta(str(meta_path)))
+    if layer_idx is not None:
+        # The path IS a layer directory — scan .meta files directly
+        metas = [load_meta(str(mp)) for mp in sorted(root.glob("*.meta"))]
         if metas:
             result[layer_idx] = metas
+    else:
+        # The path is a parent directory — scan layer_N subdirectories
+        for layer_dir in sorted(root.iterdir()):
+            if not layer_dir.is_dir():
+                continue
+            try:
+                lidx = int(layer_dir.name.split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+
+            metas = [load_meta(str(mp)) for mp in sorted(layer_dir.glob("*.meta"))]
+            if metas:
+                result[lidx] = metas
 
     return result
 
