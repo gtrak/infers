@@ -48,8 +48,12 @@ __global__ void infers_rope_bf16(
         float sin_val = sin[cos_idx];
 
         // Index into [total_tokens × num_heads × head_dim]
-        int i0 = token_idx * num_heads * head_dim + head_idx * head_dim + dim_pair * 2;
-        int i1 = i0 + 1;
+        // Half-split pairing: pair dim_pair with dim_pair + half_rotary
+        // (e.g., dim 0 pairs with dim 32, dim 1 pairs with dim 33, etc.)
+        // This matches the rotate_half convention used by Qwen3.5/Llama/GPT-NeoX.
+        int base = token_idx * num_heads * head_dim + head_idx * head_dim;
+        int i0 = base + dim_pair;
+        int i1 = base + dim_pair + half_rotary;
 
         float q0 = __bfloat162float(q[i0]);
         float q1 = __bfloat162float(q[i1]);
