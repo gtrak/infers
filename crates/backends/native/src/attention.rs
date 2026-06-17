@@ -1034,12 +1034,14 @@ pub fn decode_forward(
             .map_err(|e| anyhow::anyhow!("Copy per-head Q from q_single failed: {e}"))?;
 
         // --- Extract per-head KV cache on CPU and upload to GPU ---
+        // With GQA, multiple query heads share the same KV head.
+        let kv_head_idx = head_idx / (num_heads / num_kv_heads);
         let mut k_h_cache = Vec::with_capacity(num_cached * head_dim);
         let mut v_h_cache = Vec::with_capacity(num_cached * head_dim);
         for pos in 0..num_cached {
             for d in 0..head_dim {
-                k_h_cache.push(k_cache_host[pos * kv_dim + head_idx * head_dim + d]);
-                v_h_cache.push(v_cache_host[pos * kv_dim + head_idx * head_dim + d]);
+                k_h_cache.push(k_cache_host[pos * kv_dim + kv_head_idx * head_dim + d]);
+                v_h_cache.push(v_cache_host[pos * kv_dim + kv_head_idx * head_dim + d]);
             }
         }
 
@@ -1047,6 +1049,8 @@ pub fn decode_forward(
             .map_err(|e| anyhow::anyhow!("Failed to upload K cache: {e}"))?;
         let v_h_cache_gpu = stream.clone_htod(&v_h_cache)
             .map_err(|e| anyhow::anyhow!("Failed to upload V cache: {e}"))?;
+        stream.synchronize()
+            .map_err(|e| anyhow::anyhow!("Failed to sync stream after KV cache upload: {e}"))?;
 
         // --- RoPE (per-head, num_heads=1) ---
         let mut k_rope_dummy = stream

@@ -54,8 +54,10 @@ __global__ void infers_silu_glu_bf16(
 // @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
 /// Attention output gate kernel: output[i] = x[i] * sigmoid(gate[i])
 ///
-/// Unlike SwiGLU (x * gate * sigmoid(gate)), this applies only the sigmoid to the gate,
-/// which is the correct behavior for Qwen3.5 with output_gate_type="swish".
+/// Unlike SwiGLU (x * gate * sigmoid(gate)), this applies only the sigmoid to the gate.
+/// Qwen3.5 full-attention layers use sigmoid gating (not SiLU/swish) despite the
+/// config field `output_gate_type="swish"`. The HuggingFace reference uses
+/// `attn_output * torch.sigmoid(gate)` in Qwen3_5Attention.
 ///
 /// # Launch configuration
 /// * grid: `(total_elements + block_size - 1) / block_size`
