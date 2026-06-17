@@ -487,7 +487,7 @@ impl ForwardEngine {
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, token_ids, &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
-            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[seq_len, config.hidden_size]);
+            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[seq_len, config.hidden_size], "prefill");
             hidden_states.push(h);
         }
 
@@ -508,7 +508,7 @@ impl ForwardEngine {
             // Dump hidden input at start of layer for reference comparison
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
 
             // Phase A: Attention/GDN on each GPU
@@ -528,7 +528,7 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[seq_len, config.hidden_size], "prefill");
 
                 // Attention or GDN with sharded weights
                 let attn_out = match config.get_layer_type(layer_idx) {
@@ -572,7 +572,7 @@ impl ForwardEngine {
                     }
                 };
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[seq_len, config.hidden_size], "prefill");
 
                 attn_outputs.push(attn_out);
             }
@@ -589,7 +589,7 @@ impl ForwardEngine {
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
             // Phase B: Residual add on each GPU
             for gpu_idx in 0..num_gpus {
@@ -602,7 +602,7 @@ impl ForwardEngine {
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
 
             // ================================================================
@@ -624,7 +624,7 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[seq_len, config.hidden_size], "prefill");
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -637,7 +637,7 @@ impl ForwardEngine {
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[seq_len, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[seq_len, config.intermediate_size / num_gpus], "prefill");
 
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -650,7 +650,7 @@ impl ForwardEngine {
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[seq_len, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[seq_len, config.intermediate_size / num_gpus], "prefill");
 
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
@@ -665,7 +665,7 @@ impl ForwardEngine {
                         })?;
                 }
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[seq_len, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[seq_len, config.intermediate_size / num_gpus], "prefill");
 
                 // Down projection (row-parallel: full hidden_size output, sharded_intermediate inner dim)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
@@ -678,7 +678,7 @@ impl ForwardEngine {
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[seq_len, config.hidden_size], "prefill");
 
                 mlp_outputs.push(mlp_out);
             }
@@ -695,7 +695,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
 
             // Phase D: Residual add on each GPU
@@ -709,7 +709,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[seq_len, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
         }
 
@@ -730,7 +730,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             config.rms_norm_eps, config.hidden_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size]);
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size], "prefill");
 
         // LM head
         let lm_head_weight = final_weights.lm_head.as_ref()
@@ -746,7 +746,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             self.group_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[seq_len, config.vocab_size]);
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[seq_len, config.vocab_size], "prefill");
 
         // Sample: last row argmax
         let last_row_start = (seq_len - 1) * config.vocab_size;
@@ -865,7 +865,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, &[token_id], &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
-            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[1, config.hidden_size]);
+            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[1, config.hidden_size], "decode");
             hidden_states.push(h);
         }
 
@@ -884,7 +884,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             // Dump hidden input at start of layer
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
             // Phase A: Attention/GDN on each GPU
@@ -904,7 +904,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[1, config.hidden_size], "decode");
 
                 // Attention or GDN (decode versions)
                 let attn_out = match config.get_layer_type(layer_idx) {
@@ -949,7 +949,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     }
                 };
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[1, config.hidden_size], "decode");
 
                 attn_outputs.push(attn_out);
             }
@@ -966,7 +966,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
             // Phase B: Residual add on each GPU
@@ -980,7 +980,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
             // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
@@ -1000,7 +1000,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[1, config.hidden_size], "decode");
 
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
@@ -1013,7 +1013,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[1, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
@@ -1026,7 +1026,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[1, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // up * SiLU(gate) = SwiGLU (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
@@ -1041,7 +1041,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                         })?;
                 }
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[1, config.intermediate_size / num_gpus]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Down projection (row-parallel: full hidden_size output)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
@@ -1054,7 +1054,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[1, config.hidden_size], "decode");
 
                 mlp_outputs.push(mlp_out);
             }
@@ -1071,7 +1071,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
             // Phase D: Residual add on each GPU
@@ -1085,7 +1085,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[1, config.hidden_size]);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
         }
 
@@ -1106,7 +1106,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             config.rms_norm_eps, config.hidden_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size]);
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size], "decode");
 
         // LM head
         let lm_head_weight = final_weights.lm_head.as_ref()
@@ -1122,7 +1122,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             self.group_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size]);
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size], "decode");
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::greedy_sample_bf16(

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Compare engine dumps against PyTorch reference.
 
+Dumps are organized by phase (prefill/decode) under each layer directory:
+    /tmp/dump/layer_3/prefill/attn.norm1_gpu0.raw
+    /tmp/dump/layer_3/decode/attn.norm1_gpu0.raw
+
 Usage:
     # Dump engine intermediates
     INFERS_DUMP_LAYERS=3 INFERS_DUMP_DIR=/tmp/dump \
         cargo test --package infers-backend-native --test smoke_test -- --ignored --nocapture
 
-    # Compare against reference (full attention + MLP stages)
+    # Compare prefill dumps against reference (full attention + MLP stages)
+    python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 --phase prefill --model-dir /path/to/model
+
+    # Compare decode dumps (default phase)
     python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 --model-dir /path/to/model
 
     # Compare only attention stages
-    python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 --model-dir /path/to/model --stages attn
+    python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 --phase prefill --stages attn
 
     # Verbose per-stage stats
-    python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 --model-dir /path/to/model -v
+    python -m tests.compare.compare --dump-dir /tmp/dump/layer_3 -v
 """
 
 import argparse
@@ -358,6 +365,10 @@ def main():
         help="Override the inferred layer index (useful when dump-dir is not named layer_N)",
     )
     parser.add_argument(
+        "--phase", type=str, default="decode", choices=["prefill", "decode"],
+        help="Phase to compare (prefill or decode). Dumps are stored in separate subdirectories [default: decode]",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Verbose output with per-stage L2 and max_diff statistics",
     )
@@ -392,8 +403,8 @@ def main():
     root_dump_dir = str(config_path.parent)
 
     print("=" * 70)
-    print(f"Compare — Layer {layer_idx}, Model: {args.model_dir}")
-    print(f"  Dump dir: {dump_dir}")
+    print(f"Compare — Layer {layer_idx}, Phase: {args.phase}, Model: {args.model_dir}")
+    print(f"  Dump dir: {dump_dir}/{args.phase}")
     print(f"  Config:   {config_path}")
     print("=" * 70)
 
@@ -431,7 +442,9 @@ def main():
     print(f"\n  Running {len(stages)} stages...")
 
     # Compute and compare
-    results = _compute_and_compare_layer(layer_idx, str(dump_dir), weights, config, stages, args.verbose)
+    phase = args.phase
+    actual_dump_dir = str(dump_dir / phase)
+    results = _compute_and_compare_layer(layer_idx, actual_dump_dir, weights, config, stages, args.verbose)
 
     if results is None:
         print("[ERROR] missing hidden_input.raw")

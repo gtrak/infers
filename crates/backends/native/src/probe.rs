@@ -31,6 +31,10 @@ pub struct ProbeConfig {
 
     /// Print min/max/mean_abs stats to stderr.
     pub stats: bool,
+
+    /// Phase identifier ("prefill" or "decode") — creates a subdirectory
+    /// under the layer directory so prefill and decode dumps coexist.
+    pub phase: String,
 }
 
 impl ProbeConfig {
@@ -42,17 +46,19 @@ impl ProbeConfig {
             stages: None,
             dir: None,
             stats: false,
+            phase: "decode".to_string(),
         }
     }
 
     /// Read probe configuration from environment variables.
     ///
-    /// | Variable              | Description                                        | Default          |
-    /// |-----------------------|----------------------------------------------------|------------------|
-    /// | `INFERS_DUMP_DIR`     | Output directory (must be set for any dumping)      | *(disabled)*     |
-    /// | `INFERS_DUMP_LAYERS`  | Comma-separated layer indices, or `all`             | all layers       |
-    /// | `INFERS_DUMP_STAGES`  | Comma-separated stage prefixes                     | all stages       |
-    /// | `INFERS_DUMP_STATS`   | `1` to print stats                                 | off              |
+    /// | Variable               | Description                                        | Default          |
+    /// |------------------------|----------------------------------------------------|------------------|
+    /// | `INFERS_DUMP_DIR`      | Output directory (must be set for any dumping)      | *(disabled)*     |
+    /// | `INFERS_DUMP_LAYERS`   | Comma-separated layer indices, or `all`             | all layers       |
+    /// | `INFERS_DUMP_STAGES`   | Comma-separated stage prefixes                     | all stages       |
+    /// | `INFERS_DUMP_STATS`    | `1` to print stats                                 | off              |
+    /// | `INFERS_DUMP_PHASE`    | Phase identifier ("prefill" or "decode")            | decode           |
     pub fn from_env() -> Self {
         let dir = std::env::var("INFERS_DUMP_DIR").ok();
         let enabled = dir.is_some();
@@ -103,12 +109,15 @@ impl ProbeConfig {
             false
         };
 
+        let phase = std::env::var("INFERS_DUMP_PHASE").unwrap_or_else(|_| "decode".to_string());
+
         Self {
             enabled,
             layers,
             stages,
             dir,
             stats,
+            phase,
         }
     }
 
@@ -146,8 +155,8 @@ impl ProbeConfig {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn layer_dir(dir: &str, layer: usize) -> PathBuf {
-    PathBuf::from(dir).join(format!("layer_{layer}"))
+fn layer_dir(dir: &str, layer: usize, phase: &str) -> PathBuf {
+    PathBuf::from(dir).join(format!("layer_{layer}/{phase}"))
 }
 
 /// Compute (min, max, mean_abs) over a BF16 slice.
@@ -175,10 +184,11 @@ fn bf16_stats(cpu: &[bf16]) -> (f32, f32, f64) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Dump a BF16 GPU tensor to disk under `{dir}/layer_{layer}/{stage}_gpu{gpu}.raw`.
+/// Dump a BF16 GPU tensor to disk under `{dir}/layer_{layer}/{phase}/{stage}_gpu{gpu}.raw`.
 ///
 /// Also writes a `.meta` JSON sidecar file.  When `stats` is enabled, prints
-/// min/max/mean_abs to stderr.
+/// min/max/mean_abs to stderr.  The `phase` parameter ("prefill" or "decode")
+/// creates a subdirectory so prefill and decode dumps coexist without overwriting.
 pub fn dump(
     stream: &Arc<CudaStream>,
     config: &ProbeConfig,
@@ -187,6 +197,7 @@ pub fn dump(
     stage: &str,
     tensor: &CudaSlice<bf16>,
     shape: &[usize],
+    phase: &str,
 ) {
     if !config.should_dump(layer, stage) {
         return;
@@ -201,7 +212,7 @@ pub fn dump(
     };
 
     let dir = config.dir.as_ref().unwrap(); // safe because should_dump checks
-    let ldir = layer_dir(dir, layer);
+    let ldir = layer_dir(dir, layer, phase);
     if let Err(e) = std::fs::create_dir_all(&ldir) {
         eprintln!("WARN probe create_dir failed: {e}");
         return;
@@ -223,6 +234,7 @@ pub fn dump(
         "shape": shape,
         "dtype": "bf16",
         "stage": stage,
+        "phase": phase,
     });
     if let Err(e) = std::fs::write(
         ldir.join(format!("{name}.meta")),
@@ -235,12 +247,11 @@ pub fn dump(
     if config.stats {
         let (min_val, max_val, mean_abs) = bf16_stats(&cpu);
         eprintln!(
-            "probe stats layer={layer} gpu={gpu} stage={} shape=[{}] min={:.4} max={:.4} mean_abs={:.6}",
+            "probe stats phase={} layer={layer} gpu={gpu} stage={} shape=[{}] min={:.4} max={:.4} mean_abs={:.6}",
+            phase,
             stage,
             shape.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
-            min_val,
-            max_val,
-            mean_abs,
+            min_val, max_val, mean_abs,
         );
     }
 }
@@ -405,6 +416,28 @@ mod tests {
     }
 
     #[test]
+    fn from_env_phase_default() {
+        set_env("INFERS_DUMP_DIR", "/tmp/dump");
+
+        let config = ProbeConfig::from_env();
+        assert_eq!(config.phase, "decode");
+
+        unset_env("INFERS_DUMP_DIR");
+    }
+
+    #[test]
+    fn from_env_phase_override() {
+        set_env("INFERS_DUMP_DIR", "/tmp/dump");
+        set_env("INFERS_DUMP_PHASE", "prefill");
+
+        let config = ProbeConfig::from_env();
+        assert_eq!(config.phase, "prefill");
+
+        unset_env("INFERS_DUMP_DIR");
+        unset_env("INFERS_DUMP_PHASE");
+    }
+
+    #[test]
     fn should_dump_allows_all_when_filters_none() {
         let config = ProbeConfig {
             enabled: true,
@@ -412,6 +445,7 @@ mod tests {
             stages: None,
             dir: Some("/tmp/dump".to_string()),
             stats: false,
+            phase: "decode".to_string(),
         };
 
         assert!(config.should_dump(0, "attn.norm1"));
@@ -426,6 +460,7 @@ mod tests {
             stages: None,
             dir: Some("/tmp/dump".to_string()),
             stats: false,
+            phase: "decode".to_string(),
         };
 
         assert!(config.should_dump(0, "attn.q_proj"));
@@ -441,6 +476,7 @@ mod tests {
             stages: Some(vec!["attn".to_string()]),
             dir: Some("/tmp/dump".to_string()),
             stats: false,
+            phase: "decode".to_string(),
         };
 
         assert!(config.should_dump(5, "attn.norm1"));
@@ -456,6 +492,7 @@ mod tests {
             stages: None,
             dir: None,
             stats: false,
+            phase: "decode".to_string(),
         };
 
         assert!(!config.should_dump(0, "attn.q_proj"));

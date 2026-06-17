@@ -497,10 +497,11 @@ General-purpose forward-pass instrumentation via the `probe` module. Controlled 
 | `INFERS_DUMP_LAYERS` | Comma-separated layer indices, or `all` | all layers |
 | `INFERS_DUMP_STAGES` | Comma-separated stage prefixes (e.g., `attn,mlp`) | all stages |
 | `INFERS_DUMP_STATS` | `1` to print min/max/mean_abs to stderr | off |
+| `INFERS_DUMP_PHASE` | Phase identifier (`prefill` or `decode`) — creates phase subdirectory under layer dir | decode |
 
 `ProbeConfig::from_env()` parses these variables. `should_dump(layer, stage)` checks both layer and stage filters — stage matching uses prefix check (e.g., `attn` matches `attn.norm1`, `attn.q_proj`). See [[crates/backends/native/src/probe.rs#ProbeConfig]].
 
-`dump(stream, config, layer, gpu, stage, tensor, shape)` writes `{dir}/layer_{layer}/{stage}_gpu{gpu}.raw` (bf16 LE bytes) and `.meta` JSON sidecar. When `stats` is enabled, prints min/max/mean_abs to stderr. See [[crates/backends/native/src/probe.rs#dump]].
+`dump(stream, config, layer, gpu, stage, tensor, shape, phase)` writes `{dir}/layer_{layer}/{phase}/{stage}_gpu{gpu}.raw` (bf16 LE bytes) and `.meta` JSON sidecar. The `phase` parameter (`prefill` or `decode`) creates a subdirectory under each layer directory so prefill and decode dumps coexist without overwriting each other. When `stats` is enabled, prints min/max/mean_abs to stderr. See [[crates/backends/native/src/probe.rs#dump]].
 
 `stats(stream, config, layer, gpu, stage, tensor)` prints stats only — no file I/O overhead for quick debugging. See [[crates/backends/native/src/probe.rs#stats]].
 
@@ -508,7 +509,7 @@ General-purpose forward-pass instrumentation via the `probe` module. Controlled 
 
 **Engine-level wiring**: The probe module is now wired into both `prefill_paged()` and `decode_paged()` in the engine, as well as into GDN `forward()` and `decode_forward()` in [[crates/backends/native/src/gdn.rs#forward]]. Old ad-hoc debug code (`INFERS_DEBUG_LAYER`, `INFERS_DUMP_HIDDEN`, `INFERS_DUMP_LAYER_DIR`, `debug_hidden_stats()`, `dump_bf16_tensor()`) has been replaced entirely with structured probe::dump() calls. GDN-specific old code (`dump_gdn_intermediate()`, `INFERS_DUMP_GDN_LAYER`, `INFERS_DUMP_GDN_DIR`) was removed and replaced with the same probe infrastructure.
 
-Each call site creates a `ProbeConfig::from_env()` at the top of the function and calls `dump_config()` to write model config. The stage prefix is determined by layer type: FullAttention layers use `attn.*` stages, GDN layers use `gdn.*` stages.
+Each call site creates a `ProbeConfig::from_env()` at the top of the function and calls `dump_config()` to write model config. The stage prefix is determined by layer type: FullAttention layers use `attn.*` stages, GDN layers use `gdn.*` stages. Every dump call passes an explicit phase string — prefill functions (prefill_paged, forward_paged, gdn::forward) pass `"prefill"`, while decode functions (decode_paged, decode_forward_paged, gdn::decode_forward) pass `"decode"`. This ensures prefill and decode tensors are written to separate subdirectories rather than overwriting each other.
 
 Engine-level dump stages in `prefill_paged` and `decode_paged`:
 
@@ -550,7 +551,7 @@ All stage modules import from the `tests.compare` package with five submodules.
 - **weight_loader.py**: TP-aware `WeightLoader` class. Handles safetensors loading (keeps int dtypes intact for INT4 packed data), config.json parsing with `text_config` sub-key support, and column-parallel / row-parallel sharding for attention and MLP projections.
 - **cos.py**: Comparison functions — `cos_sim`, `l2_error`, `element_stats`.
 - **config.py**: `DumpConfig` dataclass reading the engine's `config.json`. Provides `get_layer_type()` to determine full-attention vs GDN layers.
-- **compare.py**: CLI entry point for stage-by-stage comparison. Discovers engine dumps, loads DumpConfig, creates WeightLoader, and chains stages together computing reference outputs from `inputs` dict (each stage feeds the next). Filters by layer type (full-attention vs GDN) and category (`--stages attn mlp gdn final`). Returns exit code 0 if all pass, 1 if any fail.
+- **compare.py**: CLI entry point for stage-by-stage comparison. Discovers engine dumps, loads DumpConfig, creates WeightLoader, and chains stages together computing reference outputs from `inputs` dict (each stage feeds the next). Accepts `--phase prefill|decode` to select which phase subdirectory to compare against (default: decode). Filters by layer type (full-attention vs GDN) and category (`--stages attn mlp gdn final`). Returns exit code 0 if all pass, 1 if any fail.
 
 Stage modules under `tests/compare/stages/`:
 

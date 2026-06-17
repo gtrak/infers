@@ -216,7 +216,7 @@ fn repeat_interleave_heads(
     let seq_len = input.len() / hidden_size;
 
     // Dump the layer input hidden state for reference comparison
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.hidden_input", input, &[seq_len, hidden_size]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.hidden_input", input, &[seq_len, hidden_size], "prefill");
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
     let num_v_heads = weight_output_dim(&weights.in_proj_b);  // Per-GPU: e.g. 24 at TP=2, 48 at TP=1
@@ -240,7 +240,7 @@ fn repeat_interleave_heads(
             seq_len, conv_dim, hidden_size, group_size,
         )?;
     }
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[seq_len, conv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[seq_len, conv_dim], "prefill");
 
     // =========================================================================
     // Phase 2: Depthwise conv1d on mixed_qkv (SiLU activation)
@@ -274,7 +274,7 @@ fn repeat_interleave_heads(
             })
             .map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
     }
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
 
     // =========================================================================
     // Phase 3: Split conv_out into query, key, value (extract as proper slices)
@@ -289,9 +289,9 @@ fn repeat_interleave_heads(
     let query_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, 0, key_dim)?;
     let key_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, key_dim, 2 * key_dim)?;
     let value_flat = extract_columns(stream, &conv_out, seq_len, conv_dim, 2 * key_dim, 2 * key_dim + value_dim)?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &query_flat, &[seq_len, key_dim]);
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &key_flat, &[seq_len, key_dim]);
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &value_flat, &[seq_len, value_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &query_flat, &[seq_len, key_dim], "prefill");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &key_flat, &[seq_len, key_dim], "prefill");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &value_flat, &[seq_len, value_dim], "prefill");
 
     // =========================================================================
     // Phase 4: Reshape and repeat_interleave query/key for num_v_heads
@@ -311,8 +311,8 @@ fn repeat_interleave_heads(
     } else {
         key_flat
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", &query_expanded, &[seq_len, num_v_heads * head_k_dim]);
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key_expanded", &key_expanded, &[seq_len, num_v_heads * head_k_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", &query_expanded, &[seq_len, num_v_heads * head_k_dim], "prefill");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key_expanded", &key_expanded, &[seq_len, num_v_heads * head_k_dim], "prefill");
 
     // =========================================================================
     // Phase 5: Per-head scalar projections
@@ -332,7 +332,7 @@ fn repeat_interleave_heads(
         &weights.in_proj_a.name, input, &mut a_proj,
         seq_len, num_v_heads, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &a_proj, &[seq_len, num_v_heads]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &a_proj, &[seq_len, num_v_heads], "prefill");
 
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(seq_len * b_dim)?;
@@ -343,7 +343,7 @@ fn repeat_interleave_heads(
     )?;
     // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads)
     let b_proj = b_proj_raw;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &b_proj, &[seq_len, num_v_heads]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &b_proj, &[seq_len, num_v_heads], "prefill");
 
     // =========================================================================
     // Phase 6: Upload A_log and dt_bias as float32
@@ -425,7 +425,7 @@ fn repeat_interleave_heads(
             .map_err(|e| anyhow::anyhow!("Failed to copy step output at token {t}: {e}"))?;
     }
 
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[seq_len, num_v_heads * head_v_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[seq_len, num_v_heads * head_v_dim], "prefill");
 
     // =========================================================================
     // Phase 8: RMSNormGated — norm(gdn_output, z_gate, weight)
@@ -450,7 +450,7 @@ fn repeat_interleave_heads(
 
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &z_gate_raw, &[seq_len, z_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &z_gate_raw, &[seq_len, z_dim], "prefill");
 
         unsafe {
             stream.launch_builder(rms_norm_gated_kernel)
@@ -473,7 +473,7 @@ fn repeat_interleave_heads(
         gdn_output.try_clone()
             .map_err(|e| anyhow::anyhow!("Failed to clone GDN output: {e}"))?
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.norm_output", &norm_output, &[seq_len, num_v_heads * head_v_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.norm_output", &norm_output, &[seq_len, num_v_heads * head_v_dim], "prefill");
 
     // =========================================================================
     // Phase 9: Output projection — [seq_len, value_dim] → [seq_len, hidden_size]
@@ -484,7 +484,7 @@ fn repeat_interleave_heads(
         &weights.out_proj_weight.name, &norm_output, &mut output,
         seq_len, hidden_size, value_dim, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[seq_len, hidden_size]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[seq_len, hidden_size], "prefill");
 
     Ok(output)
 }

@@ -865,7 +865,7 @@ pub fn forward_paged(
         seq_len, kv_dim, hidden_size, group_size,
     )?;
 
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_full, &[seq_len, kv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_full, &[seq_len, kv_dim], "prefill");
 
     // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut v_full = stream
@@ -876,7 +876,7 @@ pub fn forward_paged(
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_full, &[seq_len, kv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_full, &[seq_len, kv_dim], "prefill");
 
     // --- K-norm on full K before Phase 1 RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
@@ -885,7 +885,7 @@ pub fn forward_paged(
         k_full = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_full, &[seq_len, kv_dim]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_full, &[seq_len, kv_dim], "prefill");
     }
 
     // Apply RoPE to K_full
@@ -942,7 +942,7 @@ pub fn forward_paged(
         seq_len, q_out_dim, hidden_size, group_size,
     )?;
 
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[seq_len, q_out_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[seq_len, q_out_dim], "prefill");
     // --- Q-norm on Q portion only (not gate) before split ---
     if let Some(q_norm_w) = weights.q_norm.as_ref() {
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
@@ -966,7 +966,7 @@ pub fn forward_paged(
         let q_normed = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_normed, &[seq_len, per_gpu_head_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_normed, &[seq_len, per_gpu_head_dim], "prefill");
         // Write normalized Q back into q_full (per-head interleaved)
         for s in 0..seq_len {
             for h in 0..num_heads {
@@ -1003,7 +1003,7 @@ pub fn forward_paged(
                     .map_err(|e| anyhow::anyhow!("Copy gate data from q_full failed: {e}"))?;
             }
         }
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[seq_len, per_gpu_head_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[seq_len, per_gpu_head_dim], "prefill");
         Some(gate_buf)
     } else {
         None
@@ -1053,7 +1053,7 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy per-head K from k_full failed: {e}"))?;
         }
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_h0", &k_h, &[seq_len, head_dim]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_h0", &k_h, &[seq_len, head_dim], "prefill");
         }
 
         // --- Extract per-head V from v_full ---
@@ -1070,7 +1070,7 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy per-head V from v_full failed: {e}"))?;
         }
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_h0", &v_h, &[seq_len, head_dim]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_h0", &v_h, &[seq_len, head_dim], "prefill");
         }
 
         // --- RoPE (per-head, num_heads=1) — apply only to q_h (k_h already has RoPE from Phase 1) ---
@@ -1088,7 +1088,7 @@ pub fn forward_paged(
             partial_rotary_factor,
         )?;
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_h0", &q_h, &[seq_len, head_dim]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_h0", &q_h, &[seq_len, head_dim], "prefill");
         }
 
         // --- Attention scores: Q_h @ K_h^T → [seq_len × seq_len] ---
@@ -1116,7 +1116,7 @@ pub fn forward_paged(
             &mut scores_h,
         )?;
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.scores_h0", &scores_h, &[seq_len, seq_len]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.scores_h0", &scores_h, &[seq_len, seq_len], "prefill");
         }
 
         // --- Softmax with causal masking ---
@@ -1153,7 +1153,7 @@ pub fn forward_paged(
                 .map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
         }
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
-            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.softmax_h0", &softmax_out_h, &[seq_len, seq_len]);
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.softmax_h0", &softmax_out_h, &[seq_len, seq_len], "prefill");
         }
 
         // --- Attention output: softmax_out_h @ V_h → [seq_len × head_dim] ---
@@ -1191,7 +1191,7 @@ pub fn forward_paged(
         }
     }
 
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_combined, &[seq_len, per_gpu_head_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_combined, &[seq_len, per_gpu_head_dim], "prefill");
 
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
@@ -1220,7 +1220,7 @@ pub fn forward_paged(
     } else {
         attn_combined
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[seq_len, per_gpu_head_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[seq_len, per_gpu_head_dim], "prefill");
 
     // =========================================================================
     // O-projection using gated attention output
@@ -1233,7 +1233,7 @@ pub fn forward_paged(
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[seq_len, hidden_size]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[seq_len, hidden_size], "prefill");
 
     Ok(output)
 }
@@ -1303,7 +1303,7 @@ pub fn decode_forward_paged(
         cache, &weights.k_proj.name, input, &mut k_single,
         1, kv_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_single, &[1, kv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_single, &[1, kv_dim], "decode");
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
     let mut v_single = stream
@@ -1314,7 +1314,7 @@ pub fn decode_forward_paged(
         cache, &weights.v_proj.name, input, &mut v_single,
         1, kv_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_single, &[1, kv_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_single, &[1, kv_dim], "decode");
 
     // --- K-norm on full K before RoPE ---
     if let Some(k_norm_w) = weights.k_norm.as_ref() {
@@ -1323,7 +1323,7 @@ pub fn decode_forward_paged(
         k_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_single, &[1, kv_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_single, &[1, kv_dim], "decode");
     }
 
     // Apply RoPE to K_single
@@ -1376,7 +1376,7 @@ pub fn decode_forward_paged(
         cache, &weights.q_proj.name, input, &mut q_full,
         1, q_out_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[1, q_out_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[1, q_out_dim], "decode");
 
     // --- Q-norm on Q portion only (not gate) ---
     // Split first, then normalize only the Q part.
@@ -1408,7 +1408,7 @@ pub fn decode_forward_paged(
                 .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
         }
 
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[1, per_gpu_head_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[1, per_gpu_head_dim], "decode");
         (q_buf, Some(gate_buf))
     } else {
         (q_full, None)
@@ -1421,7 +1421,7 @@ pub fn decode_forward_paged(
         q_single = crate::norm::rms_norm(
             stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_single, &[1, per_gpu_head_dim]);
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_single, &[1, per_gpu_head_dim], "decode");
     }
 
 
@@ -1461,7 +1461,7 @@ pub fn decode_forward_paged(
         page_size,
         kv_dim,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_output, &[1, per_gpu_head_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_output, &[1, per_gpu_head_dim], "decode");
 
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
@@ -1489,7 +1489,7 @@ pub fn decode_forward_paged(
      } else {
         attn_output
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[1, per_gpu_head_dim]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[1, per_gpu_head_dim], "decode");
 
     // =========================================================================
     // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
@@ -1507,7 +1507,7 @@ pub fn decode_forward_paged(
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         1, hidden_size, per_gpu_head_dim, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[1, hidden_size]);
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[1, hidden_size], "decode");
 
     Ok(output)
 }
