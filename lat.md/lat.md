@@ -1090,7 +1090,23 @@ cuBLAS writes GEMM output in column-major order, but downstream code reads buffe
 
 **Attention output GEMM**: `softmax @ V` — cuBLAS output in column-major means downstream reads transposed. Fix: swap m/n dimensions, change `transa`/`transb` to false, and swap `v_h` with `softmax_out_h`. Computes `V^T @ S^T = [head_dim × seq_len]` in column-major; reading as row-major `[seq_len × head_dim]` gives correct layout because offset `m*head_dim + k = k + m*head_dim` matches column-major offset `k + m*head_dim`.
 
-Fixed in 4 GEMM calls across non-paged and paged prefill paths. The decode path uses `m=1` so column-major and row-major are identical for single-row output — correct by coincidence. See [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#forward_paged]].
+Applied in 4 GEMM calls across `forward()` and `forward_paged()` prefill paths. The decode path uses `m=1` so column-major and row-major are identical for single-row output — correct by coincidence. After applying, prefill attention verification improved from cos=0.008 to cos>0.9996 across all 34 stages (attention + MLP) on both GPUs. See [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/attention.rs#forward_paged]].
+
+The scores GEMM swap (`q_h`↔`k_h`) was NOT applied because scores already match reference (cos=0.993) — the transpose produces `Q[j]·K[i]` but the softmax kernel reads row-by-row, effectively computing the same causal attention. The attention output GEMM fix (swap m/n, transa→false, transb→false, swap A/B) WAS the critical fix.
+
+## Reference Comparison Bugs Found
+
+The Python reference comparison framework (`tests/compare/`) had two bugs that masked the GEMM fix verification:
+
+**Einsum bug** in `_scaled_dot_product_attention()`: used `"sah,sbh->sab"` which computes head-to-head dot products at each position, not per-head position-to-position attention. Fixed to `"sah,tah->sat"` for scores and `"sat,tad->sad"` for V multiplication. Causal mask needed `.unsqueeze(1)` for broadcast with `[S,H,S]` shape.
+
+**Missing residual** in `Norm2Stage.compute()`: computed `rms_norm(attn.after_ar)` instead of `rms_norm(hidden_input + attn.after_ar)`. The residual connection was missing, causing cos=0.982 and max_diff=13.16 for norm2. After fix, cos=1.000021. See [[tests/compare/stages/attention.py#_scaled_dot_product_attention]], [[tests/compare/stages/mlp.py#Norm2Stage]].
+
+## Paged Attention Decode Kernel Divergence
+
+The paged attention decode kernel produces output with cos≈0.97 against PyTorch reference, causing garbage model output. Root cause under investigation.
+
+The kernel `infers_paged_attention_decode_bf16` computes attention for one query token against all cached K/V tokens. When the kernel algorithm is simulated in Python with the same inputs (K/V from dumps, Q from dumps), the result matches PyTorch reference exactly (cos=1.0). But the engine's actual kernel output diverges (cos=0.97). This points to the KV cache contents differing from the dumped K/V values, possibly due to a write-ordering or layout issue in the paged KV cache.
 
 ## SSE Constant Usage
 
