@@ -219,6 +219,8 @@ fn bf16_to_f32_gpu(
     let cpu_f32: Vec<f32> = cpu_bf16.iter().map(|v| v.to_f32()).collect();
     let dst = stream.clone_htod(&cpu_f32)
         .map_err(|e| anyhow::anyhow!("Failed to upload f32 buffer: {e}"))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after bf16_to_f32 upload: {e}"))?;
     Ok(dst)
 }
 // ──────────────────────────────────────────────

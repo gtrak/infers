@@ -275,9 +275,12 @@ fn upload_weight_bytes(
         .chunks_exact(2)
         .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect();
-    stream
+    let gpu_buf = stream
         .clone_htod(&bf16_vec)
-        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))
+        .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", weight.name, e))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after uploading '{}': {}", weight.name, e))?;
+    Ok(gpu_buf)
 }
 
 /// Simple element-wise addition of two BF16 GPU tensors.
@@ -302,9 +305,12 @@ fn add_bf16_simple(
         .zip(b_host.iter())
         .map(|(x, y)| bf16::from_f32(x.to_f32() + y.to_f32()))
         .collect();
-    stream
+    let gpu_result = stream
         .clone_htod(&result)
-        .map_err(|e| anyhow::anyhow!("Failed to upload add result: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to upload add result: {e}"))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after add_bf16_simple upload: {e}"))?;
+    Ok(gpu_result)
 }
 
 #[cfg(test)]

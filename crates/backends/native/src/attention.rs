@@ -912,9 +912,12 @@ pub fn decode_forward(
 
     // Write K and V to KV cache at position
     let kv_buf = kv_cache.ensure_allocated(stream, max_seq_len, kv_dim)?;
+    let position_arr = [position];
     let positions_gpu = stream
-        .clone_htod(&[position])
+        .clone_htod(&position_arr)
         .map_err(|e| anyhow::anyhow!("Failed to copy position to device: {e}"))?;
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Failed to sync stream after position upload: {e}"))?;
 
     let kv_grid = (kv_dim as u32).div_ceil(256);
     let kv_config = LaunchConfig {

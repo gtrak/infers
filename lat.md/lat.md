@@ -1454,6 +1454,19 @@ TP=2 comparison: `scripts/compare_gdn_tp2.py` compares engine dumps (BF16 raw, s
 
 Current comparison results (2 OK, 11 divergent): a_proj cos=0.999997, b_proj cos=0.999999 (both pass), z_gate cos=0.989430 (improved from 0.495 after per-token slicing fix), norm_output cos=0.985635 (improved from 0.281 after same fix). Remaining divergences include mixed_qkv cos=0.994911, core_attn_out cos=0.999341, output cos=0.882144. Reference shapes: mixed_qkv=(15,10240), query=(15,2048), key=(15,2048), value=(15,6144), a_proj=(15,48), b_proj=(15,48), core_attn_out=(15,48,128).
 
+### GDN Layer Compare Script
+
+Script at `tests/gdn_layer_compare.py` provides two comparison modes for verifying GDN kernel correctness against engine dumps for a specific layer (default: layer 18, TP=2 GPU 0).
+
+**Mode 1 — Full Pipeline**: Computes all stages from hidden_input using dequantized INT4 weights. All stages fail because INT4 dequantization error propagates through the entire chain, and even BF16 GEMM stages diverge (likely due to weight sharding differences between engine and safetensors loading).
+
+**Mode 2 — Kernel-Only**: Uses engine's dumped intermediates as inputs, avoiding INT4 dequantization entirely. Only BF16 weights are needed: conv1d weight loaded from engine dump, A_log/dt_bias/norm.weight from safetensors. Three kernel stages verified:
+- **conv_out** (cos=0.999998): depthwise conv1d with SiLU using engine's mixed_qkv input and engine's conv1d_weight
+- **core_attn_out** (cos=1.000000): GDN recurrent step matching CUDA kernel `gdn_recurrent_step.cu` exactly — L2 normalization, softplus-clamped decay, sigmoid beta, state update with outer product
+- **norm_output** (cos=1.000000): RMSNormGated using correct formula from `Qwen3_5RMSNormGated` — multiplicative weight (not 1+weight), SiLU gate (not sigmoid)
+
+Kernel-only mode confirms all GDN kernel implementations are numerically correct at f32 precision when fed the engine's own intermediate values.
+
 ## GDN fp32 vs bf16 Precision Test
 
 Tests whether computing the q/k/v pipeline in fp32 (instead of bf16) fixes the GDN cosine divergence against the engine. Script at `/tmp/test_fp32.py`.
