@@ -279,13 +279,13 @@ def _compute_and_compare_layer(
             try:
                 ref_tensor = stage.compute(inputs, weights, config, layer_idx, gpu_idx)
 
-                # Store with GPU suffix so subsequent stages can reference it
-                key = f"{stage.name}_gpu{gpu_idx}" if gpu_idx > 0 else stage.name
+                # Always store with GPU suffix so each GPU's reference is kept separate
+                key = f"{stage.name}_gpu{gpu_idx}"
                 inputs[key] = ref_tensor
 
                 # Compare against engine dump
                 cmp_result = stage.compare(dump_dir, ref_tensor, layer_idx, gpu_idx)
-                result_key = f"{stage.name}_gpu{gpu_idx}" if gpu_idx > 0 else stage.name
+                result_key = f"{stage.name}_gpu{gpu_idx}"
                 results[result_key] = cmp_result
                 computed_any = True
 

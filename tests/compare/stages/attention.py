@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from tests.compare.config import DumpConfig
 from tests.compare.weight_loader import WeightLoader
-from tests.compare.stages.base import Stage
+from tests.compare.stages.base import Stage, _get_input
 
 # Attention thresholds — tighter for elementwise/norm stages, looser for INT4 GEMM
 _ATTN_THRESHOLDS = {
@@ -133,24 +133,47 @@ def _gqa_repeat_kv(
     return x_expanded.reshape(-1, num_attention_heads, x.shape[-1])  # [S, attn_heads, head_dim]
 
 
+def _get_input(inputs: dict, key: str, gpu_idx: int) -> torch.Tensor:
+    """Resolve a GPU-specific input key.
+
+    All intermediate outputs are stored with _gpu{idx} suffix (e.g. "attn.q_proj_raw_gpu1").
+    For shared values (e.g. norm1) the tensor is identical across GPUs so any key works.
+    """
+    if gpu_idx == 0:
+        # Try without suffix first for backward compat, fall back to suffixed key
+        return inputs.get(key, inputs[f"{key}_gpu{gpu_idx}"])
+    return inputs[f"{key}_gpu{gpu_idx}"]
+
+
 def _scaled_dot_product_attention(
     q: torch.Tensor,   # [S, num_heads, head_dim]
     k: torch.Tensor,   # [S, num_heads, head_dim]
     v: torch.Tensor,   # [S, num_heads, head_dim]
     head_dim: int,
 ) -> torch.Tensor:
-    """Scaled dot-product attention for prefill (no sliding window mask needed).
+    """Causal scaled dot-product attention for autoregressive models.
+
+    For decode phase (seq_len=1), this degenerates to no-mask attention.
+    For prefill phase, applies causal mask so position i attends only to positions 0..i.
 
     softmax(Q @ K^T / sqrt(head_dim)) @ V
 
     Returns [S, num_heads, head_dim].
     """
     scale = 1.0 / math.sqrt(head_dim)
-    # Q @ K^T: [S, H, D] @ [S, H, D]^T -> [S, H, H]
+    # Q @ K^T: [S, H, D] @ [S, H, D]^T -> [S, H, S]
     scores = torch.einsum("sah,sbh->sab", q.float(), k.float()) * scale
+
+    # Apply causal mask for prefill (seq_len > 1)
+    # Each position can only attend to itself and previous positions
+    if scores.shape[-1] > 1:
+        seq_len = scores.shape[-1]
+        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+
     # Softmax over key dimension (last dim)
     attn_weights = F.softmax(scores, dim=-1)
-    # @V: [S, H, H] @ [S, H, D] -> [S, H, D]
+    # @V: [S, H, S] @ [S, H, D] -> [S, H, D]
     return torch.einsum("sab,sbd->sad", attn_weights.float(), v.float())
 
 
@@ -189,7 +212,7 @@ class QProjRawStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.q_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["attn.norm1"]
+        norm1_out = _get_input(inputs, "attn.norm1", gpu_idx)
         W_q = weights.load_q_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_q.float()
 
@@ -201,7 +224,7 @@ class QNormStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.q_norm"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        q_proj_raw = inputs["attn.q_proj_raw"]
+        q_proj_raw = _get_input(inputs, "attn.q_proj_raw", gpu_idx)
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         head_dim = config.head_dim
 
@@ -229,7 +252,7 @@ class GateStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.gate"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        q_proj_raw = inputs["attn.q_proj_raw"]
+        q_proj_raw = _get_input(inputs, "attn.q_proj_raw", gpu_idx)
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         head_dim = config.head_dim
 
@@ -253,7 +276,7 @@ class KProjStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.k_proj"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["attn.norm1"]
+        norm1_out = _get_input(inputs, "attn.norm1", gpu_idx)
         W_k = weights.load_k_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_k.float()
 
@@ -265,7 +288,7 @@ class KNormStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.k_norm"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        k_proj_raw = inputs["attn.k_proj"]
+        k_proj_raw = _get_input(inputs, "attn.k_proj", gpu_idx)
         num_kv_heads_per_gpu = config.num_key_value_heads // config.num_gpus
         head_dim = config.head_dim
 
@@ -281,7 +304,7 @@ class VProjStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.v_proj"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm1_out = inputs["attn.norm1"]
+        norm1_out = _get_input(inputs, "attn.norm1", gpu_idx)
         W_v = weights.load_v_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm1_out @ W_v.float()
 
@@ -299,9 +322,9 @@ class AttentionCombinedStage(Stage):
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
         seq_len = inputs["hidden_input"].shape[0]
-        q_normed = inputs["attn.q_norm"]
-        k_normed = inputs["attn.k_norm"]
-        v_proj_raw = inputs["attn.v_proj"]
+        q_normed = _get_input(inputs, "attn.q_norm", gpu_idx)
+        k_normed = _get_input(inputs, "attn.k_norm", gpu_idx)
+        v_proj_raw = _get_input(inputs, "attn.v_proj", gpu_idx)
 
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         num_kv_heads_per_gpu = config.num_key_value_heads // config.num_gpus
@@ -339,8 +362,8 @@ class GatedStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.gated"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        combined = inputs["attn.combined"]
-        gate_flat = inputs["attn.gate"]
+        combined = _get_input(inputs, "attn.combined", gpu_idx)
+        gate_flat = _get_input(inputs, "attn.gate", gpu_idx)
 
         # Reshape gate to match attention output: [S, num_heads_per_gpu, head_dim]
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
@@ -360,7 +383,7 @@ class OProjStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.o_proj"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        gated = inputs["attn.gated"]
+        gated = _get_input(inputs, "attn.gated", gpu_idx)
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         head_dim = config.head_dim
         per_gpu_attn_dim = num_heads_per_gpu * head_dim
@@ -381,7 +404,7 @@ class AfterArStage(Stage):
             raise ValueError("AfterArStage should only be computed on GPU 0")
         result = None
         for g in range(config.num_gpus):
-            key = f"attn.o_proj_gpu{g}" if g > 0 else "attn.o_proj"
+            key = f"attn.o_proj_gpu{g}"
             if key in inputs:
                 if result is None:
                     result = inputs[key]

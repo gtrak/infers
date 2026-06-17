@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from tests.compare.config import DumpConfig
 from tests.compare.weight_loader import WeightLoader
-from tests.compare.stages.base import Stage
+from tests.compare.stages.base import Stage, _get_input
 
 
 # Thresholds from ref_intermediates.py STAGE_THRESHOLDS
@@ -47,7 +47,7 @@ class Norm2Stage(Stage):
     threshold = _MLP_THRESHOLDS["mlp.norm2"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        residual_attn = inputs["attn.after_ar"]
+        residual_attn = _get_input(inputs, "attn.after_ar", 0)
         norm2_w = weights.load_norm2(layer_idx)
         return _rms_norm(residual_attn, norm2_w, config.rms_norm_eps)
 
@@ -59,7 +59,7 @@ class GateProjStage(Stage):
     threshold = _MLP_THRESHOLDS["mlp.gate_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm2_out = inputs["mlp.norm2"]
+        norm2_out = _get_input(inputs, "mlp.norm2", gpu_idx)
         W_gate = weights.load_gate_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm2_out @ W_gate.float()  # [S, hidden] @ [hidden, sharded_int]
 
@@ -71,7 +71,7 @@ class UpProjStage(Stage):
     threshold = _MLP_THRESHOLDS["mlp.up_proj_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        norm2_out = inputs["mlp.norm2"]
+        norm2_out = _get_input(inputs, "mlp.norm2", gpu_idx)
         W_up = weights.load_up_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return norm2_out @ W_up.float()
 
@@ -83,8 +83,8 @@ class SiluStage(Stage):
     threshold = _MLP_THRESHOLDS["mlp.silu"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        gate = inputs["mlp.gate_proj"]
-        up = inputs["mlp.up_proj"]
+        gate = _get_input(inputs, "mlp.gate_proj", gpu_idx)
+        up = _get_input(inputs, "mlp.up_proj", gpu_idx)
         return F.silu(gate.float()) * up.float()
 
 
@@ -95,7 +95,7 @@ class DownRawStage(Stage):
     threshold = _MLP_THRESHOLDS["mlp.down_raw"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        silu_out = inputs["mlp.silu"]
+        silu_out = _get_input(inputs, "mlp.silu", gpu_idx)
         W_down = weights.load_down_proj_dequant(layer_idx, config.num_gpus, gpu_idx)
         return silu_out @ W_down.float()  # [S, sharded_int] @ [sharded_int, hidden]
 
@@ -112,7 +112,7 @@ class DownArStage(Stage):
         # Sum all GPUs' mlp.down_raw outputs
         result = None
         for g in range(config.num_gpus):
-            key = f"mlp.down_raw_gpu{g}" if g > 0 else "mlp.down_raw"
+            key = f"mlp.down_raw_gpu{g}"
             if key in inputs:
                 if result is None:
                     result = inputs[key]
@@ -133,7 +133,7 @@ class ResidualAttnStage(Stage):
         # This stage is the sum of hidden_input and attention output.
         # attn.after_ar comes from the AfterArStage (all-reduce of attn.o_proj).
         hidden_input = inputs["hidden_input"]
-        attn_ar = inputs.get("attn.after_ar")  # After all-reduce from attention path
+        attn_ar = _get_input(inputs, "attn.after_ar", 0)  # GPU 0 only after AR
         if attn_ar is None:
             raise ValueError("attn.after_ar not found for residual_attn computation")
         return hidden_input + attn_ar
@@ -146,6 +146,6 @@ class ResidualMlpStage(Stage):
     threshold = _MLP_THRESHOLDS["residual.mlp"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
-        residual_attn = inputs["residual.attn"]
-        mlp_down = inputs["mlp.down_ar"]
+        residual_attn = _get_input(inputs, "residual.attn", 0)
+        mlp_down = _get_input(inputs, "mlp.down_ar", 0)
         return residual_attn + mlp_down

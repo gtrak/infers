@@ -11,6 +11,18 @@ from tests.compare.cos import cos_sim, element_stats, l2_error
 from tests.compare.weight_loader import WeightLoader
 
 
+def _get_input(inputs: dict, key: str, gpu_idx: int) -> torch.Tensor:
+    """Resolve a GPU-specific input key.
+
+    All intermediate outputs are stored with _gpu{idx} suffix (e.g. "attn.q_proj_raw_gpu1").
+    For shared values (e.g. norm1) the tensor is identical across GPUs so any key works.
+    For gpu_idx == 0, also checks without suffix for backward compatibility.
+    """
+    if gpu_idx == 0:
+        return inputs.get(key, inputs[f"{key}_gpu{gpu_idx}"])
+    return inputs[f"{key}_gpu{gpu_idx}"]
+
+
 class Stage(ABC):
     """Base class for a single reference computation stage.
 
