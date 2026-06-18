@@ -152,7 +152,16 @@ impl ForwardEngine {
                 gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
                 gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
                 gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
-                gdn_chunked_prefill: kernels.get_function("infers_gdn_chunked_gated_delta_prefill_bf16")?,
+                gdn_chunked_prefill: {
+                    let f = kernels.get_function("infers_gdn_chunked_gated_delta_prefill_bf16")?;
+                    // Allow up to 100KB dynamic shared memory for the chunked GDN kernel
+                    // (default is 48KB; the kernel uses ~81KB for C=64, K=128)
+                    f.set_attribute(
+                        infers_cuda::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        100000,
+                    ).ok(); // ok() — ignore error if attribute not supported
+                    f
+                },
                 conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
                 rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
                 attn_output_gate: kernels.get_function("infers_attn_output_gate_bf16")?,

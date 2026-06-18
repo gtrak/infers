@@ -17,7 +17,8 @@
 extern "C" {
 
 __launch_bounds__(INFERS_BLOCK_SIZE)
-__global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
+__global__ __attribute__((maxdynamicsharedmemsize(100000)))
+void infers_gdn_chunked_gated_delta_prefill_bf16(
     const __nv_bfloat16* __restrict__ query,   // [S, H, K]
     const __nv_bfloat16* __restrict__ key,     // [S, H, K]
     const __nv_bfloat16* __restrict__ value,   // [S, H, V]
@@ -190,9 +191,10 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                     sum += k_beta_sm[row * K + d] * k_normed[col * K + d];
                 }
 
-                // Apply decay mask: exp(g_cs[row] - g_cs[col]) for row >= col, else 0
+                // Apply decay mask: exp(g_cs[row] - g_cs[col]) for row > col (strictly lower triangular)
+                // Diagonal and upper triangle are 0 (masked out before forward substitution)
                 float attn_val = 0.0f;
-                if (row >= col) {
+                if (row > col) {
                     float g_diff = g_cs[row] - g_cs[col];
                     attn_val     = -sum * expf(g_diff);
                 }
