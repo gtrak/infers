@@ -7,6 +7,7 @@ This is a **greenfield** project. Breaking changes are permitted and expected ac
 
 - Run `lat search` to find sections relevant to your task. Read them to understand the design intent before writing code.
 - Run `lat expand` on user prompts to expand any `[[refs]]` — this resolves section names to file locations and provides context.
+- **Always use `--release` for builds and tests.** Debug builds are ~100x slower and may OOM or timeout on real workloads. Use `cargo build --release`, `cargo test --release`, etc. The only exception is `cargo check` (no compilation) and `cargo clippy`.
 
 # Post-task checklist (REQUIRED — do not skip)
 
