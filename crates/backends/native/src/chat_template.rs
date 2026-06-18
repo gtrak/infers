@@ -116,15 +116,20 @@ impl ChatTemplate {
         Ok(Self { env })
     }
 
-    /// Render a single user message with add_generation_prompt=true.
+    /// Render a single user message with add_generation_prompt=true and enable_thinking=false.
+    ///
+    /// The Qwen3.6 template conditionally inserts a `\u{3010}\u{601D}\u{3011}` block. Passing
+    /// `enable_thinking: false` matches the behavior used by vLLM/transformers
+    /// when `\u{3010}\u{601D}\u{3011}` tags are requested: the template emits a pre-closed thinking
+    /// block so the model can output thinking tokens.
     ///
     /// Returns the rendered text — the caller is responsible for tokenizing it.
     pub fn render_user(&self, prompt: &str) -> Result<String> {
         let context = serde_json::json!({
             "messages": [{"role": "user", "content": prompt}],
-            "add_generation_prompt": true
+            "add_generation_prompt": true,
+            "enable_thinking": false
         });
-
         let tmpl = self.env.get_template("chat_template")
             .expect("chat_template should exist");
         tmpl.render(context)

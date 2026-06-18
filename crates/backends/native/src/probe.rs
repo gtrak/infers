@@ -322,6 +322,11 @@ pub fn dump_config(model_config: &ModelConfig, num_gpus: usize, group_size: usiz
         "rms_norm_eps": model_config.rms_norm_eps,
         "rope_theta": model_config.rope_theta,
         "partial_rotary_factor": model_config.partial_rotary_factor,
+        "linear_num_key_heads": model_config.linear_num_key_heads,
+        "linear_num_value_heads": model_config.linear_num_value_heads,
+        "linear_key_head_dim": model_config.linear_key_head_dim,
+        "linear_value_head_dim": model_config.linear_value_head_dim,
+        "linear_conv_kernel_dim": model_config.linear_conv_kernel_dim,
     });
 
     if let Err(e) = std::fs::write(

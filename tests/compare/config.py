@@ -28,6 +28,11 @@ class DumpConfig:
     rms_norm_eps: float
     rope_theta: float
     partial_rotary_factor: float
+    linear_num_key_heads: int = 1
+    linear_num_value_heads: int = 1
+    linear_key_head_dim: int = 1
+    linear_value_head_dim: int = 1
+    linear_conv_kernel_dim: int = 4
 
     @classmethod
     def from_dir(cls, dump_dir: str) -> "DumpConfig":
@@ -57,6 +62,11 @@ class DumpConfig:
             rms_norm_eps=float(data["rms_norm_eps"]),
             rope_theta=float(data["rope_theta"]),
             partial_rotary_factor=float(data["partial_rotary_factor"]),
+            linear_num_key_heads=data.get("linear_num_key_heads", 1),
+            linear_num_value_heads=data.get("linear_num_value_heads", 1),
+            linear_key_head_dim=data.get("linear_key_head_dim", 1),
+            linear_value_head_dim=data.get("linear_value_head_dim", 1),
+            linear_conv_kernel_dim=data.get("linear_conv_kernel_dim", 4),
         )
 
     def get_layer_type(self, layer_idx: int) -> str:
