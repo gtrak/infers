@@ -7,6 +7,8 @@
 //! - NCCL all-reduce for tensor parallelism
 //! - Hybrid GDN/FullAttention layer dispatch
 
+pub mod chat_template;
+
 pub mod add;
 pub mod engine;
 pub mod prefill;

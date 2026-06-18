@@ -544,8 +544,14 @@ YH:### Standalone Infer Binary
 RS:
 XN:The `infer` binary at [[crates/backends/native/src/bin/infer.rs]] is a one-shot inference tool that loads a model, runs prefill + decode, and prints generated text. It follows the same pattern as the smoke test: load config, shard weights via TP, initialize CUDA contexts, create ForwardEngine, initialize paged KV cache, tokenize, prefill, then decode with greedy sampling.
 TX:
-BY:CLI arguments are parsed via clap: `--model` (required), `--tp` (default 2), `--prompt` (required), `--max-tokens` (default 64), `--dump-dir` (enables probe dumps), `--dump-layers` (layer filter for dumps), `--group-size` (quantization group size, default 128), and `--max-seq-len` (override sequence length). When `--dump-dir` is set, the binary sets `INFERS_DUMP_DIR` and optionally `INFERS_DUMP_LAYERS` before engine creation so that probe instrumentation captures intermediates during both prefill and decode phases.
-TR:
+BY:CLI arguments are parsed via clap: `--model` (required), `--tp` (default 2), `--prompt` (optional), `--token-ids` (comma-separated IDs, bypasses tokenizer), `--max-tokens` (default 64), `--dump-dir` (enables probe dumps), `--dump-layers` (layer filter for dumps), `--group-size` (quantization group size, default 128), `--max-seq-len` (override sequence length), and `--no-chat` (disables chat template wrapping). Either `--prompt` or `--token-ids` must be specified.
+TR:Chat template: by default, when `--prompt` is used, the binary extracts the Jinja chat template from the model via a **one-time** Python call (`AutoTokenizer.chat_template`), then renders it locally using minijinja ([[crates/backends/native/src/chat_template.rs]]). The renderer supports Python string methods (split, startswith, endswith, lstrip, rstrip) and the `raise_exception()` function required by some templates. After rendering, the text is encoded with the Rust tokenizer. Use `--no-chat` to bypass this and use raw Rust tokenizer encoding instead. If template extraction or rendering fails, the binary falls back to raw tokenization with a warning.
+
+#### Chat Template Rendering
+
+Pure-Rust chat template rendering via minijinja replacing the Python subprocess dependency.
+
+The `chat_template` module ([[crates/backends/native/src/chat_template.rs]]) provides two key items: `extract_template()` makes a one-time Python call to extract the raw Jinja template string from the model directory, and `ChatTemplate` wraps a minijinja `Environment` configured with trim_blocks, lstrip_blocks, autoescape disabled, the `raise_exception()` function, and an unknown method callback for Python string methods (split, startswith, endswith, lstrip, rstrip). The `render_user(prompt)` method builds a context with `{"messages": [{"role": "user", "content": prompt}], "add_generation_prompt": true}` and renders the template, returning plain text that the caller encodes with the Rust tokenizer.
 ### PyTorch Reference Intermediates
 
 Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.

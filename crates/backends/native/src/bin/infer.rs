@@ -7,8 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use clap::Parser;
+use infers_backend_native::chat_template::{ChatTemplate, extract_template};
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
 use infers_cuda::kernels::KernelRegistry;
@@ -56,6 +57,28 @@ struct Args {
     /// Override max sequence length (default: min(4096, config.max_position_embeddings))
     #[arg(long)]
     max_seq_len: Option<usize>,
+
+    /// Disable chat template wrapping (raw tokenization)
+    #[arg(long, default_value = "false")]
+    no_chat: bool,
+}
+
+/// Apply chat template using minijinja, then encode with the Rust tokenizer.
+fn apply_chat_template(model_dir: &Path, prompt: &str, tokenizer: &infers_tokenizer::Tokenizer) -> Result<Vec<u32>> {
+    // One-time: extract template from model via Python
+    let template_source = extract_template(model_dir)?;
+    eprintln!("Chat template extracted ({} bytes)", template_source.len());
+
+    // Create minijinja renderer
+    let chat_tmpl = ChatTemplate::new(template_source)
+        .context("Failed to create chat template renderer")?;
+
+    // Render user message
+    let rendered = chat_tmpl.render_user(prompt)?;
+    eprintln!("Rendered prompt ({} bytes)", rendered.len());
+
+    // Encode with Rust tokenizer
+    tokenizer.encode(&rendered)
 }
 
 fn main() -> Result<()> {
@@ -184,15 +207,33 @@ fn main() -> Result<()> {
     };
 
     let token_ids: Vec<u32> = if let Some(ref ids_str) = args.token_ids {
+        // Direct token IDs (highest priority)
         ids_str.split(',')
             .map(|s| u32::from_str_radix(s.trim(), 10).unwrap())
             .collect()
     } else if let Some(ref prompt) = args.prompt {
-        if let Some(ref tok) = tokenizer {
-            tok.encode(prompt)?
+        if args.no_chat {
+            // Raw tokenization
+            if let Some(ref tok) = tokenizer {
+                tok.encode(prompt)?
+            } else {
+                eprintln!("No tokenizer found, using fallback token [151644]");
+                vec![151644u32]
+            }
         } else {
-            eprintln!("No tokenizer found, using fallback token [151644]");
-            vec![151644u32]
+            // Apply chat template via minijinja
+            if let Some(ref tok) = tokenizer {
+                match apply_chat_template(&model_dir, prompt, tok) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Warning: chat template failed ({}), falling back to raw encode", e);
+                        tok.encode(prompt)?
+                    }
+                }
+            } else {
+                eprintln!("No tokenizer found — cannot apply chat template, using fallback token [151644]");
+                vec![151644u32]
+            }
         }
     } else {
         anyhow::bail!("either --prompt or --token-ids must be specified");
