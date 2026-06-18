@@ -34,6 +34,7 @@ pub struct PrefillKernels {
     pub gdn_prefill: CudaFunction,
     pub gdn_gated_delta_prefill: CudaFunction,
     pub gdn_recurrent_step: CudaFunction,
+    pub gdn_chunked_prefill: CudaFunction,
     pub conv1d_depthwise: CudaFunction,
     pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
@@ -145,6 +146,7 @@ pub fn prefill(
                     &kernels.int4_gemm,
                     stream,
                     &kernels.gdn_recurrent_step,
+                    &kernels.gdn_chunked_prefill,
                     &kernels.conv1d_depthwise,
                     &kernels.rms_norm_gated,
                     gdn_weights,

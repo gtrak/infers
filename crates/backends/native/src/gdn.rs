@@ -200,6 +200,7 @@ fn repeat_interleave_heads(
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
     gdn_recurrent_step_kernel: &CudaFunction,
+    gdn_chunked_prefill_kernel: &CudaFunction,
     conv1d_kernel: &CudaFunction,
     rms_norm_gated_kernel: &CudaFunction,
     weights: &GdnWeights,
@@ -365,64 +366,44 @@ fn repeat_interleave_heads(
     };
 
     // =========================================================================
-    // Phase 7: Sequential recurrent step for each token (fp32 inputs)
+    // Phase 7: Chunked parallel GDN recurrence (fp32 state, bf16 I/O)
     // =========================================================================
     gdn_state.ensure_allocated(stream, num_v_heads, head_k_dim, head_v_dim)?;
     let mut gdn_output = stream.alloc_zeros::<bf16>(seq_len * num_v_heads * head_v_dim)?;
     let state_ref = gdn_state.state.as_mut()
         .ok_or_else(|| anyhow::anyhow!("GDN state not allocated"))?;
 
-    // Per-token bf16 extraction for the recurrent step kernel
-
     let num_v_heads_i32 = num_v_heads as i32;
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
-    let total_threads = num_v_heads * head_v_dim;
+    let chunk_size: i32 = 64;
 
-    for t in 0..seq_len {
-        // Extract per-token bf16 slices
-        let q_offset = t * num_v_heads * head_k_dim;
-        let k_offset = t * num_v_heads * head_k_dim;
-        let v_offset = t * num_v_heads * head_v_dim;
-        let a_offset = t * num_v_heads;
-        let b_offset = t * num_v_heads;
+    // Launch chunked parallel kernel: one block per head, 256 threads per block
+    // Shared memory: 3 arrays of size [C, K] in fp32 = 3 * 64 * 128 * 4 = 96KB
+    let smem_size = (3 * chunk_size as usize * head_k_dim * std::mem::size_of::<f32>()) as u32;
 
-        let q_t = clone_view_to_slice(stream, &query_expanded, q_offset..q_offset + num_v_heads * head_k_dim)?;
-        let k_t = clone_view_to_slice(stream, &key_expanded, k_offset..k_offset + num_v_heads * head_k_dim)?;
-        let v_t = clone_view_to_slice(stream, &value_flat, v_offset..v_offset + num_v_heads * head_v_dim)?;
-        let a_t = clone_view_to_slice(stream, &a_proj, a_offset..a_offset + num_v_heads)?;
-        let b_t = clone_view_to_slice(stream, &b_proj, b_offset..b_offset + num_v_heads)?;
-
-        // Output slice for this token: gdn_output[t * H * V .. (t+1) * H * V]
-        let y_offset = t * num_v_heads * head_v_dim;
-        let mut y_t = stream.alloc_zeros::<bf16>(num_v_heads * head_v_dim)?;
-
-        unsafe {
-            stream.launch_builder(gdn_recurrent_step_kernel)
-                .arg(&q_t)         // [H, K] BF16
-                .arg(&k_t)         // [H, K] BF16
-                .arg(&v_t)         // [H, V] BF16
-                .arg(&a_t)         // [H] BF16
-                .arg(&b_t)         // [H] BF16
-                .arg(&a_log_f32)   // [H] float32 (shared across tokens)
-                .arg(&dt_bias_f32) // [H] float32 (shared across tokens)
-               .arg(&mut *state_ref)   // [H, K, V] float32 mutable (shared state) - reborrow each iteration
-                .arg(&mut y_t)     // [H, V] BF16 output for this token
-                .arg(&num_v_heads_i32)
-                .arg(&head_k_dim_i32)
-                .arg(&head_v_dim_i32)
-                .launch(LaunchConfig {
-                    grid_dim: ((total_threads as u32).div_ceil(256), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed at token {t}: {e}"))?;
-        }
-
-        // Copy y_t into the correct position in gdn_output
-        let mut out_slice = gdn_output.slice_mut(y_offset..y_offset + num_v_heads * head_v_dim);
-        stream.memcpy_dtod(&y_t, &mut out_slice)
-            .map_err(|e| anyhow::anyhow!("Failed to copy step output at token {t}: {e}"))?;
+    unsafe {
+        stream.launch_builder(gdn_chunked_prefill_kernel)
+            .arg(&query_expanded)      // [S, H, K] BF16
+            .arg(&key_expanded)        // [S, H, K] BF16
+            .arg(&value_flat)          // [S, H, V] BF16
+            .arg(&a_proj)              // [S, H] BF16
+            .arg(&b_proj)              // [S, H] BF16
+            .arg(&a_log_f32)           // [H] float32
+            .arg(&dt_bias_f32)         // [H] float32
+            .arg(&mut *state_ref)      // [H, K, V] float32 mutable
+            .arg(&mut gdn_output)      // [S, H, V] BF16 output
+            .arg(&(seq_len as i32))
+            .arg(&num_v_heads_i32)
+            .arg(&head_k_dim_i32)
+            .arg(&head_v_dim_i32)
+            .arg(&chunk_size)
+            .launch(LaunchConfig {
+                grid_dim: (num_v_heads as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem_size,
+            })
+            .map_err(|e| anyhow::anyhow!("GDN chunked prefill kernel launch failed: {e}"))?;
     }
 
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[seq_len, num_v_heads * head_v_dim], "prefill");

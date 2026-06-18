@@ -81,6 +81,7 @@ impl KernelRegistry {
         self.register("infers_gdn_gated_delta_prefill_bf16", kdir("gdn_gated_delta_prefill.cubin"));
         self.register("infers_gdn_gated_delta_update_bf16", kdir("gdn_gated_delta_update.cubin"));
         self.register("infers_gdn_recurrent_step_bf16", kdir("gdn_recurrent_step.cubin"));
+        self.register("infers_gdn_chunked_gated_delta_prefill_bf16", kdir("gdn_chunked_gated_delta_prefill.cubin"));
         self.register("infers_conv1d_depthwise_silu_bf16", kdir("conv1d_depthwise.cubin"));
         self.register("infers_rms_norm_gated_bf16", kdir("rms_norm_gated.cubin"));
         self.register("infers_paged_attention_decode_bf16", kdir("paged_attention_decode.cubin"));
