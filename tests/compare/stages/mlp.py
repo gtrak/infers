@@ -23,9 +23,13 @@ _MLP_THRESHOLDS = {
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm with multiplicative weight (Qwen style: output = x * rsqrt(rms^2 + eps) * weight)."""
+    """RMSNorm with additive offset (Qwen3.5 style: output = x * rsqrt(rms^2 + eps) * (1 + weight)).
+
+    Qwen3.5 uses zero-initialized norm weights with the formula (1 + weight),
+    same as Gemma-style RMSNorm.
+    """
     rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).sqrt()
-    return (x / rms) * weight.float().unsqueeze(0)
+    return (x / rms) * (1.0 + weight.float().unsqueeze(0))
 
 
 class Norm1Stage(Stage):

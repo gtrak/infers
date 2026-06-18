@@ -43,10 +43,10 @@ def _per_head_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     """Per-head RMSNorm over the last dimension (head_dim).
 
     Expects x shape [S, num_heads, head_dim] and weight shape [head_dim].
-    Uses multiplicative weight style: output = x * rsqrt(rms^2 + eps) * weight.
+    Uses Qwen3.5 additive offset style: output = x * rsqrt(rms^2 + eps) * (1 + weight).
     """
     rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).sqrt()
-    return (x / rms) * weight.float().unsqueeze(0).unsqueeze(0)
+    return (x / rms) * (1.0 + weight.float().unsqueeze(0).unsqueeze(0))
 
 
 def _apply_rope(
@@ -87,15 +87,20 @@ def _build_rope_cache(
     head_dim: int,
     rope_theta: float,
     partial_rotary_factor: float,
+    position_offset: int = 0,
 ) -> tuple:
     """Build rotary position embedding cache.
 
     Returns (cos_cache, sin_cache) each with shape [1, 1, S, head_dim].
+
+    Args:
+        position_offset: starting token position. Use 0 for prefill, or the
+            absolute position of the first new token for decode.
     """
     dim = int(head_dim * partial_rotary_factor)
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2).float() / dim))
-    # Positional IDs for prefill: [0, 1, ..., seq_len-1]
-    positions = torch.arange(seq_len, dtype=torch.float32)
+    # Positions with offset: prefill gets [0..seq_len-1], decode gets [offset..offset+seq_len-1]
+    positions = torch.arange(position_offset, position_offset + seq_len, dtype=torch.float32)
     freqs = positions[:, None] @ inv_freq[None, :]  # [S, dim/2]
 
     emb = torch.cat([freqs, freqs], dim=-1)  # [S, dim]
@@ -166,7 +171,7 @@ def _scaled_dot_product_attention(
 
     # Apply causal mask for prefill (seq_len > 1)
     # Each position can only attend to itself and previous positions
-    if scores.shape[-1] > 1:
+    if scores.shape[0] > 1:
         seq_len = scores.shape[-1]
         mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device), diagonal=1).unsqueeze(1)
         scores = scores.masked_fill(mask, float("-inf"))
@@ -321,21 +326,40 @@ class AttentionCombinedStage(Stage):
     threshold = _ATTN_THRESHOLDS["attn.combined"]
 
     def compute(self, inputs, weights, config, layer_idx, gpu_idx):
+        from pathlib import Path
+
+        from tests.compare import io as compare_io
+
         seq_len = inputs["hidden_input"].shape[0]
-        q_normed = _get_input(inputs, "attn.q_norm", gpu_idx)
-        k_normed = _get_input(inputs, "attn.k_norm", gpu_idx)
-        v_proj_raw = _get_input(inputs, "attn.v_proj", gpu_idx)
+        is_decode = seq_len == 1
 
         num_heads_per_gpu = config.num_attention_heads // config.num_gpus
         num_kv_heads_per_gpu = config.num_key_value_heads // config.num_gpus
         head_dim = config.head_dim
+        kv_dim = num_kv_heads_per_gpu * head_dim
+
+        # Position offset for decode: absolute token position (0 for prefill)
+        position_offset = int(inputs.get("position", 0))
+
+        if is_decode:
+            return self._compute_decode(
+                inputs, config, layer_idx, gpu_idx,
+                num_heads_per_gpu, num_kv_heads_per_gpu, head_dim, kv_dim,
+                position_offset,
+            )
+
+        # --- Prefill path (unchanged) ---
+        q_normed = _get_input(inputs, "attn.q_norm", gpu_idx)
+        k_normed = _get_input(inputs, "attn.k_norm", gpu_idx)
+        v_proj_raw = _get_input(inputs, "attn.v_proj", gpu_idx)
 
         # V needs reshape: [S, num_kv_heads * head_dim] -> [S, num_kv_heads, head_dim]
         v = v_proj_raw.view(-1, num_kv_heads_per_gpu, head_dim)
 
         # Build RoPE cache
         cos_cache, sin_cache = _build_rope_cache(
-            seq_len, head_dim, config.rope_theta, config.partial_rotary_factor
+            seq_len, head_dim, config.rope_theta, config.partial_rotary_factor,
+            position_offset=position_offset,
         )
 
         # Apply RoPE to Q and K (per-GPU shard)
@@ -347,6 +371,82 @@ class AttentionCombinedStage(Stage):
         v_expanded = _gqa_repeat_kv(v, num_heads_per_gpu, num_kv_heads_per_gpu)
 
         # Scaled dot-product attention
+        combined = _scaled_dot_product_attention(q_rope, k_expanded, v_expanded, head_dim)
+        return combined
+
+    def _compute_decode(
+        self,
+        inputs: dict,
+        config: DumpConfig,
+        layer_idx: int,
+        gpu_idx: int,
+        num_heads_per_gpu: int,
+        num_kv_heads_per_gpu: int,
+        head_dim: int,
+        kv_dim: int,
+        position_offset: int,
+    ) -> torch.Tensor:
+        """Decode attention with KV cache from prefill + decode.
+
+        Loads k_cached and v_cached from the prefill dump directory,
+        concatenates with the decode token's k_cached/v_cached, then
+        computes full-attention with the combined cache.
+
+        Key insight: k_cached already has RoPE baked in (norm+RoPE applied
+        before caching), so we must NOT re-apply RoPE to K. Only apply
+        RoPE to Q.
+        """
+        from pathlib import Path
+
+        from tests.compare import io as compare_io
+
+        dump_dir = inputs["dump_dir"]
+        decode_dir = Path(dump_dir)
+        prefill_dir = decode_dir.parent / "prefill"
+
+        # --- Step 1: Load Q and apply RoPE (position = position_offset for decode token) ---
+        q_normed = _get_input(inputs, "attn.q_norm", gpu_idx)  # [1, num_heads_per_gpu, head_dim]
+
+        cos_cache, sin_cache = _build_rope_cache(
+            1, head_dim, config.rope_theta, config.partial_rotary_factor,
+            position_offset=position_offset,
+        )
+        q_rope = _apply_rope(q_normed, cos_cache, sin_cache, config.partial_rotary_factor, head_dim)
+
+        # --- Step 2: Load K cache from prefill + decode, concatenate ---
+        k_prefill_path = str(prefill_dir / f"attn.k_cached_gpu{gpu_idx}.raw")
+        k_decode_path = str(decode_dir / f"attn.k_cached_gpu{gpu_idx}.raw")
+
+        # Determine S_prefill from file size
+        n_bf16_k_prefill = Path(k_prefill_path).stat().st_size // 2
+        s_prefill = n_bf16_k_prefill // kv_dim
+
+        k_prefill = compare_io.load_raw_bf16(k_prefill_path, (s_prefill, kv_dim))
+        k_decode = compare_io.load_raw_bf16(k_decode_path, (1, kv_dim))
+        k_full = torch.cat([k_prefill, k_decode], dim=0)  # [S_total, kv_dim]
+
+        # --- Step 3: Load V cache from prefill + decode, concatenate ---
+        v_prefill_path = str(prefill_dir / f"attn.v_cached_gpu{gpu_idx}.raw")
+        v_decode_path = str(decode_dir / f"attn.v_cached_gpu{gpu_idx}.raw")
+
+        n_bf16_v_prefill = Path(v_prefill_path).stat().st_size // 2
+        s_prefill_v = n_bf16_v_prefill // kv_dim
+
+        v_prefill = compare_io.load_raw_bf16(v_prefill_path, (s_prefill_v, kv_dim))
+        v_decode = compare_io.load_raw_bf16(v_decode_path, (1, kv_dim))
+        v_full = torch.cat([v_prefill, v_decode], dim=0)  # [S_total, kv_dim]
+
+        s_total = k_full.shape[0]
+
+        # --- Step 4: Reshape to per-head format ---
+        k_heads = k_full.view(s_total, num_kv_heads_per_gpu, head_dim)  # [S_total, kv_heads, D]
+        v_heads = v_full.view(s_total, num_kv_heads_per_gpu, head_dim)
+
+        # --- Step 5: GQA repeat KV heads to match query heads ---
+        k_expanded = _gqa_repeat_kv(k_heads, num_heads_per_gpu, num_kv_heads_per_gpu)
+        v_expanded = _gqa_repeat_kv(v_heads, num_heads_per_gpu, num_kv_heads_per_gpu)
+
+        # --- Step 6: Compute attention (no causal mask needed — Q has only 1 position) ---
         combined = _scaled_dot_product_attention(q_rope, k_expanded, v_expanded, head_dim)
         return combined
 

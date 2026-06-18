@@ -245,6 +245,7 @@ def _compute_and_compare_layer(
     config: DumpConfig,
     stages: List[Stage],
     verbose: bool = False,
+    position_offset: int = 0,
 ) -> Optional[Dict[str, dict]]:
     """Compute reference outputs and compare against engine dumps for a single layer.
 
@@ -271,6 +272,8 @@ def _compute_and_compare_layer(
     tp_size = config.num_gpus
     results: Dict[str, dict] = {}
     inputs: Dict[str, torch.Tensor] = {"hidden_input": hidden_input}
+    inputs["position"] = position_offset  # type: ignore  # int for RoPE offset
+    inputs["dump_dir"] = dump_dir  # type: ignore  # str for KV cache path resolution
 
     for stage in stages:
         # Try each GPU if the stage supports TP sharding
@@ -342,14 +345,64 @@ def _print_results(results: dict, verbose: bool = False):
 
 DEFAULT_MODEL_PATH = "/home/gary/opt/vllm/models/qwen3.6-27b-autoround-int4"
 
+def _run_oracle_mode(args):
+    """Run in oracle mode: compare HF oracle dumps against engine dumps."""
+    from tests.compare.hf_compare import compare_layers, print_results
+
+    oracle_dir = Path(args.oracle_dir)
+    engine_dir = Path(args.engine_dir)
+
+    if not oracle_dir.exists():
+        print(f"[ERROR] Oracle directory does not exist: {oracle_dir}")
+        sys.exit(1)
+    if not engine_dir.exists():
+        print(f"[ERROR] Engine directory does not exist: {engine_dir}")
+        sys.exit(1)
+
+    # Load summary to get num_layers
+    summary_path = oracle_dir / "summary.json"
+    if summary_path.exists():
+        import json
+        with open(summary_path) as f:
+            summary = json.load(f)
+        num_layers = summary["num_layers"]
+    else:
+        num_layers = sum(1 for d in oracle_dir.iterdir() if d.is_dir() and d.name.startswith("layer_"))
+
+    print("=" * 70)
+    print(f"Oracle Compare — {num_layers} layers, Phase: {args.phase}")
+    print(f"  Oracle dir: {oracle_dir}")
+    print(f"  Engine dir: {engine_dir}")
+    print("=" * 70)
+
+    all_passed, results, first_fail_layer, first_fail_tensor = compare_layers(
+        oracle_dir, engine_dir, args.phase, num_layers, args.threshold,
+    )
+
+    print_results(results, first_fail_layer, first_fail_tensor)
+
+    passed_count = sum(1 for r in results if r.get("passed", False))
+    total = len(results)
+    print(f"\n{'=' * 70}")
+    print(f"  {passed_count}/{total} tensors passed")
+    if all_passed:
+        print("ALL STAGES PASSED")
+    else:
+        print("SOME STAGES FAILED — check which tensor shows divergence")
+    print(f"{'=' * 70}")
+
+    sys.exit(0 if all_passed else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare engine dumps against PyTorch reference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--dump-dir", type=str, required=True,
-        help="Engine dump directory for a single layer (e.g. /tmp/dump/layer_3)",
+        "--dump-dir", type=str, default=None,
+        help="Engine dump directory for a single layer (e.g. /tmp/dump/layer_3). "
+             "Required for custom mode. In oracle mode, used as --engine-dir alias.",
     )
     parser.add_argument(
         "--model-dir", type=str, default=DEFAULT_MODEL_PATH,
@@ -369,10 +422,50 @@ def main():
         help="Phase to compare (prefill or decode). Dumps are stored in separate subdirectories [default: decode]",
     )
     parser.add_argument(
+        "--position", type=int, default=0,
+        help="Absolute token position for RoPE offset (0 for prefill, e.g. 15 for decode after 15 prefill tokens)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Verbose output with per-stage L2 and max_diff statistics",
     )
+    parser.add_argument(
+        "--mode", type=str, default="custom", choices=["custom", "oracle"],
+        help="Comparison mode: 'custom' uses Python reference stages, "
+             "'oracle' uses HF oracle dumps [default: custom]",
+    )
+    parser.add_argument(
+        "--oracle-dir", type=str, default=None,
+        help="Directory with HF oracle dumps (required for oracle mode)",
+    )
+    parser.add_argument(
+        "--engine-dir", type=str, default=None,
+        help="Root directory with engine dumps (required for oracle mode)",
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=0.99,
+        help="Cosine similarity threshold for oracle mode [default: 0.99]",
+    )
     args = parser.parse_args()
+
+    if args.mode == "oracle":
+        # Oracle mode: use hf_compare
+        if args.oracle_dir is None:
+            print("[ERROR] --oracle-dir is required for oracle mode")
+            sys.exit(1)
+        if args.engine_dir is None and args.dump_dir is not None:
+            # Allow --dump-dir as alias for --engine-dir
+            args.engine_dir = args.dump_dir
+        if args.engine_dir is None:
+            print("[ERROR] --engine-dir (or --dump-dir) is required for oracle mode")
+            sys.exit(1)
+        _run_oracle_mode(args)
+        return
+
+    # Custom mode: existing behavior
+    if args.dump_dir is None:
+        print("[ERROR] --dump-dir is required for custom mode")
+        sys.exit(1)
 
     dump_dir = Path(args.dump_dir)
     if not dump_dir.exists():
@@ -438,6 +531,7 @@ def main():
     print(f"  intermediate_size:     {config.intermediate_size}")
     print(f"  layer_type:            {config.get_layer_type(layer_idx)}")
     print(f"  num_gpus:              {config.num_gpus}")
+    print(f"  position_offset:       {args.position}")
 
     # Resolve stages for this layer type
     categories = args.stages if args.stages else None
@@ -450,7 +544,7 @@ def main():
     print(f"\n  Running {len(stages)} stages...")
 
     # Compute and compare
-    results = _compute_and_compare_layer(layer_idx, actual_dump_dir, weights, config, stages, args.verbose)
+    results = _compute_and_compare_layer(layer_idx, actual_dump_dir, weights, config, stages, args.verbose, args.position)
 
     if results is None:
         print("[ERROR] missing hidden_input.raw")
