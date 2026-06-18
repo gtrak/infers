@@ -189,7 +189,7 @@ impl PagedKvManager {
         Ok(result)
     }
 
-    /// Increment the token count for a sequence.
+   /// Increment the token count for a sequence.
     ///
     /// If the token count reaches a page boundary (multiple of `page_size`),
     /// the current tail page is sealed in the pool.
@@ -217,7 +217,35 @@ impl PagedKvManager {
         Ok(())
     }
 
-    /// Seal the tail page and insert it into the prefix cache.
+    /// Increment the token count by n for a sequence (bulk version for prefill).
+    ///
+    /// Seals pages as they become full.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::InvalidSequence`] if the sequence does not exist.
+    pub fn add_tokens(&mut self, seq_id: SequenceId, n: usize) -> Result<(), ManagerError> {
+        let mut pool = self.page_pool.lock().unwrap();
+
+        let table = self
+            .sequences
+            .get_mut(seq_id)
+            .and_then(|opt| opt.as_mut())
+            .ok_or(ManagerError::InvalidSequence(seq_id))?;
+
+        for _ in 0..n {
+            table.num_tokens += 1;
+            if table.num_tokens > 0
+                && table.num_tokens.is_multiple_of(self.page_size)
+                && let Some(tail_page_id) = table.tail_page_id()
+            {
+                pool.seal(tail_page_id);
+            }
+        }
+
+        Ok(())
+    }
+
+   /// Seal the tail page and insert it into the prefix cache.
     ///
     /// Computes a content hash from the provided K/V data and model info,
     /// then inserts the page into the prefix cache for future sharing.

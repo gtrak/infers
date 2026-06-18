@@ -62,6 +62,11 @@ impl SequencePageTable {
         self.num_tokens += 1;
     }
 
+    /// Increment the token count by n (bulk version for prefill).
+    pub fn add_tokens(&mut self, n: usize) {
+        self.num_tokens += n;
+    }
+
     /// Remove and return the last page ID from the table.
     ///
     /// Returns `None` if the table has no pages.

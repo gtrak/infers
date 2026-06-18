@@ -713,6 +713,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
         }
 
+        // Record prefill tokens in the KV manager so decode sees the correct count
+        if let Some(mgr) = self.paged_kv_manager.as_mut() {
+            mgr.add_tokens(seq_id, seq_len)
+                .map_err(|e| anyhow::anyhow!("Failed to record prefill tokens: {:?}", e))?;
+        }
+
         // ================================================================
         // Final norm + LM head on GPU 0 (same on all GPUs after all-reduce)
         // ================================================================
@@ -831,7 +837,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     .map_err(|e| anyhow::anyhow!("Failed to allocate KV page for decode: {:?}", e))?;
             }
 
-            let cached = mgr.num_tokens(seq_id)? as i32;
+            let cached = mgr.num_tokens(seq_id)? as i32 + 1;  // +1 for current decode token
             let bt: Vec<i32> = mgr.block_table(seq_id)?.iter().map(|p| *p as i32).collect();
             (ps, cached, bt)
         };
