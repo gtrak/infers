@@ -72,7 +72,7 @@ Three directories hold kernel source and compiled binaries under `crates/cuda/ke
 ### Kernel Source Files
 All kernels use `extern "C" __global__` so function names are directly loadable from cubin files. Launch configuration is determined by Rust dispatch code, not kernel wrappers.
 
-Nineteen kernel implementations across 17 files for transformer forward-pass operations using BF16 data, plus INT4 GEMM for AutoRound quantization.
+Twenty-two kernel implementations across 20 files for transformer forward-pass operations using BF16 data, plus INT4 GEMM for AutoRound quantization.
 
 | File | Kernels | Description |
 |------|---------|-------------|
@@ -86,7 +86,10 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 | `softmax.cu` | `infers_softmax_bf16` | Online softmax for attention scores with optional causal masking, using three-phase parallel reduction (max, sum, normalize) in shared memory |
 | `kv_cache.cu` | `infers_kv_cache_write_bf16` | Scattered KV cache write using position IDs: writes K and V rows into cache at arbitrary positions via strided thread loops |
 | `gdn_update.cu` | `infers_gdn_update_bf16` | Gated DeltaNet decode kernel: recurrent state update for a single token via three-phase block reduction (beta, state update, output) with one block per state row |
-| `gdn_prefill.cu` | `infers_gdn_prefill_bf16` | Gated DeltaNet prefill kernel: processes all tokens in a sequence sequentially within each block, updating state and writing per-token output via shared memory reduction |
+| `gdn_recurrent_step.cu` | `infers_gdn_recurrent_step_bf16` | Gated DeltaNet single-token decode: L2-normalize q/k with 1/sqrt(K) scaling, softplus-clamped decay, sigmoid beta, state update with outer product — one thread per (head, v_dim) element, no shared memory |
+| `gdn_gated_delta_prefill.cu` | `infers_gdn_gated_delta_prefill_bf16` | Gated DeltaNet sequential prefill: per-token recurrence with L2 normalization, softplus decay, sigmoid beta — one thread per (head, v_dim) element, no shared memory, sequential token loop |
+| `gdn_chunked_gated_delta_prefill.cu` | `infers_gdn_chunked_gated_delta_prefill_bf16` | Gated DeltaNet chunked parallel prefill: replaces the per-token loop with intra-chunk WY representation via attn matrix + forward substitution, followed by inter-chunk state recurrence — one block per head, 256 threads, ~80KB shared memory for k_normed, k_beta, and attn buffers |
+| `gdn_gated_delta_update.cu` | `infers_gdn_gated_delta_update_bf16` | Gated Delta Rule single-token decode: L2-normalize q/k, softplus decay, sigmoid beta, state update — variant of recurrent_step with gated delta rule specific logic |
 | `gdn_mamba2_prefill.cu` | `infers_gdn_mamba2_prefill_bf16` | Mamba2 SSM prefill kernel: element-wise SSM recurrence with softplus delta, state update, SiLU gating — one thread per total_dim element (total_dim = num_heads × head_dim), per-head signals (x_proj, b_proj, A_log, dt_bias) broadcast across head_dim, sequential token loop, no shared memory |
 | `gdn_mamba2_update.cu` | `infers_gdn_mamba2_update_bf16` | Mamba2 SSM decode kernel: single-token state update with sigmoid decay, softplus delta, SiLU gating — one thread per total_dim element (total_dim = num_heads × head_dim), per-head signals broadcast across head_dim, no token loop, no shared memory |
 | `paged_kv_write.cu` | `infers_paged_kv_write_bf16` | Paged KV cache write using block-table address translation: writes K and V into interleaved per-page layout via strided thread loops, eliminating CPU round-trips during prefill |
@@ -98,7 +101,7 @@ Nineteen kernel implementations across 17 files for transformer forward-pass ope
 ### Build Script
 #PS:Compiles `.cu` in `kernels/infers/` to .cubin via nvcc `-O3`. Non-GDN kernels use `--use_fast_math`; GDN kernels are excluded from `--use_fast_math` due to precision requirements. Targets `sm_120` by default (`INFERS_CUDA_ARCH` override).
 
-**Precision policy**: `--use_fast_math` causes `expf()`/`logf()`/`rsqrtf()` to use reduced-precision approximations (~2 ULP vs ~1 ULP). In the GDN recurrence kernel (`gdn_gated_delta_prefill.cu`), these small per-step errors compound through the sequential state update, causing cosine similarity of only ~0.94 vs PyTorch reference after 15 tokens (token 0 matches perfectly at 1.0, worst at token 9 = 0.84). To prevent this, all 7 GDN kernel files (`gdn_*.cu`) are compiled **without** `--use_fast_math`, while the remaining kernels (softmax, silu, conv1d_depthwise, etc.) retain the flag for performance. The build script determines this by checking whether the file stem starts with `"gdn"` in `compile_kernel()`.
+**Precision policy**: `--use_fast_math` causes `expf()`/`logf()`/`rsqrtf()` to use reduced-precision approximations (~2 ULP vs ~1 ULP). In the GDN recurrence kernel (`gdn_gated_delta_prefill.cu`), these small per-step errors compound through the sequential state update, causing cosine similarity of only ~0.94 vs PyTorch reference after 15 tokens (token 0 matches perfectly at 1.0, worst at token 9 = 0.84). To prevent this, all GDN kernel files (`gdn_*.cu`) are compiled **without** `--use_fast_math`, while the remaining kernels (softmax, silu, conv1d_depthwise, etc.) retain the flag for performance. The build script determines this by checking whether the file stem starts with `"gdn"` in `compile_kernel()`.
 
 The `find_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` with matching names and loaded at runtime by the KernelRegistry.
 
@@ -121,11 +124,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
 - GpuAllocator block pool memory bookkeeper with allocate/free/reuse (5 unit tests)
-- KernelRegistry for .cubin loading (20 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_f32, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, gdn_mamba2_prefill, gdn_mamba2_update, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (23 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_f32, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_update, gdn_prefill, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with FP16/BF16/FP32 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` accept `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_recurrent_step.cu, gdn_gated_delta_prefill.cu, gdn_chunked_gated_delta_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 
 # Phase 3 Deliverables
@@ -151,7 +154,9 @@ Phase 4.5 (Attention, KV Cache, and GDN Kernels) adds custom CUDA kernels for at
 - `softmax.cu` + `.cubin`: Online softmax with causal masking (3-phase reduction)
 - `kv_cache.cu` + `.cubin`: Scattered KV cache write with position-based indexing
 - `gdn_update.cu` + `.cubin`: Single-token decode recurrent state update
-- `gdn_prefill.cu` + `.cubin`: Chunked prefill state update across all tokens
+- `gdn_prefill.cu` + `.cubin`: Sequential per-token prefill state update
+- `gdn_gated_delta_prefill.cu` + `.cubin`: Gated Delta Rule sequential prefill with L2 normalization
+- `gdn_chunked_gated_delta_prefill.cu` + `.cubin`: Chunked parallel prefill with WY representation, forward substitution, and inter-chunk state recurrence
 - `gdn_mamba2_prefill.cu` + `.cubin`: Mamba2 SSM prefill with element-wise state recurrence, softplus delta, SiLU gating
 - `gdn_mamba2_update.cu` + `.cubin`: Mamba2 SSM decode with single-token state update, sigmoid decay, softplus delta, SiLU gating
 - `attention.rs` wired: per-head weight slicing, QKV/RoPE/KV cache/scores/softmax/O-proj/all-reduce (prefill + decode)
@@ -773,7 +778,43 @@ Per-intermediate comparison results between TP=2 GPU 0 and HF reference.
 | norm_output | [15, total_dim] | >0.98 | — | ✅ Match |
 | output | [15, hidden_size] | N/A | — | ⚠ ROW-PAR partial sum (before all-reduce) |
 
-### GDN Decode Forward Pass
+
+### GDN Numerical Comparison: Chunked vs Sequential
+
+The engine uses a per-token sequential GDN algorithm, while HuggingFace uses a chunked parallel variant. Both are mathematically equivalent but differ numerically due to different FP32 operation order.
+
+The comparison script at [[tests/compare/chunked_vs_sequential.py]] loads HF oracle intermediates from `/tmp/ref_gdn_new/` and model weights for layer 0, runs both algorithms with identical inputs, and reports per-token metrics.
+
+**Key findings:**
+
+- **Sequential GDN** drifts significantly: mean cosine similarity = 0.9956 vs HF reference, norm ratio reaches 2.6x at token 14, L2 error grows to 1.21. Drift compounds monotonically across the sequence.
+- **Chunked GDN** stays extremely close: mean cosine similarity = 0.9972 vs HF reference, norm ratio within 0.17% of 1.0, max L2 error under 0.0021.
+- The chunked algorithm reduces magnitude drift by ~500x compared to sequential, strongly justifying a future CUDA kernel rewrite using the chunked parallel approach.
+
+The chunked parallel kernel (`gdn_chunked_gated_delta_prefill.cu`) has been implemented to replace the per-token loop. It matches the HF reference with cosine similarity > 0.997 while the sequential version drifts to ~0.996.
+
+### Chunked Parallel GDN Kernel Design
+
+The chunked kernel replaces the per-token sequential loop with a two-stage approach: intra-chunk WY representation plus forward substitution, then inter-chunk state recurrence. One block per head processes chunks sequentially.
+
+**Phase 1 — Preprocessing**: Compute `g = -exp(A_log) * softplus(a_proj + dt_bias)` and `beta = sigmoid(b_proj)` per position. L2-normalize key vectors, compute `k_beta = k_normed * beta`. Compute cumulative sum of g over chunk positions for decay masking.
+
+**Phase 2 — Intra-chunk GEMM**: Compute `attn = -(k_beta @ k_normed^T) * exp(g_cumsum[i] - g_cumsum[j])` for lower triangular (i >= j). This is the WY representation of intra-chunk attention. All threads cooperate to fill the [C,C] matrix, each computing multiple elements.
+
+**Phase 3 — Forward substitution**: Sequential update over rows i=1..C-1: `attn[i][j] = row[j] + sum_m(row[m] * attn[m][j])` for m < j. Then add identity: `attn[i][i] += 1`. This solves the linear system `(I + A_lower) @ x = b` that arises from the gated recurrence.
+
+**Phase 4 — Output computation**: For each (row, col_v), compute `attn_inter = q_scaled @ S` where `q_scaled = query * exp(g_cumsum[row])`. Compute `v_nc[j][col_v]` on-the-fly: `v_new - v_prime` where `v_new = attn @ (value * beta)` and `v_prime = k_cumdecay @ S` with `k_cumdecay = attn @ (k_beta * exp(g_cumsum))`. Combine with `attn_qk @ v_nc` for strictly upper-triangular q-k attention. Write result to global memory as bf16.
+
+**Phase 5 — State update**: Decay state by `exp(g_cumsum[-1])`, then add `sum_j(exp_diff[j] * k_normed[j]^T ⊗ v_nc[j])` where `exp_diff[j] = exp(g_cumsum[-1] - g_cumsum[j])`.
+
+**Shared memory layout** (~80KB for C=64, K=128):
+- `k_normed[C][K]` fp32: 32KB — L2-normalized key vectors reused across phases
+- `k_beta[C][K]` fp32: 32KB — weighted keys (k_normed * beta)
+- `attn_sm[C][C]` fp32: 16KB — attention matrix with forward substitution
+
+**Padding**: Last chunk may have fewer than C valid tokens. Padded rows are zeroed in k_normed and k_beta, g_cumsum is clamped to the last valid position, and identity addition skips padded diagonal entries. This ensures padded positions contribute nothing to attention or state updates.
+
+**Precision**: Compiled without `--use_fast_math` (same as all GDN kernels). All arithmetic uses fp32 for computation; bf16 only for input/output conversions via `bf16_to_float()` / `float_to_bf16()` helpers from `common.cuh`.
 
 Gated DeltaNet decode: Mamba2 SSM recurrent single-token state update with sigmoid decay, softplus delta, and SiLU gating using `infers_gdn_mamba2_update_bf16` kernel. All projections use INT4-aware `gemm_projection` dispatch.
 

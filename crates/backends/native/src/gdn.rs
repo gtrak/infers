@@ -379,8 +379,10 @@ fn repeat_interleave_heads(
     let chunk_size: i32 = 64;
 
     // Launch chunked parallel kernel: one block per head, 256 threads per block
-    // Shared memory: 3 arrays of size [C, K] in fp32 = 3 * 64 * 128 * 4 = 96KB
-    let smem_size = (3 * chunk_size as usize * head_k_dim * std::mem::size_of::<f32>()) as u32;
+    // Shared memory: k_normed[C][K] + k_beta[C][K] + attn[C][C] + g_cs[C] + beta_arr[C] + row_buf[C]
+    let smem_size = ((2 * chunk_size as usize * head_k_dim
+        + chunk_size as usize * chunk_size as usize
+        + 3 * chunk_size as usize) * std::mem::size_of::<f32>()) as u32;
 
     unsafe {
         stream.launch_builder(gdn_chunked_prefill_kernel)

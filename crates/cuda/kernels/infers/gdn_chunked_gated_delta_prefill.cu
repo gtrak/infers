@@ -43,6 +43,8 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
     float decay_rate = expf(A_log[h]);   // A = exp(A_log[h])
 
     // ── Shared memory layout ────────────────────────────────────────────────
+    // Dynamic: k_normed[C][K], k_beta[C][K], attn[C][C]
+    // Plus: g_cs[C], beta_arr[C], row_buf[C] (Phase 3 temp)
     extern __shared__ char smem[];
 
     // k_normed[C][K]  — L2-normalized key vectors (fp32), used in GEMM and Phase 5
@@ -51,10 +53,12 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
     float* k_beta_sm  = (float*)(void*)(smem + C * K * sizeof(float));
     // attn[C][C]      — attention matrix with forward substitution (fp32)
     float* attn_sm    = (float*)(void*)(smem + 2 * C * K * sizeof(float));
-
-    // Smaller shared arrays for per-position metadata
-    __shared__ float g_cs_shared[C];   // cumulative sum of g over chunk positions
-    __shared__ float beta_shared[C];   // beta per position
+    // g_cs[C]         — cumulative sum of g over chunk positions (fp32)
+    float* g_cs       = (float*)(void*)(smem + 2 * C * K * sizeof(float) + C * C * sizeof(float));
+    // beta_arr[C]     — beta per position (fp32)
+    float* beta_arr   = (float*)(void*)(smem + 2 * C * K * sizeof(float) + C * C * sizeof(float) + C * sizeof(float));
+    // row_buf[C]      — Phase 3 temporary (fp32)
+    float* row_buf    = (float*)(void*)(smem + 2 * C * K * sizeof(float) + C * C * sizeof(float) + 2 * C * sizeof(float));
 
     int state_base = h * K * V;        // base index into state[h][k][v]
 
@@ -90,8 +94,8 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 float b_val   = bf16_to_float(b_proj[(int)(seq_pos * num_heads) + h]);
                 float beta_v  = 1.0f / (1.0f + expf(-b_val));
 
-                g_cs_shared[i]   = g_val;
-                beta_shared[i]  = beta_v;
+                g_cs[i]   = g_val;
+                beta_arr[i]  = beta_v;
             }
         }
         __syncthreads();
@@ -101,8 +105,8 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
             int tid = threadIdx.x;
             for (int i = tid; i < C; i += blockDim.x) {
                 if (i >= actual_len) {
-                    g_cs_shared[i]  = 0.0f;
-                    beta_shared[i] = 0.0f;
+                    g_cs[i]  = 0.0f;
+                    beta_arr[i] = 0.0f;
                 }
             }
         }
@@ -112,8 +116,8 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
         if (threadIdx.x == 0) {
             float running = 0.0f;
             for (int i = 0; i < C; i++) {
-                running      += g_cs_shared[i];
-                g_cs_shared[i] = running;
+                running      += g_cs[i];
+                g_cs[i] = running;
             }
         }
         __syncthreads();
@@ -158,7 +162,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 int col   = idx % K;
 
                 float kv  = k_normed[row * K + col];
-                float btv = (row < actual_len) ? beta_shared[row] : 0.0f;
+                float btv = (row < actual_len) ? beta_arr[row] : 0.0f;
                 k_beta_sm[row * K + col] = kv * btv;
             }
         }
@@ -189,7 +193,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 // Apply decay mask: exp(g_cs[row] - g_cs[col]) for row >= col, else 0
                 float attn_val = 0.0f;
                 if (row >= col) {
-                    float g_diff = g_cs_shared[row] - g_cs_shared[col];
+                    float g_diff = g_cs[row] - g_cs[col];
                     attn_val     = -sum * expf(g_diff);
                 }
 
@@ -205,7 +209,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
 
         {
             if (threadIdx.x == 0) {
-                __shared__ float row_buf[C];
+                // row_buf is in shared memory (see layout above)
 
                 // Forward substitution: for each row i, update attn[i][j] using
                 // original row values and the submatrix of previous rows.
@@ -266,7 +270,8 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 int q_base      = (int)(seq_row * num_heads * K) + h * K;
 
                 // ── Load and L2-normalize query for this row ────────────────
-                float q_reg[K];  // register array for K=128 — OK in CUDA
+                // q_reg is a per-thread register array (K typically 128)
+                float q_reg[128];
                 float q_l2_sq    = 0.0f;
 
                 for (int d = 0; d < K; d++) {
@@ -276,7 +281,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 }
 
                 float q_rcp     = rsqrtf(q_l2_sq + 1e-6f) * rcp_sqrt_k;
-                float exp_g_row = expf(g_cs_shared[row]);
+                float exp_g_row = expf(g_cs[row]);
 
                 // ── attn_inter[row][col_v] = (q_normed * exp(g_cs) @ S)[row][col_v] ──
                 float attn_inter_val = 0.0f;
@@ -298,7 +303,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                         qk_dot_j += q_reg[d] * q_rcp * k_normed[j * K + d];
                     }
 
-                    float g_diff      = g_cs_shared[row] - g_cs_shared[j];
+                    float g_diff      = g_cs[row] - g_cs[j];
                     float attn_qk_val = qk_dot_j * expf(g_diff);
 
                     // ── v_nc[j][col_v]: corrected value for row j ───────────
@@ -307,7 +312,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                     for (int ii = 0; ii < actual_len; ii++) {
                         float seq_pos   = chunk_start + ii;
                         int v_idx       = (int)(seq_pos * num_heads * V) + h * V + col_v;
-                        float v_val     = bf16_to_float(value[v_idx]) * beta_shared[ii];
+                        float v_val     = bf16_to_float(value[v_idx]) * beta_arr[ii];
                         v_new_j        += attn_sm[j * C + ii] * v_val;
                     }
 
@@ -318,7 +323,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                         for (int ii = 0; ii < actual_len; ii++) {
                             k_cd_j += attn_sm[j * C + ii]
                                      * k_beta_sm[ii * K + d]
-                                     * expf(g_cs_shared[ii]);
+                                     * expf(g_cs[ii]);
                         }
                         v_prime_j += k_cd_j * state[state_base + d * V + col_v];
                     }
@@ -352,21 +357,21 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                 int d     = flat_s / V;
                 int col_v = flat_s % V;
 
-                float exp_g_last = expf(g_cs_shared[actual_len - 1]);
+                float exp_g_last = expf(g_cs[actual_len - 1]);
 
                 // S[d][col_v] *= exp(g_cs[-1])
                 float s_val = state[state_base + d * V + col_v] * exp_g_last;
 
                 // Add: sum_j exp_diff[j] * k_normed[j][d] * v_nc[j][col_v]
                 for (int j = 0; j < actual_len; j++) {
-                    float exp_diff_j = expf(g_cs_shared[actual_len - 1] - g_cs_shared[j]);
+                    float exp_diff_j = expf(g_cs[actual_len - 1] - g_cs[j]);
 
                     // v_new[j][col_v] = attn @ (v * beta)
                     float v_new_j = 0.0f;
                     for (int ii = 0; ii < actual_len; ii++) {
                         float seq_pos   = chunk_start + ii;
                         int v_idx       = (int)(seq_pos * num_heads * V) + h * V + col_v;
-                        float v_val     = bf16_to_float(value[v_idx]) * beta_shared[ii];
+                        float v_val     = bf16_to_float(value[v_idx]) * beta_arr[ii];
                         v_new_j        += attn_sm[j * C + ii] * v_val;
                     }
 
@@ -377,7 +382,7 @@ __global__ void infers_gdn_chunked_gated_delta_prefill_bf16(
                         for (int ii = 0; ii < actual_len; ii++) {
                             k_cd_j += attn_sm[j * C + ii]
                                      * k_beta_sm[ii * K + dd]
-                                     * expf(g_cs_shared[ii]);
+                                     * expf(g_cs[ii]);
                         }
                         v_prime_j += k_cd_j * state[state_base + dd * V + col_v];
                     }
