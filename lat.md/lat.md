@@ -782,6 +782,18 @@ Tensor-parallel all-reduce is handled by the paged decode path in `engine.rs`.
 
 See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
+### GDN TP=2 Comparison Investigation
+
+Investigation of mixed_qkv segmentation and o_proj/after_ar magnitude issues in the HF oracle comparison.
+
+**mixed_qkv segmentation verified from source code:** The Rust code in [[crates/model/src/sharding.rs#shard_fused_projection_columns]] and [[crates/backends/native/src/gdn.rs#forward]] confirms the fused segment sharding: each GPU computes [Q_gpu, K_gpu, V_gpu] with per-GPU dimensions Q_dim=key_dim=1024, K_dim=key_dim=1024, V_dim=value_dim=3072. Total conv_dim = 5120 per GPU, 10240 total across TP=2. Correct reconstruction requires segmenting each GPU's output and concatenating corresponding segments: Q_full = cat(Q_gpu0, Q_gpu1), K_full = cat(K_gpu0, K_gpu1), V_full = cat(V_gpu0, V_gpu1). Naive torch.cat([GPU0, GPU1]) produces wrong order [Q0,K0,V0,Q1,K1,V1].
+
+**Correct mixed_qkv comparison results:** Reconstructed QKV vs HF mixed_qkv cos=0.658 (naive cat gives only 0.239). Individual components: Q cos=0.694, K cos=0.684, V cos=0.648. These scores are lower than expected (~1.0) due to bf16 vs fp32 precision differences and potential architectural differences in how HF computes query/key/value (HF's separate query tensor has completely different magnitude distribution from the Q segment of mixed_qkv).
+
+**key_gpu0 does NOT come from mixed_qkv:** Investigation showed that no 1024-dimensional segment of mixed_qkv matches key_gpu0 (cos < 0.3 for all positions). This is because key comes from conv_out after the depthwise conv1d + SiLU activation (Phase 3 in gdn.rs), not directly from mixed_qkv segments.
+
+**o_proj and after_ar magnitude investigation:** Engine o_proj GPU0 vs GPU1 cos=0.013 (DIFFERENT — pre-all-reduce partial outputs). After all-reduce, GPUs are identical: after_ar GPU0 vs GPU1 cos=1.000. However, comparing engine output against HF oracle gives very low cosine scores regardless of strategy (GPU0 only: 0.109, sum: 0.109). The root cause is a magnitude distribution mismatch: HF o_proj has sparse values (mean_abs=0.022) with occasional large outliers (max=24.0), while engine produces dense moderate values (mean_abs=1.3 for GPU0, max=2.97 per GPU). This pattern suggests the HF oracle may have been computed with different weights, a different normalization step, or the fp32 outlier elements that are truncated in bf16 create distribution skew.
+
 ### Sampling
 `SamplingStrategy` enum and `SamplingConfig` for token selection. `greedy_sample_bf16()` dispatches `infers_argmax_bf16` directly on BF16 logits (no CPU round-trip). See [[crates/backends/native/src/sample.rs#SamplingStrategy]], [[crates/backends/native/src/sample.rs#greedy_sample_bf16]].
 

@@ -74,8 +74,8 @@ __global__ void infers_rms_norm_gated_bf16(
         float g = __bfloat162float(gate[row * D + j]);
         float w = __bfloat162float(weight[j]);
         float x_norm = x * rsqrt_var;
-        // Qwen3_5RMSNormGated: weight is zero-initialized with additive offset (1 + weight)
-        float w_scale = 1.0f + w;
+        // Qwen3_5RMSNormGated: weight is one-initialized, used directly (no additive offset)
+        float w_scale = w;
         float gated = w_scale * x_norm * (g / (1.0f + expf(-g)));  // SiLU(gate) = gate * sigmoid(gate)
         output[row * D + j] = __float2bfloat16(gated);
     }
