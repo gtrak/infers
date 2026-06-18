@@ -892,6 +892,7 @@ pub fn forward_paged(
     let mut q_dummy = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_full, &[seq_len, kv_dim], "prefill");
     rope::apply_rope(
         stream,
         rope_kernel,
@@ -903,12 +904,17 @@ pub fn forward_paged(
         rope_theta,
         partial_rotary_factor,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &k_full, &[seq_len, kv_dim], "prefill");
 
     // =========================================================================
     // Phase 2: Paged KV write
     // =========================================================================
 
     let page_pool = paged_cache.ensure_allocated(stream)?;
+
+    // Probe: K and V data right before writing to paged KV cache (after norm+RoPE)
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", &k_full, &[seq_len, kv_dim], "prefill");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &v_full, &[seq_len, kv_dim], "prefill");
 
     paged_kv_write(
         stream,
@@ -1330,6 +1336,7 @@ pub fn decode_forward_paged(
     let mut q_dummy = stream
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_single, &[1, kv_dim], "decode");
     rope::apply_rope(
         stream,
         rope_kernel,
@@ -1341,12 +1348,17 @@ pub fn decode_forward_paged(
         rope_theta,
         partial_rotary_factor,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &k_single, &[1, kv_dim], "decode");
 
     // =========================================================================
     // Phase 2: Paged KV write — write new token to page pool
     // =========================================================================
 
     let page_pool = paged_cache.ensure_allocated(stream)?;
+
+    // Probe: K and V data right before writing to paged KV cache (after norm+RoPE)
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", &k_single, &[1, kv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &v_single, &[1, kv_dim], "decode");
 
     paged_kv_write(
         stream,
