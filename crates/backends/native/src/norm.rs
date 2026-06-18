@@ -1,9 +1,8 @@
 //! RMSNorm kernel dispatch.
 //!
-//! Applies Root Mean Square Layer Normalization: `output = x * rsqrt(mean(x²) + eps) * weight`
-//! using the `infers_rmsnorm_bf16` CUDA kernel. Qwen3_5RMSNorm stores weight as a multiplicative
-//! scale factor (initialized to values around ±0.02 for norm1 and ±0.21 for norm2).
-//! This differs from Gemma-style RMSNorm which uses `(1 + weight)` with zero-initialized weights.
+//! Applies Root Mean Square Layer Normalization: `output = x * rsqrt(mean(x²) + eps) * (1 + weight)`
+//! using the `infers_rmsnorm_bf16` CUDA kernel. Qwen3_5RMSNorm uses zero-initialized weights
+//! with the additive offset formula `(1 + weight)`, same as Gemma-style RMSNorm.
 
 use std::sync::Arc;
 
