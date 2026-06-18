@@ -16,7 +16,8 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::PagedKvManager;
-use infers_model::{load_model, ModelConfig, WeightRegistry};
+use infers_model::sharding::shard_weights_tp;
+use infers_model::{load_model, load_safetensors, strip_language_model_prefix, build_main_layers, ModelConfig, WeightRegistry};
 use infers_scheduler::RoundRobinScheduler;
 use infers_tokenizer::Tokenizer;
 
@@ -135,15 +136,21 @@ async fn run() -> Result<()> {
     tracing::info!("Num pages: {}", args.num_pages);
     tracing::info!("Page size: {}", args.page_size);
 
-    // Step 1: Initialize CUDA runtime
+    // Step 1: Initialize CUDA runtime with tensor parallelism support
+    let num_gpus = args.tensor_parallel_size;
     let cuda_runtime = CudaRuntime::new()
         .context("Failed to initialize CUDA runtime")?;
-    let ctx = cuda_runtime.device(0)
-        .context("Failed to get CUDA device 0")?
-        .clone();
+    let mut contexts = Vec::new();
+    for i in 0..num_gpus {
+        contexts.push(
+            cuda_runtime.device(i)
+                .with_context(|| format!("Failed to get CUDA device {i}"))?
+                .clone()
+        );
+    }
 
     // Step 2: Create CUDA stream pool and get a stream for the orchestrator
-    let streams = StreamPool::new(&[ctx.clone()])
+    let streams = StreamPool::new(&contexts)
         .context("Failed to create CUDA stream pool")?;
     let stream = streams.get(0)
         .context("Failed to get CUDA stream")?
@@ -151,7 +158,26 @@ async fn run() -> Result<()> {
 
     // Step 3: Load model config and weights
     let model_path = Path::new(&args.model);
-    let (model_config, weight_registry) = if model_path.exists() {
+    let (model_config, weight_registries) = if model_path.exists() && num_gpus > 1 {
+        // TP path: load raw safetensors, shard, build per-GPU layers
+        tracing::info!("Loading model from {} with TP={}", args.model, num_gpus);
+        let config = infers_model::config::ModelConfig::load(model_path)
+            .with_context(|| format!("Failed to load model config from {}", args.model))?;
+        let mut raw_weights = load_safetensors(model_path)
+            .with_context(|| format!("Failed to load safetensors from {}", args.model))?;
+        strip_language_model_prefix(&mut raw_weights);
+        let shards = shard_weights_tp(&raw_weights, &config, num_gpus)
+            .with_context(|| format!("Failed to shard weights for TP={num_gpus}"))?;
+        let mut registries = Vec::new();
+        for shard in shards {
+            let mut registry = shard.registry;
+            build_main_layers(&mut registry, &config)
+                .with_context(|| format!("Failed to build layers for GPU {}", shard.gpu_id))?;
+            registries.push(registry);
+        }
+        (Arc::new(config), registries)
+    } else if model_path.exists() {
+        // TP=1 path: use load_model as before
         tracing::info!("Loading model from {}", args.model);
         let loaded = load_model(model_path)
             .with_context(|| format!("Failed to load model from {}", args.model))?;
@@ -201,8 +227,8 @@ async fn run() -> Result<()> {
     // Step 5: Create ForwardEngine
     let engine = ForwardEngine::new(
         model_config.clone(),
-        weight_registry,
-        vec![ctx.clone()],
+        weight_registries,
+        contexts,
         kernel_registry,
         streams,
         128, // group_size (default AutoRound)
