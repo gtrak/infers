@@ -856,6 +856,36 @@ Investigation of mixed_qkv segmentation and o_proj/after_ar magnitude issues in 
 Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 
+## Chunked Parallel GDN Kernel
+
+The chunked parallel GDN kernel replaces the per-token sequential loop with intra-chunk WY representation via attention matrix and forward substitution, then inter-chunk state recurrence. One block per head processes chunks sequentially.
+
+Kernel file: `crates/cuda/kernels/infers/gdn_chunked_gated_delta_prefill.cu`. The kernel is compiled without `--use_fast_math` like all GDN kernels, preventing precision loss from reduced-precision exp/log/rsqrt approximations compounding through the sequential state update.
+
+The algorithm operates in five phases per chunk (see [[lat#Module Structure#Chunked Parallel GDN Kernel Design]] for phase details). Key design decisions:
+
+- **Shared memory via extern __shared__**: All large shared memory buffers (k_normed, k_beta, attn) use `extern __shared__ char smem[]` with pointer casting, since C, K, V are runtime kernel arguments and static arrays require compile-time constants.
+- **Dynamic shared memory limit**: The kernel declares `__attribute__((maxdynamicsharedmemsize(100000)))` requiring ~100KB per block (k_normed 32KB + k_beta 32KB + attn 16KB + metadata ~768B). Configured at dispatch via cudarc's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 100000`.
+- **Fixed-size q_reg**: Uses `float q_reg[128]` instead of VLA `float q_reg[K]` since K is a runtime parameter and VLAs are not allowed in CUDA C++.
+
+**Bugs found and fixed during development**:
+
+a. **Forward substitution inner loop limit**: Loop used `m < j` but should have been `m < i` — row i depends on all previous rows 0..i-1, not just columns before j.
+b. **Phase 4 output computation range**: Loop range was `j > row` (upper triangle) instead of `j <= row` (lower triangle) — attn_qk contributions only exist for j <= row where q-k attention is valid.
+c. **Missing 1/sqrt(K) scaling in query normalization**: L2 normalization lacked the `rsqrtf((float)K)` factor applied by HF, causing magnitude drift across tokens.
+d. **Diagonal masking error**: Phase 2 used `row >= col` (including diagonal) instead of `row > col` (strictly lower triangular). Identity is added separately in Phase 3.
+e. **Static shared memory arrays**: C, K, V are runtime arguments but static arrays require compile-time constants — all moved to `extern __shared__ char smem[]`.
+f. **VLA violation**: `float q_reg[K]` with variable K replaced by fixed-size `float q_reg[128]`.
+
+**Numerical results**:
+
+- GPU0: cos=0.992, ratio=0.997 (sequential was cos=0.999, ratio 0.95-0.97)
+- GPU1: cos=0.935, ratio=0.783
+- Per-token ratios consistently 0.95-1.05, closer to 1.0 than sequential version
+- The chunked algorithm's ratio proximity to 1.0 should reduce per-layer magnitude drift compared to the sequential version that compoundingly grows error over tokens
+
+**Performance consideration**: Phases 4-5 recompute v_new and k_cumdecay from scratch for each output element (O(C^3 K^2 V^2) complexity). Materializing intermediate tensors would eliminate redundant computation but increases shared memory pressure. The current implementation trades memory efficiency for code simplicity.
+
 # API Types
 OpenAI-compatible request, response, streaming, and error types for the inference API.
 

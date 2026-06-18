@@ -43,6 +43,48 @@ core_attn_out per-token ratio stays bounded (0.94-1.00) and does NOT grow monoto
 
 mixed_qkv per-segment ratios: Q≈0.98, K≈1.00, V≈0.98. No systematic over/under-estimation.
 
+
+## Chunked Parallel GDN Implementation
+
+Kernel file: `crates/cuda/kernels/infers/gdn_chunked_gated_delta_prefill.cu`
+
+Replaces the per-token sequential loop with a two-stage approach: intra-chunk WY representation via attn matrix + forward substitution, then inter-chunk state recurrence. One block per head (256 threads) processes chunks sequentially.
+
+**Algorithm Phases**:
+
+1. **Phase 1 — Preprocessing**: Compute g = -exp(A_log) * softplus(a_proj + dt_bias), beta = sigmoid(b_proj). L2-normalize key vectors, compute k_beta = k_normed * beta. Cumulative sum of g over chunk positions.
+2. **Phase 2 — Intra-chunk GEMM**: attn = -(k_beta @ k_normed^T) * exp(g_cumsum[i] - g_cumsum[j]) for strictly lower triangular (row > col).
+3. **Phase 3 — Forward substitution**: Sequential update over rows, then add identity.
+4. **Phase 4 — Output computation**: Compute attn_inter = q_scaled @ S, v_nc = v_new - v_prime, combine with attn_qk @ v_nc for lower-triangular q-k attention.
+5. **Phase 5 — State update**: Decay state by exp(g_cumsum[-1]), add correction from k_normed^T \otimes v_nc weighted by exp_diff.
+
+**Shared memory layout** (~80KB for C=64, K=128):
+- `k_normed[C][K]` fp32: 32KB — L2-normalized key vectors
+- `k_beta[C][K]` fp32: 32KB — weighted keys (k_normed * beta)
+- `attn_sm[C][C]` fp32: 16KB — attention matrix with forward substitution
+- g_cs, beta_arr, row_buf: ~768B — metadata and temporaries
+
+Total dynamic shared memory requirement: ~100KB (set via `__attribute__((maxdynamicsharedmemsize(100000)))`). Configured at dispatch via cudarc's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 100000`.
+
+**Bugs found and fixed during development**:
+
+a. **Forward substitution inner loop**: limit was j, fixed to i — the inner loop iterated `m < j` but should have been `m < i` since row i depends on all previous rows 0..i-1.
+b. **Phase 4 output computation**: loop range was `j > row` (upper triangle), fixed to `j <= row` (lower triangle) — the attn_qk contribution only exists for j <= row where q-k attention is valid.
+c. **Missing 1/sqrt(K) scaling in query normalization**: L2 normalization of queries lacked the `rsqrtf((float)K)` factor that HF applies, causing magnitude drift.
+d. **Diagonal masking**: `row >= col` included diagonal, fixed to `row > col` — Phase 2 attn matrix should be strictly lower triangular; identity is added in Phase 3.
+e. **Static shared memory arrays with non-constant sizes**: C, K, V are runtime kernel arguments but static arrays require compile-time constants. Moved all large shared memory arrays to `extern __shared__ char smem[]` with pointer casting.
+f. **VLA q_reg[K]**: `float q_reg[K]` where K is a variable violates the C++ standard (VLA not allowed in CUDA). Changed to fixed-size `float q_reg[128]` since K=128 at runtime.
+
+**Results**:
+
+- GPU0: cos=0.992, ratio=0.997 (sequential was cos=0.999, ratio=0.95-0.97)
+- GPU1: cos=0.935, ratio=0.783
+- Per-token ratios 0.95-1.05, closer to 1.0 than sequential
+- The chunked algorithm's ratio being closer to 1.0 should reduce per-layer magnitude drift compared to the sequential version, which compoundingly grows error over tokens.
+
+**Performance note**: Phases 4-5 recompute v_new and k_cumdecay from scratch per output element (O(C^3 K^2 V^2) complexity). Optimize later with materialization of intermediate tensors. The current implementation trades memory for computational simplicity — no shared memory is needed beyond the Phase 1-3 buffers, but Phases 4-5 redundantly recompute GEMMs that could be cached.
+
+**Compilation**: Like all GDN kernels, compiled without `--use_fast_math` to prevent precision loss from reduced-precision exp/log/rsqrt approximations compounding through the sequential state update.
 ## Tooling
 
 ### Generate oracle dumps (HF ground truth)
