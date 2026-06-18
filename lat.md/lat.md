@@ -540,6 +540,12 @@ The `decode_forward_paged` function in [[crates/backends/native/src/attention.rs
 
 The `gdn::forward()` function in [[crates/backends/native/src/gdn.rs#forward]] has been wired with probe::dump() for all GDN intermediates, replacing the old ad-hoc `dump_gdn_intermediate()` and `INFERS_DUMP_GDN_LAYER`/`INFERS_DUMP_GDN_DIR` code paths. GDN stages include: `gdn.hidden_input`, `gdn.mixed_qkv`, `gdn.conv_out`, `gdn.query`, `gdn.key`, `gdn.value`, `gdn.query_expanded`, `gdn.key_expanded`, `gdn.a_proj`, `gdn.b_proj`, `gdn.core_attn_out`, `gdn.z_gate`, `gdn.norm_output`, and `gdn.output`. Weight tensors (conv1d_weight, norm_weight) are excluded from probing as they are not intermediates. The `gdn::decode_forward()` function accepts the same `gpu_idx` and `ProbeConfig` parameters for future consistency.
 
+YH:### Standalone Infer Binary
+RS:
+XN:The `infer` binary at [[crates/backends/native/src/bin/infer.rs]] is a one-shot inference tool that loads a model, runs prefill + decode, and prints generated text. It follows the same pattern as the smoke test: load config, shard weights via TP, initialize CUDA contexts, create ForwardEngine, initialize paged KV cache, tokenize, prefill, then decode with greedy sampling.
+TX:
+BY:CLI arguments are parsed via clap: `--model` (required), `--tp` (default 2), `--prompt` (required), `--max-tokens` (default 64), `--dump-dir` (enables probe dumps), `--dump-layers` (layer filter for dumps), `--group-size` (quantization group size, default 128), and `--max-seq-len` (override sequence length). When `--dump-dir` is set, the binary sets `INFERS_DUMP_DIR` and optionally `INFERS_DUMP_LAYERS` before engine creation so that probe instrumentation captures intermediates during both prefill and decode phases.
+TR:
 ### PyTorch Reference Intermediates
 
 Computes per-suboperation reference intermediates on CPU using manual INT4 dequantization from safetensors, then compares against engine dumps via cosine similarity. Avoids loading the full model on GPU.
