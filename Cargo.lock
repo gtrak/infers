@@ -1043,6 +1043,7 @@ dependencies = [
  "infers-kv",
  "infers-model",
  "infers-mtp",
+ "infers-scheduler",
  "infers-tokenizer",
  "minijinja",
  "serde",

@@ -51,6 +51,7 @@ pub async fn chat_completions(
         strategy: SamplingStrategy::Greedy,
         max_tokens,
         stop_sequences: Vec::new(),
+        ..Default::default()
     };
 
     if req.stream {

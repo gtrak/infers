@@ -28,6 +28,18 @@ pub struct SamplingConfig {
     pub max_tokens: usize,
     /// Sequences that, if generated, stop further generation.
     pub stop_sequences: Vec<String>,
+    /// Repetition penalty (1.0 = disabled). Positive logits multiplied, negative divided.
+    pub repetition_penalty: f32,
+    /// Presence penalty subtracted from logits for generated tokens in history.
+    pub presence_penalty: f32,
+    /// Frequency penalty per occurrence of generated tokens in history.
+    pub frequency_penalty: f32,
+    /// EOS token ID that stops generation.
+    pub eos_token_id: Option<u32>,
+    /// Token IDs that stop generation (pre-tokenized stop sequences).
+    pub stop_token_ids: Vec<u32>,
+    /// Random seed for reproducible sampling (None = random).
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingConfig {
@@ -36,6 +48,12 @@ impl Default for SamplingConfig {
             strategy: SamplingStrategy::Greedy,
             max_tokens: 512,
             stop_sequences: Vec::new(),
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            eos_token_id: None,
+            stop_token_ids: Vec::new(),
+            seed: None,
         }
     }
 }
@@ -226,6 +244,12 @@ mod tests {
         assert!(matches!(config.strategy, SamplingStrategy::Greedy));
         assert_eq!(config.max_tokens, 512);
         assert!(config.stop_sequences.is_empty());
+        assert!((config.repetition_penalty - 1.0).abs() < 1e-6);
+        assert!((config.presence_penalty - 0.0).abs() < 1e-6);
+        assert!((config.frequency_penalty - 0.0).abs() < 1e-6);
+        assert!(config.eos_token_id.is_none());
+        assert!(config.stop_token_ids.is_empty());
+        assert!(config.seed.is_none());
     }
 
     #[test]

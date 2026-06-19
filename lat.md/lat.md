@@ -850,7 +850,9 @@ Investigation of mixed_qkv segmentation and o_proj/after_ar magnitude issues in 
 **After fix (expected):** norm_output ratio → 1.0, o_proj ratio → 1.0, after_ar ratio → 1.0. Full pipeline should match HF within bf16 precision.
 
 ### Sampling
-`SamplingStrategy` enum and `SamplingConfig` for token selection. `greedy_sample_bf16()` dispatches `infers_argmax_bf16` directly on BF16 logits (no CPU round-trip). See [[crates/backends/native/src/sample.rs#SamplingStrategy]], [[crates/backends/native/src/sample.rs#greedy_sample_bf16]].
+Unified sampling types in scheduler crate; CPU sampling implementation with Xoshiro256++ RNG, penalties, top-K/P, and GPU fast path for greedy. See [[crates/scheduler/src/queue.rs#SamplingStrategy]], [[crates/backends/native/src/sample.rs#Xoshiro256PlusPlus]], [[crates/backends/native/src/sample.rs#apply_penalties]], [[crates/backends/native/src/sample.rs#sample_with_config]].
+
+`SamplingConfig` now includes `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `eos_token_id`, `stop_token_ids`, and `seed` fields. The `sample_with_config()` dispatch takes a fast GPU-only path for pure greedy with no penalties, or downloads logits to CPU for all other strategies via the full pipeline: download → BF16→F32 → penalties → temperature → top_K filter → softmax → weighted sample.
 
 ### Kernel Dispatch
 Kernel dispatch functions launch pre-compiled .cubin kernels using cudarc's `LaunchArgs` API. Each function allocates output buffers, builds a `LaunchConfig`, and passes kernel arguments via the `PushKernelArg` trait. See [[crates/backends/native/src/norm.rs#rms_norm]], [[crates/backends/native/src/embedding.rs#embed_tokens]], [[crates/backends/native/src/sample.rs#greedy_sample]], [[crates/backends/native/src/mlp.rs#mlp_forward]], [[crates/backends/native/src/add.rs#add]], [[crates/backends/native/src/rope.rs#apply_rope]], [[crates/backends/native/src/attention.rs#forward]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
@@ -1487,7 +1489,7 @@ Sampling strategy selection for token generation during inference.
 
 Sampling configuration for token generation.
 
-`SamplingConfig` holds `strategy` (`SamplingStrategy`), `max_tokens` (generation limit), and `stop_sequences` (early termination triggers). Default uses Greedy strategy with 512 max tokens and empty stop sequences. See [[crates/scheduler/src/queue.rs#SamplingConfig]].
+`SamplingConfig` holds `strategy` (`SamplingStrategy`), `max_tokens` (generation limit), `stop_sequences` (early termination triggers), `repetition_penalty` (default 1.0, disables repetition penalty when set to 1.0), `presence_penalty` (default 0.0, subtracts from logits for generated tokens), `frequency_penalty` (default 0.0, per-occurrence penalty for generated tokens), `eos_token_id` (Optional EOS token ID that stops generation), `stop_token_ids` (pre-tokenized stop sequence IDs), and `seed` (optional random seed for reproducible sampling). Default uses Greedy strategy with 512 max tokens, empty stop sequences, all penalties at zero/default, and no seed. See [[crates/scheduler/src/queue.rs#SamplingConfig]].
 
 ## Request
 

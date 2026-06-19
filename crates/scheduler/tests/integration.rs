@@ -266,13 +266,14 @@ fn test_session_eviction_timing() {
     assert!(session.is_evictable());
 }
 
-/// Verify SamplingStrategy and SamplingConfig types are re-exportable and usable.
+ /// Verify SamplingStrategy and SamplingConfig types are re-exportable and usable.
 #[test]
 fn test_sampling_config_reexport() {
     let config = SamplingConfig {
         strategy: SamplingStrategy::Temperature { temp: 0.8 },
         max_tokens: 256,
         stop_sequences: vec!["<eos>".to_string()],
+        ..Default::default()
     };
 
     assert!(matches!(config.strategy, SamplingStrategy::Temperature { .. }));

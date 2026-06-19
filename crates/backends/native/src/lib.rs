@@ -31,3 +31,4 @@ pub mod probe;
 
 pub use engine::ForwardEngine;
 pub use eviction::BackendEvictionStore;
+pub use sample::Xoshiro256PlusPlus;
