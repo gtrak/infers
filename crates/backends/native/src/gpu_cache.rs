@@ -228,32 +228,20 @@ impl GpuWeightCache {
     ) -> Result<Self> {
         let mut weights = HashMap::new();
 
-        // 1. Upload embedding table (if present)
-        if let Some(embed) = &registry.embedding {
-            upload_mmap_tensor(stream, embed, &registry.int4_companions, pinned, &mut weights)?;
-        }
-
-        // 2. Upload LM head (if present)
-        if let Some(lm_head) = &registry.lm_head {
-            upload_mmap_tensor(stream, lm_head, &registry.int4_companions, pinned, &mut weights)?;
-        }
-
-        // 3. Upload final norm (if present)
-        if let Some(norm) = &registry.norm {
-            upload_mmap_tensor(stream, norm, &registry.int4_companions, pinned, &mut weights)?;
-        }
-
-        // 4. Iterate over all tensors directly (layers is a placeholder for mmap path)
-        for (name, tensor) in &registry.tensors {
-            if weights.contains_key(name.as_str()) {
-                continue;
-            }
+        // Single pass: upload all tensors from the registry
+        for (_name, tensor) in &registry.tensors {
             upload_mmap_tensor(stream, tensor, &registry.int4_companions, pinned, &mut weights)?;
         }
 
         Ok(Self { weights })
     }
 
+}
+
+/// Synchronize a CUDA stream with a descriptive reason on error.
+fn sync_stream(stream: &CudaStream, reason: &str) -> Result<()> {
+    stream.synchronize()
+        .map_err(|e| anyhow::anyhow!("Stream sync failed ({reason}): {e}"))
 }
 
 /// Upload a single weight to GPU and cache it in the `weights` map.
@@ -340,12 +328,7 @@ fn upload_mmap_tensor(
                 .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", tensor.name(), e))?;
 
             // Sync after qweight upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap_qweight");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream after qweight '{}': {}", tensor.name(), e))?;
-            }
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             // Upload scales: reinterpret u8 as f16, upload directly (scales are FP16)
             let scales_data = companions.scales.data();
@@ -359,12 +342,7 @@ fn upload_mmap_tensor(
                 .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", tensor.name(), e))?;
 
             // Sync after scales upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap_scales");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream after scales '{}': {}", tensor.name(), e))?;
-            }
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             // Upload qzeros: reinterpret u8 as u32, upload directly
             let qzeros_data = companions.qzeros.data();
@@ -378,12 +356,7 @@ fn upload_mmap_tensor(
                 .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", tensor.name(), e))?;
 
             // Sync after qzeros upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap_qzeros");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream after qzeros '{}': {}", tensor.name(), e))?;
-            }
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             weights.insert(
                 tensor.name().to_string(),
@@ -407,13 +380,8 @@ fn upload_mmap_tensor(
             let gpu_slice = stream.clone_htod(bf16_slice)
                 .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
 
-            // Sync after upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream: {}", e))?;
-            }
+           // Sync after upload
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
         }
@@ -445,12 +413,7 @@ fn upload_mmap_tensor(
                 .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
 
             // Sync after upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream: {}", e))?;
-            }
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
         }
@@ -479,12 +442,7 @@ fn upload_mmap_tensor(
                 .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
 
             // Sync after upload
-            {
-                let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload_mmap");
-                let _enter = sync_span.enter();
-                stream.synchronize()
-                    .map_err(|e| anyhow::anyhow!("Failed to sync stream: {}", e))?;
-            }
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
 
             weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
         }

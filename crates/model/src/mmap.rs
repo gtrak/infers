@@ -108,29 +108,12 @@ pub struct MmapCompanions {
     pub scales: MmapTensor,
 }
 
-/// A single transformer layer's mmap weights (placeholder — to be populated).
-#[derive(Debug, Clone)]
-pub struct MmapLayerWeights {
-    pub layer_idx: usize,
-    // Fields to be populated when layer structure is built
-}
-
-/// Multi-token prediction head weights (placeholder — to be populated).
-#[derive(Debug, Clone)]
-pub struct MmapMtpWeights {
-    // Fields to be populated when MTP support is added
-}
 
 /// Complete model weight registry backed by memory-mapped files.
 #[derive(Clone)]
 pub struct MmapWeightRegistry {
     pub tensors: HashMap<String, MmapTensor>,
     pub int4_companions: HashMap<String, MmapCompanions>,
-    pub embedding: Option<MmapTensor>,
-    pub layers: Vec<MmapLayerWeights>,
-    pub norm: Option<MmapTensor>,
-    pub lm_head: Option<MmapTensor>,
-    pub mtp: Option<MmapMtpWeights>,
     _mmaps: Vec<Arc<Mmap>>, // prevent mmap from being dropped
 }
 
@@ -140,11 +123,6 @@ impl MmapWeightRegistry {
         Self {
             tensors: HashMap::new(),
             int4_companions: HashMap::new(),
-            embedding: None,
-            layers: Vec::new(),
-            norm: None,
-            lm_head: None,
-            mtp: None,
             _mmaps: Vec::new(),
         }
     }
@@ -211,20 +189,9 @@ fn mmap_tensor_from_data(
     dtype: WeightDtype,
     name: String,
 ) -> Result<MmapTensor> {
-    let path = format!(
-        "/tmp/mmap_shard_{}_{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    );
-
-    let mut file = std::fs::File::create(&path)?;
+    let mut file = tempfile::NamedTempFile::new()?;
     std::io::Write::write_all(&mut file, &data)?;
-    file.sync_all()?;
-
-    // Open for mmap (read-only); the Mmap keeps the mapping alive via its own fd.
-    let read_file = std::fs::File::open(&path)?;
-    let mmap = Arc::new(unsafe { Mmap::map(&read_file)? });
-
+    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     Ok(MmapTensor::new(mmap.clone(), mmap.as_ptr(), data.len(), shape, dtype, name))
 }
 
@@ -278,7 +245,6 @@ fn mmap_slice_last_dim(
 /// operates on MmapTensor references. Contiguous splits (BF16 dim-0, INT4 dim-0) are zero-copy;
 /// non-contiguous splits require copying data into a new allocation.
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#shard_weights_tp_mmap]]
-#[allow(dead_code)]
 pub fn shard_weights_tp_mmap(
     registry: &MmapWeightRegistry,
     _config: &super::config::ModelConfig,
@@ -680,11 +646,6 @@ mod tests {
         let registry = MmapWeightRegistry::new();
         assert_eq!(registry.num_tensors(), 0);
         assert_eq!(registry.total_bytes(), 0);
-        assert!(registry.layers.is_empty());
-        assert!(registry.embedding.is_none());
-        assert!(registry.norm.is_none());
-        assert!(registry.lm_head.is_none());
-        assert!(registry.mtp.is_none());
     }
 
     #[test]

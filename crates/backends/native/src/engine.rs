@@ -72,8 +72,9 @@ pub struct ForwardEngine {
     /// Model architecture configuration.
     config: Arc<ModelConfig>,
 
-    /// One weight registry per GPU shard (tensor parallelism).
-    weights: Vec<WeightRegistry>,
+    /// Weight metadata for name lookups during inference.
+    /// Contains weight names/shapes but no actual weight data.
+    metadata: Vec<WeightRegistry>,
 
     /// Mmap weight registries (retained to keep mmap handles alive).
     _mmap_registries: Vec<MmapWeightRegistry>,
@@ -111,30 +112,17 @@ pub struct ForwardEngine {
 }
 
 impl ForwardEngine {
-    /// Construct a `ForwardEngine` from model config, weights, and GPU resources.
-    ///
-    /// # Arguments
-    /// * `config` — Model architecture parameters
-    /// * `weights` — Per-GPU weight registries (one per tensor-parallel rank)
-    /// * `ctx` — CUDA context for kernel loading
-    /// * `kernel_registry` — Names and paths of CUDA kernels to load
-    /// * `streams` — Pool of async CUDA streams
-    /// * `nccl` — NCCL communicator for multi-GPU collectives
-    pub fn new(
-        config: Arc<ModelConfig>,
-        weights: Vec<WeightRegistry>,
-        contexts: Vec<Arc<CudaContext>>,
-        kernel_registry: KernelRegistry,
-        streams: StreamPool,
-        group_size: usize,
-    ) -> Result<Self> {
-        // Load CUDA kernel modules on each GPU context
-        let num_gpus = streams.len();
+    /// Load CUDA kernel modules on each GPU and return per-GPU kernel handles.
+    fn load_per_gpu_kernels(
+        contexts: &[Arc<CudaContext>],
+        kernel_registry: &KernelRegistry,
+        num_gpus: usize,
+    ) -> Result<Vec<PerGpuKernels>> {
         let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
         for gpu_idx in 0..num_gpus {
             let ctx = contexts.get(gpu_idx)
                 .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
-            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), &kernel_registry)
+            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), kernel_registry)
                 .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
 
             let pk = PerGpuKernels {
@@ -173,8 +161,11 @@ impl ForwardEngine {
             };
             per_gpu_kernels.push(pk);
         }
+        Ok(per_gpu_kernels)
+    }
 
-        // Create one GEMM engine per GPU (one per stream in the pool)
+    /// Create one cuBLASLt GEMM engine per GPU.
+    fn create_gemm_engines(streams: &StreamPool, num_gpus: usize) -> Result<Vec<GemmEngine>> {
         let mut gemm_engines = Vec::with_capacity(num_gpus);
         for i in 0..num_gpus {
             let s = streams.get(i).ok_or_else(|| anyhow::anyhow!("Missing stream {i}"))?;
@@ -183,14 +174,50 @@ impl ForwardEngine {
                     .map_err(|e| anyhow::anyhow!("Failed to create cuBLASLt engine for GPU {i}: {e}"))?
             );
         }
-        // Create NCCL communicator for tensor parallelism
-        let nccl = {
-            let comm_streams: Vec<Arc<CudaStream>> = (0..streams.len())
-                .filter_map(|i| streams.get(i).cloned())
-                .collect();
-            NcclCommunicator::new(comm_streams)
-                .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
-        };
+        Ok(gemm_engines)
+    }
+
+    /// Create NCCL communicator for tensor parallelism.
+    fn create_nccl(streams: &StreamPool) -> Result<NcclCommunicator> {
+        let comm_streams: Vec<Arc<CudaStream>> = (0..streams.len())
+            .filter_map(|i| streams.get(i).cloned())
+            .collect();
+        NcclCommunicator::new(comm_streams)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))
+    }
+
+    /// Initialize per-GPU, per-layer KV caches, GDN states, and paged KV caches.
+    fn init_layer_states(
+        num_gpus: usize,
+        num_layers: usize,
+    ) -> (Vec<Vec<KvCache>>, Vec<Vec<GdnState>>, Vec<Vec<PagedKvCache>>) {
+        let kv_caches = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
+        let gdn_states = (0..num_gpus).map(|_| (0..num_layers).map(|_| GdnState::new()).collect()).collect();
+        let paged_kv_caches = (0..num_gpus).map(|_| Vec::new()).collect();
+        (kv_caches, gdn_states, paged_kv_caches)
+    }
+
+    /// Construct a `ForwardEngine` from model config, weights, and GPU resources.
+    ///
+    /// # Arguments
+    /// * `config` — Model architecture parameters
+    /// * `weights` — Per-GPU weight registries (one per tensor-parallel rank)
+    /// * `ctx` — CUDA context for kernel loading
+    /// * `kernel_registry` — Names and paths of CUDA kernels to load
+    /// * `streams` — Pool of async CUDA streams
+    /// * `nccl` — NCCL communicator for multi-GPU collectives
+    pub fn new(
+        config: Arc<ModelConfig>,
+        weights: Vec<WeightRegistry>,
+        contexts: Vec<Arc<CudaContext>>,
+        kernel_registry: KernelRegistry,
+        streams: StreamPool,
+        group_size: usize,
+    ) -> Result<Self> {
+        let num_gpus = streams.len();
+        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
+        let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
+        let nccl = Self::create_nccl(&streams)?;
 
         // Build GPU-resident weight caches for each GPU in parallel
         let mut handles = Vec::with_capacity(num_gpus);
@@ -216,10 +243,7 @@ impl ForwardEngine {
             .collect();
 
         // Initialize per-GPU, per-layer caches and states
-        let num_layers = config.num_hidden_layers;
-        let kv_caches: Vec<Vec<KvCache>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
-        let gdn_states: Vec<Vec<GdnState>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| GdnState::new()).collect()).collect();
-        let paged_kv_caches: Vec<Vec<PagedKvCache>> = (0..num_gpus).map(|_| Vec::new()).collect();
+        let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
         tracing::info!(
             "ForwardEngine initialized: {} layers, {} GPU shards",
@@ -229,7 +253,7 @@ impl ForwardEngine {
 
         Ok(Self {
             config,
-            weights,
+            metadata: weights,
             _mmap_registries: Vec::new(),
             weight_caches,
             per_gpu_kernels,
@@ -268,69 +292,10 @@ impl ForwardEngine {
         pinned: &mut PinnedHostBuffer,
         group_size: usize,
     ) -> Result<Self> {
-        // Load CUDA kernel modules on each GPU context
-        let num_gpus = streams.len();
-        let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
-        for gpu_idx in 0..num_gpus {
-            let ctx = contexts.get(gpu_idx)
-                .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
-            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), &kernel_registry)
-                .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
-
-            let pk = PerGpuKernels {
-                rmsnorm: kernels.get_function("infers_rmsnorm_bf16")?,
-                silu_glu: kernels.get_function("infers_silu_glu_bf16")?,
-                rope: kernels.get_function("infers_rope_bf16")?,
-                embedding: kernels.get_function("infers_embedding_gather_bf16")?,
-                add: kernels.get_function("infers_add_bf16")?,
-                argmax: kernels.get_function("infers_argmax_bf16")?,
-                softmax: kernels.get_function("infers_softmax_bf16")?,
-                kv_cache_write: kernels.get_function("infers_kv_cache_write_bf16")?,
-                gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
-                gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
-                paged_kv_write: kernels.get_function("infers_paged_kv_write_bf16")?,
-                paged_kv_read: kernels.get_function("infers_paged_kv_read_bf16")?,
-                paged_attention_decode: kernels.get_function("infers_paged_attention_decode_bf16")?,
-                fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
-                fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
-                int4_gemm: kernels.get_function("int4_gemm_kernel")?,
-                gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
-                gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
-                gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
-                gdn_chunked_prefill: {
-                    let f = kernels.get_function("infers_gdn_chunked_gated_delta_prefill_bf16")?;
-                    // Allow up to 100KB dynamic shared memory for the chunked GDN kernel
-                    // (default is 48KB; the kernel uses ~81KB for C=64, K=128)
-                    f.set_attribute(
-                        infers_cuda::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        100000,
-                    ).ok(); // ok() — ignore error if attribute not supported
-                    f
-                },
-                conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
-                rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
-                attn_output_gate: kernels.get_function("infers_attn_output_gate_bf16")?,
-            };
-            per_gpu_kernels.push(pk);
-        }
-
-        // Create one GEMM engine per GPU (one per stream in the pool)
-        let mut gemm_engines = Vec::with_capacity(num_gpus);
-        for i in 0..num_gpus {
-            let s = streams.get(i).ok_or_else(|| anyhow::anyhow!("Missing stream {i}"))?;
-            gemm_engines.push(
-                GemmEngine::new(s.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to create cuBLASLt engine for GPU {i}: {e}"))?
-            );
-        }
-        // Create NCCL communicator for tensor parallelism
-        let nccl = {
-            let comm_streams: Vec<Arc<CudaStream>> = (0..streams.len())
-                .filter_map(|i| streams.get(i).cloned())
-                .collect();
-            NcclCommunicator::new(comm_streams)
-                .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
-        };
+       let num_gpus = streams.len();
+        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
+        let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
+        let nccl = Self::create_nccl(&streams)?;
 
         // Build GPU-resident weight caches for each GPU (mmap path).
         // Sequential — pinned buffer is per-thread and mmap upload requires CUDA context on current thread.
@@ -344,10 +309,7 @@ impl ForwardEngine {
         }
 
         // Initialize per-GPU, per-layer caches and states
-        let num_layers = config.num_hidden_layers;
-        let kv_caches: Vec<Vec<KvCache>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
-        let gdn_states: Vec<Vec<GdnState>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| GdnState::new()).collect()).collect();
-        let paged_kv_caches: Vec<Vec<PagedKvCache>> = (0..num_gpus).map(|_| Vec::new()).collect();
+        let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
         tracing::info!(
             "ForwardEngine initialized (mmap): {} layers, {} GPU shards",
@@ -357,7 +319,7 @@ impl ForwardEngine {
 
         Ok(Self {
             config,
-            weights: metadata_registries, // metadata registries for name lookups during inference
+            metadata: metadata_registries, // metadata registries for name lookups during inference
             _mmap_registries: mmap_registries,
             weight_caches,
             per_gpu_kernels,
@@ -385,7 +347,7 @@ impl ForwardEngine {
     /// # Returns
     /// The sampled token ID for the first generated token, or an error if GPU execution fails.
     pub fn prefill(&mut self, stream: &Arc<CudaStream>, token_ids: &[u32]) -> Result<u32> {
-        let weights = &self.weights[0];
+        let weights = &self.metadata[0];
 
         let kernels = crate::prefill::PrefillKernels {
             rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
@@ -444,7 +406,7 @@ impl ForwardEngine {
         );
 
         // kv_dim is per GPU: num_kv_heads/num_gpus * head_dim
-        let num_gpus = self.weights.len();
+        let num_gpus = self.metadata.len();
         let kv_dim_per_gpu = (num_kv_heads / num_gpus) * head_dim;
 
         let caches: Vec<Vec<PagedKvCache>> = (0..num_gpus)
@@ -585,7 +547,7 @@ impl ForwardEngine {
         let _enter = span.enter();
 
         // GPU timing: create events on each GPU's context
-        let num_gpus = self.weights.len();
+        let num_gpus = self.metadata.len();
         let gpu_start_events: Vec<_> = (0..num_gpus)
             .map(|gpu_idx| {
                 let ctx = self.streams.get(gpu_idx).unwrap().context();
@@ -609,7 +571,7 @@ impl ForwardEngine {
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
-        let num_gpus = self.weights.len();
+        let num_gpus = self.metadata.len();
         let config = &self.config;
         let page_size = manager.page_size();
         let head_dim = config.head_dim;
@@ -651,7 +613,7 @@ impl ForwardEngine {
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            let w = &self.weights[gpu_idx];
+            let w = &self.metadata[gpu_idx];
             let embed_weight = w.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
             let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
@@ -700,7 +662,7 @@ impl ForwardEngine {
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
-                let w = &self.weights[gpu_idx];
+                let w = &self.metadata[gpu_idx];
                 let layer = &w.layers[layer_idx];
 
                 // Norm1
@@ -797,7 +759,7 @@ impl ForwardEngine {
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
-                let w = &self.weights[gpu_idx];
+                let w = &self.metadata[gpu_idx];
                 let mlp_weights = &w.layers[layer_idx].mlp;
 
                 // Norm2
@@ -907,7 +869,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // Final norm + LM head on GPU 0 (same on all GPUs after all-reduce)
         // ================================================================
         let final_stream = self.streams.get(0).unwrap().clone();
-        let final_weights = &self.weights[0];
+        let final_weights = &self.metadata[0];
         let mut final_hidden = hidden_states.into_iter().next().unwrap(); // GPU 0's hidden state
 
         // Final norm
@@ -993,7 +955,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
     ) -> Result<u32> {
         let span = tracing::info_span!("decode");
         let _enter = span.enter();
-        let num_gpus = self.weights.len();
+        let num_gpus = self.metadata.len();
 
         // GPU timing: create events on each GPU's context
         let gpu_start_events: Vec<_> = (0..num_gpus)
@@ -1064,7 +1026,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            let w = &self.weights[gpu_idx];
+            let w = &self.metadata[gpu_idx];
             let embed_weight = w.embedding.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
             let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
@@ -1111,7 +1073,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
-                let w = &self.weights[gpu_idx];
+                let w = &self.metadata[gpu_idx];
                 let layer = &w.layers[layer_idx];
 
                 // Norm1
@@ -1207,7 +1169,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
-                let w = &self.weights[gpu_idx];
+                let w = &self.metadata[gpu_idx];
                 let mlp_weights = &w.layers[layer_idx].mlp;
 
                 // Norm2
@@ -1311,7 +1273,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // Final norm + LM head + sample on GPU 0
         // ================================================================
         let final_stream = self.streams.get(0).unwrap().clone();
-        let final_weights = &self.weights[0];
+        let final_weights = &self.metadata[0];
         let mut final_hidden = hidden_states.into_iter().next().unwrap();
 
         // Final norm

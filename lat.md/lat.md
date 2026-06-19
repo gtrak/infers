@@ -442,9 +442,9 @@ Central `ForwardEngine` struct owns all GPU state and coordinates prefill/decode
 
 
 ### Engine Structure
-`ForwardEngine` holds config, weights, a `Vec<PerGpuKernels>` (one set of 16 `CudaFunction` handles per GPU since kernel handles are context-bound), per-GPU GEMM engines, NcclCommunicator, StreamPool, and paged KV fields.
+`ForwardEngine` holds config, metadata (renamed from weights for clarity), per-GPU kernels, GEMM engines, NCCL, streams, and paged KV caches.
 
-The struct owns `Option<PagedKvManager>` for the paged system, plus per-GPU, per-layer paged caches (`paged_kv_caches: Vec<Vec<PagedKvCache>>`), legacy flat caches (`kv_caches: Vec<Vec<KvCache>>`), and GDN states (`gdn_states: Vec<Vec<GdnState>>`). It also holds `weight_caches: Vec<GpuWeightCache>` — one cache per GPU, built in parallel during construction: each GPU spawns a thread that uploads all weights from its `WeightRegistry` via `GpuWeightCache::new()` (cloning the registry is cheap since inner `Bytes` are Arc-based). Threads join and results are placed by GPU index. The `weights: Vec<WeightRegistry>` field is retained for weight name resolution and metadata access. Kernels are loaded on each GPU's context independently at init — `LoadedKernelRegistry::load_all()` is called per-GPU inside a loop over `contexts`, producing one `PerGpuKernels` instance per GPU. In non-paged paths (`prefill`) kernel handles come from `per_gpu_kernels[0]`. In paged paths (`prefill_paged`, `decode_paged`), the per-GPU layer loop uses `per_gpu_kernels[gpu_idx]`, while the final norm/LM head outside the loop uses `per_gpu_kernels[0]`. One `GemmEngine` is created per GPU stream.
+The struct owns `Option<PagedKvManager>` for the paged system, plus per-GPU, per-layer paged caches (`paged_kv_caches: Vec<Vec<PagedKvCache>>`), legacy flat caches (`kv_caches: Vec<Vec<KvCache>>`), and GDN states (`gdn_states: Vec<Vec<GdnState>>`). It also holds `weight_caches: Vec<GpuWeightCache>` — one cache per GPU, built in parallel during construction: each GPU spawns a thread that uploads all weights from its `WeightRegistry` via `GpuWeightCache::new()` (cloning the registry is cheap since inner `Bytes` are Arc-based). Threads join and results are placed by GPU index. The `metadata: Vec<WeightRegistry>` field is retained for weight name resolution and metadata access during inference. Constructor duplication was eliminated via helper methods: `load_per_gpu_kernels()`, `create_gemm_engines()`, `create_nccl()`, and `init_layer_states()` are shared between `new()` (heap path) and `new_from_mmap()` (mmap path). In non-paged paths (`prefill`) kernel handles come from `per_gpu_kernels[0]`. In paged paths (`prefill_paged`, `decode_paged`), the per-GPU layer loop uses `per_gpu_kernels[gpu_idx]`, while the final norm/LM head outside the loop uses `per_gpu_kernels[0]`. One `GemmEngine` is created per GPU stream.
  `init_paged()` creates the manager and caches, computing per-GPU kv_dim as `(num_kv_heads / num_gpus) * head_dim`. `prefill_paged()` and `decode_paged()` run the complete inference pipeline (embedding, layer loop with GDN/attention dispatch, MLP, final norm, LM head, sampling) using paged KV attention. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 
 ### Eviction Integration
@@ -696,6 +696,8 @@ Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. 
 `CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as fp16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 
 `GpuWeightCache::new()` iterates every tensor in a `WeightRegistry`, classifies by dtype (BF16/Fp16/Fp32 → `CachedWeight::Bf16`; Int4Packed → `CachedWeight::Int4` with companions lookup), and uploads to GPU. Unsupported dtypes are skipped with a warning. The cache provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
+
+`GpuWeightCache::new_from_mmap()` uses a single pass over `registry.tensors` to upload all tensors — the two-pass approach (embedding/lm_head/norm first, then all tensors with dedup guard) was redundant since `registry.tensors` already contains ALL tensors. Stream synchronization after each upload uses the `sync_stream()` helper which formats error messages with the tensor name for debugging.
 
 ### Cached GEMM Dispatch
 
@@ -1208,7 +1210,7 @@ Zero-copy companion tensors (qzeros, scales) for INT4 quantized weights. See [[c
 
 ### MmapWeightRegistry
 
-Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap, INT4 companions, and placeholders for layers/norm/lm_head/mtp. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
+Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap, INT4 companions, and retains Arc-backed mmap handles to prevent unmapping. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
 
 ### load_safetensors_mmap
 
