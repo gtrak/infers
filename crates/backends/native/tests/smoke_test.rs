@@ -152,9 +152,9 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("Prompt tokens ({}): {:?}", token_ids.len(), &token_ids[..5.min(token_ids.len())]);
     let prefill_start = Instant::now();
-    let pages_used = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
+    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
     let prefill_elapsed = prefill_start.elapsed();
-    eprintln!("Prefill completed: {} pages used, {:.3}s", pages_used, prefill_elapsed.as_secs_f64());
+    eprintln!("Prefill completed: {} pages used, first_sampled={}, {:.3}s", pages_used, first_token, prefill_elapsed.as_secs_f64());
 
     // 13. Run decode for 30 steps to get a coherent response
     let mut generated_tokens: Vec<u32> = Vec::new();

@@ -242,11 +242,12 @@ fn main() -> Result<()> {
 
     // --- 12. Run prefill ---
     let prefill_start = Instant::now();
-    let pages_used = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
+    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
     let prefill_elapsed = prefill_start.elapsed();
     eprintln!(
-        "Prefill: {} pages used, {:.3}s",
+        "Prefill: {} pages used, first_sampled={}, {:.3}s",
         pages_used,
+        first_token,
         prefill_elapsed.as_secs_f64()
     );
 
@@ -254,9 +255,9 @@ fn main() -> Result<()> {
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut total_decode_time = std::time::Duration::ZERO;
 
-    // Start autoregressive decoding from the last prefill token.
+    // Start autoregressive decoding from the first sampled token produced during prefill.
     // Each decode step embeds the previous token and produces the next logits.
-    let mut current_token = *token_ids.last().unwrap();
+    let mut current_token = first_token;
     for step in 0..args.max_tokens {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;

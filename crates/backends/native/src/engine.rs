@@ -437,14 +437,14 @@ impl ForwardEngine {
     /// * `seq_id` — Sequence ID from PagedKvManager
     ///
     /// # Returns
-    /// The number of pages allocated for the sequence.
+    /// Tuple of (number of pages allocated, first sampled token ID).
     // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Prefill Path]]
     pub fn prefill_paged(
         &mut self,
         _stream: &Arc<CudaStream>,
         token_ids: &[u32],
         seq_id: infers_kv::SequenceId,
-    ) -> Result<usize> {
+    ) -> Result<(usize, u32)> {
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
@@ -801,7 +801,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
 
-        Ok(num_pages_needed)
+        Ok((num_pages_needed, sampled))
     }
 
     /// Run paged single-token decode — zero CPU round-trips.
