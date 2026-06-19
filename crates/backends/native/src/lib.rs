@@ -30,5 +30,6 @@ pub mod gpu_cache;
 pub mod probe;
 
 pub use engine::ForwardEngine;
+pub use gpu_cache::{CachedWeight, Int4GpuBuffers};
 pub use eviction::BackendEvictionStore;
 pub use sample::Xoshiro256PlusPlus;

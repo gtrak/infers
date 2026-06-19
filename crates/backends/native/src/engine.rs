@@ -268,6 +268,11 @@ impl ForwardEngine {
         })
     }
 
+    /// Access the per-GPU weight caches (diagnostic access for testing).
+    pub fn weight_caches(&self) -> &[GpuWeightCache] {
+        &self.weight_caches
+    }
+
     /// Construct a `ForwardEngine` from mmap-backed weight registries.
     ///
     /// Similar to [`new`] but loads weights via zero-copy memory-mapped access.

@@ -403,6 +403,16 @@ Phase 4.7 (GPU-Resident Weight Cache) eliminates per-GEMM weight upload overhead
 ## GpuWeightCache
 Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. Supports both BF16 weights and INT4 quantized weights (qweight + scales + qzeros). See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gpu_cache.rs#CachedWeight]], [[crates/backends/native/src/gpu_cache.rs#Int4GpuBuffers]].
 
+### GPU Buffer Download
+
+`download_bf16(name, stream)` downloads a BF16 weight from GPU to CPU. Verifies GPU buffers match source data — 0/5120 mismatches for `layers.0.input_layernorm.weight`. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#download_bf16]].
+
+`download_int4_qweight(name, stream)` downloads an INT4 qweight from GPU to CPU. The qweight buffer is a transmuted `CudaSlice<u32>` (originally allocated as u8), so cudarc's DevicePtr computes wrong copy sizes. Falls back to raw `cuMemcpyDtoH_v2` which fails with CUDA_ERROR_INVALID_VALUE for 89MB copies (small 64-byte copies succeed). Full INT4 GPU buffer verification is blocked by this limitation. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#download_int4_qweight]].
+
+`download_int4_scales(name, stream)` downloads an INT4 scales tensor from GPU to CPU as `Vec<f16>`. Scales are uploaded directly as `CudaSlice<f16>` (no transmutation), so the copy is straightforward. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#download_int4_scales]].
+
+`download_int4_qzeros(name, stream)` downloads an INT4 qzeros tensor from GPU to CPU as `Vec<u32>`. Qzeros are uploaded directly as `CudaSlice<u32>` (no transmutation), so the copy is straightforward. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#download_int4_qzeros]].
+
 ## Cached GEMM Dispatch
 Replaces `gemm_projection` at call-sites by looking up weights from the cache instead of re-uploading per forward pass. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
@@ -410,6 +420,16 @@ Replaces `gemm_projection` at call-sites by looking up weights from the cache in
 `ForwardEngine` holds one `GpuWeightCache` per GPU, built at construction time. Attention functions now accept the cache and look up norm weights via `cache.get_bf16()` instead of uploading per-call. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 ## Mmap Weight Upload
 Zero-copy mmap weight upload via `GpuWeightCache::new_from_mmap()`. Strided tensors use cuMemcpy2D DMA — see [[crates/cuda/src/memcpy2d.rs#clone_htod_2d]]. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#new_from_mmap]], [[crates/backends/native/src/gpu_cache.rs#upload_mmap_tensor]].
+
+### Upload Verification (Heap vs Mmap)
+BF16 weights, INT4 qweights, scales, and qzeros all match exactly between heap and mmap GPU caches.
+
+Verified via `download_bf16`, `download_int4_qweight`, `download_int4_scales`, `download_int4_qzeros` — all 20480 conv1d values, 64 qweight/scales/qzeros values identical.
+
+### Root Cause: conv1d.weight Fused QKV Sharding Bug (FIXED)
+The `conv1d.weight` tensor contains concatenated Q/K/V row segments. The mmap path naively split dim 0, producing wrong Q/K/V segment boundaries.
+
+Shape `[conv_dim, 1, kernel_size]` where `conv_dim = key_dim*2 + value_dim`. The heap path uses `shard_fused_projection_columns` with per-segment row splitting. The mmap path used `mmap_slice_dim0` producing Q[0:2048]+K[0:2048]+V[0:1024] instead of correct Q[0:1024]+K[0:1024]+V[0:3072]. Fixed by adding `mmap_shard_fused_projection_rows` that does per-segment row splitting, matching the heap path's `shard_fused_projection_columns` with `RowMajor` layout.
 
 ## Completed
 Tasks implemented so far in Phase 4.7 GPU weight cache migration.
@@ -692,6 +712,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 
 ### GPU Weight Cache
 Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gpu_cache.rs#CachedWeight]], [[crates/backends/native/src/gpu_cache.rs#Int4GpuBuffers]].
+
 
 `CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as fp16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 
@@ -1240,7 +1261,7 @@ Follows the same sharding rules as `shard_weights_tp()` but operates on MmapTens
 - **RowParallel + INT4**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset
 - **Replicated**: Clone MmapTensor (cheap Arc clone)
 
-INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent (strided when needed), and stored in `int4_companions`. Fused QKV projections (in_proj_qkv, conv1d) fall through to regular column-parallel — TODO: proper per-segment mmap sharding.
+INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent (strided when needed), and stored in `int4_companions`. Fused QKV projections (`in_proj_qkv`) use per-segment column splitting — each segment (Q, K, V) is independently divided by num_gpus via [[crates/model/src/mmap.rs#mmap_shard_fused_projection_columns]]. The `conv1d.weight` tensor uses per-segment row splitting via [[crates/model/src/mmap.rs#mmap_shard_fused_projection_rows]], extracting Q/K/V row segments independently rather than naively dividing dim 0. Both match the heap path's [[lat#Weight Sharding#Tensor Parallelism Sharding]] behavior. The companion_skip pre-scan handles all .scales/.qzeros names; redundant per-GPU inserts inside INT4 blocks were removed as dead code.
 
 MmapWeightShard holds gpu_id and the shard's MmapWeightRegistry. See [[crates/model/src/mmap.rs#MmapWeightShard]].
 
@@ -1717,6 +1738,9 @@ The `tests/integration.rs` suite exercises: (1) `test_full_session_lifecycle` �
 Ignored integration tests that validate the full engine with real model weights and GPU hardware.
 
 The `smoke_test_real_model` test in `crates/backends/native/tests/smoke_test.rs` loads a real model (Qwen3.6-27B AutoRound INT4 by default), initializes CUDA runtime, creates `ForwardEngine`, runs prefill + 10 decode steps, and verifies all sampled tokens are within vocab range. Requires GPU with CUDA CC 12.0+ and model weights at `INFERS_TEST_MODEL` env var path (default `~/opt/vllm/models/qwen3.6-27b-autoround-int4/`). Marked `#[ignore]` so it only runs with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test.rs#smoke_test_real_model]].
+The `smoke_test_mmap_only` and `smoke_test_heap_only` tests in `crates/backends/native/tests/smoke_test_mmap_only.rs` each test exactly one load path (mmap or heap respectively) without cross-comparison, eliminating the complexity of running both engines sequentially. Each loads the model via its designated path, runs prefill + 30 decode steps, prints generated text, and asserts all tokens are within vocab range. The mmap-only test uses `ForwardEngine::new_from_mmap` with a pinned host buffer, while the heap-only test uses `ForwardEngine::new`. Marked `#[ignore]` so they only run with `-- --ignored --nocapture`. See [[crates/backends/native/tests/smoke_test_mmap_only.rs#smoke_test_mmap_only]], [[crates/backends/native/tests/smoke_test_mmap_only.rs#smoke_test_heap_only]]. The heap path produces coherent output (first token 248068, diverse subsequent tokens) while the mmap-only path produces all-220 tokens — an open diagnostic issue.
+The `smoke_test_mmap_vs_heap_gpu_data` test in `crates/backends/native/tests/smoke_test_mmap_only.rs` compares INT4 GPU data between heap and mmap engines sequentially (both engines cannot coexist due to NCCL single-init and StreamPool non-clonability). It loads the model via both paths, creates each engine in turn, drops it, and downloads an INT4 qweight from each engine's GPU 0 cache using `GpuWeightCache::download_int4_qweight`. Compares the first 64 u32 values of a row-parallel weight (`layers.63.self_attn.o_proj.qweight` — expected contiguous) and a column-parallel weight (`layers.63.mlp.gate_proj.qweight` — may be strided in mmap path). Prints MATCH/MISMATCH summaries for each comparison. See [[crates/backends/native/tests/smoke_test_mmap_only.rs#smoke_test_mmap_vs_heap_gpu_data]].
+
 ## GDN Reference Tests
 
 HuggingFace-based reference capturing all GDN intermediates as .npy ground truth.

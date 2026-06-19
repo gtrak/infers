@@ -69,6 +69,11 @@ impl GpuWeightCache {
         self.weights.is_empty()
     }
 
+    /// Iterator over the tensor names in this cache.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.weights.keys().map(|s| s.as_str())
+    }
+
     /// Upload all weights from a `WeightRegistry` to GPU memory.
     ///
     /// Iterates over every tensor in the registry, classifying each as either
@@ -215,6 +220,89 @@ impl GpuWeightCache {
 
         Ok(Self { weights })
     }
+
+    /// @lat: [[lat.md/lat#GpuWeightCache#GPU Buffer Download]]
+    /// Download a BF16 weight from GPU to CPU for debugging.
+    pub fn download_bf16(&self, name: &str, stream: &Arc<CudaStream>) -> Option<Vec<bf16>> {
+        match self.weights.get(name)? {
+            CachedWeight::Bf16(slice) => {
+                stream.clone_dtoh(slice).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Download an INT4 qweight from GPU to CPU for debugging.
+    pub fn download_int4_qweight(&self, name: &str, stream: &Arc<CudaStream>) -> Option<Vec<u32>> {
+        match self.weights.get(name)? {
+            CachedWeight::Int4(bufs) => {
+                // The qweight CudaSlice<u32> was transmuted from CudaSlice<u8>, so cudarc's
+                // copy operations compute wrong sizes (len field stores byte count, not element count).
+                // 
+                // Workaround: try clone_dtoh first. If it fails, fall back to raw FFI with small test.
+                // First attempt: cudarc's clone_dtoh (works for properly-typed slices)
+                match stream.clone_dtoh(&bufs.qweight) {
+                    Ok(data) => Some(data),
+                    Err(e) => {
+                        // Second attempt: raw cuMemcpyDtoH_v2 with correct byte count
+                        use cudarc::driver::{DevicePtr, sys::*};
+                        let (dev_ptr, _sync) = <CudaSlice<u32> as DevicePtr<u32>>::device_ptr(&bufs.qweight, stream);
+                        
+                        // Test small copy first to verify pointer is valid
+                        let test_size = 64usize;
+                        let mut test_buf = vec![0u8; test_size];
+                        unsafe {
+                            if cuMemcpyDtoH_v2(test_buf.as_mut_ptr() as *mut ::std::os::raw::c_void, dev_ptr, test_size) != CUresult::CUDA_SUCCESS {
+                                return None;
+                            }
+                        }
+
+                        // If small copy works, try full download
+                        let byte_count = bufs.qweight.len() * std::mem::size_of::<u32>();
+                        let mut host_data: Vec<u8> = vec![0u8; byte_count];
+                        unsafe {
+                            if cuMemcpyDtoH_v2(
+                                host_data.as_mut_ptr() as *mut ::std::os::raw::c_void,
+                                dev_ptr,
+                                byte_count,
+                            ) != CUresult::CUDA_SUCCESS {
+                                return None;
+                            }
+                        }
+                        
+                        let u32_data: Vec<u32> = host_data.chunks_exact(std::mem::size_of::<u32>())
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        Some(u32_data)
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// @lat: [[lat.md/lat#GpuWeightCache#GPU Buffer Download]]
+    /// Download INT4 scales from GPU to CPU for debugging.
+    pub fn download_int4_scales(&self, name: &str, stream: &Arc<CudaStream>) -> Option<Vec<f16>> {
+        match self.weights.get(name)? {
+            CachedWeight::Int4(bufs) => {
+                stream.clone_dtoh(&bufs.scales).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// @lat: [[lat.md/lat#GpuWeightCache#GPU Buffer Download]]
+    /// Download INT4 qzeros from GPU to CPU for debugging.
+    pub fn download_int4_qzeros(&self, name: &str, stream: &Arc<CudaStream>) -> Option<Vec<u32>> {
+        match self.weights.get(name)? {
+            CachedWeight::Int4(bufs) => {
+                stream.clone_dtoh(&bufs.qzeros).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Upload all weights from a memory-mapped `MmapWeightRegistry` to GPU memory.
     ///
     /// Iterates over every tensor in the registry, dispatching by dtype:
@@ -229,9 +317,13 @@ impl GpuWeightCache {
     ) -> Result<Self> {
         let mut weights = HashMap::new();
 
-        // Single pass: upload all tensors from the registry
-        for (_name, tensor) in &registry.tensors {
-            upload_mmap_tensor(stream, tensor, &registry.int4_companions, pinned, &mut weights)?;
+   // Single pass: upload all tensors from the registry
+        // Use the registry key (original name) for companion lookup, since sliced mmap tensors
+        // store a suffixed name internally (e.g. "qweight_gpu0") but are keyed by the original name.
+
+
+        for (key, tensor) in &registry.tensors {
+            upload_mmap_tensor(stream, tensor, key, &registry.int4_companions, pinned, &mut weights)?;
         }
 
         Ok(Self { weights })
@@ -308,14 +400,15 @@ fn upload_and_cache(
 fn upload_mmap_tensor(
     stream: &Arc<CudaStream>,
     tensor: &MmapTensor,
+    key: &str,
     int4_companions: &HashMap<String, MmapCompanions>,
     pinned: &mut PinnedHostBuffer,
     weights: &mut HashMap<String, CachedWeight>,
 ) -> Result<()> {
     if tensor.is_strided() {
-        upload_strided_mmap_tensor(stream, tensor, int4_companions, weights)?;
+        upload_strided_mmap_tensor(stream, tensor, key, int4_companions, weights)?;
     } else {
-        upload_contiguous_mmap_tensor(stream, tensor, int4_companions, pinned, weights)?;
+        upload_contiguous_mmap_tensor(stream, tensor, key, int4_companions, pinned, weights)?;
     }
     Ok(())
 }
@@ -324,11 +417,14 @@ fn upload_mmap_tensor(
 fn upload_strided_mmap_tensor(
     stream: &Arc<CudaStream>,
     tensor: &MmapTensor,
+    key: &str,
     int4_companions: &HashMap<String, MmapCompanions>,
     weights: &mut HashMap<String, CachedWeight>,
 ) -> Result<()> {
+
     match tensor.dtype() {
         WeightDtype::Bf16 => {
+
             // 2D DMA copy from strided mmap to contiguous GPU buffer (zero CPU copy)
             let gpu_bytes = memcpy2d::clone_htod_2d(
                 stream,
@@ -340,63 +436,75 @@ fn upload_strided_mmap_tensor(
             )?;
 
             // Sync after upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
             // Cast CudaSlice<u8> to CudaSlice<bf16> — same layout, just different element type.
             let bf16_slice = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<bf16>>(gpu_bytes) };
-            weights.insert(tensor.name().to_string(), CachedWeight::Bf16(bf16_slice));
+            weights.insert(key.to_string(), CachedWeight::Bf16(bf16_slice));
         }
         WeightDtype::Int4Packed => {
-            let companions = int4_companions.get(tensor.name())
-                .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", tensor.name()))?;
+            let companions = int4_companions.get(key)
+                .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", key))?;
 
-            // Upload qweight via 2D DMA (zero CPU copy)
-            let gpu_bytes = memcpy2d::clone_htod_2d(
-                stream,
-                tensor.base_ptr(),
-                tensor.col_start_bytes(),
-                tensor.src_pitch(),
-                tensor.strided_width(),
-                tensor.strided_rows(),
-            )?;
+            // TEMPORARY: Use contiguous copy instead of cuMemcpy2D for debugging
+            // Copy strided data to a contiguous buffer, then upload normally
+            let src = tensor.data();  // full tensor data (contiguous in mmap)
+            let col_start = tensor.col_start_bytes();
+            let src_pitch = tensor.src_pitch();
+            let width = tensor.strided_width();
+            let height = tensor.strided_rows();
 
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            // Compute the strided slice as a contiguous buffer
+            let mut qweight_bytes = Vec::with_capacity(width * height);
+            for row in 0..height {
+                let row_start = col_start + row * src_pitch;
+                let row_end = row_start + width;
+                qweight_bytes.extend_from_slice(&src[row_start..row_end]);
+            }
+            let qweight_u32: Vec<u32> = qweight_bytes.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let qweight_gpu = stream.clone_htod(&qweight_u32)?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
-            // Cast CudaSlice<u8> to CudaSlice<u32> — u32 is 4 bytes, same as packed INT4.
-            let qweight_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<u32>>(gpu_bytes) };
+            // Scales: same approach
+            let scales_src = companions.scales.data();
+            let scales_col = companions.scales.col_start_bytes();
+            let scales_pitch = companions.scales.src_pitch();
+            let scales_width = companions.scales.strided_width();
+            let scales_height = companions.scales.strided_rows();
+            let mut scales_bytes = Vec::with_capacity(scales_width * scales_height);
+            for row in 0..scales_height {
+                let row_start = scales_col + row * scales_pitch;
+                let row_end = row_start + scales_width;
+                scales_bytes.extend_from_slice(&scales_src[row_start..row_end]);
+            }
+            let scales_f16: Vec<f16> = scales_bytes.chunks_exact(2)
+                .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let scales_gpu = stream.clone_htod(&scales_f16)?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
-            // Upload scales via 2D DMA (zero CPU copy)
-            let scales_gpu_bytes = memcpy2d::clone_htod_2d(
-                stream,
-                companions.scales.base_ptr(),
-                companions.scales.col_start_bytes(),
-                companions.scales.src_pitch(),
-                companions.scales.strided_width(),
-                companions.scales.strided_rows(),
-            )?;
-
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
-
-            // Cast CudaSlice<u8> to CudaSlice<f16> — f16 is 2 bytes.
-            let scales_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<f16>>(scales_gpu_bytes) };
-
-            // Upload qzeros via 2D DMA (zero CPU copy)
-            let qzeros_gpu_bytes = memcpy2d::clone_htod_2d(
-                stream,
-                companions.qzeros.base_ptr(),
-                companions.qzeros.col_start_bytes(),
-                companions.qzeros.src_pitch(),
-                companions.qzeros.strided_width(),
-                companions.qzeros.strided_rows(),
-            )?;
-
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
-
-            // Cast CudaSlice<u8> to CudaSlice<u32> — u32 is 4 bytes, same as packed qzeros.
-            let qzeros_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<u32>>(qzeros_gpu_bytes) };
+            // Qzeros: same approach
+            let qzeros_src = companions.qzeros.data();
+            let qzeros_col = companions.qzeros.col_start_bytes();
+            let qzeros_pitch = companions.qzeros.src_pitch();
+            let qzeros_width = companions.qzeros.strided_width();
+            let qzeros_height = companions.qzeros.strided_rows();
+            let mut qzeros_bytes = Vec::with_capacity(qzeros_width * qzeros_height);
+            for row in 0..qzeros_height {
+                let row_start = qzeros_col + row * qzeros_pitch;
+                let row_end = row_start + qzeros_width;
+                qzeros_bytes.extend_from_slice(&qzeros_src[row_start..row_end]);
+            }
+            let qzeros_u32: Vec<u32> = qzeros_bytes.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let qzeros_gpu = stream.clone_htod(&qzeros_u32)?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
             weights.insert(
-                tensor.name().to_string(),
+                key.to_string(),
                 CachedWeight::Int4(Int4GpuBuffers {
                     qweight: qweight_gpu,
                     scales: scales_gpu,
@@ -408,7 +516,7 @@ fn upload_strided_mmap_tensor(
         _ => anyhow::bail!(
             "Unsupported dtype {:?} for strided upload of '{}'",
             tensor.dtype(),
-            tensor.name()
+            key
         ),
     }
     Ok(())
@@ -418,14 +526,17 @@ fn upload_strided_mmap_tensor(
 fn upload_contiguous_mmap_tensor(
     stream: &Arc<CudaStream>,
     tensor: &MmapTensor,
+    key: &str,
     int4_companions: &HashMap<String, MmapCompanions>,
     pinned: &mut PinnedHostBuffer,
     weights: &mut HashMap<String, CachedWeight>,
 ) -> Result<()> {
     match tensor.dtype() {
         WeightDtype::Int4Packed => {
-            let companions = int4_companions.get(tensor.name())
-                .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", tensor.name()))?;
+
+            let companions = int4_companions.get(key)
+                .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", key))?;
+
 
             // Upload qweight: reinterpret u8 as u32, upload directly
             let data = tensor.data();
@@ -436,10 +547,10 @@ fn upload_contiguous_mmap_tensor(
                 )
             };
             let qweight_gpu = stream.clone_htod(u32_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", key, e))?;
 
             // Sync after qweight upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
             // Upload scales: reinterpret u8 as f16, upload directly (scales are FP16)
             let scales_data = companions.scales.data();
@@ -450,10 +561,10 @@ fn upload_contiguous_mmap_tensor(
                 )
             };
             let scales_gpu = stream.clone_htod(f16_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", key, e))?;
 
             // Sync after scales upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
             // Upload qzeros: reinterpret u8 as u32, upload directly
             let qzeros_data = companions.qzeros.data();
@@ -464,13 +575,13 @@ fn upload_contiguous_mmap_tensor(
                 )
             };
             let qzeros_gpu = stream.clone_htod(qzeros_u32_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", key, e))?;
 
             // Sync after qzeros upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
             weights.insert(
-                tensor.name().to_string(),
+                key.to_string(),
                 CachedWeight::Int4(Int4GpuBuffers {
                     qweight: qweight_gpu,
                     scales: scales_gpu,
@@ -489,14 +600,15 @@ fn upload_contiguous_mmap_tensor(
                 )
             };
             let gpu_slice = stream.clone_htod(bf16_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", key, e))?;
 
            // Sync after upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
-            weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
+            weights.insert(key.to_string(), CachedWeight::Bf16(gpu_slice));
         }
         WeightDtype::Fp16 => {
+
             // Copy into pinned buffer, convert f16→bf16 in-place, upload
             let data = tensor.data();
             let count = data.len() / 2;
@@ -521,12 +633,12 @@ fn upload_contiguous_mmap_tensor(
                 )
             };
             let gpu_slice = stream.clone_htod(bf16_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", key, e))?;
 
             // Sync after upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
-            weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
+            weights.insert(key.to_string(), CachedWeight::Bf16(gpu_slice));
         }
         WeightDtype::Fp32 => {
             // Copy into pinned buffer, convert f32→bf16, upload
@@ -550,12 +662,12 @@ fn upload_contiguous_mmap_tensor(
             }
 
             let gpu_slice = stream.clone_htod(&bf16_result)
-                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", tensor.name(), e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to upload weight '{}': {}", key, e))?;
 
             // Sync after upload
-            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+            sync_stream(stream.as_ref(), &format!("upload_{}", key))?;
 
-            weights.insert(tensor.name().to_string(), CachedWeight::Bf16(gpu_slice));
+            weights.insert(key.to_string(), CachedWeight::Bf16(gpu_slice));
         }
         _ => {
             tracing::warn!(

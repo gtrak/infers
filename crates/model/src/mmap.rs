@@ -16,16 +16,23 @@ use super::loader::ShardIndex;
 use super::weights::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
 
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#DataOwner]]
-/// Owns the backing data for an MmapTensor — a memory-mapped file (zero-copy).
+/// Owns the backing data for an MmapTensor — either a memory-mapped file (zero-copy)
+/// or an owned CPU buffer (for non-contiguous sharded results like fused QKV).
 #[derive(Clone)]
-pub struct DataOwner {
+pub enum DataOwner {
     /// Backing data is a memory-mapped file (zero-copy).
-    mmap: Arc<Mmap>,
+    Mmap(Arc<Mmap>),
+    /// Backing data is an owned CPU buffer (contiguous, for sharded copies).
+    Owned(Arc<Vec<u8>>),
 }
 
 impl DataOwner {
-    fn new(mmap: Arc<Mmap>) -> Self {
-        Self { mmap }
+    fn new_mmap(mmap: Arc<Mmap>) -> Self {
+        Self::Mmap(mmap)
+    }
+
+    fn new_owned(data: Vec<u8>) -> Self {
+        Self::Owned(Arc::new(data))
     }
 }
 
@@ -89,9 +96,33 @@ impl MmapTensor {
         name: String,
     ) -> Self {
         Self {
-            owner: DataOwner::new(mmap),
+            owner: DataOwner::new_mmap(mmap),
             data_ptr,
             data_len,
+            shape,
+            dtype,
+            name,
+            src_pitch: 0,
+            col_start_bytes: 0,
+            strided_width: 0,
+            strided_rows: 0,
+        }
+    }
+
+    /// Create a contiguous tensor reference backed by an owned CPU buffer.
+    /// Used for non-contiguous sharded results (e.g., fused QKV segment-aware split).
+    pub fn from_owned(
+        data: Vec<u8>,
+        shape: Vec<usize>,
+        dtype: WeightDtype,
+        name: String,
+    ) -> Self {
+        let ptr = data.as_ptr();
+        let len = data.len();
+        Self {
+            owner: DataOwner::new_owned(data),
+            data_ptr: ptr,
+            data_len: len,
             shape,
             dtype,
             name,
@@ -123,7 +154,7 @@ impl MmapTensor {
     ) -> Self {
         let data_len = src_pitch * strided_rows; // approximate bounding box
         Self {
-            owner: DataOwner::new(mmap),
+            owner: DataOwner::new_mmap(mmap),
             data_ptr: base_ptr,
             data_len,
             shape,
@@ -186,9 +217,12 @@ impl MmapTensor {
         &self.name
     }
 
-    /// Get a clone of the underlying Arc<Mmap>.
-    pub fn mmap_arc(&self) -> Arc<Mmap> {
-        self.owner.mmap.clone()
+    /// Get a clone of the underlying Arc<Mmap>, if this tensor is mmap-backed.
+    pub fn mmap_arc(&self) -> Option<Arc<Mmap>> {
+        match &self.owner {
+            DataOwner::Mmap(m) => Some(m.clone()),
+            DataOwner::Owned(_) => None,
+        }
     }
 
     /// Clone the data owner — used by sharding to create sub-views sharing the same backing.
@@ -318,7 +352,7 @@ fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> R
     new_shape[1] = shard_size;
 
     Ok(MmapTensor::new_strided(
-        tensor.mmap_arc(),
+        tensor.mmap_arc().expect("mmap_slice_last_dim requires mmap-backed tensor"),
         unsafe { tensor.data().as_ptr() }, // base pointer to original mmap data
         src_pitch,
         col_start_bytes,
@@ -330,15 +364,116 @@ fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> R
     ))
 }
 
+/// Shard a fused QKV projection along the column dimension with per-segment splitting.
+///
+/// Unlike generic column-parallel which splits the entire last dimension evenly,
+/// this function splits each Q/K/V segment independently. Since segments have
+/// different sizes (Q=2048, K=2048, V=6144 for example), a naive split gives
+/// wrong results — GPU 0 would get columns [0,5120) instead of the correct
+/// [0,1024) + [2048,3072) + [4096,7168).
+///
+/// The result is a contiguous owned buffer containing the correctly sharded data,
+/// because the per-segment columns are non-contiguous in the source.
+fn mmap_shard_fused_projection_columns(
+    tensor: &MmapTensor,
+    gpu_id: usize,
+    num_gpus: usize,
+    segments: &[(usize, usize)],
+) -> Result<MmapTensor> {
+    anyhow::ensure!(tensor.shape().len() >= 2, "Fused projection weight must be at least 2D");
+
+    let shape = tensor.shape();
+    let rows = shape[0];
+    let full_n = shape[1];
+    let bytes_per_element = tensor.data_len / (rows * full_n);
+
+    // Total shard columns = sum of each segment's shard portion
+    let shard_n: usize = segments.iter().map(|&(s, e)| (e - s) / num_gpus).sum();
+
+    // Copy the correctly sharded data into a contiguous buffer
+    let mut shard_data = Vec::with_capacity(rows * shard_n * bytes_per_element);
+
+    for row in 0..rows {
+        let row_offset = row * full_n * bytes_per_element;
+
+        for &(start, end) in segments {
+            let seg_len = end - start;
+            let shard_size = seg_len / num_gpus;
+            let shard_start = start + gpu_id * shard_size;
+            let shard_end = shard_start + shard_size;
+
+            shard_data.extend_from_slice(
+                &tensor.data()[row_offset + shard_start * bytes_per_element
+                    ..row_offset + shard_end * bytes_per_element],
+            );
+        }
+    }
+
+    let mut new_shape = shape.to_vec();
+    new_shape[1] = shard_n;
+
+    Ok(MmapTensor::from_owned(
+        shard_data,
+        new_shape,
+        tensor.dtype(),
+        format!("{}_gpu{}", tensor.name(), gpu_id),
+    ))
+}
+/// Shard a fused QKV weight along dim 0 (rows) with per-segment splitting.
+///
+/// Unlike `mmap_slice_dim0` which naively splits dim 0 evenly, this splits
+/// each Q/K/V segment independently. Used for `conv1d.weight` which has
+/// shape [conv_dim, 1, kernel_size] where conv_dim = key_dim*2 + value_dim.
+fn mmap_shard_fused_projection_rows(
+    tensor: &MmapTensor,
+    gpu_id: usize,
+    num_gpus: usize,
+    segments: &[(usize, usize)],
+) -> Result<MmapTensor> {
+    anyhow::ensure!(tensor.shape().len() >= 2, "Fused projection weight must be at least 2D");
+
+    let shape = tensor.shape();
+    let full_n = shape[0]; // conv_dim (e.g., 10240)
+    let bytes_per_row = tensor.data_len / full_n; // e.g., 1*4*2 = 8 bytes for [N,1,4] BF16
+
+    // Total shard rows = sum of each segment's shard portion
+    let shard_n: usize = segments.iter().map(|&(s, e)| (e - s) / num_gpus).sum();
+
+    // Copy the correctly sharded row data into a contiguous buffer
+    let mut shard_data = Vec::with_capacity(shard_n * bytes_per_row);
+
+    for &(start, end) in segments {
+        let seg_len = end - start;
+        let shard_size = seg_len / num_gpus;
+        let shard_start = start + gpu_id * shard_size;
+        let shard_end = shard_start + shard_size;
+
+        let start_byte = shard_start * bytes_per_row;
+        let end_byte = shard_end * bytes_per_row;
+        shard_data.extend_from_slice(&tensor.data()[start_byte..end_byte]);
+    }
+
+    let mut new_shape = shape.to_vec();
+    new_shape[0] = shard_n;
+
+    Ok(MmapTensor::from_owned(
+        shard_data,
+        new_shape,
+        tensor.dtype(),
+        format!("{}_gpu{}", tensor.name(), gpu_id),
+    ))
+}
+
 /// Shard model weights across `num_gpus` devices for tensor parallelism (mmap version).
 ///
 /// Follows the same sharding rules as [`shard_weights_tp`](super::sharding::shard_weights_tp) but
 /// operates on MmapTensor references. Contiguous splits (BF16 dim-0, INT4 dim-0) are zero-copy.
-/// Non-contiguous splits (BF16 last-dim, INT4 last-dim) return an error — use --no-mmap.
+/// Non-contiguous splits (BF16 last-dim, INT4 last-dim) produce strided tensors uploaded via cuMemcpy2D DMA.
+/// Fused QKV projections use per-segment column splitting matching the heap path.
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#shard_weights_tp_mmap]]
 pub fn shard_weights_tp_mmap(
     registry: &MmapWeightRegistry,
-    _config: &super::config::ModelConfig,
+    config: &super::config::ModelConfig,
     num_gpus: usize,
 ) -> Result<Vec<MmapWeightShard>> {
     anyhow::ensure!(num_gpus >= 1, "num_gpus must be >= 1");
@@ -372,8 +507,74 @@ pub fn shard_weights_tp_mmap(
         let is_int4 = tensor.dtype() == WeightDtype::Int4Packed;
 
         // Check if this is a fused QKV projection that needs per-projection sharding.
-        // TODO: proper fused QKV mmap sharding not yet implemented; falls through to
-        // regular column-parallel which may give incorrect results for GDN models.
+        // Shard each sub-projection (Q/K/V) independently rather than splitting the
+        // entire fused tensor evenly, because segments have different sizes.
+        let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let qkv_segments: &[(usize, usize)] = &[
+            (0, key_dim),                // Q
+            (key_dim, 2 * key_dim),      // K
+            (2 * key_dim, conv_dim),     // V
+        ];
+
+        if name.contains("in_proj_qkv") {
+            // Scaled segments for qzeros (conv_dim/8 instead of conv_dim)
+            let qzeros_segments: Vec<(usize, usize)> =
+                qkv_segments.iter().map(|&(s, e)| (s / 8, e / 8)).collect();
+
+            for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                let sliced = mmap_shard_fused_projection_columns(
+                    tensor, gpu_id, num_gpus, qkv_segments,
+                )
+                .context(format!("Failed to shard fused QKV projection: {}", name))?;
+                shard.registry.tensors.insert(name.clone(), sliced);
+
+                 // Shard INT4 companion weights with the same segment structure
+                if is_int4 && name.ends_with(".qweight") {
+                    let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                    let scales_name = format!("{}.scales", base);
+                    let qzeros_name = format!("{}.qzeros", base);
+
+                    if let Some(scales) = registry.tensors.get(&scales_name)
+                        && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
+
+                        // Debug: trace companion lookup
+                        tracing::debug!(
+                            "Fused QKV shard {}: found companions scales={} qzeros={}",
+                            gpu_id, scales.shape().len(), qzeros.shape().len()
+                        );
+
+                        let sliced_scales = mmap_shard_fused_projection_columns(
+                            scales, gpu_id, num_gpus, qkv_segments,
+                        )
+                        .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
+                        // qzeros has last_dim = conv_dim/8, so segments must be scaled by 1/8
+                        let sliced_qzeros = mmap_shard_fused_projection_columns(
+                            qzeros, gpu_id, num_gpus, &qzeros_segments,
+                        )
+                        .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
+                        shard.registry.int4_companions.insert(
+                            name.clone(),
+                            MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // conv1d.weight: fused QKV weight needing per-segment row splitting (same as heap path)
+        if name.contains("conv1d.weight") {
+            for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                let sliced = mmap_shard_fused_projection_rows(
+                    tensor, gpu_id, num_gpus, qkv_segments,
+                )
+                    .context(format!("Failed to shard conv1d weight: {}", name))?;
+                shard.registry.tensors.insert(name.clone(), sliced);
+            }
+            continue;
+        }
         let shard_type = super::sharding::determine_shard_type(name);
 
         match shard_type {
@@ -394,8 +595,6 @@ pub fn shard_weights_tp_mmap(
                             if let Some(scales) = registry.tensors.get(&scales_name)
                                 && let Some(qzeros) = registry.tensors.get(&qzeros_name)
                             {
-                                companion_skip.insert(scales_name.clone());
-                                companion_skip.insert(qzeros_name.clone());
                                 let sliced_scales = mmap_slice_last_dim(scales, gpu_id, num_gpus)
                                     .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                                 let sliced_qzeros = mmap_slice_last_dim(qzeros, gpu_id, num_gpus)
@@ -433,8 +632,6 @@ pub fn shard_weights_tp_mmap(
                             if let Some(scales) = registry.tensors.get(&scales_name)
                                 && let Some(qzeros) = registry.tensors.get(&qzeros_name)
                             {
-                                companion_skip.insert(scales_name.clone());
-                                companion_skip.insert(qzeros_name.clone());
                                 let sliced_scales = mmap_slice_dim0(scales, gpu_id, num_gpus)
                                     .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                                 let sliced_qzeros = mmap_slice_dim0(qzeros, gpu_id, num_gpus)
@@ -469,8 +666,6 @@ pub fn shard_weights_tp_mmap(
                         if let Some(scales) = registry.tensors.get(&scales_name)
                             && let Some(qzeros) = registry.tensors.get(&qzeros_name)
                         {
-                            companion_skip.insert(scales_name.clone());
-                            companion_skip.insert(qzeros_name.clone());
                             shard.registry.int4_companions.insert(
                                 name.clone(),
                                 MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() },
@@ -814,9 +1009,9 @@ mod tests {
         assert_eq!(registry.num_tensors(), 2);
         assert!(registry.tensors.contains_key("layer.0.weight"));
         assert!(registry.tensors.contains_key("norm.weight"));
-    // Verify tensors are mmap-backed (mmap_arc() returns Arc<Mmap>)
+    // Verify tensors are mmap-backed (mmap_arc() returns Some(Arc<Mmap>))
         let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
-        let _arc: Arc<Mmap> = layer_tensor.mmap_arc();
+        let _arc: Arc<Mmap> = layer_tensor.mmap_arc().expect("should be mmap-backed");
 
         // Verify tensor shapes and data
         let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
@@ -1092,7 +1287,7 @@ mod tests {
             // Strided tensor — is_strided should be true
             assert!(w.is_strided(), "GPU {} tensor should be strided", gpu_id);
             // Still has mmap backing (zero-copy from original)
-            let _arc: Arc<Mmap> = w.mmap_arc();
+            let _arc: Arc<Mmap> = w.mmap_arc().expect("should be mmap-backed");
         }
 
         // Verify strided access parameters are correct.
@@ -1142,7 +1337,110 @@ mod tests {
             // Strided tensor — is_strided should be true
             assert!(w.is_strided(), "GPU {} tensor should be strided", gpu_id);
             // Still has mmap backing (zero-copy from original)
-            let _arc: Arc<Mmap> = w.mmap_arc();
+            let _arc: Arc<Mmap> = w.mmap_arc().expect("should be mmap-backed");
+        }
+    }
+
+    #[test]
+    fn shard_weights_tp_mmap_fused_qkv_segment_aware() {
+        // Fused QKV: each segment (Q/K/V) should be split independently.
+        // With key_dim=32, value_dim=64, conv_dim=128:
+        //   Q=[0,32), K=[32,64), V=[64,128)
+        // For TP=2, GPU 0 gets first half of each segment:
+        //   [0,16) from Q + [32,48) from K + [64,96) from V = 64 cols total
+        // This is NOT the same as taking columns [0,64) (which would include
+        // all of Q and K but only half of V — wrong!).
+
+        // Fill with predictable data: byte at position (row * 128 + col) = col % 256
+        let mut qweight_bytes: Vec<u8> = Vec::with_capacity(4 * 128);
+        for _row in 0..4 {
+            for col in 0..128 {
+                qweight_bytes.push(col as u8);
+            }
+        }
+
+        // Scales: shape [4, 128] (same as qweight for this test)
+        let mut scales_bytes: Vec<u8> = Vec::with_capacity(4 * 128);
+        for _row in 0..4 {
+            for col in 0..128 {
+                scales_bytes.push(col as u8 + 1);
+            }
+        }
+
+        // Qzeros: shape [4, 16] (conv_dim/8 = 128/8 = 16)
+        let mut qzeros_bytes: Vec<u8> = Vec::with_capacity(4 * 16);
+        for _row in 0..4 {
+            for col in 0..16 {
+                qzeros_bytes.push(col as u8 + 2);
+            }
+        }
+
+        // Write each to a separate temp file so they don't overwrite each other
+        let file1 = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(&file1, &qweight_bytes).unwrap();
+        let mmap1 = Arc::new(unsafe { Mmap::map(&file1).unwrap() });
+
+        let file2 = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(&file2, &scales_bytes).unwrap();
+        let mmap2 = Arc::new(unsafe { Mmap::map(&file2).unwrap() });
+
+        let file3 = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(&file3, &qzeros_bytes).unwrap();
+        let mmap3 = Arc::new(unsafe { Mmap::map(&file3).unwrap() });
+
+        let mut registry = MmapWeightRegistry::new();
+        registry.tensors.insert(
+            "layers.0.linear_attn.in_proj_qkv.qweight".to_string(),
+            MmapTensor::new(mmap1.clone(), unsafe { mmap1.as_ptr() }, 512, vec![4, 128], WeightDtype::Int4Packed, "layers.0.linear_attn.in_proj_qkv.qweight".into()),
+        );
+
+        registry.tensors.insert(
+            "layers.0.linear_attn.in_proj_qkv.scales".to_string(),
+            MmapTensor::new(mmap2.clone(), unsafe { mmap2.as_ptr() }, 512, vec![4, 128], WeightDtype::Int4Packed, "layers.0.linear_attn.in_proj_qkv.scales".into()),
+        );
+
+        registry.tensors.insert(
+            "layers.0.linear_attn.in_proj_qkv.qzeros".to_string(),
+            MmapTensor::new(mmap3.clone(), unsafe { mmap3.as_ptr() }, 64, vec![4, 16], WeightDtype::Int4Packed, "layers.0.linear_attn.in_proj_qkv.qzeros".into()),
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"linear_num_key_heads":2,"linear_key_head_dim":16,"linear_num_value_heads":4,"linear_value_head_dim":16}"#;
+        let config: crate::config::ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        let shards = shard_weights_tp_mmap(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.linear_attn.in_proj_qkv.qweight").unwrap();
+            // Shape should be [4, 64] (64 = 16 from Q + 16 from K + 32 from V)
+            assert_eq!(w.shape(), &[4, 64], "GPU {} shape should be [4, 64]", gpu_id);
+
+            // Debug: verify data is correctly owned (not mmap-backed)
+            assert!(w.mmap_arc().is_none(), "GPU {} fused QKV qweight should be owned", gpu_id);
+            // NOT strided — owned data for contiguous shard buffer
+            assert!(!w.is_strided(), "GPU {} fused QKV should not be strided (owned data)", gpu_id);
+
+            // Verify the data is correctly sharded per segment
+            // For row 0: we expect bytes from columns [0,16) + [32,48) + [64,96) for GPU 0
+            // or [16,32) + [48,64) + [96,128) for GPU 1
+            let row0_data = &w.data()[0..64];
+
+            if gpu_id == 0 {
+                // GPU 0: first half of Q [0,16), first half of K [32,48), first half of V [64,96)
+                let expected: Vec<u8> = (0..16).chain(32..48).chain(64..96).collect();
+                assert_eq!(row0_data, &expected[..], "GPU 0 row data mismatch");
+            } else {
+                // GPU 1: second half of Q [16,32), second half of K [48,64), second half of V [96,128)
+                let expected: Vec<u8> = (16..32).chain(48..64).chain(96..128).collect();
+                assert_eq!(row0_data, &expected[..], "GPU 1 row data mismatch");
+            }
+
+            // Verify companion tensors were also correctly sharded
+            let companions = shards[gpu_id].registry.int4_companions.get("layers.0.linear_attn.in_proj_qkv.qweight")
+                .expect("companion should exist for qweight");
+            assert_eq!(companions.scales.shape(), &[4, 64], "GPU {} scales shape", gpu_id);
+            // Qzeros segments scaled by 1/8: Q=[0,4), K=[4,8), V=[8,16) → shard 2+2+4=8 cols per GPU
+            assert_eq!(companions.qzeros.shape(), &[4, 8], "GPU {} qzeros shape", gpu_id);
         }
     }
 }
