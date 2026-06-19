@@ -29,6 +29,8 @@ pub fn upload_weight(
     stream: &Arc<CudaStream>,
     weight: &WeightData,
 ) -> Result<CudaSlice<bf16>> {
+    let span = tracing::debug_span!("weight_upload", tensor = %weight.name, bytes = weight.data.len());
+    let _enter = span.enter();
     let bf16_vec = bytes_to_bf16(&weight.data, weight.dtype)?;
 
     // Debug: dump conv1d weight bytes just before GPU upload
@@ -68,9 +70,13 @@ pub fn upload_weight(
     // from returning the same GPU address for consecutive allocations on this stream.
     // The async memory pool can return overlapping addresses if prior allocations are
     // still pending (copy not yet completed) when the next allocation is made.
-    stream
-        .synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after uploading '{}': {}", weight.name, e))?;
+    {
+        let sync_span = tracing::debug_span!("cuda_sync", reason = "weight_upload");
+        let _enter = sync_span.enter();
+        stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("Failed to sync stream after uploading '{}': {}", weight.name, e))?;
+    }
 
     Ok(gpu_slice)
 }
@@ -186,22 +192,34 @@ pub fn upload_int4_weight(
         .map_err(|e| anyhow::anyhow!("Failed to upload qweight '{}': {}", qweight.name, e))?;
     // CRITICAL: Sync after each upload to prevent cudaMallocAsync
     // from returning overlapping addresses on the same stream.
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after qweight '{}': {}", qweight.name, e))?;
+    {
+        let sync_span = tracing::debug_span!("cuda_sync", reason = "int4_qweight");
+        let _enter = sync_span.enter();
+        stream.synchronize()
+            .map_err(|e| anyhow::anyhow!("Failed to sync stream after qweight '{}': {}", qweight.name, e))?;
+    }
 
     let scales_gpu = stream
         .clone_htod(&scales_vec)
         .map_err(|e| anyhow::anyhow!("Failed to upload scales '{}': {}", scales.name, e))?;
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after scales '{}': {}", scales.name, e))?;
+    {
+        let sync_span = tracing::debug_span!("cuda_sync", reason = "int4_scales");
+        let _enter = sync_span.enter();
+        stream.synchronize()
+            .map_err(|e| anyhow::anyhow!("Failed to sync stream after scales '{}': {}", scales.name, e))?;
+    }
 
     let qzeros_gpu = stream
         .clone_htod(&qzeros_u32)
         .map_err(|e| anyhow::anyhow!("Failed to upload qzeros '{}': {}", qzeros.name, e))?;
     // Final sync not strictly needed since nothing follows in this function,
     // but good practice for callers that immediately launch kernels.
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after qzeros '{}': {}", qzeros.name, e))?;
+    {
+        let sync_span = tracing::debug_span!("cuda_sync", reason = "int4_qzeros");
+        let _enter = sync_span.enter();
+        stream.synchronize()
+            .map_err(|e| anyhow::anyhow!("Failed to sync stream after qzeros '{}': {}", qzeros.name, e))?;
+    }
 
     Ok((qweight_gpu, scales_gpu, qzeros_gpu))
 }

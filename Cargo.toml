@@ -42,9 +42,16 @@ serde_with = "3.21.0"
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 
-# Logging
+# Logging / Tracing
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "registry"] }
+
+# OTLP Tracing
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.28"
+tonic = "0.12"
 
 # CLI
 clap = { version = "4.6.1", features = ["derive", "env"] }

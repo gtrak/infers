@@ -29,6 +29,8 @@ pub fn spawn_scheduler_loop(orchestrator: Arc<Mutex<InferenceOrchestrator>>) {
         tracing::info!("Background scheduler loop started");
         loop {
             {
+                let span = tracing::debug_span!("scheduler_loop_tick");
+                let _enter = span.enter();
                 let mut guard = orchestrator.lock().await;
                 if let Err(e) = guard.step() {
                     tracing::error!("Scheduler step failed: {:?}", e);

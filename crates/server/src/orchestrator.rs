@@ -119,6 +119,8 @@ impl InferenceOrchestrator {
     /// 6. Sends generated tokens through response channels.
     /// 7. Cleans up completed sessions' response channels.
     pub fn step(&mut self) -> Result<()> {
+        let span = tracing::info_span!("scheduler_step");
+        let _enter = span.enter();
         // Step 1: Schedule — admit requests, build decode/prefill batches
         let work = self.scheduler.schedule()?;
 
@@ -148,6 +150,8 @@ impl InferenceOrchestrator {
 
         // Step 3: Handle eviction
         if let Some(evicted_id) = work.evicted_session {
+            let evict_span = tracing::debug_span!("eviction", session_id = evicted_id);
+            let _evict_enter = evict_span.enter();
             tracing::info!("Evicting session {} due to memory pressure", evicted_id);
             // For now, use direct cleanup (full paged eviction is deferred)
             let _ = self.scheduler.kv_manager.delete_sequence(evicted_id);
@@ -157,6 +161,8 @@ impl InferenceOrchestrator {
         // Step 4: Handle prefill batch
         if let Some(prefill_batch) = &work.prefill_batch {
             for &seq_id in &prefill_batch.sessions {
+                let session_span = tracing::info_span!("prefill_session", session_id = seq_id);
+                let _session_enter = session_span.enter();
                 // Get the prompt tokens from the batch
                 let tokens = &prefill_batch.input_tokens;
                 tracing::debug!(
@@ -189,6 +195,8 @@ impl InferenceOrchestrator {
 
         // Step 5: Handle decode batch
         for (i, &seq_id) in work.decode_batch.sessions.iter().enumerate() {
+            let session_span = tracing::info_span!("decode_session", session_id = seq_id);
+            let _session_enter = session_span.enter();
             let token_id = work.decode_batch.input_tokens[i];
 
             // Get session for sampling config, token history, and position

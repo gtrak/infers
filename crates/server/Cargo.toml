@@ -16,6 +16,14 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
+
+# OTLP Tracing
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tonic = { workspace = true }
+
 # Internal crates
 infers-api = { path = "../api" }
 infers-metrics = { path = "../metrics" }

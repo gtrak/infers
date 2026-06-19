@@ -9,9 +9,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::Mutex;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt, Registry};
 
 use infers_backend_native::{BackendEvictionStore, ForwardEngine};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+
 use infers_cuda::context::CudaRuntime;
 use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
@@ -84,6 +87,18 @@ pub struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Enable OTLP trace export
+    #[arg(long, default_value = "false")]
+    pub otlp_enabled: bool,
+
+    /// OTLP gRPC endpoint
+    #[arg(long, default_value = "http://localhost:4317")]
+    pub otlp_endpoint: String,
+
+    /// OTLP service name
+    #[arg(long, default_value = "infers")]
+    pub otlp_service_name: String,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -120,13 +135,42 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    // Initialize layered tracing subscriber
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(true);
+
+    if args.otlp_enabled {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&args.otlp_endpoint)
+            .build()
+            .expect("Failed to build OTLP span exporter");
+        let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .build();
+        let tracer = tracer_provider.tracer(args.otlp_service_name);
+
+        use opentelemetry::global;
+        global::set_tracer_provider(tracer_provider);
+
+        let otlp_layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer);
+
+        Registry::default()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(otlp_layer)
+            .init();
+    } else {
+        Registry::default()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+    }
 
     tracing::info!("Starting infers server");
     tracing::info!("Model: {}", args.model);

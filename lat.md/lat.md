@@ -56,6 +56,10 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
 | nccl | Multi-GPU collective operations for TP/PP |
 
+### cuda-oxide: Quantization-Generic Kernels (Phase 18)
+
+Rust→PTX compiler for three quantization-sensitive kernels with trait-based dispatch. Enables AutoRound, GGUF, AWQ, GPTQ with one kernel. Rust source is portable to rust-gpu (SPIR-V) and amdgcn (HIP) for multi-hardware.
+
 # Kernel Extraction and Build System
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.
 
@@ -472,6 +476,10 @@ Full prefill pipeline using paged KV cache instead of flat buffers. See [[crates
 
 Key differences from flat `prefill()`: uses `attention::forward_paged` which writes K/V to paged cache via `paged_kv_write` kernel, passes block table GPU pointer and positions GPU pointer to the attention function.
 
+#### Paged KV Manager Sharing (Phase 17)
+
+The `PagedKvManager` is owned by the scheduler, not the engine. The engine receives `&mut PagedKvManager` as a parameter, ensuring prefill and decode share the same page pool. GPU-side caches (`PagedKvCache`) stay in the engine.
+
 ### Paged Decode Path
 
 Full decode pipeline using paged KV cache with zero CPU round-trips and TP support. See [[crates/backends/native/src/engine.rs#ForwardEngine#decode_paged]].
@@ -544,6 +552,15 @@ The `forward_paged` function in [[crates/backends/native/src/attention.rs#forwar
 The `decode_forward_paged` function in [[crates/backends/native/src/attention.rs#decode_forward_paged]] has been wired with the same probe::dump() instrumentation. Decode-specific shapes use `seq_len=1`: `attn.k_proj`, `attn.v_proj`, `attn.k_norm` (only when K-norm weights exist), `attn.q_proj_raw`, `attn.q_norm` (only when Q-norm weights exist), `attn.gate` (only when attn_output_gate is enabled), `attn.combined`, `attn.gated`, and `attn.o_proj`. Also, `attn.k_cached` and `attn.v_cached` dump K (after norm+RoPE) and V (raw) right before the paged KV cache write. No per-head dumps since decode path has no per-head extraction loop.
 
 The `gdn::forward()` function in [[crates/backends/native/src/gdn.rs#forward]] has been wired with probe::dump() for all GDN intermediates, replacing the old ad-hoc `dump_gdn_intermediate()` and `INFERS_DUMP_GDN_LAYER`/`INFERS_DUMP_GDN_DIR` code paths. GDN stages include: `gdn.hidden_input`, `gdn.mixed_qkv`, `gdn.conv_out`, `gdn.query`, `gdn.key`, `gdn.value`, `gdn.query_expanded`, `gdn.key_expanded`, `gdn.a_proj`, `gdn.b_proj`, `gdn.core_attn_out`, `gdn.z_gate`, `gdn.norm_output`, and `gdn.output`. Weight tensors (conv1d_weight, norm_weight) are excluded from probing as they are not intermediates. The `gdn::decode_forward()` function accepts the same `gpu_idx` and `ProbeConfig` parameters for future consistency.
+
+### Tracing Spans
+
+Structured tracing spans via the `tracing` crate for distributed tracing and performance profiling. Spans form a hierarchy: top-level `prefill` or `decode` spans contain per-layer `layer` spans with structured attributes.
+
+`prefill_paged()` emits `tracing::info_span!("prefill", num_tokens = token_ids.len())` at function entry. Each layer iteration in the loop emits `tracing::info_span!("layer", layer_idx, layer_type)` where `layer_type` is `"full_attn"` for FullAttention layers or `"gdn"` for GatedDeltaNet layers.
+
+`decode_paged()` emits `tracing::info_span!("decode")` at function entry with the same per-layer span pattern as prefill. All spans use structured fields (no string interpolation) so OTLP exports them as queryable attributes in Jaeger/Tempo/Grafana.
+
 
 YH:### Standalone Infer Binary
 RS:
@@ -953,6 +970,91 @@ Request latency distribution in seconds with buckets at [0.01, 0.05, 0.1, 0.25, 
 ## Metrics HTTP Endpoint
 
 Axum handler exposes all registered metrics at `/metrics` in Prometheus text format.
+
+# Tracing and Observability
+
+Distributed tracing via OpenTelemetry OTLP/gRPC for profiling and bottleneck identification.
+
+## Architecture
+
+Layered `tracing_subscriber::Registry` with `fmt` (always on) and optional `otlp` layer (gRPC, conditional on `--otlp-enabled`). Zero overhead when disabled.
+
+## CLI Arguments
+
+OTLP-related CLI arguments for the server binary.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--otlp-enabled` | `false` | Enable OTLP trace export |
+| `--otlp-endpoint` | `http://localhost:4317` | OTLP gRPC collector endpoint |
+| `--otlp-service-name` | `infers` | Service name in OTLP traces |
+
+## Span Taxonomy
+
+Structured `tracing` spans form a hierarchy with key-value attributes for OTLP export.
+
+### Top-Level Spans
+
+Root spans for inference operations with GPU timing attributes.
+
+| Span | Level | Key Attributes | Description |
+|------|-------|---------------|-------------|
+| `prefill` | info | `num_tokens`, `num_layers`, `gpu_time_ms` | Full prefill pass |
+| `decode` | info | `gpu_time_ms` | Full decode step |
+| `scheduler_step` | info | — | Scheduling iteration |
+| `scheduler_loop_tick` | debug | — | Background scheduler loop tick |
+| `weight_cache_build` | info | `gpu_idx`, `num_weights` | Startup weight upload |
+
+### Per-Layer Spans
+
+One span per transformer layer showing layer type and sub-operations.
+
+| Span | Level | Key Attributes | Description |
+|------|-------|---------------|-------------|
+| `layer` | info | `layer_idx`, `layer_type` | Per-layer dispatch |
+| `attention` | info | `gpu_idx` | Full-attention forward |
+| `gdn` | info | `gpu_idx` | GDN linear-attention forward |
+| `nccl_all_reduce` | debug | `kind` (`attention`/`mlp`/`gdn`) | Inter-GPU communication |
+| `mlp` | info | — | SwiGLU MLP block |
+| `norm1` / `norm2` | debug | — | RMSNorm |
+| `residual` | debug | — | Residual connection add |
+| `final_norm` | debug | — | Post-layer-loop RMSNorm |
+| `lm_head` | debug | — | Logits projection |
+| `sample` | debug | — | Token sampling |
+
+### I/O Spans
+
+I/O operations that may be bottlenecks: weight upload, logits download, CUDA synchronization.
+
+| Span | Level | Key Attributes | Description |
+|------|-------|---------------|-------------|
+| `weight_upload` | debug | `tensor`, `bytes` | CPU→GPU weight copy |
+| `logits_download` | debug | `vocab_size` | GPU→CPU logits copy |
+| `cuda_sync` | debug | `reason` (`weight_upload`, `int4_qweight`, `int4_scales`, `int4_qzeros`) | Explicit stream synchronize |
+| `prefill_session` | info | `session_id` | Per-session prefill |
+| `decode_session` | info | `session_id` | Per-session decode |
+| `eviction` | debug | `session_id` | KV cache eviction |
+
+## CUDA Event Timing
+
+CPU wall-clock vs GPU execution time distinguishes launch overhead from GPU saturation. Uses cudarc's built-in `CudaEvent` (re-exported via `infers_cuda`) for RAII GPU timing — no custom FFI wrapper needed.
+
+cudarc 0.19.7 provides `CudaContext::new_event(None)`, `CudaEvent::record(&stream)`, `CudaEvent::synchronize()`, and `CudaEvent::elapsed_ms(end)` natively. Events are recorded on a CUDA stream; `elapsed_ms(start, end)` measures GPU time between two points on the same stream.
+
+For TP=2, each GPU has its own stream. Top-level `gpu_time_ms` reports the max across GPUs (bottleneck GPU determines throughput). Per-layer GPU timing is available via `INFERS_TRACE_LAYER_TIMING=1` env var — adds ~5μs overhead per layer (acceptable for profiling, env-gated off for production).
+
+## Dependency Chain
+
+OTLP dependencies are isolated to `infers-server` only. Other crates emit `tracing` spans (no-ops without a subscriber).
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `opentelemetry` | `0.27` | API types |
+| `opentelemetry_sdk` | `0.27` | Batch processor, runtime |
+| `opentelemetry-otlp` | `0.27` | OTLP gRPC exporter |
+| `tracing-opentelemetry` | `0.28` | Bridge: tracing → OTel spans |
+| `tonic` | `0.12` | gRPC transport |
+
 
 # Server
 
@@ -1850,6 +1952,34 @@ Cosine similarity at last token position shows directional drift. By L31 (60% th
 ## Conclusion
 The bug is localized to **full-attention layers** (every 4th layer: L3, L7, L11, ...). GDN layers are largely correct (ratio ~0.85-0.95). Attention produces values approximately 2x larger than reference, compounding across all 16 full-attention layers.
 
+# Decode Embedding Divergence Investigation
+
+Investigation into why the engine's decode output diverges from HF at step 2 (token 279 vs 9338) using probe dumps of hidden states.
+
+## Setup
+
+Using prefill tokens `[248045,846,...,271]` with 3 cached decode steps (tokens 760, 6511, 314). HF model via `Qwen3_5ForCausalLM`. Engine uses probe dumps for `embed.output`.
+
+## Results
+
+The engine's embedding table is COMPLETELY DIFFERENT from HF's embedding table:
+
+- **Zero matching elements** between HF and engine embeddings for any token (across all 5120 dimensions, all tested tokens)
+- **100% sign agreement** — every element has the same sign as HF
+- **Norms are ~66-88x larger** than HF: engine norms range from 58-74 per token while HF norms are 0.77-1.09
+- **Cosine similarity is only 0.23-0.86** across tokens (not uniformly scaled)
+
+The norm variation is NOT explained by RMSNorm alone — different tokens have different scaling ratios (66x to 88x). The per-element scaling is non-uniform: top-100 HF dimensions (largest values) are scaled ~48x on average, while bottom-100 dimensions (smallest HF values) are over-scaled by ~29,000x on average.
+
+Despite the completely wrong embedding table, the engine produces correct tokens for steps 0 and 1. Only at step 2 does it diverge (token 279 vs HF's token 9338). The prefill logits match HF (top1=760), confirming the bug manifests during decode.
+
+## Open Questions
+
+The embedding table is loaded as bf16 directly from safetensors with no INT4 companion weights. The engine code path for bf16 weights is straightforward (`upload_weight` → `CachedWeight::Bf16`). Possible causes:
+
+1. **CUDA embedding gather kernel bug** — the `infers_embedding_gather_bf16` kernel might transform the data incorrectly
+2. **Memory corruption between load and use** — GPU memory for the embedding table might be corrupted before the embed_tokens() call
+3. **TP=2 weight loading issue** — with replicated embeddings on 2 GPUs, there might be a synchronization or alignment problem
 # Numerical Precision Investigation
 
 Investigation into bf16 precision compounding through GDN recurrent layers in the Qwen3.6-27B INT4 inference engine.
@@ -2033,3 +2163,33 @@ Analysis of the engine's norm2 (post-MLP RMSNorm) output against HF oracle revea
 **Layer 0 final output is cos=0.991.** Despite the misleading norm2 weighted cos, the residual connection after MLP dilutes the error. Layer 0 final output has cos=0.9914 vs oracle, with ratio=1.10 (10% magnitude error). This 10% accumulates over 64 layers.
 
 **Correct comparison metric for RMSNorm stages.** For comparing norm outputs, the unweighted cosine of the normalized vectors (before weight application) is the correct metric. The weighted cos is sensitive to the weight's variance and can be misleading.
+
+# Phase 15: Tracing Integration + OTLP Export
+OpenTelemetry tracing via layered subscriber with conditional OTLP gRPC export for performance profiling and bottleneck identification.
+
+## Architecture
+Layered `tracing_subscriber::Registry` with fmt layer always on, optional OTLP layer when `--otlp-enabled`.
+
+Dependency chain: `tracing` spans → `tracing-subscriber` Registry → `tracing-opentelemetry` bridge → `opentelemetry-sdk` batch processor → `opentelemetry-otlp` gRPC exporter via tonic.
+
+## Workspace Dependencies
+Five new workspace deps: opentelemetry 0.27, opentelemetry_sdk 0.27 (with rt-tokio feature), opentelemetry-otlp 0.27 (grpc-tonic feature), tracing-opentelemetry 0.28, tonic 0.12. tracing-subscriber now includes registry feature explicitly.
+
+## Server Dependencies
+All five OTLP deps added to infers-server via workspace references. No OTLP deps in other crates — only the server binary depends on opentelemetry-* and tonic.
+
+## CLI Arguments
+Three new args: `--otlp-enabled` (bool, default false), `--otlp-endpoint` (string, default http://localhost:4317), `--otlp-service-name` (string, default infers). See [[crates/server/src/main.rs#Args]].
+
+## Layered Subscriber Init
+`Registry::default()` as base subscriber. Fmt layer always present; OTLP layer conditional on `--otlp-enabled`.
+
+Bases SpanExporter via tonic, creates TracerProvider with batch exporter on Tokio runtime, sets global tracer provider, passes tracer to tracing_opentelemetry::layer(). See [[crates/server/src/main.rs#run]].
+
+## I/O Latency Spans
+I/O latency spans instrument weight upload, NCCL synchronization, logits download, and CUDA stream syncs. Added in Commit 7 of Phase 15.
+
+- `upload_weight()` emits `tracing::debug_span!("weight_upload", tensor = %weight.name, bytes = weight.data.len())` spanning the entire CPU→GPU copy plus BF16 conversion. The subsequent `stream.synchronize()` is wrapped in a `cuda_sync` span with reason `weight_upload`.
+- `upload_int4_weight()` wraps each of its three `stream.synchronize()` calls in `cuda_sync` spans with reasons `int4_qweight`, `int4_scales`, and `int4_qzeros` respectively. See [[crates/backends/native/src/upload.rs#upload_weight]], [[crates/backends/native/src/upload.rs#upload_int4_weight]].
+- `all_reduce_attention()`, `all_reduce_mlp()`, and `all_reduce_gdn()` each emit `tracing::debug_span!("nccl_all_reduce", kind = "attention")` / `kind = "mlp"` / `kind = "gdn"`. See [[crates/backends/native/src/sync.rs#all_reduce_attention]], [[crates/backends/native/src/sync.rs#all_reduce_mlp]], [[crates/backends/native/src/sync.rs#all_reduce_gdn]].
+- `sample_with_config()` wraps the non-greedy `clone_dtoh` logits download in `tracing::debug_span!("logits_download", vocab_size = gpu_logits.len())`. See [[crates/backends/native/src/sample.rs#sample_with_config]].

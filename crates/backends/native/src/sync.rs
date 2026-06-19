@@ -23,7 +23,9 @@ pub fn all_reduce_attention(
     nccl: &NcclCommunicator,
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<bf16>,
-) -> Result<()> {
+    ) -> Result<()> {
+    let span = tracing::debug_span!("nccl_all_reduce", kind = "attention");
+    let _enter = span.enter();
     let rank = stream.context().ordinal();
     nccl.all_reduce_in_place(rank, buffer, NcclReduceOp::Sum)
 }
@@ -42,6 +44,8 @@ pub fn all_reduce_mlp(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<bf16>,
 ) -> Result<()> {
+    let span = tracing::debug_span!("nccl_all_reduce", kind = "mlp");
+    let _enter = span.enter();
     let rank = stream.context().ordinal();
     nccl.all_reduce_in_place(rank, buffer, NcclReduceOp::Sum)
 }
@@ -60,6 +64,8 @@ pub fn all_reduce_gdn(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<bf16>,
 ) -> Result<()> {
+    let span = tracing::debug_span!("nccl_all_reduce", kind = "gdn");
+    let _enter = span.enter();
     let rank = stream.context().ordinal();
     nccl.all_reduce_in_place(rank, buffer, NcclReduceOp::Sum)
 }

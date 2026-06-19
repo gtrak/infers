@@ -63,7 +63,12 @@ CUDA Kernels
 | [Phase 10](phase-10-server-orchestration.md) | PARTIAL | 1.5 weeks | Server orchestration — wire everything together | **Mock model only**. Not wired to real inference engine. |
 | [Phase 11](phase-11-model-integration.md) | PARTIAL | 3–4 weeks | Model integration — real model loading and inference | Real model loads and produces tokens. **Performance 200× off.** |
 | [Phase 12](phase-12-get-it-working.md) | PARTIAL | 3–4 weeks | End-to-end real model inference | Smoke test passes. **Server unwired. No HF reference.** |
-| [Phase 13](phase-13-instrumentation.md) | NOT DONE | 2 weeks | General-purpose instrumentation + bug hunt | Replace ad-hoc debug with structured probe. Find and fix garbage output bug. |
+| [Phase 13](phase-13-instrumentation.md) | PARTIAL | 2 weeks | General-purpose instrumentation + bug hunt | Replace ad-hoc debug with structured probe. Find and fix garbage output bug. |
+| [Phase 14](phase-14-decode-pipeline.md) | IN PROGRESS | — | Decode pipeline — sampling, stopping, autoregressive loop | CPU sampling, EOS/stop detection, prefill return fix |
+| [Phase 15](phase-15-tracing-otlp.md) | NOT STARTED | 1 week | Tracing integration + OTLP export | Distributed tracing with CUDA event timing for bottleneck identification |
+| [Phase 16](phase-16-zero-copy-weights.md) | NOT STARTED | 1 week | Zero-copy weight streaming from mmap to GPU | Eliminate DRAM residency — stream directly from disk via mmap + pinned staging buffer |
+| [Phase 17](phase-17-paged-prefill-wiring.md) | NOT STARTED | 2–3 days | Wire paged prefill into server orchestrator | Unified KV state, prefix caching enabled |
+| [Phase 18](phase-18-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: quantization-generic INT4 GEMM + hardware portability | Rust kernels with trait-based quant dispatch (AutoRound, GGUF, GPTQ) |
 
 **Critical Path**: Phase 4.7 (GPU Weight Cache) → Phase 4 (hit 20 tok/s) → Phase 6 (continuous batching) → Phase 7 (MTP) → Phase 10 (wire server)
 

@@ -448,6 +448,31 @@ impl ForwardEngine {
         sampling_config: &infers_scheduler::SamplingConfig,
         rng: &mut Xoshiro256PlusPlus,
     ) -> Result<(usize, u32)> {
+        let span = tracing::info_span!("prefill", num_tokens = token_ids.len());
+        let _enter = span.enter();
+
+        // GPU timing: create events on each GPU's context
+        let num_gpus = self.weights.len();
+        let gpu_start_events: Vec<_> = (0..num_gpus)
+            .map(|gpu_idx| {
+                let ctx = self.streams.get(gpu_idx).unwrap().context();
+                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU start event for GPU {gpu_idx}: {:?}", e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gpu_end_events: Vec<_> = (0..num_gpus)
+            .map(|gpu_idx| {
+                let ctx = self.streams.get(gpu_idx).unwrap().context();
+                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU end event for GPU {gpu_idx}: {:?}", e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Record start events
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            gpu_start_events[gpu_idx].record(&gpu_stream)
+                .map_err(|e| anyhow::anyhow!("Failed to record start event on GPU {gpu_idx}: {:?}", e))?;
+        }
+
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
@@ -515,10 +540,20 @@ impl ForwardEngine {
         for layer_idx in 0..config.num_hidden_layers {
             tracing::info!("Layer {}/{} (phase A)", layer_idx + 1, config.num_hidden_layers);
 
-            let stage_prefix = match config.get_layer_type(layer_idx) {
+            let layer_type = config.get_layer_type(layer_idx);
+            let stage_prefix = match layer_type {
                 LayerType::FullAttention => "attn",
                 LayerType::GatedDeltaNet => "gdn",
             };
+            let layer_span = tracing::info_span!(
+                "layer",
+                layer_idx,
+                layer_type = match layer_type {
+                    LayerType::FullAttention => "full_attn",
+                    LayerType::GatedDeltaNet => "gdn",
+                }
+            );
+            let _layer_enter = layer_span.enter();
 
             // Dump hidden input at start of layer for reference comparison
             for gpu_idx in 0..num_gpus {
@@ -780,6 +815,20 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
 
+        // Record end events and report GPU timing
+        let mut max_gpu_ms: f32 = 0.0;
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            gpu_end_events[gpu_idx].record(&gpu_stream)
+                .map_err(|e| anyhow::anyhow!("Failed to record end event on GPU {gpu_idx}: {:?}", e))?;
+            gpu_end_events[gpu_idx].synchronize()
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize end event on GPU {gpu_idx}: {:?}", e))?;
+            let gpu_ms = gpu_start_events[gpu_idx].elapsed_ms(&gpu_end_events[gpu_idx])
+                .unwrap_or(0.0);
+            max_gpu_ms = max_gpu_ms.max(gpu_ms);
+        }
+        tracing::info!(gpu_time_ms = max_gpu_ms as f64, phase = "prefill", "GPU execution complete");
+
         Ok((num_pages_needed, sampled))
     }
 
@@ -809,7 +858,31 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         num_prompt_tokens: usize,
         rng: &mut Xoshiro256PlusPlus,
     ) -> Result<u32> {
+        let span = tracing::info_span!("decode");
+        let _enter = span.enter();
         let num_gpus = self.weights.len();
+
+        // GPU timing: create events on each GPU's context
+        let gpu_start_events: Vec<_> = (0..num_gpus)
+            .map(|gpu_idx| {
+                let ctx = self.streams.get(gpu_idx).unwrap().context();
+                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU start event for GPU {gpu_idx}: {:?}", e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gpu_end_events: Vec<_> = (0..num_gpus)
+            .map(|gpu_idx| {
+                let ctx = self.streams.get(gpu_idx).unwrap().context();
+                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU end event for GPU {gpu_idx}: {:?}", e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Record start events
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            gpu_start_events[gpu_idx].record(&gpu_stream)
+                .map_err(|e| anyhow::anyhow!("Failed to record start event on GPU {gpu_idx}: {:?}", e))?;
+        }
+
         let config = &self.config;
         let head_dim = config.head_dim;
 
@@ -878,10 +951,20 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         // Layer loop
         for layer_idx in 0..config.num_hidden_layers {
-            let stage_prefix = match config.get_layer_type(layer_idx) {
+            let layer_type = config.get_layer_type(layer_idx);
+            let stage_prefix = match layer_type {
                 LayerType::FullAttention => "attn",
                 LayerType::GatedDeltaNet => "gdn",
             };
+            let layer_span = tracing::info_span!(
+                "layer",
+                layer_idx,
+                layer_type = match layer_type {
+                    LayerType::FullAttention => "full_attn",
+                    LayerType::GatedDeltaNet => "gdn",
+                }
+            );
+            let _layer_enter = layer_span.enter();
 
             // Dump hidden input at start of layer
             for gpu_idx in 0..num_gpus {
@@ -1138,6 +1221,20 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             mgr.add_token(seq_id)
                 .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
         }
+
+        // Record end events and report GPU timing
+        let mut max_gpu_ms: f32 = 0.0;
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            gpu_end_events[gpu_idx].record(&gpu_stream)
+                .map_err(|e| anyhow::anyhow!("Failed to record end event on GPU {gpu_idx}: {:?}", e))?;
+            gpu_end_events[gpu_idx].synchronize()
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize end event on GPU {gpu_idx}: {:?}", e))?;
+            let gpu_ms = gpu_start_events[gpu_idx].elapsed_ms(&gpu_end_events[gpu_idx])
+                .unwrap_or(0.0);
+            max_gpu_ms = max_gpu_ms.max(gpu_ms);
+        }
+        tracing::info!(gpu_time_ms = max_gpu_ms as f64, phase = "decode", "GPU execution complete");
 
         Ok(sampled)
     }

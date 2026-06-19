@@ -258,9 +258,10 @@ pub fn sample_with_config(
     }
 
     // Slow path: download logits and sample on CPU
+    let span = tracing::debug_span!("logits_download", vocab_size = gpu_logits.len());
+    let _enter = span.enter();
     let logits_bf16: Vec<bf16> = stream.clone_dtoh(gpu_logits)?;
     let mut logits: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-
     // Apply penalties
     apply_penalties(&mut logits, token_history, num_prompt_tokens, config);
 
