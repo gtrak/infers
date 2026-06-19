@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use half::bf16;
+use half::{bf16, f16};
 use infers_cuda::{CudaSlice, CudaStream};
 use infers_model::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
 
@@ -15,14 +15,14 @@ use infers_model::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
 pub enum CachedWeight {
     /// BF16/FP16/FP32 weight uploaded as CudaSlice<bf16>
     Bf16(CudaSlice<bf16>),
-    /// INT4 quantized weight triplet: qweight (u32 packed) + scales (bf16) + qzeros (u32 packed)
+    /// INT4 quantized weight triplet: qweight (u32 packed) + scales (fp16) + qzeros (u32 packed)
     Int4(Int4GpuBuffers),
 }
 
 /// GPU buffers for an INT4 quantized weight tensor.
 pub struct Int4GpuBuffers {
     pub qweight: CudaSlice<u32>,
-    pub scales: CudaSlice<bf16>,
+    pub scales: CudaSlice<f16>,
     pub qzeros: CudaSlice<u32>,
     /// Original shape of the INT4 weight tensor, used by GEMM dispatch to
     /// determine transposition at call time (depends on the K dimension).

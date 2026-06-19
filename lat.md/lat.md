@@ -603,10 +603,10 @@ Conversion logic extracted into `bytes_to_bf16()` for GPU-free unit testing.
 
 Uploads INT4 triplets (qweight + scales + qzeros) to GPU without dequantizing. The kernel handles both layouts natively — no CPU transposition is needed.
 
-`upload_int4_weight()` returns `(qweight_gpu, scales_gpu, qzeros_gpu)` for `int4_gemm_kernel` on-the-fly dequantization. Both standard [N, K/8] and transposed [K/8, N] layouts are supported via the kernel's `transposed` flag.
+`upload_int4_weight()` returns `(CudaSlice<u32>, CudaSlice<half::f16>, CudaSlice<u32>)` for `int4_gemm_kernel` on-the-fly dequantization. Scales are preserved as FP16 (not converted to BF16) to maintain full 10-bit mantissa precision — the FP16→BF16 conversion would truncate 3 mantissa bits, causing ~0.8% cosine error per layer that compounds across 64 layers. Uses `bytes_to_fp16()` for CPU-side FP16 parsing. Both standard [N, K/8] and transposed [K/8, N] layouts are supported via the kernel's `transposed` flag.
 
 `dequantize_int4_to_bf16()` is a CPU fallback that decompresses INT4 triplets to `Vec<bf16>`. **BUG**: it uses `(int4_val - zero_point) * scale` without the +1 offset that HF requires (correct formula: `(w_int4 - (zero + 1)) * scale`). This function is only used in tests, not in production inference paths — the GPU kernel `int4_gemm_kernel` applies the correct +1 offset.
-See [[crates/backends/native/src/upload.rs#upload_int4_weight]], [[crates/backends/native/src/upload.rs#dequantize_int4_to_bf16]].
+See [[crates/backends/native/src/upload.rs#upload_int4_weight]], [[crates/backends/native/src/upload.rs#bytes_to_fp16]], [[crates/backends/native/src/upload.rs#dequantize_int4_to_bf16]].
 
 ### INT4 Dequantization Verification
 
@@ -672,7 +672,7 @@ Per-layer CUDA kernel dispatch for transformer operations.
 ### GPU Weight Cache
 Per-GPU cache of dequantized, GPU-resident weight buffers keyed by tensor name. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gpu_cache.rs#CachedWeight]], [[crates/backends/native/src/gpu_cache.rs#Int4GpuBuffers]].
 
-`CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as bf16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
+`CachedWeight` enum holds either `Bf16(CudaSlice<bf16>)` for raw BF16/FP16/FP32 weights, or `Int4(Int4GpuBuffers)` for INT4 quantized triplets (qweight as u32-packed, scales as fp16, qzeros as u32-packed). The `Int4GpuBuffers.shape` field stores the original tensor shape so GEMM dispatch can determine transposition at call time from the K dimension.
 
 `GpuWeightCache::new()` iterates every tensor in a `WeightRegistry`, classifies by dtype (BF16/Fp16/Fp32 → `CachedWeight::Bf16`; Int4Packed → `CachedWeight::Int4` with companions lookup), and uploads to GPU. Unsupported dtypes are skipped with a warning. The cache provides: `get()` for general lookup, `get_bf16()` for typed BF16 access (returns None on INT4), `get_int4()` for typed INT4 access (returns None on BF16), plus `len()` and `is_empty()`.
 

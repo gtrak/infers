@@ -173,7 +173,7 @@ pub struct Int4GemmConfig {
 /// * `config` — M, N, K, group_size, transposed dimensions
 /// * `output` — [M, N] BF16 output buffer
 /// * `weight` — [N, K/8] packed INT4 weights
-/// * `scales` — [N, K/group_size] BF16 group scales
+/// * `scales` — [N, K/group_size] FP16 group scales
 /// * `zeros`  — [N, K/group_size/8] packed INT4 zero points
 /// * `input`  — [M, K] BF16 input activations
 pub fn matmul_int4(
@@ -182,7 +182,7 @@ pub fn matmul_int4(
     config: &Int4GemmConfig,
     output: &mut CudaSlice<half::bf16>,
     weight: &CudaSlice<u32>,
-    scales: &CudaSlice<half::bf16>,
+    scales: &CudaSlice<half::f16>,
     zeros: &CudaSlice<u32>,
     input: &CudaSlice<half::bf16>,
 ) -> anyhow::Result<()> {

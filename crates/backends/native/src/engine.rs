@@ -23,7 +23,7 @@ use crate::gdn::GdnState;
 
 use infers_kv::PagedKvManager;
 
-use half::bf16;
+use half::{bf16, f16};
 use infers_kv::KvCacheDtype;
 use infers_cuda::CudaSlice;
 
@@ -410,7 +410,7 @@ impl ForwardEngine {
         config: &Int4GemmConfig,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
-        scales: &CudaSlice<half::bf16>,
+        scales: &CudaSlice<f16>,
         zeros: &CudaSlice<u32>,
         input: &CudaSlice<half::bf16>,
     ) -> Result<()> {

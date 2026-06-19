@@ -120,6 +120,27 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
     }
 }
 
+/// Convert raw bytes to a `Vec<f16>` based on the declared dtype.
+///
+/// Preserves FP16 data as-is without converting to BF16, maintaining full
+/// 10-bit mantissa precision for INT4 quantization scales.
+// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#INT4 Triplet Upload]]
+pub fn bytes_to_fp16(data: &[u8], dtype: WeightDtype) -> Result<Vec<f16>> {
+    match dtype {
+        WeightDtype::Fp16 => {
+            let count = data.len() / 2;
+            let mut result = Vec::with_capacity(count);
+            for chunk in data.chunks_exact(2) {
+                result.push(f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
+            }
+            Ok(result)
+        }
+        _ => {
+            anyhow::bail!("bytes_to_fp16 only supports Fp16 dtype, got {:?}", dtype)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // INT4 triplet upload (qweight + scales + qzeros)
 // ---------------------------------------------------------------------------
@@ -128,8 +149,8 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
 ///
 /// AutoRound / GPTQ-style INT4 stores weights as three separate buffers:
 /// - **qweight**: Packed INT4 weights as `u32` (8 weights per u32).
-/// - **scales**: BF16 group-wise scales.
-/// - **qzeros**: Packed INT4 zero-points as `u32` (8 per u32).
+/// - **scales**: FP16 group-wise scales (preserves full 10-bit mantissa precision).
+/// - **qzeros**: Packed INT4 zero-points as `u32` (8 per u32). Stored values are offset by -1 (actual_zero = stored + 1).
 ///
 /// The `int4_gemm_kernel` handles both standard [N, K/8] and transposed [K/8, N]
 /// layouts natively, so weights are uploaded as-is without CPU transposition.
@@ -139,19 +160,20 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
 ///
 /// # Returns
 /// `(qweight_gpu, scales_gpu, qzeros_gpu)` triple of GPU buffers.
+// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#INT4 Triplet Upload]]
 pub fn upload_int4_weight(
     stream: &Arc<CudaStream>,
     qweight: &WeightData,
     scales: &WeightData,
     qzeros: &WeightData,
-) -> Result<(CudaSlice<u32>, CudaSlice<bf16>, CudaSlice<u32>)> {
+) -> Result<(CudaSlice<u32>, CudaSlice<f16>, CudaSlice<u32>)> {
     // Parse packed u32 data
     let qweight_u32: Vec<u32> = qweight
         .data
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
-    let scales_vec = bytes_to_bf16(&scales.data, scales.dtype)
+    let scales_vec = bytes_to_fp16(&scales.data, scales.dtype)
         .map_err(|e| anyhow::anyhow!("Invalid scales data for '{}': {}", scales.name, e))?;
     let qzeros_u32: Vec<u32> = qzeros
         .data
@@ -399,6 +421,34 @@ mod tests {
         let result = bytes_to_bf16(&data, WeightDtype::Int4Packed);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn bytes_to_fp16_roundtrip() {
+        let values = [1.0f32, -2.5, 0.0, 100.0, -0.5];
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| {
+                let f = f16::from_f32(*v);
+                f.to_bits().to_le_bytes()
+            })
+            .collect();
+
+        let result = bytes_to_fp16(&bytes, WeightDtype::Fp16).unwrap();
+        assert_eq!(result.len(), 5);
+        for (i, &v) in values.iter().enumerate() {
+            let expected = f16::from_f32(v);
+            // Exact bit comparison — no conversion loss since we stay in FP16
+            assert_eq!(result[i].to_bits(), expected.to_bits(), "mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn bytes_to_fp16_unsupported_dtype() {
+        let data = vec![0u8; 4];
+        let result = bytes_to_fp16(&data, WeightDtype::Bf16);
+        assert!(result.is_err());
+    }
+
 
     // =====================================================================
     // INT4 dequantization tests (CPU-side, no GPU)

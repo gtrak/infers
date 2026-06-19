@@ -15,6 +15,7 @@
 ///   block: (16, 16, 1) — each thread computes one output element
 
 #include "common.cuh"
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 /// INT4 GEMM kernel: output[M][N] = dequant(weight) @ input[M][K]
@@ -33,7 +34,7 @@
 /// # Arguments
 /// * `output` — [M, N] output in BF16
 /// * `weight` — packed INT4 weights (8 weights per uint32_t)
-/// * `scales` — BF16 group scales
+/// * `scales` — FP16 group scales (preserves full 10-bit mantissa precision)
 /// * `zeros`  — packed INT4 zero points (8 per uint32_t)
 /// * `input`  — [M, K] activation in BF16
 /// * `M` — rows of input and output
@@ -45,7 +46,7 @@ extern "C" {
 __global__ void int4_gemm_kernel(
     __nv_bfloat16* __restrict__ output,
     const uint32_t* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ scales,
+    const __half* __restrict__ scales,
     const uint32_t* __restrict__ zeros,
     const __nv_bfloat16* __restrict__ input,
     int M, int N, int K,
@@ -62,7 +63,7 @@ __global__ void int4_gemm_kernel(
     for (int k = 0; k < K; k += group_size) {
         // Load scale and zero point for this group
         int group_idx = k / group_size;
-        float scale = __bfloat162float(transposed
+        float scale = __half2float(transposed
             ? scales[group_idx * N + col]
             : scales[col * (K / group_size) + group_idx]);
 
@@ -77,7 +78,7 @@ __global__ void int4_gemm_kernel(
             zero_shift = ((col * (K / group_size) + group_idx) % 8) * 4;
         }
         uint32_t zero_packed = zeros[zero_packed_idx];
-        int8_t zero = (int8_t)((zero_packed >> zero_shift) & 0xF);
+        int8_t zero = (int8_t)((zero_packed >> zero_shift) & 0xF) + 1;
 
         for (int kk = 0; kk < group_size; kk += 8) {
             // Load 8 INT4 weights from one uint32_t
@@ -91,8 +92,8 @@ __global__ void int4_gemm_kernel(
                 int8_t w_int4 = (int8_t)((packed >> shift) & 0xF);
 
                 // Dequantize on-the-fly: (w_int4 - zero) * scale
-                // For AutoRound with sym=true, stored zero is the literal zero point.
-                // Tested: qzeros are uniformly 7, not 8 (no biased representation).
+                // For AutoRound with sym=true, stored zero is offset by -1.
+                // The actual zero point is stored_zero + 1 (=8 for symmetric INT4).
                 float w_fp32 = ((float)(w_int4 - zero)) * scale;
 
                 // Load activation (BF16 → float)
