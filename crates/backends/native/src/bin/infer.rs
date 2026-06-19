@@ -254,10 +254,14 @@ fn main() -> Result<()> {
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut total_decode_time = std::time::Duration::ZERO;
 
+    // Start autoregressive decoding from the last prefill token.
+    // Each decode step embeds the previous token and produces the next logits.
+    let mut current_token = *token_ids.last().unwrap();
     for step in 0..args.max_tokens {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
-        let token = engine.decode_paged(&external_stream, token_ids[0], pos, seq_id)?;
+        let token = engine.decode_paged(&external_stream, current_token, pos, seq_id)?;
+        current_token = token;
         let decode_elapsed = decode_start.elapsed();
         total_decode_time += decode_elapsed;
         generated_tokens.push(token);
