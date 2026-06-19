@@ -46,12 +46,36 @@ pub async fn chat_completions(
         .or(req.max_completion_tokens)
         .unwrap_or(512) as usize;
 
+    // Determine sampling strategy from request params
+    let strategy = if let Some(top_k) = req.top_k {
+        SamplingStrategy::TopK { k: top_k as usize, temp: req.temperature }
+    } else if req.top_p < 1.0 {
+        SamplingStrategy::TopP { p: req.top_p as f64, temp: req.temperature }
+    } else if req.temperature != 1.0 || req.repetition_penalty.unwrap_or(1.0) != 1.0 {
+        SamplingStrategy::Temperature { temp: req.temperature }
+    } else {
+        SamplingStrategy::Greedy
+    };
+
+    // Tokenize stop sequences if present
+    use infers_api::StopConfig;
+    let stop_sequences: Vec<String> = match &req.stop {
+        Some(StopConfig::String(s)) => vec![s.clone()],
+        Some(StopConfig::Array(arr)) => arr.clone(),
+        None => Vec::new(),
+    };
+
     // Build SamplingConfig
     let sampling_config = SamplingConfig {
-        strategy: SamplingStrategy::Greedy,
+        strategy,
         max_tokens,
-        stop_sequences: Vec::new(),
-        ..Default::default()
+        stop_sequences,
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        eos_token_id: None, // will be set from tokenizer config later
+        stop_token_ids: Vec::new(), // will be populated from tokenized stop_sequences later
+        seed: req.seed.map(|s| s as u64),
     };
 
     if req.stream {

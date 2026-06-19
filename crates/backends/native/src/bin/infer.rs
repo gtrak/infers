@@ -61,6 +61,38 @@ struct Args {
     /// Disable chat template wrapping (raw tokenization)
     #[arg(long, default_value = "false")]
     no_chat: bool,
+
+    /// Temperature for sampling (0.0 = greedy, default 1.0)
+    #[arg(long, default_value = "1.0")]
+    temperature: f32,
+
+    /// Top-k sampling (0 = disabled)
+    #[arg(long, default_value = "0")]
+    top_k: usize,
+
+    /// Top-p (nucleus) sampling threshold
+    #[arg(long, default_value = "1.0")]
+    top_p: f64,
+
+    /// Repetition penalty (1.0 = disabled)
+    #[arg(long, default_value = "1.0")]
+    repetition_penalty: f32,
+
+    /// Presence penalty
+    #[arg(long, default_value = "0.0")]
+    presence_penalty: f32,
+
+    /// Frequency penalty
+    #[arg(long, default_value = "0.0")]
+    frequency_penalty: f32,
+
+    /// RNG seed for deterministic sampling
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// EOS token ID (stops generation when generated)
+    #[arg(long)]
+    eos_token_id: Option<u32>,
 }
 
 /// Apply chat template using minijinja, then encode with the Rust tokenizer.
@@ -242,8 +274,33 @@ fn main() -> Result<()> {
 
     // --- 12. Run prefill ---
     let prefill_start = Instant::now();
-    let sampling_config = infers_scheduler::SamplingConfig::default();
-    let mut rng = infers_backend_native::Xoshiro256PlusPlus::from_seed(42);
+    // Determine sampling strategy from CLI args
+    let strategy = if args.temperature == 0.0 {
+        infers_scheduler::SamplingStrategy::Greedy
+    } else if args.top_k > 0 {
+        infers_scheduler::SamplingStrategy::TopK { k: args.top_k, temp: args.temperature }
+    } else if args.top_p < 1.0 {
+        infers_scheduler::SamplingStrategy::TopP { p: args.top_p, temp: args.temperature }
+    } else if args.temperature != 1.0 {
+        infers_scheduler::SamplingStrategy::Temperature { temp: args.temperature }
+    } else {
+        infers_scheduler::SamplingStrategy::Greedy
+    };
+
+    let sampling_config = infers_scheduler::SamplingConfig {
+        strategy,
+        max_tokens: args.max_tokens,
+        repetition_penalty: args.repetition_penalty,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        eos_token_id: args.eos_token_id,
+        seed: args.seed,
+        ..Default::default()
+    };
+
+    let mut rng = infers_backend_native::Xoshiro256PlusPlus::from_seed(
+        sampling_config.seed.unwrap_or_else(infers_backend_native::sample::random_seed)
+    );
     let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id, &sampling_config, &mut rng)?;
     let prefill_elapsed = prefill_start.elapsed();
     eprintln!(
