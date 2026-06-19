@@ -13,8 +13,9 @@ use infers_cuda::gemm::Int4GemmConfig;
 use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
+use infers_cuda::PinnedHostBuffer;
 use infers_cuda::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
-use infers_model::{LayerType, ModelConfig, WeightRegistry};
+use infers_model::{LayerType, MmapWeightRegistry, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
 use crate::gpu_cache::GpuWeightCache;
@@ -73,6 +74,9 @@ pub struct ForwardEngine {
 
     /// One weight registry per GPU shard (tensor parallelism).
     weights: Vec<WeightRegistry>,
+
+    /// Mmap weight registries (retained to keep mmap handles alive).
+    _mmap_registries: Vec<MmapWeightRegistry>,
 
     /// Per-GPU weight caches with GPU-resident buffers.
     weight_caches: Vec<GpuWeightCache>,
@@ -226,6 +230,135 @@ impl ForwardEngine {
         Ok(Self {
             config,
             weights,
+            _mmap_registries: Vec::new(),
+            weight_caches,
+            per_gpu_kernels,
+            paged_kv_manager: None,
+            gemm_engines,
+            nccl,
+            streams,
+            kv_caches,
+            paged_kv_caches,
+            gdn_states,
+            group_size,
+        })
+    }
+
+    /// Construct a `ForwardEngine` from mmap-backed weight registries.
+    ///
+    /// Similar to [`new`] but loads weights via zero-copy memory-mapped access.
+    /// The `_mmap_registries` field retains the Arc-based mmap handles for
+    /// the lifetime of the engine, preventing premature unmapping.
+    ///
+    /// # Arguments
+    /// * `config` — Model architecture parameters
+    /// * `mmap_registries` — Per-GPU mmap weight registries (one per tensor-parallel rank)
+    /// * `contexts` — CUDA contexts for kernel loading
+    /// * `kernel_registry` — Names and paths of CUDA kernels to load
+    /// * `streams` — Pool of async CUDA streams
+    /// * `pinned` — Pinned host buffer for dtype conversion during upload
+    /// * `group_size` — INT4 quantization group size for on-the-fly dequantization
+    pub fn new_from_mmap(
+        config: Arc<ModelConfig>,
+        mmap_registries: Vec<MmapWeightRegistry>,
+        metadata_registries: Vec<WeightRegistry>,
+        contexts: Vec<Arc<CudaContext>>,
+        kernel_registry: KernelRegistry,
+        streams: StreamPool,
+        pinned: &mut PinnedHostBuffer,
+        group_size: usize,
+    ) -> Result<Self> {
+        // Load CUDA kernel modules on each GPU context
+        let num_gpus = streams.len();
+        let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let ctx = contexts.get(gpu_idx)
+                .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
+            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), &kernel_registry)
+                .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
+
+            let pk = PerGpuKernels {
+                rmsnorm: kernels.get_function("infers_rmsnorm_bf16")?,
+                silu_glu: kernels.get_function("infers_silu_glu_bf16")?,
+                rope: kernels.get_function("infers_rope_bf16")?,
+                embedding: kernels.get_function("infers_embedding_gather_bf16")?,
+                add: kernels.get_function("infers_add_bf16")?,
+                argmax: kernels.get_function("infers_argmax_bf16")?,
+                softmax: kernels.get_function("infers_softmax_bf16")?,
+                kv_cache_write: kernels.get_function("infers_kv_cache_write_bf16")?,
+                gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
+                gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
+                paged_kv_write: kernels.get_function("infers_paged_kv_write_bf16")?,
+                paged_kv_read: kernels.get_function("infers_paged_kv_read_bf16")?,
+                paged_attention_decode: kernels.get_function("infers_paged_attention_decode_bf16")?,
+                fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
+                fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
+                int4_gemm: kernels.get_function("int4_gemm_kernel")?,
+                gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
+                gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
+                gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
+                gdn_chunked_prefill: {
+                    let f = kernels.get_function("infers_gdn_chunked_gated_delta_prefill_bf16")?;
+                    // Allow up to 100KB dynamic shared memory for the chunked GDN kernel
+                    // (default is 48KB; the kernel uses ~81KB for C=64, K=128)
+                    f.set_attribute(
+                        infers_cuda::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        100000,
+                    ).ok(); // ok() — ignore error if attribute not supported
+                    f
+                },
+                conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
+                rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
+                attn_output_gate: kernels.get_function("infers_attn_output_gate_bf16")?,
+            };
+            per_gpu_kernels.push(pk);
+        }
+
+        // Create one GEMM engine per GPU (one per stream in the pool)
+        let mut gemm_engines = Vec::with_capacity(num_gpus);
+        for i in 0..num_gpus {
+            let s = streams.get(i).ok_or_else(|| anyhow::anyhow!("Missing stream {i}"))?;
+            gemm_engines.push(
+                GemmEngine::new(s.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to create cuBLASLt engine for GPU {i}: {e}"))?
+            );
+        }
+        // Create NCCL communicator for tensor parallelism
+        let nccl = {
+            let comm_streams: Vec<Arc<CudaStream>> = (0..streams.len())
+                .filter_map(|i| streams.get(i).cloned())
+                .collect();
+            NcclCommunicator::new(comm_streams)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize NCCL: {e}"))?
+        };
+
+        // Build GPU-resident weight caches for each GPU (mmap path).
+        // Sequential — pinned buffer is per-thread and mmap upload requires CUDA context on current thread.
+        let mut weight_caches = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            let registry = &mmap_registries[gpu_idx];
+            let cache = GpuWeightCache::new_from_mmap(&gpu_stream, registry, pinned)?;
+            tracing::info!("GPU {}: cached {} weights (mmap)", gpu_idx, cache.len());
+            weight_caches.push(cache);
+        }
+
+        // Initialize per-GPU, per-layer caches and states
+        let num_layers = config.num_hidden_layers;
+        let kv_caches: Vec<Vec<KvCache>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| KvCache::new()).collect()).collect();
+        let gdn_states: Vec<Vec<GdnState>> = (0..num_gpus).map(|_| (0..num_layers).map(|_| GdnState::new()).collect()).collect();
+        let paged_kv_caches: Vec<Vec<PagedKvCache>> = (0..num_gpus).map(|_| Vec::new()).collect();
+
+        tracing::info!(
+            "ForwardEngine initialized (mmap): {} layers, {} GPU shards",
+            config.num_hidden_layers,
+            mmap_registries.len()
+        );
+
+        Ok(Self {
+            config,
+            weights: metadata_registries, // metadata registries for name lookups during inference
+            _mmap_registries: mmap_registries,
             weight_caches,
             per_gpu_kernels,
             paged_kv_manager: None,

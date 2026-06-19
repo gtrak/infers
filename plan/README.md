@@ -66,7 +66,7 @@ CUDA Kernels
 | [Phase 13](phase-13-instrumentation.md) | PARTIAL | 2 weeks | General-purpose instrumentation + bug hunt | Replace ad-hoc debug with structured probe. Find and fix garbage output bug. |
 | [Phase 14](phase-14-decode-pipeline.md) | IN PROGRESS | — | Decode pipeline — sampling, stopping, autoregressive loop | CPU sampling, EOS/stop detection, prefill return fix |
 | [Phase 15](phase-15-tracing-otlp.md) | NOT STARTED | 1 week | Tracing integration + OTLP export | Distributed tracing with CUDA event timing for bottleneck identification |
-| [Phase 16](phase-16-zero-copy-weights.md) | NOT STARTED | 1 week | Zero-copy weight streaming from mmap to GPU | Eliminate DRAM residency — stream directly from disk via mmap + pinned staging buffer |
+| [Phase 16](phase-16-zero-copy-weights.md) | DONE | 1 week | Zero-copy weight streaming from mmap to GPU | Eliminate DRAM residency — stream directly from disk via mmap + pinned staging buffer |
 | [Phase 17](phase-17-paged-prefill-wiring.md) | NOT STARTED | 2–3 days | Wire paged prefill into server orchestrator | Unified KV state, prefix caching enabled |
 | [Phase 18](phase-18-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: quantization-generic INT4 GEMM + hardware portability | Rust kernels with trait-based quant dispatch (AutoRound, GGUF, GPTQ) |
 

@@ -7,6 +7,7 @@ pub mod memory;
 pub mod kernels;
 pub mod gemm;
 pub mod nccl;
+pub mod pinned;
 
 // Re-export key cudarc types so consumers don't need `cudarc` directly.
 pub use cudarc::driver::{
@@ -22,3 +23,4 @@ pub use cudarc::nccl::safe::{
     Comm as NcclComm, ReduceOp as NcclReduceOp, NcclType,
 };
 pub use cudarc::nccl::result::{group_end, group_start};
+pub use pinned::PinnedHostBuffer;

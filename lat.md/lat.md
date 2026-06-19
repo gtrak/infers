@@ -45,7 +45,7 @@ CUDA runtime crate for GPU inference. cudarc is always present with no feature g
 
 ### Module Structure
 
-Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
+Seven modules cover context, streams, memory, kernels, GEMM, pinned, and NCCL.
 
 | Module | Purpose |
 |--------|---------|
@@ -54,6 +54,7 @@ Six modules cover context, streams, memory, kernels, GEMM, and NCCL.
 | memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
 | gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
+| pinned | Page-locked host memory (`PinnedHostBuffer`) for fast DMA transfers to GPU — Phase 16 Zero-Copy Weight Streaming |
 | nccl | Multi-GPU collective operations for TP/PP |
 
 ### cuda-oxide: Quantization-Generic Kernels (Phase 18)
@@ -407,12 +408,15 @@ Replaces `gemm_projection` at call-sites by looking up weights from the cache in
 
 ## Engine Integration
 `ForwardEngine` holds one `GpuWeightCache` per GPU, built at construction time. Attention functions now accept the cache and look up norm weights via `cache.get_bf16()` instead of uploading per-call. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
+## Mmap Weight Upload
+Zero-copy mmap weight upload via `GpuWeightCache::new_from_mmap()`. Dispatches by dtype with zero-copy BF16, pinned-buffer FP16/FP32 conversion, and per-component INT4 triplet upload. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#new_from_mmap]], [[crates/backends/native/src/gpu_cache.rs#upload_mmap_tensor]].
 
 ## Completed
 Tasks implemented so far in Phase 4.7 GPU weight cache migration.
 
 - `GpuWeightCache` struct with BF16 and INT4 weight caching
 - One-time weight upload at `ForwardEngine` construction via `GpuWeightCache::new()`
+- Zero-copy mmap weight upload via `GpuWeightCache::new_from_mmap()` — BF16 direct reinterpret, FP16/FP32 pinned-buffer conversion, INT4 triplet zero-copy with per-component sync
 - `gemm_projection_cached` dispatch for cached GEMM projections
 - `forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
 - `decode_forward_paged`: replaced k_proj, v_proj, q_proj, o_proj GEMMs with cached variants; replaced k_norm/q_norm uploads with cache lookups
@@ -1193,7 +1197,50 @@ MTP head weights with pre-FC norms, FC projection, full transformer layers, fina
 
 Complete model weight registry with embedding, layers, optional MTP head, LM head, norm, and a `HashMap<String, WeightData>` for name-based lookup and sharding. See [[crates/model/src/weights.rs#WeightRegistry]].
 
-# Safetensors Loader
+
+## MmapTensor and MmapWeightRegistry
+
+Zero-copy references to tensors in memory-mapped safetensors files. `MmapTensor` wraps `Arc<Mmap>` with a raw pointer, shape, dtype, and name. Implements `Deref<Target = [u8]>`; clone is cheap. See [[crates/model/src/mmap.rs#MmapTensor]].
+
+### MmapCompanions
+
+Zero-copy companion tensors (qzeros, scales) for INT4 quantized weights. See [[crates/model/src/mmap.rs#MmapCompanions]].
+
+### MmapWeightRegistry
+
+Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap, INT4 companions, and placeholders for layers/norm/lm_head/mtp. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
+
+### load_safetensors_mmap
+
+Zero-copy safetensors loader storing raw pointers into mmap regions as `MmapTensor` references instead of copying data. Auto-detects single vs sharded files. See [[crates/model/src/mmap.rs#load_safetensors_mmap]].
+
+Unlike `load_safetensors()` which copies data via `Bytes::copy_from_slice()`, the `Arc<Mmap>` stored in both `_mmaps` and each `MmapTensor` keeps mappings alive without duplication. Supports single-file (`model.safetensors`) and sharded (`model.safetensors.index.json`) formats.
+
+### strip_language_model_prefix_mmap
+
+Strips `model.language_model.` prefix from tensor names and removes `model.visual.*` tensors on `MmapWeightRegistry`. See [[crates/model/src/mmap.rs#strip_language_model_prefix_mmap]].
+
+Same logic as `strip_language_model_prefix()` but for the zero-copy mmap variant. Updates internal tensor name fields so companion lookups match after renaming.
+
+### shard_weights_tp_mmap
+
+Shards MmapWeightRegistry across GPUs for tensor parallelism without copying weight data for contiguous splits. See [[crates/model/src/mmap.rs#shard_weights_tp_mmap]].
+
+Follows the same sharding rules as `shard_weights_tp()` but operates on MmapTensor references. Dispatch table:
+
+- **ColumnParallel + BF16**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset into same mmap
+- **ColumnParallel + INT4**: Split dim 1 (N, last dim) — non-contiguous, copies data to temp file + new mmap
+- **RowParallel + BF16**: Split dim 1 (last dim) — non-contiguous, copies data
+- **RowParallel + INT4**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset
+- **Replicated**: Clone MmapTensor (cheap Arc clone)
+
+INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent, and stored in `int4_companions`. Fused QKV projections (in_proj_qkv, conv1d) fall through to regular column-parallel — TODO: proper per-segment mmap sharding.
+
+MmapWeightShard holds gpu_id and the shard's MmapWeightRegistry. See [[crates/model/src/mmap.rs#MmapWeightShard]].
+
+### build_metadata_registry
+
+Converts an `MmapWeightRegistry` into a `WeightRegistry` with metadata only — empty data but correct shapes, dtypes, and names. Used so that `self.weights[gpu_idx]` has structure for name lookups during inference. See [[crates/model/src/mmap.rs#build_metadata_registry]].
 
 Multi-format model loader with safetensors file reading and auto-detection of single vs sharded model files.
 
@@ -2193,3 +2240,12 @@ I/O latency spans instrument weight upload, NCCL synchronization, logits downloa
 - `upload_int4_weight()` wraps each of its three `stream.synchronize()` calls in `cuda_sync` spans with reasons `int4_qweight`, `int4_scales`, and `int4_qzeros` respectively. See [[crates/backends/native/src/upload.rs#upload_weight]], [[crates/backends/native/src/upload.rs#upload_int4_weight]].
 - `all_reduce_attention()`, `all_reduce_mlp()`, and `all_reduce_gdn()` each emit `tracing::debug_span!("nccl_all_reduce", kind = "attention")` / `kind = "mlp"` / `kind = "gdn"`. See [[crates/backends/native/src/sync.rs#all_reduce_attention]], [[crates/backends/native/src/sync.rs#all_reduce_mlp]], [[crates/backends/native/src/sync.rs#all_reduce_gdn]].
 - `sample_with_config()` wraps the non-greedy `clone_dtoh` logits download in `tracing::debug_span!("logits_download", vocab_size = gpu_logits.len())`. See [[crates/backends/native/src/sample.rs#sample_with_config]].
+
+# Phase 16: Zero-Copy Weight Streaming
+Eliminates DRAM residency for model weights by streaming directly from disk via mmap + pinned staging buffer.
+## Mmap Constructor on ForwardEngine
+
+`new_from_mmap()` takes `Vec<MmapWeightRegistry>` and `Vec<WeightRegistry>` metadata registries for name lookups, plus a mutable `PinnedHostBuffer`. The `_mmap_registries` field retains Arc-based mmap handles. See [[crates/backends/native/src/engine.rs#ForwardEngine#new_from_mmap]].
+
+## Server Binary Wiring
+The server has four loading branches: mmap + TP>1, heap + TP>1, TP=1, and no-model fallback. The `--no-mmap` flag forces the heap path. See [[crates/server/src/main.rs#run]].

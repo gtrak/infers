@@ -261,7 +261,7 @@ pub enum ShardType {
 
 /// Determine sharding type for a weight tensor by its name.
 // @lat: [[lat#Weight Sharding#Shard Type Detection]]
-fn determine_shard_type(name: &str) -> ShardType {
+pub fn determine_shard_type(name: &str) -> ShardType {
     // Column-parallel: projections that produce per-head outputs
     if name.contains("q_proj") || name.contains("k_proj") || name.contains("v_proj") {
         return ShardType::ColumnParallel;
