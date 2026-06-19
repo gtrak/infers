@@ -409,7 +409,7 @@ Replaces `gemm_projection` at call-sites by looking up weights from the cache in
 ## Engine Integration
 `ForwardEngine` holds one `GpuWeightCache` per GPU, built at construction time. Attention functions now accept the cache and look up norm weights via `cache.get_bf16()` instead of uploading per-call. See [[crates/backends/native/src/engine.rs#ForwardEngine]].
 ## Mmap Weight Upload
-Zero-copy mmap weight upload via `GpuWeightCache::new_from_mmap()`. Dispatches by dtype with zero-copy BF16, pinned-buffer FP16/FP32 conversion, and per-component INT4 triplet upload. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#new_from_mmap]], [[crates/backends/native/src/gpu_cache.rs#upload_mmap_tensor]].
+Zero-copy mmap weight upload via `GpuWeightCache::new_from_mmap()`. Strided tensors use cuMemcpy2D DMA — see [[crates/cuda/src/memcpy2d.rs#clone_htod_2d]]. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache#new_from_mmap]], [[crates/backends/native/src/gpu_cache.rs#upload_mmap_tensor]].
 
 ## Completed
 Tasks implemented so far in Phase 4.7 GPU weight cache migration.
@@ -1202,7 +1202,11 @@ Complete model weight registry with embedding, layers, optional MTP head, LM hea
 
 ## MmapTensor and MmapWeightRegistry
 
-Zero-copy references to tensors in memory-mapped safetensors files. `MmapTensor` wraps `Arc<Mmap>` with a raw pointer, shape, dtype, and name. Implements `Deref<Target = [u8]>`; clone is cheap. See [[crates/model/src/mmap.rs#MmapTensor]].
+Zero-copy tensor references in memory-mapped safetensors files. `MmapTensor` wraps `DataOwner` (`Arc<Mmap>`) with shape, dtype, and name. Non-contiguous shards use strided metadata for cuMemcpy2D DMA upload — no CPU copies needed. See [[crates/model/src/mmap.rs#MmapTensor]].
+
+### DataOwner
+
+Simple wrapper around `Arc<Mmap>` keeping mmap mappings alive across tensor references. Non-contiguous shards no longer use heap-owned buffers — they store strided metadata for cuMemcpy2D DMA transfers. See [[crates/model/src/mmap.rs#DataOwner]].
 
 ### MmapCompanions
 
@@ -1210,13 +1214,13 @@ Zero-copy companion tensors (qzeros, scales) for INT4 quantized weights. See [[c
 
 ### MmapWeightRegistry
 
-Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap, INT4 companions, and retains Arc-backed mmap handles to prevent unmapping. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
+Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap and INT4 companions. Each MmapTensor's DataOwner keeps mmaps alive — no separate `_mmaps` tracking needed. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
 
 ### load_safetensors_mmap
 
 Zero-copy safetensors loader storing raw pointers into mmap regions as `MmapTensor` references instead of copying data. Auto-detects single vs sharded files. See [[crates/model/src/mmap.rs#load_safetensors_mmap]].
 
-Unlike `load_safetensors()` which copies data via `Bytes::copy_from_slice()`, the `Arc<Mmap>` stored in both `_mmaps` and each `MmapTensor` keeps mappings alive without duplication. Supports single-file (`model.safetensors`) and sharded (`model.safetensors.index.json`) formats.
+Unlike `load_safetensors()` which copies data via `Bytes::copy_from_slice()`, the `Arc<Mmap>` stored in each MmapTensor's `DataOwner::Mmap` keeps mappings alive without duplication. Supports single-file (`model.safetensors`) and sharded (`model.safetensors.index.json`) formats.
 
 ### strip_language_model_prefix_mmap
 
@@ -1226,17 +1230,17 @@ Same logic as `strip_language_model_prefix()` but for the zero-copy mmap variant
 
 ### shard_weights_tp_mmap
 
-Shards MmapWeightRegistry across GPUs for tensor parallelism without copying weight data for contiguous splits. See [[crates/model/src/mmap.rs#shard_weights_tp_mmap]].
+Shards MmapWeightRegistry across GPUs for tensor parallelism. All splits are zero-copy on CPU: contiguous splits use pointer offsets, non-contiguous splits produce strided tensors uploaded via cuMemcpy2D DMA. See [[crates/model/src/mmap.rs#shard_weights_tp_mmap]].
 
 Follows the same sharding rules as `shard_weights_tp()` but operates on MmapTensor references. Dispatch table:
 
 - **ColumnParallel + BF16**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset into same mmap
-- **ColumnParallel + INT4**: Split dim 1 (N, last dim) — non-contiguous, copies data to temp file + new mmap
-- **RowParallel + BF16**: Split dim 1 (last dim) — non-contiguous, copies data
+- **ColumnParallel + INT4**: Split dim 1 (N, last dim) — non-contiguous, strided tensor with cuMemcpy2D DMA upload
+- **RowParallel + BF16**: Split dim 1 (last dim) — non-contiguous, strided tensor with cuMemcpy2D DMA upload
 - **RowParallel + INT4**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset
 - **Replicated**: Clone MmapTensor (cheap Arc clone)
 
-INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent, and stored in `int4_companions`. Fused QKV projections (in_proj_qkv, conv1d) fall through to regular column-parallel — TODO: proper per-segment mmap sharding.
+INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent (strided when needed), and stored in `int4_companions`. Fused QKV projections (in_proj_qkv, conv1d) fall through to regular column-parallel — TODO: proper per-segment mmap sharding.
 
 MmapWeightShard holds gpu_id and the shard's MmapWeightRegistry. See [[crates/model/src/mmap.rs#MmapWeightShard]].
 

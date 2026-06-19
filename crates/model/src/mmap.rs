@@ -16,24 +16,36 @@ use super::loader::ShardIndex;
 use super::weights::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
 
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#DataOwner]]
-/// Owns the backing data for an MmapTensor — either a memory-mapped file or heap-owned bytes.
+/// Owns the backing data for an MmapTensor — a memory-mapped file (zero-copy).
 #[derive(Clone)]
-pub enum DataOwner {
+pub struct DataOwner {
     /// Backing data is a memory-mapped file (zero-copy).
-    Mmap(Arc<Mmap>),
-    /// Backing data is heap-allocated bytes (copy of sliced tensor).
-    Owned(Arc<Vec<u8>>),
+    mmap: Arc<Mmap>,
+}
+
+impl DataOwner {
+    fn new(mmap: Arc<Mmap>) -> Self {
+        Self { mmap }
+    }
 }
 
 /// Zero-copy reference to a tensor stored in a memory-mapped safetensors file.
 #[derive(Clone)]
 pub struct MmapTensor {
-    owner: DataOwner,       // keeps the data alive (mmap or heap)
-    data_ptr: *const u8,   // pointer into owned region
-    data_len: usize,       // byte length
+    owner: DataOwner,             // keeps the data alive (mmap)
+    data_ptr: *const u8,          // for contiguous: start of shard data; for strided: base of original tensor
+    data_len: usize,              // for contiguous: shard data length; for strided: total bytes of original tensor
     shape: Vec<usize>,
     dtype: WeightDtype,
     name: String,
+    /// Strided metadata (for non-contiguous shards via cuMemcpy2D).
+    /// When src_pitch == 0 (default), data is contiguous — use data_ptr/data_len.
+    /// When src_pitch > 0, data_ptr is the BASE of the original tensor,
+    /// and the shard data starts at col_start_bytes on each row.
+    src_pitch: usize,              // bytes between consecutive rows in source (0 = contiguous)
+    col_start_bytes: usize,       // byte offset within each row where shard data begins
+    strided_width: usize,         // bytes per row to copy (shard_cols * elem_size)
+    strided_rows: usize,          // number of rows to copy
 }
 
 // SAFETY: MmapTensor does not allow mutable access to the underlying bytes.
@@ -77,36 +89,81 @@ impl MmapTensor {
         name: String,
     ) -> Self {
         Self {
-            owner: DataOwner::Mmap(mmap),
+            owner: DataOwner::new(mmap),
             data_ptr,
             data_len,
             shape,
             dtype,
             name,
+            src_pitch: 0,
+            col_start_bytes: 0,
+            strided_width: 0,
+            strided_rows: 0,
         }
     }
 
-    /// Create a new tensor backed by heap-allocated data.
-    pub fn from_owned(
-        data: Vec<u8>,
+    /// Create a strided tensor reference backed by a memory-mapped file.
+    ///
+    /// Used for non-contiguous sharding — the shard data is a column slice
+    /// across rows of the original tensor. Data is transferred to GPU via
+    /// cuMemcpy2D (zero-copy on CPU side).
+    ///
+    /// # Safety
+    /// The `base_ptr` must point into the region covered by `mmap`.
+    pub fn new_strided(
+        mmap: Arc<Mmap>,
+        base_ptr: *const u8,
+        src_pitch: usize,
+        col_start_bytes: usize,
+        strided_width: usize,
+        strided_rows: usize,
         shape: Vec<usize>,
         dtype: WeightDtype,
         name: String,
     ) -> Self {
-        let data_len = data.len();
-        // Get the pointer before moving into Arc — Vec is guaranteed to not
-        // reallocate once constructed.
-        let data_ptr = data.as_ptr();
-        let arc = Arc::new(data);
-        // SAFETY: Arc<Vec> guarantees the pointer remains valid while the Arc is alive.
+        let data_len = src_pitch * strided_rows; // approximate bounding box
         Self {
-            owner: DataOwner::Owned(arc),
-            data_ptr,
+            owner: DataOwner::new(mmap),
+            data_ptr: base_ptr,
             data_len,
             shape,
             dtype,
             name,
+            src_pitch,
+            col_start_bytes,
+            strided_width,
+            strided_rows,
         }
+    }
+
+    /// Whether this tensor has strided (non-contiguous) memory layout.
+    pub fn is_strided(&self) -> bool {
+        self.src_pitch > 0
+    }
+
+    /// Base pointer to the original tensor data (for strided access).
+    pub fn base_ptr(&self) -> *const u8 {
+        self.data_ptr
+    }
+
+    /// Bytes between consecutive rows in source.
+    pub fn src_pitch(&self) -> usize {
+        self.src_pitch
+    }
+
+    /// Byte offset within each row where shard data begins.
+    pub fn col_start_bytes(&self) -> usize {
+        self.col_start_bytes
+    }
+
+    /// Bytes per row to copy (shard width).
+    pub fn strided_width(&self) -> usize {
+        self.strided_width
+    }
+
+    /// Number of rows to copy.
+    pub fn strided_rows(&self) -> usize {
+        self.strided_rows
     }
 
     /// Safe access to the tensor's raw bytes.
@@ -129,12 +186,9 @@ impl MmapTensor {
         &self.name
     }
 
-    /// Get a clone of the underlying Arc<Mmap> if this tensor is mmap-backed.
-    pub fn mmap_arc(&self) -> Option<Arc<Mmap>> {
-        match &self.owner {
-            DataOwner::Mmap(mmap) => Some(mmap.clone()),
-            DataOwner::Owned(_) => None,
-        }
+    /// Get a clone of the underlying Arc<Mmap>.
+    pub fn mmap_arc(&self) -> Arc<Mmap> {
+        self.owner.mmap.clone()
     }
 
     /// Clone the data owner — used by sharding to create sub-views sharing the same backing.
@@ -173,7 +227,14 @@ impl MmapWeightRegistry {
 
     /// Total bytes of all weight data.
     pub fn total_bytes(&self) -> usize {
-        self.tensors.values().map(|t| t.data_len).sum()
+        self.tensors.values().map(|t| {
+            if t.is_strided() {
+                // For strided tensors, the actual shard data is strided_width * strided_rows
+                t.strided_width() * t.strided_rows()
+            } else {
+                t.data_len
+            }
+        }).sum()
     }
 }
 
@@ -217,11 +278,15 @@ fn mmap_slice_dim0(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> Resul
         shape: new_shape,
         dtype: tensor.dtype(),
         name: tensor.name().to_string(),
+        src_pitch: 0,
+        col_start_bytes: 0,
+        strided_width: 0,
+        strided_rows: 0,
     })
 }
 
 /// Slice an MmapTensor along the last dimension for a specific GPU.
-/// This is a non-contiguous slice — copies data into a contiguous heap buffer.
+/// This is a non-contiguous slice — creates a strided tensor that transfers data via cuMemcpy2D.
 fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> Result<MmapTensor> {
     let shape = tensor.shape();
     anyhow::ensure!(
@@ -243,21 +308,25 @@ fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> R
     let cols = last_dim;
     let num_rows = shape[0];
 
-    let mut new_data = Vec::with_capacity(num_rows * shard_size * bytes_per_element);
-    for row in 0..num_rows {
-        let row_start = row * cols * bytes_per_element + start * bytes_per_element;
-        let row_end = row_start + shard_size * bytes_per_element;
-        new_data.extend_from_slice(&tensor.data()[row_start..row_end]);
-    }
+    // Strided access parameters for cuMemcpy2D:
+    let src_pitch = cols * bytes_per_element;        // bytes between rows in original tensor
+    let col_start_bytes = start * bytes_per_element; // byte offset within each row where shard begins
+    let strided_width = shard_size * bytes_per_element; // bytes per row to copy
+    let strided_rows = num_rows;
 
     let mut new_shape = shape.to_vec();
     new_shape[1] = shard_size;
 
-    Ok(MmapTensor::from_owned(
-        new_data,
+    Ok(MmapTensor::new_strided(
+        tensor.mmap_arc(),
+        unsafe { tensor.data().as_ptr() }, // base pointer to original mmap data
+        src_pitch,
+        col_start_bytes,
+        strided_width,
+        strided_rows,
         new_shape,
         tensor.dtype(),
-        tensor.name().to_string(),
+        format!("{}_gpu{}", tensor.name(), gpu_id),
     ))
 }
 
@@ -745,9 +814,9 @@ mod tests {
         assert_eq!(registry.num_tensors(), 2);
         assert!(registry.tensors.contains_key("layer.0.weight"));
         assert!(registry.tensors.contains_key("norm.weight"));
-        // Verify tensors are mmap-backed
+    // Verify tensors are mmap-backed (mmap_arc() returns Arc<Mmap>)
         let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
-        assert!(layer_tensor.mmap_arc().is_some());
+        let _arc: Arc<Mmap> = layer_tensor.mmap_arc();
 
         // Verify tensor shapes and data
         let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
@@ -993,28 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn mmap_tensor_from_owned_works() {
-        // Create an owned tensor with 4x8 BF16 data (64 bytes)
-        let data: Vec<u8> = (0..64).collect();
-        let tensor = MmapTensor::from_owned(
-            data,
-            vec![4, 8],
-            WeightDtype::Bf16,
-            "owned_test".to_string(),
-        );
-
-        assert_eq!(tensor.shape(), &[4, 8]);
-        assert_eq!(tensor.dtype(), WeightDtype::Bf16);
-        assert_eq!(tensor.data_len, 64);
-        assert_eq!(tensor.name(), "owned_test");
-        assert!(tensor.mmap_arc().is_none()); // not mmap-backed
-
-        // Verify data content via Deref
-        let slice: &[u8] = &*tensor;
-        assert_eq!(slice.len(), 64);
-    }
-
-    #[test]
     fn shard_weights_tp_mmap_int4_column_parallel_owned() {
         // INT4 column-parallel (e.g. q_proj.qweight with shape [K/8, N]): split last dim — non-contiguous.
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1042,20 +1089,27 @@ mod tests {
             let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
             // Shape should have last dim halved: [4, 8] -> [4, 4]
             assert_eq!(w.shape(), &[4, 4], "GPU {} shape should be [4, 4]", gpu_id);
-            // Each shard has 4 rows * 4 cols * 2 bytes = 32 bytes
-            assert_eq!(w.data_len, 32, "GPU {} data_len should be 32", gpu_id);
-            // Owned tensors should not have an mmap arc (data was copied)
-            assert!(w.mmap_arc().is_none());
+            // Strided tensor — is_strided should be true
+            assert!(w.is_strided(), "GPU {} tensor should be strided", gpu_id);
+            // Still has mmap backing (zero-copy from original)
+            let _arc: Arc<Mmap> = w.mmap_arc();
         }
 
-        // Verify the two shards' data doesn't overlap — combined they cover original data.
+        // Verify strided access parameters are correct.
+        // Original tensor: [4, 8], elem_size=2 (BF16-sized for Int4Packed).
+        // src_pitch = 8 * 2 = 16 bytes per row in original tensor
+        // col_start_bytes for GPU 0 = 0, for GPU 1 = 4 * 2 = 8
         let g0_data = shards[0].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
+        assert_eq!(g0_data.src_pitch(), 16);
+        assert_eq!(g0_data.col_start_bytes(), 0);
+        assert_eq!(g0_data.strided_width(), 8); // 4 cols * 2 bytes
+        assert_eq!(g0_data.strided_rows(), 4);
+
         let g1_data = shards[1].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
-        // Combined shard data should be a permutation of the original bytes (non-contiguous slices).
-        let mut combined: Vec<u8> = Vec::new();
-        combined.extend_from_slice(g0_data.data());
-        combined.extend_from_slice(g1_data.data());
-        assert_eq!(combined.len(), 64); // same total as original
+        assert_eq!(g1_data.src_pitch(), 16);
+        assert_eq!(g1_data.col_start_bytes(), 8); // columns 4-7, offset by 4*2=8 bytes
+        assert_eq!(g1_data.strided_width(), 8);
+        assert_eq!(g1_data.strided_rows(), 4);
     }
 
     #[test]
@@ -1085,9 +1139,10 @@ mod tests {
         for gpu_id in 0..2 {
             let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.o_proj.weight").unwrap();
             assert_eq!(w.shape(), &[4, 4], "GPU {} shape should be [4, 4]", gpu_id);
-            assert_eq!(w.data_len, 32, "GPU {} data_len should be 32", gpu_id);
-            // Owned tensors should not have an mmap arc
-            assert!(w.mmap_arc().is_none());
+            // Strided tensor — is_strided should be true
+            assert!(w.is_strided(), "GPU {} tensor should be strided", gpu_id);
+            // Still has mmap backing (zero-copy from original)
+            let _arc: Arc<Mmap> = w.mmap_arc();
         }
     }
 }

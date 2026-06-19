@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use half::{bf16, f16};
 use infers_cuda::{CudaSlice, CudaStream};
+use infers_cuda::memcpy2d;
 use infers_cuda::PinnedHostBuffer;
 use infers_model::{Int4Companions, MmapCompanions, MmapTensor, MmapWeightRegistry, WeightData, WeightDtype, WeightRegistry};
 
@@ -305,6 +306,116 @@ fn upload_and_cache(
 ///   upload each component with sync between uploads.
 /// - **Other**: skip with a warning log.
 fn upload_mmap_tensor(
+    stream: &Arc<CudaStream>,
+    tensor: &MmapTensor,
+    int4_companions: &HashMap<String, MmapCompanions>,
+    pinned: &mut PinnedHostBuffer,
+    weights: &mut HashMap<String, CachedWeight>,
+) -> Result<()> {
+    if tensor.is_strided() {
+        upload_strided_mmap_tensor(stream, tensor, int4_companions, weights)?;
+    } else {
+        upload_contiguous_mmap_tensor(stream, tensor, int4_companions, pinned, weights)?;
+    }
+    Ok(())
+}
+
+/// Upload a strided (non-contiguous) tensor using cuMemcpy2D DMA.
+fn upload_strided_mmap_tensor(
+    stream: &Arc<CudaStream>,
+    tensor: &MmapTensor,
+    int4_companions: &HashMap<String, MmapCompanions>,
+    weights: &mut HashMap<String, CachedWeight>,
+) -> Result<()> {
+    match tensor.dtype() {
+        WeightDtype::Bf16 => {
+            // 2D DMA copy from strided mmap to contiguous GPU buffer (zero CPU copy)
+            let gpu_bytes = memcpy2d::clone_htod_2d(
+                stream,
+                tensor.base_ptr(),
+                tensor.col_start_bytes(),
+                tensor.src_pitch(),
+                tensor.strided_width(),
+                tensor.strided_rows(),
+            )?;
+
+            // Sync after upload
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+
+            // Cast CudaSlice<u8> to CudaSlice<bf16> — same layout, just different element type.
+            let bf16_slice = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<bf16>>(gpu_bytes) };
+            weights.insert(tensor.name().to_string(), CachedWeight::Bf16(bf16_slice));
+        }
+        WeightDtype::Int4Packed => {
+            let companions = int4_companions.get(tensor.name())
+                .ok_or_else(|| anyhow::anyhow!("INT4 companions not found for weight '{}'", tensor.name()))?;
+
+            // Upload qweight via 2D DMA (zero CPU copy)
+            let gpu_bytes = memcpy2d::clone_htod_2d(
+                stream,
+                tensor.base_ptr(),
+                tensor.col_start_bytes(),
+                tensor.src_pitch(),
+                tensor.strided_width(),
+                tensor.strided_rows(),
+            )?;
+
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+
+            // Cast CudaSlice<u8> to CudaSlice<u32> — u32 is 4 bytes, same as packed INT4.
+            let qweight_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<u32>>(gpu_bytes) };
+
+            // Upload scales via 2D DMA (zero CPU copy)
+            let scales_gpu_bytes = memcpy2d::clone_htod_2d(
+                stream,
+                companions.scales.base_ptr(),
+                companions.scales.col_start_bytes(),
+                companions.scales.src_pitch(),
+                companions.scales.strided_width(),
+                companions.scales.strided_rows(),
+            )?;
+
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+
+            // Cast CudaSlice<u8> to CudaSlice<f16> — f16 is 2 bytes.
+            let scales_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<f16>>(scales_gpu_bytes) };
+
+            // Upload qzeros via 2D DMA (zero CPU copy)
+            let qzeros_gpu_bytes = memcpy2d::clone_htod_2d(
+                stream,
+                companions.qzeros.base_ptr(),
+                companions.qzeros.col_start_bytes(),
+                companions.qzeros.src_pitch(),
+                companions.qzeros.strided_width(),
+                companions.qzeros.strided_rows(),
+            )?;
+
+            sync_stream(stream.as_ref(), &format!("upload_{}", tensor.name()))?;
+
+            // Cast CudaSlice<u8> to CudaSlice<u32> — u32 is 4 bytes, same as packed qzeros.
+            let qzeros_gpu = unsafe { std::mem::transmute::<CudaSlice<u8>, CudaSlice<u32>>(qzeros_gpu_bytes) };
+
+            weights.insert(
+                tensor.name().to_string(),
+                CachedWeight::Int4(Int4GpuBuffers {
+                    qweight: qweight_gpu,
+                    scales: scales_gpu,
+                    qzeros: qzeros_gpu,
+                    shape: tensor.shape().to_vec(),
+                }),
+            );
+        }
+        _ => anyhow::bail!(
+            "Unsupported dtype {:?} for strided upload of '{}'",
+            tensor.dtype(),
+            tensor.name()
+        ),
+    }
+    Ok(())
+}
+
+/// Upload a contiguous (non-strided) tensor — the original upload path.
+fn upload_contiguous_mmap_tensor(
     stream: &Arc<CudaStream>,
     tensor: &MmapTensor,
     int4_companions: &HashMap<String, MmapCompanions>,
