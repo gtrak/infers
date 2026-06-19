@@ -21,7 +21,7 @@ use infers_cuda::stream::StreamPool;
 use infers_kv::PagedKvManager;
 use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap};
 use infers_model::sharding::shard_weights_tp;
-use infers_model::{build_main_layers, build_metadata_registry, load_model, load_safetensors, strip_language_model_prefix, ModelConfig, WeightRegistry};
+use infers_model::{build_main_layers, build_metadata_registry, load_safetensors, strip_language_model_prefix, ModelConfig, WeightRegistry};
 use infers_scheduler::RoundRobinScheduler;
 use infers_tokenizer::Tokenizer;
 
@@ -205,16 +205,12 @@ async fn run() -> Result<()> {
         .context("Failed to get CUDA stream")?
         .clone();
 
-    // Allocate pinned host buffer for mmap weight uploads
-    let mut pinned = infers_cuda::PinnedHostBuffer::new(256 * 1024 * 1024)
-        .context("Failed to allocate pinned host buffer")?;
-
     // Step 3: Load model config and weights
     let model_path = Path::new(&args.model);
-    let use_mmap = !args.no_mmap && model_path.exists() && num_gpus > 1;
+    let use_mmap = !args.no_mmap && model_path.exists();
 
-    if use_mmap {
-        // Mmap path: load via zero-copy memory-mapped access, shard for TP
+    let (model_config, engine, num_layers) = if use_mmap {
+        // Mmap path: load via zero-copy memory-mapped access
         tracing::info!("Loading model from {} with TP={} (mmap)", args.model, num_gpus);
         let config = infers_model::config::ModelConfig::load(model_path)
             .with_context(|| format!("Failed to load model config from {}", args.model))?;
@@ -234,112 +230,28 @@ async fn run() -> Result<()> {
         }
 
         let num_layers = config.num_hidden_layers;
+        let mut pinned = infers_cuda::PinnedHostBuffer::new(256 * 1024 * 1024)
+            .context("Failed to allocate pinned host buffer")?;
 
-        // Step 4: Register and load CUDA kernels
         let mut kernel_registry = KernelRegistry::new();
         kernel_registry.register_infers_kernels();
 
-        // Step 5: Create ForwardEngine via mmap path
-        let model_config_mmap = Arc::new(config.clone());
+        let model_config = Arc::new(config);
         let engine = ForwardEngine::new_from_mmap(
-            model_config_mmap,
+            model_config.clone(),
             mmap_registries,
             metadata_registries,
             contexts,
             kernel_registry,
             streams,
             &mut pinned,
-            128, // group_size (default AutoRound)
+            128,
         ).context("Failed to create ForwardEngine (mmap)")?;
 
-        // Step 6: Create PagedKvManager for the scheduler
-        let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-        let _ = &kv_cache_dtype;
-
-        let page_size = args.page_size;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let total_pages = args.num_pages;
-        let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
-        let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
-
-        let kv_manager = PagedKvManager::new(
-            total_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            max_cache_bytes,
-            eviction_max_bytes,
-        );
-
-        // Step 7: Create RoundRobinScheduler
-        let max_concurrent_sessions = 4;
-        let max_batch_size = 4;
-        let max_tokens_per_batch = 1024;
-
-        let scheduler = RoundRobinScheduler::new(
-            max_concurrent_sessions,
-            max_batch_size,
-            max_tokens_per_batch,
-            kv_manager,
-        );
-
-        // Step 8: Create BackendEvictionStore
-        let eviction_store = BackendEvictionStore::new(num_layers);
-
-        // Step 9: Create InferenceOrchestrator
-        let enable_mtp = args.enable_mtp;
-        let mtp = None; // MTP initialization deferred — requires MtpWeights from model loading
-        let mtp_metrics = None;
-
-        let orchestrator = InferenceOrchestrator::new(
-            scheduler,
-            engine,
-            eviction_store,
-            stream,
-            num_layers,
-            enable_mtp,
-            mtp,
-            mtp_metrics,
-        );
-
-        // Step 10: Create Tokenizer
-        let tokenizer = {
-            let tokenizer_path = model_path.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                Tokenizer::from_file(tokenizer_path.to_str().unwrap())
-                    .context("Failed to load tokenizer")?
-            } else {
-                tracing::warn!("tokenizer.json not found at {:?}, using pretrained tokenizer", tokenizer_path);
-                Tokenizer::from_pretrained("Qwen/Qwen3.6-27B")
-                    .context("Failed to load pretrained tokenizer")?
-            }
-        };
-
-        // Step 11: Build AppState
-        let state = Arc::new(AppState {
-            model_name: args.model.clone(),
-            orchestrator: Arc::new(Mutex::new(orchestrator)),
-            tokenizer,
-        });
-
-        // Step 12: Spawn background scheduler loop
-        server::spawn_scheduler_loop(state.orchestrator.clone());
-
-        // Step 13: Build and start HTTP server
-        let app = server::build_router(state);
-        let addr = format!("{}:{}", args.host, args.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-        tracing::info!("Listening on {}", addr);
-
-        axum::serve(listener, app)
-            .await
-            .with_context(|| "Server shutdown unexpectedly")?;
-    } else if model_path.exists() && num_gpus > 1 {
-        // TP path (heap): load raw safetensors, shard, build per-GPU layers
-        tracing::info!("Loading model from {} with TP={} (heap)", args.model, num_gpus);
+        (model_config, engine, num_layers)
+    } else if model_path.exists() {
+        // Heap path: load into memory, shard for TP
+        tracing::info!("Loading model from {} with TP={}", args.model, num_gpus);
         let config = infers_model::config::ModelConfig::load(model_path)
             .with_context(|| format!("Failed to load model config from {}", args.model))?;
         let mut raw_weights = load_safetensors(model_path)
@@ -357,215 +269,22 @@ async fn run() -> Result<()> {
 
         let num_layers = config.num_hidden_layers;
 
-        // Step 4: Register and load CUDA kernels
         let mut kernel_registry = KernelRegistry::new();
         kernel_registry.register_infers_kernels();
 
-        // Step 5: Create ForwardEngine
-        let model_config_heap = Arc::new(config.clone());
+        let model_config = Arc::new(config);
         let engine = ForwardEngine::new(
-            model_config_heap,
+            model_config.clone(),
             registries,
             contexts,
             kernel_registry,
             streams,
-            128, // group_size (default AutoRound)
+            128,
         ).context("Failed to create ForwardEngine")?;
 
-        // Step 6: Create PagedKvManager for the scheduler
-        let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-        let _ = &kv_cache_dtype;
-
-        let page_size = args.page_size;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let total_pages = args.num_pages;
-        let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
-        let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
-
-        let kv_manager = PagedKvManager::new(
-            total_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            max_cache_bytes,
-            eviction_max_bytes,
-        );
-
-        // Step 7: Create RoundRobinScheduler
-        let max_concurrent_sessions = 4;
-        let max_batch_size = 4;
-        let max_tokens_per_batch = 1024;
-
-        let scheduler = RoundRobinScheduler::new(
-            max_concurrent_sessions,
-            max_batch_size,
-            max_tokens_per_batch,
-            kv_manager,
-        );
-
-        // Step 8: Create BackendEvictionStore
-        let eviction_store = BackendEvictionStore::new(num_layers);
-
-        // Step 9: Create InferenceOrchestrator
-        let enable_mtp = args.enable_mtp;
-        let mtp = None; // MTP initialization deferred — requires MtpWeights from model loading
-        let mtp_metrics = None;
-
-        let orchestrator = InferenceOrchestrator::new(
-            scheduler,
-            engine,
-            eviction_store,
-            stream,
-            num_layers,
-            enable_mtp,
-            mtp,
-            mtp_metrics,
-        );
-
-        // Step 10: Create Tokenizer
-        let tokenizer = {
-            let tokenizer_path = model_path.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                Tokenizer::from_file(tokenizer_path.to_str().unwrap())
-                    .context("Failed to load tokenizer")?
-            } else {
-                tracing::warn!("tokenizer.json not found at {:?}, using pretrained tokenizer", tokenizer_path);
-                Tokenizer::from_pretrained("Qwen/Qwen3.6-27B")
-                    .context("Failed to load pretrained tokenizer")?
-            }
-        };
-
-        // Step 11: Build AppState
-        let state = Arc::new(AppState {
-            model_name: args.model.clone(),
-            orchestrator: Arc::new(Mutex::new(orchestrator)),
-            tokenizer,
-        });
-
-        // Step 12: Spawn background scheduler loop
-        server::spawn_scheduler_loop(state.orchestrator.clone());
-
-        // Step 13: Build and start HTTP server
-        let app = server::build_router(state);
-        let addr = format!("{}:{}", args.host, args.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-        tracing::info!("Listening on {}", addr);
-
-        axum::serve(listener, app)
-            .await
-            .with_context(|| "Server shutdown unexpectedly")?;
-    } else if model_path.exists() {
-        // TP=1 path: use load_model as before
-        tracing::info!("Loading model from {}", args.model);
-        let loaded = load_model(model_path)
-            .with_context(|| format!("Failed to load model from {}", args.model))?;
-        let num_layers = loaded.config.num_hidden_layers;
-
-        // Step 4: Register and load CUDA kernels
-        let mut kernel_registry = KernelRegistry::new();
-        kernel_registry.register_infers_kernels();
-
-        // Step 5: Create ForwardEngine
-        let model_config_tp1 = Arc::new(loaded.config.clone());
-        let engine = ForwardEngine::new(
-            model_config_tp1,
-            vec![loaded.weights],
-            contexts,
-            kernel_registry,
-            streams,
-            128, // group_size (default AutoRound)
-        ).context("Failed to create ForwardEngine")?;
-
-        // Step 6: Create PagedKvManager for the scheduler
-        let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-        let _ = &kv_cache_dtype;
-
-        let page_size = args.page_size;
-        let num_kv_heads = loaded.config.num_key_value_heads;
-        let head_dim = loaded.config.head_dim;
-        let total_pages = args.num_pages;
-        let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
-        let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
-
-        let kv_manager = PagedKvManager::new(
-            total_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            max_cache_bytes,
-            eviction_max_bytes,
-        );
-
-        // Step 7: Create RoundRobinScheduler
-        let max_concurrent_sessions = 4;
-        let max_batch_size = 4;
-        let max_tokens_per_batch = 1024;
-
-        let scheduler = RoundRobinScheduler::new(
-            max_concurrent_sessions,
-            max_batch_size,
-            max_tokens_per_batch,
-            kv_manager,
-        );
-
-        // Step 8: Create BackendEvictionStore
-        let eviction_store = BackendEvictionStore::new(num_layers);
-
-        // Step 9: Create InferenceOrchestrator
-        let enable_mtp = args.enable_mtp;
-        let mtp = None; // MTP initialization deferred — requires MtpWeights from model loading
-        let mtp_metrics = None;
-
-        let orchestrator = InferenceOrchestrator::new(
-            scheduler,
-            engine,
-            eviction_store,
-            stream,
-            num_layers,
-            enable_mtp,
-            mtp,
-            mtp_metrics,
-        );
-
-        // Step 10: Create Tokenizer
-        let tokenizer = {
-            let tokenizer_path = model_path.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                Tokenizer::from_file(tokenizer_path.to_str().unwrap())
-                    .context("Failed to load tokenizer")?
-            } else {
-                tracing::warn!("tokenizer.json not found at {:?}, using pretrained tokenizer", tokenizer_path);
-                Tokenizer::from_pretrained("Qwen/Qwen3.6-27B")
-                    .context("Failed to load pretrained tokenizer")?
-            }
-        };
-
-        // Step 11: Build AppState
-        let state = Arc::new(AppState {
-            model_name: args.model.clone(),
-            orchestrator: Arc::new(Mutex::new(orchestrator)),
-            tokenizer,
-        });
-
-        // Step 12: Spawn background scheduler loop
-        server::spawn_scheduler_loop(state.orchestrator.clone());
-
-        // Step 13: Build and start HTTP server
-        let app = server::build_router(state);
-        let addr = format!("{}:{}", args.host, args.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-        tracing::info!("Listening on {}", addr);
-
-        axum::serve(listener, app)
-            .await
-            .with_context(|| "Server shutdown unexpectedly")?;
+        (model_config, engine, num_layers)
     } else {
-        // If no model path, create a minimal config for wiring
+        // No model path: create minimal config for wiring
         tracing::warn!("Model path {} not found, using default config for wiring", args.model);
         let config = ModelConfig {
             architectures: vec!["Qwen3_5ForConditionalGeneration".to_string()],
@@ -599,100 +318,111 @@ async fn run() -> Result<()> {
         let weights = WeightRegistry::new();
         let num_layers = config.num_hidden_layers;
 
-        // Step 4: Register and load CUDA kernels
         let mut kernel_registry = KernelRegistry::new();
         kernel_registry.register_infers_kernels();
 
-        // Step 5: Create ForwardEngine
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
+        let model_config = Arc::new(config);
         let engine = ForwardEngine::new(
-            Arc::new(config),
+            model_config.clone(),
             vec![weights],
             contexts,
             kernel_registry,
             streams,
-            128, // group_size (default AutoRound)
+            128,
         ).context("Failed to create ForwardEngine")?;
 
-        // Step 6: Create PagedKvManager for the scheduler
-        let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-        let _ = &kv_cache_dtype;
+        (model_config, engine, num_layers)
+    };
 
-        let page_size = args.page_size;
-        let total_pages = args.num_pages;
-        let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
-        let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
+    // Step 4: Create PagedKvManager for the scheduler
+    let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
+    let _ = &kv_cache_dtype;
 
-        let kv_manager = PagedKvManager::new(
-            total_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            max_cache_bytes,
-            eviction_max_bytes,
-        );
+    let page_size = args.page_size;
+    let num_kv_heads = model_config.num_key_value_heads;
+    let head_dim = model_config.head_dim;
+    let total_pages = args.num_pages;
+    let max_cache_bytes = 64 * 1024 * 1024; // 64 MB
+    let eviction_max_bytes = 32 * 1024 * 1024; // 32 MB
 
-        // Step 7: Create RoundRobinScheduler
-        let max_concurrent_sessions = 4;
-        let max_batch_size = 4;
-        let max_tokens_per_batch = 1024;
+    let kv_manager = PagedKvManager::new(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        max_cache_bytes,
+        eviction_max_bytes,
+    );
 
-        let scheduler = RoundRobinScheduler::new(
-            max_concurrent_sessions,
-            max_batch_size,
-            max_tokens_per_batch,
-            kv_manager,
-        );
+    // Step 5: Create RoundRobinScheduler
+    let max_concurrent_sessions = 4;
+    let max_batch_size = 4;
+    let max_tokens_per_batch = 1024;
 
-        // Step 8: Create BackendEvictionStore
-        let eviction_store = BackendEvictionStore::new(num_layers);
+    let scheduler = RoundRobinScheduler::new(
+        max_concurrent_sessions,
+        max_batch_size,
+        max_tokens_per_batch,
+        kv_manager,
+    );
 
-        // Step 9: Create InferenceOrchestrator
-        let enable_mtp = args.enable_mtp;
-        let mtp = None; // MTP initialization deferred — requires MtpWeights from model loading
-        let mtp_metrics = None;
+    // Step 6: Create BackendEvictionStore
+    let eviction_store = BackendEvictionStore::new(num_layers);
 
-        let orchestrator = InferenceOrchestrator::new(
-            scheduler,
-            engine,
-            eviction_store,
-            stream,
-            num_layers,
-            enable_mtp,
-            mtp,
-            mtp_metrics,
-        );
+    // Step 7: Create InferenceOrchestrator
+    let enable_mtp = args.enable_mtp;
+    let mtp = None;
+    let mtp_metrics = None;
 
-        // Step 10: Create Tokenizer
-        let tokenizer = {
-            tracing::warn!("No model path, loading pretrained tokenizer");
+    let orchestrator = InferenceOrchestrator::new(
+        scheduler,
+        engine,
+        eviction_store,
+        stream,
+        num_layers,
+        enable_mtp,
+        mtp,
+        mtp_metrics,
+    );
+
+    // Step 8: Create Tokenizer
+    let tokenizer = if model_path.exists() {
+        let tokenizer_path = model_path.join("tokenizer.json");
+        if tokenizer_path.exists() {
+            Tokenizer::from_file(tokenizer_path.to_str().unwrap())
+                .context("Failed to load tokenizer")?
+        } else {
+            tracing::warn!("tokenizer.json not found at {:?}, using pretrained tokenizer", tokenizer_path);
             Tokenizer::from_pretrained("Qwen/Qwen3.6-27B")
                 .context("Failed to load pretrained tokenizer")?
-        };
-
-        // Step 11: Build AppState
-        let state = Arc::new(AppState {
-            model_name: args.model.clone(),
-            orchestrator: Arc::new(Mutex::new(orchestrator)),
-            tokenizer,
-        });
-
-        // Step 12: Spawn background scheduler loop
-        server::spawn_scheduler_loop(state.orchestrator.clone());
-
-        // Step 13: Build and start HTTP server
-        let app = server::build_router(state);
-        let addr = format!("{}:{}", args.host, args.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-        tracing::info!("Listening on {}", addr);
-
-        axum::serve(listener, app)
-            .await
-            .with_context(|| "Server shutdown unexpectedly")?;
+        }
+    } else {
+        tracing::warn!("No model path, loading pretrained tokenizer");
+        Tokenizer::from_pretrained("Qwen/Qwen3.6-27B")
+            .context("Failed to load pretrained tokenizer")?
     };
+
+    // Step 9: Build AppState
+    let state = Arc::new(AppState {
+        model_name: args.model.clone(),
+        orchestrator: Arc::new(Mutex::new(orchestrator)),
+        tokenizer,
+    });
+
+    // Step 10: Spawn background scheduler loop
+    server::spawn_scheduler_loop(state.orchestrator.clone());
+
+    // Step 11: Build and start HTTP server
+    let app = server::build_router(state);
+    let addr = format!("{}:{}", args.host, args.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {}", addr))?;
+    tracing::info!("Listening on {}", addr);
+
+    axum::serve(listener, app)
+        .await
+        .with_context(|| "Server shutdown unexpectedly")?;
 
     Ok(())
 }
