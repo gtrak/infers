@@ -30,6 +30,7 @@ use infers_cuda::CudaSlice;
 use infers_cuda::{group_end, group_start};
 
 use crate::sync;
+use crate::sample::{Xoshiro256PlusPlus, sample_with_config};
 
 
 /// Per-GPU cached kernel function handles.
@@ -444,6 +445,8 @@ impl ForwardEngine {
         _stream: &Arc<CudaStream>,
         token_ids: &[u32],
         seq_id: infers_kv::SequenceId,
+        sampling_config: &infers_scheduler::SamplingConfig,
+        rng: &mut Xoshiro256PlusPlus,
     ) -> Result<(usize, u32)> {
         let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
@@ -770,34 +773,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // Sample: last row argmax
         let last_row_start = (seq_len - 1) * config.vocab_size;
         let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
-        let sampled = crate::sample::greedy_sample_bf16(
-            &final_stream, &self.per_gpu_kernels[0].argmax, &last_row_logits,
+        let sampled = crate::sample::sample_with_config(
+            &final_stream, &last_row_logits, &self.per_gpu_kernels[0].argmax,
+            sampling_config, token_ids, token_ids.len(), rng,
         )?;
-
-        // DEBUG: dump top-5 logits for the last token position
-        {
-            let all_logits: Vec<bf16> = final_stream.clone_dtoh(&logits)?;
-            let last_start = (seq_len - 1) * config.vocab_size;
-            let last_logits = &all_logits[last_start..last_start + config.vocab_size];
-            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate()
-                .map(|(i, &v)| (i, v.to_f32()))
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!("DEBUG TOP-5 LOGITS (last token):");
-            for (rank, (idx, val)) in indexed.iter().take(5).enumerate() {
-                eprintln!("  #{}: token_id={} logit={:.6}", rank+1, idx, val);
-            }
-            // Also check if expected token 248068 is in top-20
-            if let Some(pos) = indexed.iter().position(|&(idx, _)| idx == 248068) {
-                let (idx, val) = indexed[pos];
-                eprintln!("  Expected token 248068 at rank #{} with logit={:.6}", pos+1, val);
-            } else {
-                eprintln!("  Expected token 248068 NOT found in sorted logits!");
-                if let Some(val) = last_logits.get(248068) {
-                    eprintln!("  Token 248068 raw logit={:.6}", val.to_f32());
-                }
-            }
-        }
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
 
@@ -825,6 +804,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         token_id: u32,
         position: u32,
         seq_id: infers_kv::SequenceId,
+        sampling_config: &infers_scheduler::SamplingConfig,
+        token_history: &[u32],
+        num_prompt_tokens: usize,
+        rng: &mut Xoshiro256PlusPlus,
     ) -> Result<u32> {
         let num_gpus = self.weights.len();
         let config = &self.config;
@@ -1144,8 +1127,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size], "decode");
 
         // Sample (BF16 argmax)
-        let sampled = crate::sample::greedy_sample_bf16(
-            &final_stream, &self.per_gpu_kernels[0].argmax, &logits.as_view(),
+        let sampled = crate::sample::sample_with_config(
+            &final_stream, &logits.as_view(), &self.per_gpu_kernels[0].argmax,
+            sampling_config, token_history, num_prompt_tokens, rng,
         )?;
 
         // Record the new token in the KV manager so the next decode step

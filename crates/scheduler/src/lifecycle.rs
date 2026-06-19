@@ -100,6 +100,7 @@ mod tests {
             last_activity: Instant::now(),
             priority: 0,
             routing_id: None,
+            sampling_config: crate::queue::SamplingConfig::default(),
         }
     }
 

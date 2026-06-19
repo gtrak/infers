@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use infers_backend_native::{BackendEvictionStore, ForwardEngine};
+use infers_backend_native::{BackendEvictionStore, ForwardEngine, Xoshiro256PlusPlus};
 use infers_cuda::CudaStream;
 use infers_kv::SequenceId;
 use infers_scheduler::{
@@ -46,6 +46,8 @@ pub struct InferenceOrchestrator {
     /// MTP metrics tracker (optional).
     #[allow(dead_code)]
     mtp_metrics: Option<infers_mtp::MtpMetrics>,
+    /// Per-session RNG for reproducible sampling.
+    session_rngs: HashMap<SequenceId, Xoshiro256PlusPlus>,
 }
 
 impl InferenceOrchestrator {
@@ -73,6 +75,7 @@ impl InferenceOrchestrator {
             enable_mtp,
             mtp,
             mtp_metrics,
+            session_rngs: HashMap::new(),
         }
     }
 
@@ -162,6 +165,7 @@ impl InferenceOrchestrator {
                     tokens.len()
                 );
 
+                // TODO: switch to prefill_paged() once paged KV is initialized in server startup
                 let sampled = self.engine.prefill(&self.stream, tokens)?;
 
                 // Update session state and push generated token
@@ -187,14 +191,20 @@ impl InferenceOrchestrator {
         for (i, &seq_id) in work.decode_batch.sessions.iter().enumerate() {
             let token_id = work.decode_batch.input_tokens[i];
 
-            // Calculate position: index of the current input token in the sequence
-            let position = self
-                .scheduler
-                .active_sessions
-                .iter()
+            // Get session for sampling config, token history, and position
+            let session = self.scheduler.active_sessions.iter()
                 .find(|s| s.id == seq_id)
-                .map(|s| s.tokens.len().saturating_sub(1) as u32)
-                .unwrap_or(0);
+                .ok_or_else(|| anyhow::anyhow!("Session {} not found", seq_id))?;
+            let position = session.tokens.len().saturating_sub(1) as u32;
+            let sampling_config = &session.sampling_config;
+
+            // Get or create per-session RNG
+            if !self.session_rngs.contains_key(&seq_id) {
+                let seed = sampling_config.seed
+                    .unwrap_or_else(infers_backend_native::sample::random_seed);
+                self.session_rngs.insert(seq_id, Xoshiro256PlusPlus::from_seed(seed));
+            }
+            let rng = self.session_rngs.get_mut(&seq_id).unwrap();
 
             tracing::debug!(
                 "Decoding session {}: token_id={}, position={}",
@@ -203,16 +213,23 @@ impl InferenceOrchestrator {
                 position
             );
 
-            let sampled = self.engine.decode_paged(&self.stream, token_id, position, seq_id)?;
+            let sampled = self.engine.decode_paged(
+                &self.stream, token_id, position, seq_id,
+                sampling_config, &session.tokens, session.num_prompt_tokens, rng,
+            )?;
 
+            // Check stop tokens
+            if infers_backend_native::sample::should_stop(sampled, sampling_config) {
+                if let Some(session) = self.scheduler.active_sessions.iter_mut().find(|s| s.id == seq_id) {
+                    let _ = lifecycle::complete_session(session);
+                    self.response_tx.remove(&seq_id);
+                    self.session_rngs.remove(&seq_id);
+                }
+                continue;
+            }
 
             // Update session
-            if let Some(session) = self
-                .scheduler
-                .active_sessions
-                .iter_mut()
-                .find(|s| s.id == seq_id)
-            {
+            if let Some(session) = self.scheduler.active_sessions.iter_mut().find(|s| s.id == seq_id) {
                 session.tokens.push(sampled);
                 session.num_generated_tokens = session.num_generated_tokens.saturating_add(1);
 
@@ -224,8 +241,8 @@ impl InferenceOrchestrator {
                         session.num_generated_tokens
                     );
                     let _ = lifecycle::complete_session(session);
-                    // Close response channel
                     self.response_tx.remove(&seq_id);
+                    self.session_rngs.remove(&seq_id);
                 }
             }
 

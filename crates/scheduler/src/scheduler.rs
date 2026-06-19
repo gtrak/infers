@@ -222,6 +222,7 @@ impl RoundRobinScheduler {
             last_activity: Instant::now(),
             priority: request.priority,
             routing_id: request.routing_id,
+            sampling_config: request.config.clone(),
         })
     }
 

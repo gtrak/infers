@@ -242,7 +242,9 @@ fn main() -> Result<()> {
 
     // --- 12. Run prefill ---
     let prefill_start = Instant::now();
-    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
+    let sampling_config = infers_scheduler::SamplingConfig::default();
+    let mut rng = infers_backend_native::Xoshiro256PlusPlus::from_seed(42);
+    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id, &sampling_config, &mut rng)?;
     let prefill_elapsed = prefill_start.elapsed();
     eprintln!(
         "Prefill: {} pages used, first_sampled={}, {:.3}s",
@@ -257,11 +259,18 @@ fn main() -> Result<()> {
 
     // Start autoregressive decoding from the first sampled token produced during prefill.
     // Each decode step embeds the previous token and produces the next logits.
+    let mut all_tokens = token_ids.clone();
+    all_tokens.push(first_token);
     let mut current_token = first_token;
     for step in 0..args.max_tokens {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
-        let token = engine.decode_paged(&external_stream, current_token, pos, seq_id)?;
+        let token = engine.decode_paged(&external_stream, current_token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng)?;
+        if infers_backend_native::sample::should_stop(token, &sampling_config) {
+            eprintln!("Stop token generated: {}, stopping at step {}", token, step);
+            break;
+        }
+        all_tokens.push(token);
         current_token = token;
         let decode_elapsed = decode_start.elapsed();
         total_decode_time += decode_elapsed;

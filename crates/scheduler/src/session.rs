@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use infers_kv::{SequenceId, SequencePageTable};
 
+use crate::queue::SamplingConfig;
+
 // @lat: [[lat.md/lat#Scheduler#Session State]]
 /// The lifecycle state of an inference session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub struct Session {
     pub priority: i32,
     /// Routing ID from the original request, used to correlate with response channel.
     pub routing_id: Option<usize>,
+    /// Sampling configuration for this session (from the original request).
+    pub sampling_config: SamplingConfig,
 }
 
 impl Session {

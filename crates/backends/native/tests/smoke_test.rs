@@ -152,18 +152,23 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("Prompt tokens ({}): {:?}", token_ids.len(), &token_ids[..5.min(token_ids.len())]);
     let prefill_start = Instant::now();
-    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id)?;
+    let sampling_config = infers_scheduler::SamplingConfig::default();
+    let mut rng = infers_backend_native::Xoshiro256PlusPlus::from_seed(42);
+    let (pages_used, first_token) = engine.prefill_paged(&external_stream, &token_ids, seq_id, &sampling_config, &mut rng)?;
     let prefill_elapsed = prefill_start.elapsed();
     eprintln!("Prefill completed: {} pages used, first_sampled={}, {:.3}s", pages_used, first_token, prefill_elapsed.as_secs_f64());
 
     // 13. Run decode for 30 steps to get a coherent response
     let mut generated_tokens: Vec<u32> = Vec::new();
+    let mut all_tokens = token_ids.clone();
+    all_tokens.push(first_token);
     let mut token = token_ids[0];
     let mut total_decode_time = std::time::Duration::ZERO;
     for step in 0..30 {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
-        token = engine.decode_paged(&external_stream, token, pos, seq_id)?;
+        token = engine.decode_paged(&external_stream, token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng)?;
+        all_tokens.push(token);
         let decode_elapsed = decode_start.elapsed();
         total_decode_time += decode_elapsed;
         generated_tokens.push(token);

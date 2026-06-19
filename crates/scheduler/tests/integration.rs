@@ -96,7 +96,7 @@ fn test_batch_builder_with_real_kv_manager() {
     for _ in 0..20 {
         kv.add_token(seq1).unwrap();
     }
-    sessions.push(Session {
+      sessions.push(Session {
         id: seq1,
         state: SessionState::Decoding,
         tokens: (0..20).collect(),
@@ -108,6 +108,7 @@ fn test_batch_builder_with_real_kv_manager() {
         last_activity: Instant::now(),
         priority: 0,
         routing_id: None,
+        sampling_config: SamplingConfig::default(),
     });
 
     // Session 2: 1 page, 10 tokens
@@ -128,6 +129,7 @@ fn test_batch_builder_with_real_kv_manager() {
         last_activity: Instant::now(),
         priority: 0,
         routing_id: None,
+        sampling_config: SamplingConfig::default(),
     });
 
     let batch = builder.build_decode_batch(&sessions, &kv).unwrap();
@@ -256,6 +258,7 @@ fn test_session_eviction_timing() {
         last_activity: Instant::now(),
         priority: 0,
         routing_id: None,
+        sampling_config: SamplingConfig::default(),
     };
 
     // Just created — not evictable yet
@@ -364,6 +367,7 @@ fn test_lru_eviction_candidate_selection() {
             created_at: now, last_activity: now - Duration::from_secs(100),
             priority: 0,
             routing_id: None,
+            sampling_config: SamplingConfig::default(),
         },
         Session {
             id: 1, state: SessionState::Decoding, tokens: vec![2],
@@ -372,6 +376,7 @@ fn test_lru_eviction_candidate_selection() {
             created_at: now, last_activity: now - Duration::from_secs(200),
             priority: 0,
             routing_id: None,
+            sampling_config: SamplingConfig::default(),
         },
         Session {
             id: 2, state: SessionState::Prefilling, tokens: vec![3],
@@ -380,6 +385,7 @@ fn test_lru_eviction_candidate_selection() {
             created_at: now, last_activity: now, // too recent
             priority: 0,
             routing_id: None,
+            sampling_config: SamplingConfig::default(),
         },
     ];
 

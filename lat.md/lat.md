@@ -1477,7 +1477,7 @@ Lifecycle states that track where a session is in the inference pipeline.
 
 Struct tracking generation state, tokens, and paged KV cache page table for a single inference session.
 
-`Session` holds `id` (`SequenceId` from `PagedKvManager`), `state`, `tokens`, `num_prompt_tokens`, `num_generated_tokens`, `max_tokens`, `page_table`, `created_at`, `last_activity`, `priority`, and `routing_id` (correlates with response channel). Methods: `is_active()` (true for Prefilling/Decoding), `is_evictable()` (true if idle >30s), `is_complete()` (true if generated >= max), `total_tokens()` (sum of prompt + generated). See [[crates/scheduler/src/session.rs#Session]].
+`Session` holds `id` (`SequenceId` from `PagedKvManager`), `state`, `tokens`, `num_prompt_tokens`, `num_generated_tokens`, `max_tokens`, `page_table`, `created_at`, `last_activity`, `priority`, `routing_id` (correlates with response channel), and `sampling_config` (`SamplingConfig` from the original request, used for sampling and stop-token detection during decode). Methods: `is_active()` (true for Prefilling/Decoding), `is_evictable()` (true if idle >30s), `is_complete()` (true if generated >= max), `total_tokens()` (sum of prompt + generated). See [[crates/scheduler/src/session.rs#Session]].
 
 ## Sampling Strategy
 
