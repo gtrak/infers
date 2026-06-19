@@ -32,12 +32,18 @@ fn weight_output_dim(w: &infers_model::WeightData) -> usize {
 }
 
 /// GDN recurrent state — 2D matrix [num_heads × head_k_dim × head_v_dim] float32.
+/// Also stores the conv1d state buffer: last (kernel_size - 1) tokens' mixed_qkv values,
+/// needed for causal conv1d during decode (matches HF `causal_conv1d_update`).
 #[derive(Debug)]
 pub struct GdnState {
     pub state: Option<CudaSlice<f32>>,
+    /// Conv state buffer: last (kernel_size - 1) tokens' mixed_qkv, shape [conv_dim * (kernel_size - 1)] bf16.
+    pub conv_state: Option<CudaSlice<bf16>>,
     pub num_heads: usize,
     pub head_k_dim: usize,
     pub head_v_dim: usize,
+    pub conv_state_len: usize,  // kernel_size - 1
+    pub conv_dim: usize,
 }
 
 impl Default for GdnState {
@@ -46,7 +52,7 @@ impl Default for GdnState {
 
 impl GdnState {
     pub fn new() -> Self {
-        Self { state: None, num_heads: 0, head_k_dim: 0, head_v_dim: 0 }
+        Self { state: None, conv_state: None, num_heads: 0, head_k_dim: 0, head_v_dim: 0, conv_state_len: 0, conv_dim: 0 }
     }
 
     pub fn ensure_allocated(
@@ -67,6 +73,25 @@ impl GdnState {
             self.num_heads = num_heads;
             self.head_k_dim = head_k_dim;
             self.head_v_dim = head_v_dim;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_conv_state_allocated(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        conv_dim: usize,
+        kernel_size: usize,
+    ) -> Result<()> {
+        let state_len = kernel_size - 1;
+        let total = conv_dim * state_len;
+        if self.conv_state.is_none() || self.conv_dim != conv_dim || self.conv_state_len != state_len {
+            self.conv_state = Some(
+                stream.alloc_zeros::<bf16>(total)
+                    .map_err(|e| anyhow::anyhow!("Failed to allocate GDN conv state: {e}"))?,
+            );
+            self.conv_dim = conv_dim;
+            self.conv_state_len = state_len;
         }
         Ok(())
     }
@@ -276,6 +301,31 @@ fn repeat_interleave_heads(
             .map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
     }
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
+
+    // Save conv state: last (kernel_size - 1) tokens' mixed_qkv for decode causal conv1d.
+    // Matches HF: cache_params.update_conv_state(new_conv_state)
+    let kernel_size_usize = config.linear_conv_kernel_dim as usize;
+    let conv_state_len = kernel_size_usize - 1;
+    gdn_state.ensure_conv_state_allocated(stream, conv_dim, kernel_size_usize)?;
+    if let Some(ref mut cs) = gdn_state.conv_state {
+        if seq_len >= conv_state_len {
+            // Copy last conv_state_len rows of mixed_qkv to conv_state
+            let src_offset = (seq_len - conv_state_len) * conv_dim;
+            let src_view = mixed_qkv.slice(src_offset..seq_len * conv_dim);
+            stream.memcpy_dtod(&src_view, cs)
+                .map_err(|e| anyhow::anyhow!("Failed to copy conv state: {e}"))?;
+        } else {
+            // seq_len < conv_state_len: right-shift existing state and prepend zeros
+            // This shouldn't happen in normal operation (prefill >= kernel_size)
+            let zeros = stream.alloc_zeros::<bf16>(conv_state_len * conv_dim - seq_len * conv_dim)?;
+            let mut tmp = stream.alloc_zeros::<bf16>(conv_state_len * conv_dim)?;
+            stream.memcpy_dtod(&zeros, &mut tmp)?;
+            let offset = (conv_state_len - seq_len) * conv_dim;
+            let mut tail = tmp.slice_mut(offset..conv_state_len * conv_dim);
+            stream.memcpy_dtod(&mixed_qkv, &mut tail)?;
+            stream.memcpy_dtod(&tmp, cs)?;
+        }
+    }
 
     // =========================================================================
     // Phase 3: Split conv_out into query, key, value (extract as proper slices)
@@ -523,40 +573,90 @@ pub fn decode_forward(
     }
 
     // =========================================================================
-    // Phase 2: Conv1d
+    // Phase 2: Conv1d with causal conv_state (matches HF causal_conv1d_update)
+    //
+    // HF decode path:
+    //   hidden_states_new = cat([conv_state, hidden_states])  // prepend buffered context
+    //   conv_state = hidden_states_new[:, :, -state_len:]     // update buffer
+    //   out = conv1d(hidden_states_new, padding=0)            // no padding needed
+    //   out = silu(out[:, :, -seq_len:])                      // take last position
+    //
+    // We replicate this by prepending conv_state to mixed_qkv, calling our
+    // depthwise conv1d kernel with seq_len=kernel_size, and taking the last row.
     // =========================================================================
-    let mut conv_out = stream.alloc_zeros::<bf16>(conv_dim)?;
+    let kernel_size = config.linear_conv_kernel_dim as i32;
+    let kernel_size_usize = kernel_size as usize;
+    let conv_state_len = kernel_size_usize - 1;  // 3 for kernel_size=4
+
+    gdn_state.ensure_conv_state_allocated(stream, conv_dim, kernel_size_usize)?;
+
+    // Build the conv input: [conv_state | mixed_qkv] → [kernel_size * conv_dim]
+    let mut conv_input = stream.alloc_zeros::<bf16>(kernel_size_usize * conv_dim)?;
+    if let Some(ref cs) = gdn_state.conv_state {
+        // Copy conv_state (conv_state_len * conv_dim elements) to the start
+        stream.memcpy_dtod(cs, &mut conv_input)
+            .map_err(|e| anyhow::anyhow!("Failed to copy conv state to input: {e}"))?;
+    }
+    // Copy current token's mixed_qkv to the end (conv_state_len * conv_dim offset)
+    let mixed_qkv_offset = conv_state_len * conv_dim;
+    {
+        let mut dst = conv_input.slice_mut(mixed_qkv_offset..kernel_size_usize * conv_dim);
+        stream.memcpy_dtod(&mixed_qkv, &mut dst)
+            .map_err(|e| anyhow::anyhow!("Failed to copy mixed_qkv to conv input: {e}"))?;
+    }
+
+    // Update conv_state: shift left by conv_dim, append current mixed_qkv
+    // conv_state = cat([conv_state[:, :, -state_len+1:], hidden_states], dim=-1)
+    // = shift left by conv_dim and put mixed_qkv at the end
+    {
+        let src_offset = conv_dim;  // skip first conv_dim elements (shift left)
+        let src_view = conv_input.slice(src_offset..kernel_size_usize * conv_dim);
+        stream.memcpy_dtod(&src_view, gdn_state.conv_state.as_mut().unwrap())
+            .map_err(|e| anyhow::anyhow!("Failed to update conv state: {e}"))?;
+    }
+
+    // Launch conv1d with seq_len = kernel_size (instead of 1)
+    let mut conv_out = stream.alloc_zeros::<bf16>(kernel_size_usize * conv_dim)?;
     let conv1d_gpu = cache.get_bf16(&weights.conv1d_weight.name)
         .ok_or_else(|| anyhow::anyhow!("conv1d weight not in cache"))?;
     let batch_i32 = 1i32;
     let conv_dim_i32 = conv_dim as i32;
-    let seq_len_i32 = 1i32;
-    let kernel_size = config.linear_conv_kernel_dim as i32;
-    let grid = (conv_dim as u32).div_ceil(256);
+    let conv_seq_len_i32 = kernel_size;  // conv_input has kernel_size positions
 
     unsafe {
         stream.launch_builder(conv1d_kernel)
-            .arg(&mixed_qkv)
+            .arg(&conv_input)
             .arg(conv1d_gpu)
             .arg(&mut conv_out)
             .arg(&batch_i32)
             .arg(&conv_dim_i32)
-            .arg(&seq_len_i32)
+            .arg(&conv_seq_len_i32)
             .arg(&kernel_size)
             .launch(LaunchConfig {
-                grid_dim: (grid, 1, 1),
+                grid_dim: ((kernel_size_usize * conv_dim as usize).div_ceil(256) as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
             .map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
     }
 
+    // Extract the last position's output (the conv result for the current token)
+    // conv_out is [kernel_size, conv_dim], take the last row
+    let conv_out_last = {
+        let last_row_offset = conv_state_len * conv_dim;
+        let src_view = conv_out.slice(last_row_offset..kernel_size_usize * conv_dim);
+        let mut dst = stream.alloc_zeros::<bf16>(conv_dim)?;
+        stream.memcpy_dtod(&src_view, &mut dst)?;
+        dst
+    };
+
     // =========================================================================
     // Phase 3: Split
     // =========================================================================
-    let query_flat = clone_view_to_slice(stream, &conv_out, 0..key_dim)?;
-    let key_flat = clone_view_to_slice(stream, &conv_out, key_dim..2 * key_dim)?;
-    let value_flat = clone_view_to_slice(stream, &conv_out, 2 * key_dim..2 * key_dim + value_dim)?;
+    let query_flat = clone_view_to_slice(stream, &conv_out_last, 0..key_dim)?;
+    let key_flat = clone_view_to_slice(stream, &conv_out_last, key_dim..2 * key_dim)?;
+    let value_flat = clone_view_to_slice(stream, &conv_out_last, 2 * key_dim..2 * key_dim + value_dim)?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &value_flat, &[1, value_dim], "decode");
 
     // =========================================================================
     // Phase 4: repeat_interleave q/k
@@ -566,11 +666,13 @@ pub fn decode_forward(
     } else {
         query_flat
     };
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", &query_expanded, &[1, num_v_heads * head_k_dim], "decode");
     let key_expanded = if kv_ratio > 1 {
         repeat_interleave_heads(stream, &key_flat, 1, num_k_heads, num_v_heads, head_k_dim)?
     } else {
         key_flat
     };
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key_expanded", &key_expanded, &[1, num_v_heads * head_k_dim], "decode");
 
     // =========================================================================
     // Phase 5: in_proj_a, in_proj_b
@@ -581,6 +683,7 @@ pub fn decode_forward(
         &weights.in_proj_a.name, input, &mut a_proj,
         1, num_v_heads, hidden_size, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &a_proj, &[1, num_v_heads], "decode");
 
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(b_dim)?;
@@ -589,6 +692,7 @@ pub fn decode_forward(
         &weights.in_proj_b.name, input, &mut b_proj_raw,
         1, b_dim, hidden_size, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &b_proj_raw, &[1, b_dim], "decode");
     // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads for BF16 weight)
     let b_proj = b_proj_raw;
 
@@ -646,6 +750,7 @@ pub fn decode_forward(
             })
             .map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed: {e}"))?;
     }
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[1, num_v_heads * head_v_dim], "decode");
 
     // =========================================================================
     // Phase 8: RMSNormGated
