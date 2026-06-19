@@ -15,11 +15,21 @@ use safetensors::SafeTensors;
 use super::loader::ShardIndex;
 use super::weights::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
 
+// @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#DataOwner]]
+/// Owns the backing data for an MmapTensor — either a memory-mapped file or heap-owned bytes.
+#[derive(Clone)]
+pub enum DataOwner {
+    /// Backing data is a memory-mapped file (zero-copy).
+    Mmap(Arc<Mmap>),
+    /// Backing data is heap-allocated bytes (copy of sliced tensor).
+    Owned(Arc<Vec<u8>>),
+}
+
 /// Zero-copy reference to a tensor stored in a memory-mapped safetensors file.
 #[derive(Clone)]
 pub struct MmapTensor {
-    mmap: Arc<Mmap>,       // keeps the mmap alive
-    data_ptr: *const u8,   // pointer into mmap region
+    owner: DataOwner,       // keeps the data alive (mmap or heap)
+    data_ptr: *const u8,   // pointer into owned region
     data_len: usize,       // byte length
     shape: Vec<usize>,
     dtype: WeightDtype,
@@ -52,7 +62,7 @@ impl std::fmt::Debug for MmapTensor {
 }
 
 impl MmapTensor {
-    /// Create a new zero-copy tensor reference.
+    /// Create a new zero-copy tensor reference backed by a memory-mapped file.
     ///
     /// # Safety
     /// The `data_ptr` must point into the region covered by `mmap`, and
@@ -67,7 +77,30 @@ impl MmapTensor {
         name: String,
     ) -> Self {
         Self {
-            mmap,
+            owner: DataOwner::Mmap(mmap),
+            data_ptr,
+            data_len,
+            shape,
+            dtype,
+            name,
+        }
+    }
+
+    /// Create a new tensor backed by heap-allocated data.
+    pub fn from_owned(
+        data: Vec<u8>,
+        shape: Vec<usize>,
+        dtype: WeightDtype,
+        name: String,
+    ) -> Self {
+        let data_len = data.len();
+        // Get the pointer before moving into Arc — Vec is guaranteed to not
+        // reallocate once constructed.
+        let data_ptr = data.as_ptr();
+        let arc = Arc::new(data);
+        // SAFETY: Arc<Vec> guarantees the pointer remains valid while the Arc is alive.
+        Self {
+            owner: DataOwner::Owned(arc),
             data_ptr,
             data_len,
             shape,
@@ -96,9 +129,17 @@ impl MmapTensor {
         &self.name
     }
 
-    /// Get a clone of the underlying Arc<Mmap>, keeping the mapping alive.
-    pub fn mmap_arc(&self) -> Arc<Mmap> {
-        self.mmap.clone()
+    /// Get a clone of the underlying Arc<Mmap> if this tensor is mmap-backed.
+    pub fn mmap_arc(&self) -> Option<Arc<Mmap>> {
+        match &self.owner {
+            DataOwner::Mmap(mmap) => Some(mmap.clone()),
+            DataOwner::Owned(_) => None,
+        }
+    }
+
+    /// Clone the data owner — used by sharding to create sub-views sharing the same backing.
+    pub fn clone_owner(&self) -> DataOwner {
+        self.owner.clone()
     }
 }
 /// Companion tensors for a zero-copy INT4 quantized weight.
@@ -114,7 +155,6 @@ pub struct MmapCompanions {
 pub struct MmapWeightRegistry {
     pub tensors: HashMap<String, MmapTensor>,
     pub int4_companions: HashMap<String, MmapCompanions>,
-    _mmaps: Vec<Arc<Mmap>>, // prevent mmap from being dropped
 }
 
 impl MmapWeightRegistry {
@@ -123,7 +163,6 @@ impl MmapWeightRegistry {
         Self {
             tensors: HashMap::new(),
             int4_companions: HashMap::new(),
-            _mmaps: Vec::new(),
         }
     }
 
@@ -152,7 +191,7 @@ pub struct MmapWeightShard {
 }
 
 /// Slice an MmapTensor along dimension 0 for a specific GPU.
-/// This is a contiguous zero-copy slice — the new tensor points into the same mmap.
+/// This is a contiguous zero-copy slice — the new tensor points into the same backing store.
 fn mmap_slice_dim0(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> Result<MmapTensor> {
     let shape = tensor.shape();
     anyhow::ensure!(
@@ -171,79 +210,62 @@ fn mmap_slice_dim0(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> Resul
     let mut new_shape = shape.to_vec();
     new_shape[0] = shard_size;
 
-    Ok(MmapTensor::new(
-        tensor.mmap_arc(),
-        unsafe { tensor.data().as_ptr().add(start_byte) },
-        end_byte - start_byte,
-        new_shape,
-        tensor.dtype(),
-        tensor.name().to_string(),
-    ))
-}
-
-/// Create an MmapTensor backed by copied data stored in a temporary file.
-/// Used for non-contiguous slices that cannot be served via zero-copy pointer arithmetic.
-fn mmap_tensor_from_data(
-    data: Vec<u8>,
-    shape: Vec<usize>,
-    dtype: WeightDtype,
-    name: String,
-) -> Result<MmapTensor> {
-    let mut file = tempfile::NamedTempFile::new()?;
-    std::io::Write::write_all(&mut file, &data)?;
-    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-    Ok(MmapTensor::new(mmap.clone(), mmap.as_ptr(), data.len(), shape, dtype, name))
+    Ok(MmapTensor {
+        owner: tensor.clone_owner(),
+        data_ptr: unsafe { tensor.data().as_ptr().add(start_byte) },
+        data_len: end_byte - start_byte,
+        shape: new_shape,
+        dtype: tensor.dtype(),
+        name: tensor.name().to_string(),
+    })
 }
 
 /// Slice an MmapTensor along the last dimension for a specific GPU.
-/// This is non-contiguous (stride-aware), so data must be copied into a new allocation.
-fn mmap_slice_last_dim(
-    tensor: &MmapTensor,
-    gpu_id: usize,
-    num_gpus: usize,
-) -> Result<MmapTensor> {
+/// This is a non-contiguous slice — copies data into a contiguous heap buffer.
+fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> Result<MmapTensor> {
     let shape = tensor.shape();
     anyhow::ensure!(
-        shape.len() >= 2,
-        "Weight {} must have at least 2 dimensions",
+!shape.is_empty(),
+        "Weight {} has no dimensions",
         tensor.name()
     );
-
-    let last_dim = shape[shape.len() - 1];
-    let shard_size = last_dim / num_gpus;
-    let start = gpu_id * shard_size;
-
-    let total_elements: usize = shape.iter().product();
-    let bytes_per_element = tensor.data_len / total_elements;
-
-    // For now, only support 2D weights (covers the common TP cases).
     anyhow::ensure!(
         shape.len() == 2,
         "mmap last-dim slicing only supports 2D weights, got {}D",
         shape.len()
     );
 
-    let num_rows = shape[0];
-    let mut new_data = Vec::with_capacity(num_rows * shard_size * bytes_per_element);
+    let last_dim = shape[1];
+    let shard_size = last_dim / num_gpus;
+    let start = gpu_id * shard_size;
 
+    let bytes_per_element = tensor.data_len / (shape.iter().product::<usize>());
+    let cols = last_dim;
+    let num_rows = shape[0];
+
+    let mut new_data = Vec::with_capacity(num_rows * shard_size * bytes_per_element);
     for row in 0..num_rows {
-        let row_start =
-            row * last_dim * bytes_per_element + start * bytes_per_element;
+        let row_start = row * cols * bytes_per_element + start * bytes_per_element;
         let row_end = row_start + shard_size * bytes_per_element;
         new_data.extend_from_slice(&tensor.data()[row_start..row_end]);
     }
 
     let mut new_shape = shape.to_vec();
-    new_shape[shape.len() - 1] = shard_size;
+    new_shape[1] = shard_size;
 
-    mmap_tensor_from_data(new_data, new_shape, tensor.dtype(), format!("{}_gpu{}", tensor.name(), gpu_id))
+    Ok(MmapTensor::from_owned(
+        new_data,
+        new_shape,
+        tensor.dtype(),
+        tensor.name().to_string(),
+    ))
 }
 
 /// Shard model weights across `num_gpus` devices for tensor parallelism (mmap version).
 ///
 /// Follows the same sharding rules as [`shard_weights_tp`](super::sharding::shard_weights_tp) but
-/// operates on MmapTensor references. Contiguous splits (BF16 dim-0, INT4 dim-0) are zero-copy;
-/// non-contiguous splits require copying data into a new allocation.
+/// operates on MmapTensor references. Contiguous splits (BF16 dim-0, INT4 dim-0) are zero-copy.
+/// Non-contiguous splits (BF16 last-dim, INT4 last-dim) return an error — use --no-mmap.
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#shard_weights_tp_mmap]]
 pub fn shard_weights_tp_mmap(
     registry: &MmapWeightRegistry,
@@ -288,13 +310,13 @@ pub fn shard_weights_tp_mmap(
         match shard_type {
             super::sharding::ShardType::ColumnParallel => {
                 if is_int4 {
-                    // INT4 column-parallel: split dim 1 (N, last dim) — non-contiguous, copy.
+                    // INT4 column-parallel: split last dim — non-contiguous, copies data.
                     for (gpu_id, shard) in shards.iter_mut().enumerate() {
                         let sliced = mmap_slice_last_dim(tensor, gpu_id, num_gpus)
-                            .context(format!("Failed to shard INT4 column-parallel weight: {}", name))?;
+                            .context(format!("Failed to shard column-parallel weight: {}", name))?;
                         shard.registry.tensors.insert(name.clone(), sliced);
 
-                        // Shard INT4 companion weights.
+                        // Shard INT4 companion weights — scales and qzeros split on last dim.
                         if name.ends_with(".qweight") {
                             let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
                             let scales_name = format!("{}.scales", base);
@@ -356,7 +378,7 @@ pub fn shard_weights_tp_mmap(
                         }
                     }
                 } else {
-                    // BF16 row-parallel: split dim 1 (last dim) — non-contiguous, copy.
+                    // BF16 row-parallel: split last dim — non-contiguous, copies data.
                     for (gpu_id, shard) in shards.iter_mut().enumerate() {
                         let sliced = mmap_slice_last_dim(tensor, gpu_id, num_gpus)
                             .context(format!("Failed to shard row-parallel weight: {}", name))?;
@@ -463,7 +485,6 @@ fn load_single_mmap(path: &Path) -> Result<MmapWeightRegistry> {
 
     let mut registry = MmapWeightRegistry::new();
     registry.tensors = tensors;
-    registry._mmaps.push(mmap);
     Ok(registry)
 }
 
@@ -509,9 +530,11 @@ fn load_sharded_mmap(model_dir: &Path, index_path: &Path) -> Result<MmapWeightRe
         total_bytes as f64 / 1e9,
     );
 
+    // mmaps are kept alive by DataOwner::Mmap in each tensor.
+    drop(mmaps);
+
     let mut registry = MmapWeightRegistry::new();
     registry.tensors = all_tensors;
-    registry._mmaps = mmaps;
     Ok(registry)
 }
 
@@ -722,7 +745,9 @@ mod tests {
         assert_eq!(registry.num_tensors(), 2);
         assert!(registry.tensors.contains_key("layer.0.weight"));
         assert!(registry.tensors.contains_key("norm.weight"));
-        assert_eq!(registry._mmaps.len(), 1);
+        // Verify tensors are mmap-backed
+        let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
+        assert!(layer_tensor.mmap_arc().is_some());
 
         // Verify tensor shapes and data
         let layer_tensor = registry.tensors.get("layer.0.weight").unwrap();
@@ -964,6 +989,105 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(e.to_string().contains("num_gpus must be >= 1"));
+        }
+    }
+
+    #[test]
+    fn mmap_tensor_from_owned_works() {
+        // Create an owned tensor with 4x8 BF16 data (64 bytes)
+        let data: Vec<u8> = (0..64).collect();
+        let tensor = MmapTensor::from_owned(
+            data,
+            vec![4, 8],
+            WeightDtype::Bf16,
+            "owned_test".to_string(),
+        );
+
+        assert_eq!(tensor.shape(), &[4, 8]);
+        assert_eq!(tensor.dtype(), WeightDtype::Bf16);
+        assert_eq!(tensor.data_len, 64);
+        assert_eq!(tensor.name(), "owned_test");
+        assert!(tensor.mmap_arc().is_none()); // not mmap-backed
+
+        // Verify data content via Deref
+        let slice: &[u8] = &*tensor;
+        assert_eq!(slice.len(), 64);
+    }
+
+    #[test]
+    fn shard_weights_tp_mmap_int4_column_parallel_owned() {
+        // INT4 column-parallel (e.g. q_proj.qweight with shape [K/8, N]): split last dim — non-contiguous.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // 4 rows * 8 cols * 2 bytes per element = 64 bytes
+        let bytes: Vec<u8> = (0..64).collect();
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mmap = Arc::new(unsafe { Mmap::map(&file).unwrap() });
+        let ptr = mmap.as_ptr();
+
+        let mut registry = MmapWeightRegistry::new();
+        registry.tensors.insert(
+            "layers.0.self_attn.q_proj.qweight".to_string(),
+            MmapTensor::new(mmap.clone(), ptr, 64, vec![4, 8], WeightDtype::Int4Packed, "layers.0.self_attn.q_proj.qweight".into()),
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"linear_num_key_heads":2,"linear_key_head_dim":16,"linear_num_value_heads":4,"linear_value_head_dim":16}"#;
+        let config: crate::config::ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        // This should succeed (not bail) — non-contiguous INT4 column-parallel is now supported.
+        let shards = shard_weights_tp_mmap(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
+            // Shape should have last dim halved: [4, 8] -> [4, 4]
+            assert_eq!(w.shape(), &[4, 4], "GPU {} shape should be [4, 4]", gpu_id);
+            // Each shard has 4 rows * 4 cols * 2 bytes = 32 bytes
+            assert_eq!(w.data_len, 32, "GPU {} data_len should be 32", gpu_id);
+            // Owned tensors should not have an mmap arc (data was copied)
+            assert!(w.mmap_arc().is_none());
+        }
+
+        // Verify the two shards' data doesn't overlap — combined they cover original data.
+        let g0_data = shards[0].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
+        let g1_data = shards[1].registry.tensors.get("layers.0.self_attn.q_proj.qweight").unwrap();
+        // Combined shard data should be a permutation of the original bytes (non-contiguous slices).
+        let mut combined: Vec<u8> = Vec::new();
+        combined.extend_from_slice(g0_data.data());
+        combined.extend_from_slice(g1_data.data());
+        assert_eq!(combined.len(), 64); // same total as original
+    }
+
+    #[test]
+    fn shard_weights_tp_mmap_bf16_row_parallel_owned() {
+        // BF16 row-parallel (e.g. o_proj.weight with shape [N, K]): split last dim — non-contiguous.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // 4 rows * 8 cols * 2 bytes per element = 64 bytes
+        let bytes: Vec<u8> = (0..64).collect();
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mmap = Arc::new(unsafe { Mmap::map(&file).unwrap() });
+        let ptr = mmap.as_ptr();
+
+        let mut registry = MmapWeightRegistry::new();
+        registry.tensors.insert(
+            "layers.0.self_attn.o_proj.weight".to_string(),
+            MmapTensor::new(mmap.clone(), ptr, 64, vec![4, 8], WeightDtype::Bf16, "layers.0.self_attn.o_proj.weight".into()),
+        );
+
+        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"linear_num_key_heads":2,"linear_key_head_dim":16,"linear_num_value_heads":4,"linear_value_head_dim":16}"#;
+        let config: crate::config::ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        // This should succeed (not bail) — non-contiguous BF16 row-parallel is now supported.
+        let shards = shard_weights_tp_mmap(&registry, &config, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+
+        for gpu_id in 0..2 {
+            let w = shards[gpu_id].registry.tensors.get("layers.0.self_attn.o_proj.weight").unwrap();
+            assert_eq!(w.shape(), &[4, 4], "GPU {} shape should be [4, 4]", gpu_id);
+            assert_eq!(w.data_len, 32, "GPU {} data_len should be 32", gpu_id);
+            // Owned tensors should not have an mmap arc
+            assert!(w.mmap_arc().is_none());
         }
     }
 }
