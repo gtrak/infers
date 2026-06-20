@@ -22,8 +22,8 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
-use infers_model::sharding::shard_weights_tp;
-use infers_model::{load_safetensors, strip_language_model_prefix, build_main_layers};
+use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
+use infers_model::{strip_language_model_prefix, build_main_layers};
 
 /// Default path for the Qwen3.6-27B AutoRound INT4 model.
 const DEFAULT_MODEL_DIR: &str = "~/opt/vllm/models/qwen3.6-27b-autoround-int4/";

@@ -1178,6 +1178,7 @@ dependencies = [
  "infers-cuda",
  "infers-kv",
  "infers-model",
+ "infers-model-loader-heap",
  "infers-mtp",
  "infers-scheduler",
  "infers-tokenizer",

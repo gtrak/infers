@@ -13,6 +13,7 @@ infers-kv = { path = "../../kv" }
 infers-model = { path = "../../model" }
 infers-mtp = { path = "../../mtp" }
 infers-scheduler = { path = "../../scheduler" }
+infers-model-loader-heap = { path = "../../model-loader-heap" }
 infers-tokenizer = { path = "../../tokenizer" }
 bytes = { workspace = true }
 half = { workspace = true }

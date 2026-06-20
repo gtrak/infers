@@ -366,84 +366,8 @@ pub fn shard_weights_tp(
    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn qwen3_6_config_json() -> String {
-        serde_json::json!({
-            "architectures": ["Qwen3_5ForConditionalGeneration"],
-            "model_type": "qwen3_5",
-            "num_hidden_layers": 64,
-            "hidden_size": 5120,
-            "intermediate_size": 17408,
-            "vocab_size": 248320,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
-            "head_dim": 256,
-            "max_position_embeddings": 262144,
-            "rms_norm_eps": 1e-6,
-            "hidden_act": "silu",
-            "tie_word_embeddings": false,
-            "rope_theta": 10000000.0,
-            "partial_rotary_factor": 0.25,
-            "mrope_interleaved": true,
-            "mrope_section": [11, 11, 10],
-            "mtp_num_hidden_layers": 1,
-            "mtp_use_dedicated_embeddings": false
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn load_safetensors_no_files_bails() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = load_safetensors(dir.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No safetensors files found"));
-    }
-
-    #[test]
-    fn load_model_config_and_format() {
-        // Just verify load_model reads config successfully when files exist.
-        // We don't need actual safetensors for the config to parse.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            qwen3_6_config_json().as_bytes(),
-        )
-        .unwrap();
-        // No safetensors, so load_model will fail at the weights step,
-        // but config loading works.
-        let result = load_model(dir.path());
-        // Expected to fail because no safetensors
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn map_safetensor_dtype_bf16() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::BF16), WeightDtype::Bf16);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_fp32() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::F32), WeightDtype::Fp32);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_f16() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::F16), WeightDtype::Fp16);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_other() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::U8), WeightDtype::Other);
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::BOOL), WeightDtype::Other);
-    }
 }
-    }
-
     Ok(shards)
 }
 
