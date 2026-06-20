@@ -10,6 +10,28 @@ use infers_model::sharding::shard_weights_tp;
 use infers_model::weights::WeightShard;
 use infers_model::{load_safetensors, strip_language_model_prefix};
 
+/// Materialize a strided MmapTensor's data into a contiguous Vec<u8> by
+/// reading each row at the correct stride offset. For non-strided tensors,
+/// just returns the data as-is.
+fn materialize_mmap_tensor_data(tensor: &infers_model::mmap::MmapTensor) -> Vec<u8> {
+    if !tensor.is_strided() {
+        return tensor.data().to_vec();
+    }
+
+    let col_start = tensor.col_start_bytes();
+    let src_pitch = tensor.src_pitch();
+    let width = tensor.strided_width();
+    let rows = tensor.strided_rows();
+
+    let mut result = Vec::with_capacity(width * rows);
+    for row in 0..rows {
+        let row_start = col_start + row * src_pitch;
+        let row_end = row_start + width;
+        result.extend_from_slice(&tensor.data()[row_start..row_end]);
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic config builder
 // ---------------------------------------------------------------------------
@@ -237,19 +259,11 @@ fn compare_shards(
                 label, gpu_id, key
             );
 
-            // Byte-for-byte comparison only for non-strided (contiguous) tensors.
-            // Strided tensors (mmap_slice_last_dim results) have different memory layouts
-            // but logically equivalent data — they are used for INT4 column-parallel
-            // non-fused splits via cuMemcpy2D. Fused QKV weights produce owned contiguous
-            // buffers in both paths, so they can be compared byte-for-byte.
-            if !mmap_w.is_strided() {
-                assert_eq!(
-                    heap_w.data.as_ref(),
-                    mmap_w.data(),
-                    "{} GPU {}: {} data mismatch ({} vs {} bytes)",
-                    label, gpu_id, key, heap_w.data.len(), mmap_w.data().len()
-                );
-            }
+            // Compare data — materialize strided tensors for byte comparison
+            let mmap_data = materialize_mmap_tensor_data(mmap_w);
+            assert_eq!(heap_w.data.as_ref(), mmap_data.as_slice(), 
+                "{} GPU {}: {} data mismatch ({} vs {} bytes)", 
+                label, gpu_id, key, heap_w.data.len(), mmap_data.len());
         }
 
         // Check INT4 companion keys match
@@ -268,39 +282,29 @@ fn compare_shards(
             let heap_c = heap.int4_companions.get(key).unwrap();
             let mmap_c = mmap.int4_companions.get(key).unwrap();
 
-            // Scales
+            // Scales — materialize strided tensors for byte comparison
             assert_eq!(
                 heap_c.scales.shape,
                 mmap_c.scales.shape(),
                 "{} GPU {}: {} scales shape mismatch",
                 label, gpu_id, key
             );
-            if !mmap_c.scales.is_strided() {
-                assert_eq!(
-                    heap_c.scales.data.as_ref(),
-                    mmap_c.scales.data(),
-                    "{} GPU {}: {} scales data mismatch ({} vs {} bytes)",
-                    label, gpu_id, key,
-                    heap_c.scales.data.len(), mmap_c.scales.data().len()
-                );
-            }
+            let scales_data = materialize_mmap_tensor_data(&mmap_c.scales);
+            assert_eq!(heap_c.scales.data.as_ref(), scales_data.as_slice(),
+                "{} GPU {}: {} scales data mismatch ({} vs {} bytes)",
+                label, gpu_id, key, heap_c.scales.data.len(), scales_data.len());
 
-            // Qzeros
+            // Qzeros — materialize strided tensors for byte comparison
             assert_eq!(
                 heap_c.qzeros.shape,
                 mmap_c.qzeros.shape(),
                 "{} GPU {}: {} qzeros shape mismatch",
                 label, gpu_id, key
             );
-            if !mmap_c.qzeros.is_strided() {
-                assert_eq!(
-                    heap_c.qzeros.data.as_ref(),
-                    mmap_c.qzeros.data(),
-                    "{} GPU {}: {} qzeros data mismatch ({} vs {} bytes)",
-                    label, gpu_id, key,
-                    heap_c.qzeros.data.len(), mmap_c.qzeros.data().len()
-                );
-            }
+            let qzeros_data = materialize_mmap_tensor_data(&mmap_c.qzeros);
+            assert_eq!(heap_c.qzeros.data.as_ref(), qzeros_data.as_slice(),
+                "{} GPU {}: {} qzeros data mismatch ({} vs {} bytes)",
+                label, gpu_id, key, heap_c.qzeros.data.len(), qzeros_data.len());
         }
     }
 }
@@ -542,4 +546,208 @@ fn shard_equiv_tp2_gdn_fused_qkv_in_proj() {
     }
 
     compare_shards(&heap_shards, &mmap_shards, "TP=2 GDN fused QKV in_proj");
+}
+
+// @lat: [[lat#Weight Sharding#Sharding Equivalence Tests#TP=2 Strided Metadata Verification]]
+#[test]
+fn shard_equiv_tp2_strided_metadata_correct() {
+    let config = make_test_config();
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    create_synthetic_safetensors(tmp_dir.path(), &config).unwrap();
+
+    let (heap_registry, mmap_registry) = load_both_paths(tmp_dir.path());
+
+    let heap_shards = shard_weights_tp(&heap_registry, &config, 2).unwrap();
+    let mmap_shards = shard_weights_tp_mmap(&mmap_registry, &config, 2).unwrap();
+
+    // Verify strided metadata for INT4 column-parallel qweight in layer 1
+    // Full shape: [8, 64] -> each GPU gets [8, 32], dtype is U32 (4 bytes per element)
+    let num_gpus = 2;
+    let last_dim = config.hidden_size; // 64
+    let shard_size = last_dim / num_gpus; // 32
+    let bytes_per_element = 4; // U32
+
+    for gpu_id in 0..num_gpus {
+        let mmap_w = mmap_shards[gpu_id]
+            .registry
+            .tensors
+            .get("layers.1.self_attn.q_proj.qweight")
+            .unwrap();
+
+        assert!(mmap_w.is_strided(), "q_proj qweight must be strided in mmap path");
+
+        // src_pitch = full row width in bytes = last_dim * bytes_per_element = 64 * 4 = 256
+        let expected_src_pitch = last_dim * bytes_per_element;
+        assert_eq!(mmap_w.src_pitch(), expected_src_pitch,
+            "GPU {}: src_pitch should be {}, got {}", gpu_id, expected_src_pitch, mmap_w.src_pitch());
+
+        // col_start_bytes = gpu_id * shard_size * bytes_per_element
+        let expected_col_start = gpu_id * shard_size * bytes_per_element;
+        assert_eq!(mmap_w.col_start_bytes(), expected_col_start,
+            "GPU {}: col_start_bytes should be {}, got {}", gpu_id, expected_col_start, mmap_w.col_start_bytes());
+
+        // strided_width = shard_size * bytes_per_element = 32 * 4 = 128
+        let expected_width = shard_size * bytes_per_element;
+        assert_eq!(mmap_w.strided_width(), expected_width,
+            "GPU {}: strided_width should be {}, got {}", gpu_id, expected_width, mmap_w.strided_width());
+
+        // strided_rows = number of rows (dim 0) = 8
+        let expected_rows = config.hidden_size / 8; // 64/8 = 8
+        assert_eq!(mmap_w.strided_rows(), expected_rows,
+            "GPU {}: strided_rows should be {}, got {}", gpu_id, expected_rows, mmap_w.strided_rows());
+
+        // shape has last dim = shard_size = 32
+        assert_eq!(mmap_w.shape()[1], shard_size,
+            "GPU {}: shape last dim should be {}, got {}", gpu_id, shard_size, mmap_w.shape()[1]);
+
+        // Materialize and compare with heap path's contiguous data
+        let heap_w = heap_shards[gpu_id]
+            .registry
+            .tensors
+            .get("layers.1.self_attn.q_proj.qweight")
+            .unwrap();
+        let materialized = materialize_mmap_tensor_data(mmap_w);
+        assert_eq!(heap_w.data.as_ref(), materialized.as_slice(),
+            "GPU {}: materialized q_proj data mismatch", gpu_id);
+    }
+
+    // Also verify scales (BF16, 2 bytes per element) — full shape [1, 64], shard to [1, 32]
+    let last_dim_scales = config.hidden_size;
+    let bytes_per_elem_scales = 2; // BF16
+
+    for gpu_id in 0..num_gpus {
+        let key = "layers.1.self_attn.q_proj.qweight";
+        let mmap_c = mmap_shards[gpu_id]
+            .registry
+            .int4_companions
+            .get(key)
+            .unwrap();
+
+        assert!(mmap_c.scales.is_strided(), "q_proj scales must be strided in mmap path");
+
+        let expected_src_pitch = last_dim_scales * bytes_per_elem_scales;
+        assert_eq!(mmap_c.scales.src_pitch(), expected_src_pitch,
+            "GPU {}: scales src_pitch should be {}", gpu_id, expected_src_pitch);
+
+        let expected_col_start = gpu_id * shard_size * bytes_per_elem_scales;
+        assert_eq!(mmap_c.scales.col_start_bytes(), expected_col_start,
+            "GPU {}: scales col_start_bytes should be {}", gpu_id, expected_col_start);
+
+        // Materialize and compare
+        let heap_c = heap_shards[gpu_id]
+            .registry
+            .int4_companions
+            .get(key)
+            .unwrap();
+        let materialized_scales = materialize_mmap_tensor_data(&mmap_c.scales);
+        assert_eq!(heap_c.scales.data.as_ref(), materialized_scales.as_slice(),
+            "GPU {}: materialized scales data mismatch", gpu_id);
+    }
+
+    // Also verify qzeros (U32, 4 bytes per element) — full shape [1, 8], shard to [1, 4]
+    let last_dim_qz = config.hidden_size / 8; // 64/8 = 8
+    let shard_size_qz = last_dim_qz / num_gpus; // 4
+    let bytes_per_elem_qz = 4; // U32
+
+    for gpu_id in 0..num_gpus {
+        let key = "layers.1.self_attn.q_proj.qweight";
+        let mmap_c = mmap_shards[gpu_id]
+            .registry
+            .int4_companions
+            .get(key)
+            .unwrap();
+
+        assert!(mmap_c.qzeros.is_strided(), "q_proj qzeros must be strided in mmap path");
+
+        let expected_src_pitch_qz = last_dim_qz * bytes_per_elem_qz;
+        assert_eq!(mmap_c.qzeros.src_pitch(), expected_src_pitch_qz,
+            "GPU {}: qzeros src_pitch should be {}", gpu_id, expected_src_pitch_qz);
+
+        let expected_col_start_qz = gpu_id * shard_size_qz * bytes_per_elem_qz;
+        assert_eq!(mmap_c.qzeros.col_start_bytes(), expected_col_start_qz,
+            "GPU {}: qzeros col_start_bytes should be {}", gpu_id, expected_col_start_qz);
+
+        // Materialize and compare
+        let heap_c = heap_shards[gpu_id]
+            .registry
+            .int4_companions
+            .get(key)
+            .unwrap();
+        let materialized_qzeros = materialize_mmap_tensor_data(&mmap_c.qzeros);
+        assert_eq!(heap_c.qzeros.data.as_ref(), materialized_qzeros.as_slice(),
+            "GPU {}: materialized qzeros data mismatch", gpu_id);
+    }
+}
+
+// @lat: [[lat#Weight Sharding#Sharding Equivalence Tests#TP=2 Strided Data Materialization]]
+#[test]
+fn shard_equiv_tp2_strided_data_materializes_correctly() {
+    let config = make_test_config();
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    create_synthetic_safetensors(tmp_dir.path(), &config).unwrap();
+
+    let (heap_registry, mmap_registry) = load_both_paths(tmp_dir.path());
+
+    let heap_shards = shard_weights_tp(&heap_registry, &config, 2).unwrap();
+    let mmap_shards = shard_weights_tp_mmap(&mmap_registry, &config, 2).unwrap();
+
+    // Column-parallel INT4 projections that use mmap_slice_last_dim:
+    // q_proj, k_proj, v_proj (full attention), gate_proj, up_proj (MLP)
+    let col_parallel_keys = [
+        "layers.1.self_attn.q_proj.qweight",
+        "layers.1.self_attn.k_proj.qweight",
+        "layers.1.self_attn.v_proj.qweight",
+        "layers.1.mlp.gate_proj.qweight",
+        "layers.1.mlp.up_proj.qweight",
+    ];
+
+    for key in &col_parallel_keys {
+        for gpu_id in 0..2 {
+            let heap_w = heap_shards[gpu_id]
+                .registry
+                .tensors
+                .get(*key)
+                .unwrap();
+            let mmap_w = mmap_shards[gpu_id]
+                .registry
+                .tensors
+                .get(*key)
+                .unwrap();
+
+            // qweight must be strided in mmap path (column-parallel non-fused)
+            assert!(mmap_w.is_strided(), "{} GPU {} qweight must be strided", key, gpu_id);
+
+            // Materialize the strided data and compare byte-for-byte with heap's contiguous copy
+            let materialized = materialize_mmap_tensor_data(mmap_w);
+            assert_eq!(heap_w.data.as_ref(), materialized.as_slice(),
+                "{} GPU {}: materialized qweight mismatch ({} vs {} bytes)",
+                key, gpu_id, heap_w.data.len(), materialized.len());
+
+            // Also verify companion tensors (scales and qzeros)
+            let heap_c = heap_shards[gpu_id]
+                .registry
+                .int4_companions
+                .get(*key)
+                .unwrap();
+            let mmap_c = mmap_shards[gpu_id]
+                .registry
+                .int4_companions
+                .get(*key)
+                .unwrap();
+
+            assert!(mmap_c.scales.is_strided(), "{} GPU {} scales must be strided", key, gpu_id);
+            let mat_scales = materialize_mmap_tensor_data(&mmap_c.scales);
+            assert_eq!(heap_c.scales.data.as_ref(), mat_scales.as_slice(),
+                "{} GPU {}: materialized scales mismatch", key, gpu_id);
+
+            assert!(mmap_c.qzeros.is_strided(), "{} GPU {} qzeros must be strided", key, gpu_id);
+            let mat_qzeros = materialize_mmap_tensor_data(&mmap_c.qzeros);
+            assert_eq!(heap_c.qzeros.data.as_ref(), mat_qzeros.as_slice(),
+                "{} GPU {}: materialized qzeros mismatch", key, gpu_id);
+        }
+    }
+
+    compare_shards(&heap_shards, &mmap_shards, "TP=2 strided data materialization");
 }

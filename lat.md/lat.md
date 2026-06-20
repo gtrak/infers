@@ -1341,7 +1341,7 @@ With TP=2, `in_proj_a` and `in_proj_b` are column-parallel — each GPU has shap
 
 CPU-side equivalence tests verifying that heap and mmap sharding paths produce identical results.
 
-The `tests/shard_equiv.rs` suite creates synthetic safetensors files with a tiny 2-layer Qwen3.6-like config (1 GDN + 1 full attention layer, hidden_size=64) covering all sharding cases: BF16 column-parallel, INT4 column-parallel, INT4 row-parallel, fused QKV projections (in_proj_qkv), and conv1d.weight. Weights are loaded via both `load_safetensors` (heap copy) and `load_safetensors_mmap` (zero-copy mmap), sharded for TP=2, and compared byte-for-byte on contiguous shards (shape + data), or by shape only for strided shards (INT4 column-parallel non-fused splits use cuMemcpy2D).
+The `tests/shard_equiv.rs` suite creates synthetic safetensors files with a tiny 2-layer Qwen3.6-like config (1 GDN + 1 full attention layer, hidden_size=64) covering all sharding cases: BF16 column-parallel, INT4 column-parallel, INT4 row-parallel, fused QKV projections (in_proj_qkv), and conv1d.weight. Weights are loaded via both `load_safetensors` (heap copy) and `load_safetensors_mmap` (zero-copy mmap), sharded for TP=2, and compared byte-for-byte — strided tensors from the mmap path are materialized into contiguous buffers before comparison.
 
 These tests caught the conv1d.weight fused QKV sharding bug that produced all-220 tokens when using the mmap path — the same bug visible in `smoke_test_mmap_vs_heap_gpu_data`. They run without GPUs and exercise the real loading code via safetensors serialization.
 
@@ -1361,7 +1361,7 @@ Specifically verifies conv1d.weight sharding with the correct per-segment split 
 
 ### TP=2 INT4 Column-Parallel
 
-Verifies INT4 qweight and companion sharding for column-parallel splits (e.g., layer 1's q_proj: [8,64] → [8,32]). Non-fused column-parallel uses strided tensors in mmap path — shape verified, data compared only for contiguous shards. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_int4_column_parallel]].
+Verifies INT4 qweight and companion sharding for column-parallel splits (e.g., layer 1's q_proj: [8,64] → [8,32]). Strided data materialized and compared byte-for-byte. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_int4_column_parallel]].
 
 ### TP=2 INT4 Row-Parallel
 
@@ -1370,6 +1370,14 @@ Verifies INT4 qweight and companion sharding for row-parallel splits (e.g., laye
 ### TP=2 GDN Fused QKV in_proj
 
 Specifically verifies GDN in_proj_qkv fused QKV sharding including companion tensors (scales, qzeros). Both paths produce contiguous owned data — full byte comparison. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_gdn_fused_qkv_in_proj]].
+
+### TP=2 Strided Metadata Verification
+
+Verifies strided MmapTensors have correct src_pitch, col_start_bytes, strided_width, and strided_rows by computing expected values from the original shape. Materializes data and compares with heap path. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_strided_metadata_correct]].
+
+### TP=2 Strided Data Materialization
+
+Tests that materializing strided INT4 column-parallel weights via `materialize_mmap_tensor_data` produces byte-for-byte identical data to the heap path. Covers qweight, scales, and qzeros for each projection. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_strided_data_materializes_correctly]].
 
 # Tech Debt Fixes
 
