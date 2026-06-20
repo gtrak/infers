@@ -219,6 +219,114 @@ impl WeightRegistry {
     }
 }
 
+
+impl GdnWeights {
+    /// Drop all weight data (Bytes) from this GDN layer.
+    pub fn clear_data(&mut self) {
+        self.in_proj_a.data = Bytes::new();
+        self.in_proj_b.data = Bytes::new();
+        self.conv1d_weight.data = Bytes::new();
+        if let Some(ref mut w) = self.x_proj_weight { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.dt_proj_weight { w.data = Bytes::new(); }
+        self.out_proj_weight.data = Bytes::new();
+        if let Some(ref mut w) = self.in_proj_qkv { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.in_proj_z { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.a_log { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.dt_bias { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.norm { w.data = Bytes::new(); }
+    }
+}
+
+impl AttentionWeights {
+    /// Drop all weight data (Bytes) from this attention layer.
+    pub fn clear_data(&mut self) {
+        self.q_proj.data = Bytes::new();
+        self.k_proj.data = Bytes::new();
+        self.v_proj.data = Bytes::new();
+        self.o_proj.data = Bytes::new();
+        if let Some(ref mut w) = self.q_norm { w.data = Bytes::new(); }
+        if let Some(ref mut w) = self.k_norm { w.data = Bytes::new(); }
+    }
+}
+
+impl MlpWeights {
+    /// Drop all weight data (Bytes) from this MLP layer.
+    pub fn clear_data(&mut self) {
+        self.gate_proj.data = Bytes::new();
+        self.up_proj.data = Bytes::new();
+        self.down_proj.data = Bytes::new();
+    }
+}
+
+impl LayerWeights {
+    /// Drop all weight data (Bytes) from this layer.
+    pub fn clear_data(&mut self) {
+        if let Some(ref mut gdn) = self.gdn {
+            gdn.clear_data();
+        }
+        if let Some(ref mut attn) = self.attn {
+            attn.clear_data();
+        }
+        self.mlp.clear_data();
+        self.norm1.data = Bytes::new();
+        self.norm2.data = Bytes::new();
+    }
+}
+
+impl MtpWeights {
+    /// Drop all weight data (Bytes) from this MTP head.
+    pub fn clear_data(&mut self) {
+        self.pre_fc_norm_embedding.data = Bytes::new();
+        self.pre_fc_norm_hidden.data = Bytes::new();
+        self.fc.data = Bytes::new();
+        for layer in &mut self.layers {
+            layer.clear_data();
+        }
+        self.norm.data = Bytes::new();
+        if let Some(ref mut w) = self.embed_tokens { w.data = Bytes::new(); }
+    }
+}
+
+impl WeightRegistry {
+    /// Drop weight data (Bytes) from all WeightData entries, keeping names/shapes/dtypes.
+
+    /// After GPU upload, the CPU-side weight data is no longer needed — the GPU
+    /// weight cache holds the actual buffers. This method frees ~5 GB per GPU
+    /// of persistent heap residency for the Qwen3.6-27B model.
+    pub fn clear_data(&mut self) {
+        // Clear embedding, norm, lm_head data
+        if let Some(ref mut embed) = self.embedding {
+            embed.data = Bytes::new();
+        }
+        if let Some(ref mut norm) = self.norm {
+            norm.data = Bytes::new();
+        }
+        if let Some(ref mut lm_head) = self.lm_head {
+            lm_head.data = Bytes::new();
+        }
+
+        // Clear MTP data if present
+        if let Some(ref mut mtp) = self.mtp {
+            mtp.clear_data();
+        }
+
+        // Clear per-layer data
+        for layer in &mut self.layers {
+            layer.clear_data();
+        }
+
+        // Clear remaining flat tensors
+        for (_name, weight) in self.tensors.iter_mut() {
+            weight.data = Bytes::new();
+        }
+
+        // Clear INT4 companions
+        for (_name, companions) in self.int4_companions.iter_mut() {
+            companions.qzeros.data = Bytes::new();
+            companions.scales.data = Bytes::new();
+        }
+    }
+}
 impl Default for WeightRegistry {
     fn default() -> Self {
         Self::new()

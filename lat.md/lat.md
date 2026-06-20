@@ -1368,6 +1368,10 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 
 `WeightRegistry` now uses `Option<WeightData>` for `embedding`, `lm_head`, and `norm` fields instead of empty placeholder `WeightData` structs. See [[crates/model/src/weights.rs#WeightRegistry]].
 
+## CPU Weight Data Clearing after GPU Upload
+
+`WeightRegistry::clear_data()` frees ~5 GB per GPU of persistent heap residency by dropping CPU-side weight data after GPU upload. See [[crates/model/src/weights.rs#WeightRegistry#clear_data]], [[crates/backends/native/src/engine.rs#ForwardEngine#new]].
+
 ## GpuAllocator Encapsulation
 
 `GpuAllocator` fields are now private with accessor methods. The `free()` method has overflow protection and derives `Debug` and `Clone`.

@@ -215,6 +215,7 @@ impl ForwardEngine {
         group_size: usize,
     ) -> Result<Self> {
         let num_gpus = streams.len();
+        let mut weights = weights; // mutable for clear_data() after GPU upload
         let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
         let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
         let nccl = Self::create_nccl(&streams)?;
@@ -241,6 +242,12 @@ impl ForwardEngine {
         let weight_caches: Vec<GpuWeightCache> = weight_caches.into_iter()
             .map(|c| c.expect("All weight caches should be filled"))
             .collect();
+
+        // Free CPU-side weight data now that it's on the GPU.
+        // This drops ~5 GB per GPU of persistent heap residency.
+        for registry in &mut weights {
+            registry.clear_data();
+        }
 
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
