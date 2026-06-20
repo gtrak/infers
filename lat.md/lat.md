@@ -793,7 +793,7 @@ TP=2 GPU 0 results are compared against TP=1 (single-GPU) reference run on the s
 
 **Token ID matching fix:** The engine tokenizer (HF `tokenizers` crate) and HF Python tokenizer produced different token IDs for the same prompt. The root cause was a mismatch in tokenizer configuration (e.g., special token handling or padding side). The fix aligns both tokenizers to produce identical token ID sequences before comparing any intermediate tensors.
 
-**Per-projection sharding fix:** `in_proj_qkv` and `conv1d.weight` were previously split by dividing `conv_dim` evenly across GPUs (naive column split). This is incorrect for fused QKV — each sub-projection (Q, K, V) must be independently divided. The fix in [[crates/model/src/sharding.rs#shard_fused_projection_columns]] extracts segments Q[0:key_dim), K[key_dim:2*key_dim), V[2*key_dim:conv_dim) and divides each independently by num_gpus.
+**Per-projection sharding fix:** `in_proj_qkv` and `conv1d.weight` were previously split by dividing `conv_dim` evenly across GPUs (naive column split). This is incorrect for fused QKV — each sub-projection (Q, K, V) must be independently divided. The fix in [[crates/model-loader-heap/src/lib.rs#shard_fused_projection_columns]] extracts segments Q[0:key_dim), K[key_dim:2*key_dim), V[2*key_dim:conv_dim) and divides each independently by num_gpus.
 
 **QKV column extraction fix:** `clone_view_to_slice` performed a contiguous flat copy from row-major `conv_out`, copying entire rows instead of per-row column slices. The fix uses `extract_columns()` with per-row strided copies: each thread reads `conv_out[row * conv_dim + col]` for the correct column range. See [[crates/backends/native/src/gdn.rs#extract_columns]].
 
@@ -883,7 +883,7 @@ See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 Investigation of mixed_qkv segmentation and o_proj/after_ar magnitude issues in the HF oracle comparison.
 
-**mixed_qkv segmentation verified from source code:** The Rust code in [[crates/model/src/sharding.rs#shard_fused_projection_columns]] and [[crates/backends/native/src/gdn.rs#forward]] confirms the fused segment sharding: each GPU computes [Q_gpu, K_gpu, V_gpu] with per-GPU dimensions Q_dim=key_dim=1024, K_dim=key_dim=1024, V_dim=value_dim=3072. Total conv_dim = 5120 per GPU, 10240 total across TP=2. Correct reconstruction requires segmenting each GPU's output and concatenating corresponding segments: Q_full = cat(Q_gpu0, Q_gpu1), K_full = cat(K_gpu0, K_gpu1), V_full = cat(V_gpu0, V_gpu1). Naive torch.cat([GPU0, GPU1]) produces wrong order [Q0,K0,V0,Q1,K1,V1].
+**mixed_qkv segmentation verified from source code:** The Rust code in [[crates/model-loader-heap/src/lib.rs#shard_fused_projection_columns]] and [[crates/backends/native/src/gdn.rs#forward]] confirms the fused segment sharding: each GPU computes [Q_gpu, K_gpu, V_gpu] with per-GPU dimensions Q_dim=key_dim=1024, K_dim=key_dim=1024, V_dim=value_dim=3072. Total conv_dim = 5120 per GPU, 10240 total across TP=2. Correct reconstruction requires segmenting each GPU's output and concatenating corresponding segments: Q_full = cat(Q_gpu0, Q_gpu1), K_full = cat(K_gpu0, K_gpu1), V_full = cat(V_gpu0, V_gpu1). Naive torch.cat([GPU0, GPU1]) produces wrong order [Q0,K0,V0,Q1,K1,V1].
 
 **Correct mixed_qkv comparison results (with segment-aware reconstruction):** Reconstructed QKV vs HF mixed_qkv cos=0.994. Individual components: Q cos=0.992, K cos=0.991, V cos=0.995. The GDN in_proj_qkv INT4 GEMM is correct.
 
@@ -1277,11 +1277,11 @@ Multi-format model loader with safetensors file reading and auto-detection of si
 
 ## Loading Pipeline
 
-`load_model()` reads config, detects format, loads safetensors, then calls `build_mtp_weights()` if MTP is enabled. See [[crates/model/src/loader.rs#load_model]].
+`load_model()` reads config, detects format, loads safetensors, then calls `build_mtp_weights()` if MTP is enabled. See [[crates/model-loader-heap/src/lib.rs#load_model]].
 
 ## Single vs Sharded
 
-`load_safetensors()` auto-detects whether a model uses a single `model.safetensors` file or a sharded index (`model.safetensors.index.json` with multiple shard files). Memory maps files for efficient loading. See [[crates/model/src/loader.rs#load_safetensors]].
+`load_safetensors()` auto-detects whether a model uses a single `model.safetensors` file or a sharded index (`model.safetensors.index.json` with multiple shard files). Memory maps files for efficient loading. See [[crates/model-loader-heap/src/lib.rs#load_safetensors]].
 
 ## MTP Weight Loading
 
@@ -1293,7 +1293,7 @@ Weight sharding for tensor parallelism (TP=2) and pipeline parallelism (PP=2).
 
 ## Tensor Parallelism Sharding
 
-`shard_weights_tp()` splits weights across GPUs with INT4-aware dimension handling. See [[crates/model/src/sharding.rs#shard_weights_tp]].
+`shard_weights_tp()` splits weights across GPUs with INT4-aware dimension handling. See [[crates/model-loader-heap/src/lib.rs#shard_weights_tp]].
 
 ### BF16 sharding
 
@@ -1309,7 +1309,7 @@ After sharding, `get_weight_or_int4()` checks `registry.int4_companions` first (
 
 ### Fused QKV Projection Sharding
 
-For fused `in_proj_qkv` and `conv1d.weight`, each sub-projection (Q, K, V) is independently split across GPUs rather than splitting the full conv_dim evenly. See [[crates/model/src/sharding.rs#shard_fused_projection_columns]].
+For fused `in_proj_qkv` and `conv1d.weight`, each sub-projection (Q, K, V) is independently split across GPUs rather than splitting the full conv_dim evenly. See [[crates/model-loader-heap/src/lib.rs#shard_fused_projection_columns]].
 
 Segments: Q[0:key_dim), K[key_dim:2*key_dim), V[2*key_dim:conv_dim). Each is divided by num_gpus.
 
@@ -1397,7 +1397,7 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 
 ## Safety Comments
 
-`memmap2::Mmap::map()` calls have `// SAFETY:` comments explaining that the file is opened read-only, the file handle is verified to exist before mapping, and the mapping is read-only weight data. See [[crates/model/src/loader.rs#load_single]], [[crates/model/src/loader.rs#load_sharded]].
+`memmap2::Mmap::map()` calls have `// SAFETY:` comments explaining that the file is opened read-only, the file handle is verified to exist before mapping, and the mapping is read-only weight data. See [[crates/model-loader-heap/src/lib.rs#load_single]], [[crates/model-loader-heap/src/lib.rs#load_sharded]].
 
 ## Memory Budget Improvements
 
@@ -2020,7 +2020,7 @@ The initialization sequence: (1) parse CLI args, (2) initialize CUDA runtime via
 
 ### Model Loading
 
-If the model path exists on disk, `load_model()` reads `config.json` and safetensors files, returning `(ModelConfig, WeightRegistry)`. If the path is missing, a default Qwen3.6-27B config is created with empty weights for wiring validation. See [[crates/model/src/loader.rs#load_model]].
+If the model path exists on disk, `load_model()` reads `config.json` and safetensors files, returning `(ModelConfig, WeightRegistry)`. If the path is missing, a default Qwen3.6-27B config is created with empty weights for wiring validation. See [[crates/model-loader-heap/src/lib.rs#load_model]].
 
 ### Kernel Registration
 

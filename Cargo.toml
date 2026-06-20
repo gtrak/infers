@@ -6,6 +6,7 @@ members = [
     "crates/scheduler",
     "crates/kv",
     "crates/model",
+    "crates/model-loader-heap",
     "crates/backends/native",
     "crates/backends/gguf",
     "crates/cuda",

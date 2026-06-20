@@ -333,6 +333,18 @@ impl Default for WeightRegistry {
     }
 }
 
+/// Index file for sharded safetensors models.
+/// Maps tensor names to shard filenames.
+#[derive(Debug, serde::Deserialize)]
+pub struct ShardIndex {
+    /// Map from tensor name to shard filename.
+    pub weight_map: HashMap<String, String>,
+    /// Metadata (model name, etc). Uses Value to handle mixed types
+    /// (some models store integers like `total_shards: 10`).
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
 /// Shard assignment for a single GPU in tensor parallelism.
 #[derive(Debug, Clone)]
 pub struct WeightShard {
@@ -341,7 +353,6 @@ pub struct WeightShard {
     /// Sharded weight registry.
     pub registry: WeightRegistry,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

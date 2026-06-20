@@ -14,7 +14,7 @@ pub mod budget;
 pub use config::*;
 pub use formats::*;
 pub use weights::*;
-pub use loader::{build_main_layers, build_mtp_weights, load_model, load_safetensors, strip_language_model_prefix, LoadedModel, ShardIndex};
+pub use loader::{build_main_layers, build_mtp_weights, strip_language_model_prefix};
 pub use sharding::*;
 pub use budget::*;
 pub use mmap::{MmapTensor, MmapWeightRegistry, MmapCompanions, MmapWeightShard, load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry};

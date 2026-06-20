@@ -6,9 +6,9 @@
 
 use infers_model::config::ModelConfig;
 use infers_model::mmap::{MmapWeightShard, shard_weights_tp_mmap, load_safetensors_mmap, strip_language_model_prefix_mmap};
-use infers_model::sharding::shard_weights_tp;
 use infers_model::weights::WeightShard;
-use infers_model::{load_safetensors, strip_language_model_prefix};
+use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
+use infers_model::strip_language_model_prefix;
 
 /// Materialize a strided MmapTensor's data into a contiguous Vec<u8> by
 /// reading each row at the correct stride offset. For non-strided tensors,

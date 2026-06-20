@@ -12,8 +12,7 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use super::loader::ShardIndex;
-use super::weights::{Int4Companions, WeightData, WeightDtype, WeightRegistry};
+use super::weights::{Int4Companions, ShardIndex, WeightData, WeightDtype, WeightRegistry};
 
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#DataOwner]]
 /// Owns the backing data for an MmapTensor — either a memory-mapped file (zero-copy)

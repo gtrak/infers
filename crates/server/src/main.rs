@@ -20,8 +20,7 @@ use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::PagedKvManager;
 use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap};
-use infers_model::sharding::shard_weights_tp;
-use infers_model::{build_main_layers, build_metadata_registry, load_safetensors, strip_language_model_prefix, ModelConfig, WeightRegistry};
+use infers_model::{build_main_layers, build_metadata_registry, ModelConfig, WeightRegistry};
 use infers_scheduler::RoundRobinScheduler;
 use infers_tokenizer::Tokenizer;
 
@@ -100,10 +99,6 @@ pub struct Args {
     /// OTLP service name
     #[arg(long, default_value = "infers")]
     pub otlp_service_name: String,
-
-    /// Disable mmap weight loading (use heap copy fallback)
-    #[arg(long, default_value_t = false)]
-    pub no_mmap: bool,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -207,7 +202,7 @@ async fn run() -> Result<()> {
 
     // Step 3: Load model config and weights
     let model_path = Path::new(&args.model);
-    let use_mmap = !args.no_mmap && model_path.exists();
+    let use_mmap = model_path.exists();
 
     let (model_config, engine, num_layers) = if use_mmap {
         // Mmap path: load via zero-copy memory-mapped access
@@ -247,40 +242,6 @@ async fn run() -> Result<()> {
             &mut pinned,
             128,
         ).context("Failed to create ForwardEngine (mmap)")?;
-
-        (model_config, engine, num_layers)
-    } else if model_path.exists() {
-        // Heap path: load into memory, shard for TP
-        tracing::info!("Loading model from {} with TP={}", args.model, num_gpus);
-        let config = infers_model::config::ModelConfig::load(model_path)
-            .with_context(|| format!("Failed to load model config from {}", args.model))?;
-        let mut raw_weights = load_safetensors(model_path)
-            .with_context(|| format!("Failed to load safetensors from {}", args.model))?;
-        strip_language_model_prefix(&mut raw_weights);
-        let shards = shard_weights_tp(&raw_weights, &config, num_gpus)
-            .with_context(|| format!("Failed to shard weights for TP={num_gpus}"))?;
-        let mut registries = Vec::new();
-        for shard in shards {
-            let mut registry = shard.registry;
-            build_main_layers(&mut registry, &config)
-                .with_context(|| format!("Failed to build layers for GPU {}", shard.gpu_id))?;
-            registries.push(registry);
-        }
-
-        let num_layers = config.num_hidden_layers;
-
-        let mut kernel_registry = KernelRegistry::new();
-        kernel_registry.register_infers_kernels();
-
-        let model_config = Arc::new(config);
-        let engine = ForwardEngine::new(
-            model_config.clone(),
-            registries,
-            contexts,
-            kernel_registry,
-            streams,
-            128,
-        ).context("Failed to create ForwardEngine")?;
 
         (model_config, engine, num_layers)
     } else {

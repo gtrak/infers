@@ -1,22 +1,19 @@
 [package]
-name = "infers-model"
+name = "infers-model-loader-heap"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Heap-only weight loader — used solely for sharding equivalence tests"
 
 [dependencies]
 anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-safetensors = { workspace = true }
-memmap2 = { workspace = true }
 bytes = { workspace = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+tracing = { workspace = true }
+infers-model = { path = "../model" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-infers-model-loader-heap = { path = "../model-loader-heap" }
-
-[[test]]
-name = "shard_equiv"

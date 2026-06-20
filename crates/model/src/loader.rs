@@ -3,181 +3,13 @@
 //! Loads model weights from safetensors files (single or sharded),
 //! detects quantization format, and constructs a WeightRegistry.
 
-use std::collections::HashMap;
-use std::path::Path;
-
 use anyhow::{Context, Result};
-use safetensors::SafeTensors;
-use serde::Deserialize;
-use bytes::Bytes;
 use super::config::ModelConfig;
-use super::formats::QuantizationFormat;
 use super::weights::{
     AttentionWeights, GdnWeights, Int4Companions, LayerWeights, MlpWeights, MtpWeights,
-    WeightData, WeightDtype, WeightRegistry,
+    WeightData, WeightRegistry,
 };
 
-/// Index file for sharded safetensors models.
-/// Maps tensor names to shard filenames.
-#[derive(Debug, Deserialize)]
-pub struct ShardIndex {
-    /// Map from tensor name to shard filename.
-    pub weight_map: HashMap<String, String>,
-    /// Metadata (model name, etc). Uses Value to handle mixed types
-    /// (some models store integers like `total_shards: 10`).
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-/// Result of loading a model directory.
-#[derive(Debug)]
-pub struct LoadedModel {
-    /// Parsed model configuration.
-    pub config: ModelConfig,
-    /// Detected quantization format.
-    pub format: QuantizationFormat,
-    /// Loaded weight registry.
-    pub weights: WeightRegistry,
-}
-
-/// Load a model from a directory.
-// @lat: [[lat#Safetensors Loader#Loading Pipeline]]
-///
-/// This is the main entry point for model loading. It:
-/// 1. Reads config.json
-/// 2. Detects quantization format
-/// 3. Loads safetensors files
-/// 4. Constructs a WeightRegistry
-pub fn load_model(model_dir: &Path) -> Result<LoadedModel> {
-    let config = ModelConfig::load(model_dir)?;
-    let format = QuantizationFormat::detect(model_dir)?;
-    let mut weights = load_safetensors(model_dir)?;
-    // Strip `model.language_model.` prefix and remove vision tensors
-    strip_language_model_prefix(&mut weights);
-    // Build structured main layers (embedding, per-layer, norm, lm_head)
-    build_main_layers(&mut weights, &config)?;
-    // Build structured MTP weights if the model has MTP
-    build_mtp_weights(&mut weights, &config)?;
-    tracing::info!(
-        "Loaded model: {} layers, format: {:?}, {} tensors, {:.2} GB{}",
-        config.num_hidden_layers,
-        format,
-        weights.num_tensors(),
-        weights.total_bytes() as f64 / 1e9,
-        if config.has_mtp() {
-            format!(" (MTP: {} layers)", config.mtp_num_hidden_layers)
-        } else {
-            String::new()
-        },
-    );
-
-    Ok(LoadedModel {
-        config,
-        format,
-        weights,
-    })
-}
-
-/// Load all safetensors files from a model directory.
-// @lat: [[lat#Safetensors Loader#Single vs Sharded]]
-///
-/// Handles both single-file (`model.safetensors`) and sharded
-/// (`model.safetensors.index.json` + multiple shard files) formats.
-pub fn load_safetensors(model_dir: &Path) -> Result<WeightRegistry> {
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    if index_path.exists() {
-        load_sharded(model_dir, &index_path)
-    } else {
-        let single_path = model_dir.join("model.safetensors");
-        if single_path.exists() {
-            load_single(&single_path)
-        } else {
-            anyhow::bail!(
-                "No safetensors files found in {:?}. Expected model.safetensors or model.safetensors.index.json",
-                model_dir
-            )
-        }
-    }
-}
-
-fn load_single(path: &Path) -> Result<WeightRegistry> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open safetensors file: {:?}", path))?;
-    // SAFETY: The file is opened read-only (std::fs::File::open), the file handle
-    // is verified to exist before mapping, and the mapping is read-only weight data.
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let st = SafeTensors::deserialize(&mmap)?;
-
-    let mut tensors = HashMap::new();
-    for name in st.names() {
-        let tensor = st.tensor(name)?;
-        let shape: Vec<usize> = tensor.shape().to_vec();
-        let dtype = map_safetensor_dtype(tensor.dtype());
-        let data = Bytes::copy_from_slice(tensor.data());
-
-        tensors.insert(name.to_string(), WeightData {
-            data,
-            shape,
-            dtype,
-            name: name.to_string(),
-        });
-    }
-
-    let total_bytes: usize = tensors.values().map(|t| t.data.len()).sum();
-    tracing::debug!("Loaded {} tensors ({:.2} GB) from {:?}", tensors.len(), total_bytes as f64 / 1e9, path);
-
-    let mut registry = WeightRegistry::new();
-    registry.tensors = tensors;
-    Ok(registry)
-}
-
-fn load_sharded(model_dir: &Path, index_path: &Path) -> Result<WeightRegistry> {
-    let index_content = std::fs::read_to_string(index_path)?;
-    let index: ShardIndex = serde_json::from_str(&index_content)?;
-
-    // Collect unique shard filenames
-    let shards: std::collections::HashSet<String> = index.weight_map.values().cloned().collect();
-    let mut all_tensors = HashMap::new();
-
-    for shard_name in &shards {
-        let shard_path = model_dir.join(shard_name);
-        tracing::debug!("Loading shard: {:?}", shard_path);
-
-        let file = std::fs::File::open(&shard_path)
-            .with_context(|| format!("Failed to open shard: {:?}", shard_path))?;
-        // SAFETY: The shard file is opened read-only, verified to exist before mapping,
-        // and the mapping is read-only weight data.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let st = SafeTensors::deserialize(&mmap)?;
-
-        for name in st.names() {
-            let tensor = st.tensor(name)?;
-            let shape: Vec<usize> = tensor.shape().to_vec();
-            let dtype = map_safetensor_dtype(tensor.dtype());
-            let data = Bytes::copy_from_slice(tensor.data());
-
-            all_tensors.insert(name.to_string(), WeightData {
-                data,
-                shape,
-                dtype,
-                name: name.to_string(),
-            });
-        }
-    }
-
-    let total_bytes: usize = all_tensors.values().map(|t| t.data.len()).sum();
-    tracing::info!(
-        "Loaded {} shards, {} tensors ({:.2} GB)",
-        shards.len(),
-        all_tensors.len(),
-        total_bytes as f64 / 1e9,
-    );
-
-    let mut registry = WeightRegistry::new();
-    registry.tensors = all_tensors;
-    Ok(registry)
-}
 /// Strip `model.language_model.` prefix from tensor names and remove vision tensors.
 ///
 /// Tensors starting with `model.language_model.` get that prefix stripped, so
@@ -560,100 +392,15 @@ fn get_weight_or_int4_optional(
     Ok(Some(qweight))
 }
 
-/// Map safetensors dtype to our WeightDtype.
-fn map_safetensor_dtype(dtype: safetensors::Dtype) -> WeightDtype {
-    match dtype {
-        safetensors::Dtype::BF16 => WeightDtype::Bf16,
-        safetensors::Dtype::F16 => WeightDtype::Fp16,
-        safetensors::Dtype::F32 => WeightDtype::Fp32,
-        safetensors::Dtype::U32 => WeightDtype::Int4Packed, // INT4 packed as u32
-        safetensors::Dtype::I32 => WeightDtype::Int4Packed, // INT4 packed as i32 (used by newer AutoRound)
-        safetensors::Dtype::U8 => WeightDtype::Other,
-        safetensors::Dtype::I8 => WeightDtype::Other,
-        safetensors::Dtype::I16 => WeightDtype::Other,
-        safetensors::Dtype::I32 => WeightDtype::Other,
-        safetensors::Dtype::I64 => WeightDtype::Other,
-        safetensors::Dtype::F64 => WeightDtype::Other,
-        safetensors::Dtype::BOOL => WeightDtype::Other,
-        // Handle any future dtypes
-        _ => WeightDtype::Other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LayerType;
+    use crate::weights::{WeightData, WeightRegistry, WeightDtype, MtpWeights};
     use bytes::Bytes;
-    fn qwen3_6_config_json() -> String {
-        serde_json::json!({
-            "architectures": ["Qwen3_5ForConditionalGeneration"],
-            "model_type": "qwen3_5",
-            "num_hidden_layers": 64,
-            "hidden_size": 5120,
-            "intermediate_size": 17408,
-            "vocab_size": 248320,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
-            "head_dim": 256,
-            "max_position_embeddings": 262144,
-            "rms_norm_eps": 1e-6,
-            "hidden_act": "silu",
-            "tie_word_embeddings": false,
-            "rope_theta": 10000000.0,
-            "partial_rotary_factor": 0.25,
-            "mrope_interleaved": true,
-            "mrope_section": [11, 11, 10],
-            "mtp_num_hidden_layers": 1,
-            "mtp_use_dedicated_embeddings": false
-        })
-        .to_string()
-    }
 
-    #[test]
-    fn load_safetensors_no_files_bails() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = load_safetensors(dir.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No safetensors files found"));
-    }
-
-    #[test]
-    fn load_model_config_and_format() {
-        // Just verify load_model reads config successfully when files exist.
-        // We don't need actual safetensors for the config to parse.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            qwen3_6_config_json().as_bytes(),
-        )
-        .unwrap();
-        // No safetensors, so load_model will fail at the weights step,
-        // but config loading works.
-        let result = load_model(dir.path());
-        // Expected to fail because no safetensors
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn map_safetensor_dtype_bf16() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::BF16), WeightDtype::Bf16);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_fp32() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::F32), WeightDtype::Fp32);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_f16() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::F16), WeightDtype::Fp16);
-    }
-
-    #[test]
-    fn map_safetensor_dtype_other() {
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::U8), WeightDtype::Other);
-        assert_eq!(map_safetensor_dtype(safetensors::Dtype::BOOL), WeightDtype::Other);
+    fn dummy_weight(name: &str) -> WeightData {
+        WeightData { data: Bytes::from(vec![0u8; 32]), shape: vec![2, 16], dtype: WeightDtype::Bf16, name: name.to_string() }
     }
 
     #[test]
@@ -716,110 +463,6 @@ mod tests {
     }
 
     #[test]
-    fn build_mtp_weights_with_gdn_layer() {
-        // Config with MTP enabled, 1 GDN layer
-        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"mtp_num_hidden_layers":1,"mtp_use_dedicated_embeddings":false,"layer_types":["linear_attention"]}"#;
-        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
-
-        let mut registry = WeightRegistry::new();
-        let dummy = |name: &str| WeightData {
-            data: Bytes::from(vec![0u8; 32]),
-            shape: vec![2, 16],
-            dtype: WeightDtype::Bf16,
-            name: name.to_string(),
-        };
-
-        // Pre-FC norms and FC
-        registry.tensors.insert("mtp.pre_fc_norm_embedding.weight".to_string(), dummy("mtp.pre_fc_norm_embedding.weight"));
-        registry.tensors.insert("mtp.pre_fc_norm_hidden.weight".to_string(), dummy("mtp.pre_fc_norm_hidden.weight"));
-        registry.tensors.insert("mtp.fc.weight".to_string(), dummy("mtp.fc.weight"));
-        registry.tensors.insert("mtp.norm.weight".to_string(), dummy("mtp.norm.weight"));
-
-        // Layer 0: norms
-        registry.tensors.insert("mtp.layers.0.input_layernorm.weight".to_string(), dummy("mtp.layers.0.input_layernorm.weight"));
-        registry.tensors.insert("mtp.layers.0.post_attention_layernorm.weight".to_string(), dummy("mtp.layers.0.post_attention_layernorm.weight"));
-
-        // Layer 0: GDN (x_proj_weight and dt_proj_weight are optional — omitted like real Qwen3.6 model)
-        registry.tensors.insert("mtp.layers.0.gdn.in_proj_a.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_a.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.in_proj_b.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_b.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.conv1d_weight.weight".to_string(), dummy("mtp.layers.0.gdn.conv1d_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.out_proj.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj.weight"));
-
-        // Layer 0: MLP
-        registry.tensors.insert("mtp.layers.0.mlp.gate_proj.weight".to_string(), dummy("mtp.layers.0.mlp.gate_proj.weight"));
-        registry.tensors.insert("mtp.layers.0.mlp.up_proj.weight".to_string(), dummy("mtp.layers.0.mlp.up_proj.weight"));
-        registry.tensors.insert("mtp.layers.0.mlp.down_proj.weight".to_string(), dummy("mtp.layers.0.mlp.down_proj.weight"));
-
-        let result = build_mtp_weights(&mut registry, &config);
-        assert!(result.is_ok());
-
-        let mtp = registry.mtp.as_ref().expect("MTP weights should be populated");
-        assert_eq!(mtp.layers.len(), 1);
-        assert!(mtp.embed_tokens.is_none());
-        assert!(mtp.layers[0].gdn.is_some());
-        assert!(mtp.layers[0].attn.is_none());
-    }
-
-    #[test]
-    fn build_mtp_weights_with_dedicated_embeddings() {
-        // Config with MTP enabled and dedicated embeddings
-        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"mtp_num_hidden_layers":1,"mtp_use_dedicated_embeddings":true,"layer_types":["linear_attention"]}"#;
-        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
-
-        let mut registry = WeightRegistry::new();
-        let dummy = |name: &str| WeightData {
-            data: Bytes::from(vec![0u8; 32]),
-            shape: vec![2, 16],
-            dtype: WeightDtype::Bf16,
-            name: name.to_string(),
-        };
-
-        // Pre-FC norms and FC
-        registry.tensors.insert("mtp.pre_fc_norm_embedding.weight".to_string(), dummy("mtp.pre_fc_norm_embedding.weight"));
-        registry.tensors.insert("mtp.pre_fc_norm_hidden.weight".to_string(), dummy("mtp.pre_fc_norm_hidden.weight"));
-        registry.tensors.insert("mtp.fc.weight".to_string(), dummy("mtp.fc.weight"));
-        registry.tensors.insert("mtp.norm.weight".to_string(), dummy("mtp.norm.weight"));
-
-        // Dedicated embeddings
-        registry.tensors.insert("mtp.embed_tokens.weight".to_string(), dummy("mtp.embed_tokens.weight"));
-
-        // Layer 0: norms
-        registry.tensors.insert("mtp.layers.0.input_layernorm.weight".to_string(), dummy("mtp.layers.0.input_layernorm.weight"));
-        registry.tensors.insert("mtp.layers.0.post_attention_layernorm.weight".to_string(), dummy("mtp.layers.0.post_attention_layernorm.weight"));
-
-        // Layer 0: GDN (x_proj_weight and dt_proj_weight are optional — omitted like real Qwen3.6 model)
-        registry.tensors.insert("mtp.layers.0.gdn.in_proj_a.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_a.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.in_proj_b.weight".to_string(), dummy("mtp.layers.0.gdn.in_proj_b.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.conv1d_weight.weight".to_string(), dummy("mtp.layers.0.gdn.conv1d_weight.weight"));
-        registry.tensors.insert("mtp.layers.0.gdn.out_proj.weight".to_string(), dummy("mtp.layers.0.gdn.out_proj.weight"));
-
-        // Layer 0: MLP
-        registry.tensors.insert("mtp.layers.0.mlp.gate_proj.weight".to_string(), dummy("mtp.layers.0.mlp.gate_proj.weight"));
-        registry.tensors.insert("mtp.layers.0.mlp.up_proj.weight".to_string(), dummy("mtp.layers.0.mlp.up_proj.weight"));
-        registry.tensors.insert("mtp.layers.0.mlp.down_proj.weight".to_string(), dummy("mtp.layers.0.mlp.down_proj.weight"));
-
-        let result = build_mtp_weights(&mut registry, &config);
-        assert!(result.is_ok());
-
-        let mtp = registry.mtp.as_ref().expect("MTP weights should be populated");
-        assert!(mtp.embed_tokens.is_some(), "embed_tokens should be present when mtp_use_dedicated_embeddings is true");
-    }
-
-    #[test]
-    fn build_mtp_weights_missing_tensor_fails() {
-        // Config with MTP enabled
-        let config_json = r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","num_hidden_layers":64,"hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":262144,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":false,"rope_theta":10000000.0,"partial_rotary_factor":0.25,"mrope_interleaved":true,"mrope_section":[11,11,10],"mtp_num_hidden_layers":1,"mtp_use_dedicated_embeddings":false}"#;
-        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
-
-        let mut registry = WeightRegistry::new();
-        // No tensors at all — should fail
-        let result = build_mtp_weights(&mut registry, &config);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("mtp.pre_fc_norm_embedding.weight"));
-    }
-
-    #[test]
     fn mtp_weights_struct_has_expected_fields() {
         // Verify MtpWeights has all expected fields by constructing one
         let dummy = WeightData {
@@ -838,10 +481,6 @@ mod tests {
         };
         assert!(mtp.layers.is_empty());
         assert!(mtp.embed_tokens.is_none());
-    }
-
-    fn dummy_weight(name: &str) -> WeightData {
-        WeightData { data: Bytes::from(vec![0u8; 32]), shape: vec![2, 16], dtype: WeightDtype::Bf16, name: name.to_string() }
     }
 
     #[test]
@@ -920,11 +559,11 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(registry.layers.len(), 4);
         for i in 0..3 {
-            assert_eq!(registry.layers[i].layer_type, crate::config::LayerType::GatedDeltaNet);
+            assert_eq!(registry.layers[i].layer_type, LayerType::GatedDeltaNet);
             assert!(registry.layers[i].gdn.is_some(), "layer {} should have GDN", i);
             assert!(registry.layers[i].attn.is_none(), "layer {} should not have attention", i);
         }
-        assert_eq!(registry.layers[3].layer_type, crate::config::LayerType::FullAttention);
+        assert_eq!(registry.layers[3].layer_type, LayerType::FullAttention);
         assert!(registry.layers[3].attn.is_some());
         assert!(registry.layers[3].gdn.is_none());
         assert!(registry.embedding.is_some());
