@@ -9,7 +9,6 @@ build = "build.rs"
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 half = { workspace = true }
 
 cudarc = { workspace = true }

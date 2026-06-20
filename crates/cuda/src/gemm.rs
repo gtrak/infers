@@ -52,17 +52,6 @@ impl GemmEngine {
         Ok(Self { handle })
     }
 
-    /// Execute an FP32 GEMM: C = alpha * op(A) * op(B) + beta * C.
-    pub fn matmul_f32(
-        &self,
-        config: &GemmConfig,
-        a: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        c: &mut CudaSlice<f32>,
-    ) -> anyhow::Result<()> {
-        gemm_impl(&self.handle, config, a, b, c)
-    }
-
     /// Execute a BF16 GEMM: C = alpha * op(A) * op(B) + beta * C.
     pub fn matmul_bf16(
         &self,
@@ -74,17 +63,7 @@ impl GemmEngine {
         gemm_impl(&self.handle, config, a, b, c)
     }
 
-    /// Execute an FP16 GEMM: C = alpha * op(A) * op(B) + beta * C.
-    pub fn matmul_fp16(
-        &self,
-        config: &GemmConfig,
-        a: &CudaSlice<half::f16>,
-        b: &CudaSlice<half::f16>,
-        c: &mut CudaSlice<half::f16>,
-    ) -> anyhow::Result<()> {
-        gemm_impl(&self.handle, config, a, b, c)
-    }
-}
+ }
 
 /// Internal helper that builds a `MatmulConfig` from `GemmConfig` and
 /// calls the unsafe cuBLASLt `matmul`. Validates dimensions first.

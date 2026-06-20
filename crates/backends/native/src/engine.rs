@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use infers_cuda::gemm::GemmEngine;
-use infers_cuda::gemm::Int4GemmConfig;
 use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
@@ -24,8 +23,7 @@ use crate::gdn::GdnState;
 
 use infers_kv::PagedKvManager;
 
-use half::{bf16, f16};
-use infers_kv::KvCacheDtype;
+use half::bf16;
 use infers_cuda::CudaSlice;
 
 use infers_cuda::{group_end, group_start};
@@ -91,9 +89,6 @@ pub struct ForwardEngine {
     /// Weight metadata for name lookups during inference.
     /// Contains weight names/shapes but no actual weight data.
     metadata: Vec<WeightRegistry>,
-
-    /// Mmap weight registries (retained to keep mmap handles alive).
-    _mmap_registries: Vec<MmapWeightRegistry>,
 
     /// Per-GPU weight caches with GPU-resident buffers.
     weight_caches: Vec<GpuWeightCache>,
@@ -279,7 +274,6 @@ impl ForwardEngine {
         Ok(Self {
             config,
             metadata: weights,
-            _mmap_registries: Vec::new(),
             weight_caches,
             per_gpu_kernels,
             paged_kv_manager: None,
@@ -301,8 +295,7 @@ impl ForwardEngine {
     /// Construct a `ForwardEngine` from mmap-backed weight registries.
     ///
     /// Similar to [`new`] but loads weights via zero-copy memory-mapped access.
-    /// The `_mmap_registries` field retains the Arc-based mmap handles for
-    /// the lifetime of the engine, preventing premature unmapping.
+    /// mmap handles are dropped after GPU upload to free page cache.
     ///
     /// # Arguments
     /// * `config` — Model architecture parameters
@@ -365,7 +358,6 @@ impl ForwardEngine {
         Ok(Self {
             config,
             metadata: metadata_registries, // metadata registries for name lookups during inference
-            _mmap_registries: Vec::new(), // mmap data dropped after GPU upload
             weight_caches,
             per_gpu_kernels,
             paged_kv_manager: None,
@@ -480,91 +472,6 @@ impl ForwardEngine {
             .as_mut()
             .map(|m| m.create_sequence())
             .unwrap_or(0)
-    }
-
-    /// Write FP8-quantized K/V to a page pool using GPU kernels.
-    ///
-    /// GPU-only: quantizes BF16→FP8 on device, copies into page pool via D2D memcpy.
-    /// See [`attention::fp8_quantize_and_write`] for details.
-    pub fn fp8_quantize_and_write(
-        &self,
-        stream: &Arc<CudaStream>,
-        page_pool: &mut CudaSlice<u8>,
-        page_id: usize,
-        page_offset: usize,
-        page_size: usize,
-        kv_dim: usize,
-        dtype: KvCacheDtype,
-        k: &CudaSlice<half::bf16>,
-        v: &CudaSlice<half::bf16>,
-    ) -> Result<()> {
-        crate::attention::fp8_quantize_and_write(
-            stream,
-            &self.per_gpu_kernels[0].fp8_quantize,
-            page_pool,
-            page_id,
-            page_offset,
-            page_size,
-            kv_dim,
-            dtype,
-            k,
-            v,
-        )
-    }
-
-    /// Read FP8-quantized K/V from a page pool using GPU kernels.
-    ///
-    /// GPU-only: copies from page pool via D2D memcpy, dequantizes FP8→BF16 on device.
-    /// See [`attention::fp8_dequantize_and_read`] for details.
-    pub fn fp8_dequantize_and_read(
-        &self,
-        stream: &Arc<CudaStream>,
-        page_pool: &CudaSlice<u8>,
-        page_id: usize,
-        page_offset: usize,
-        len: usize,
-        page_size: usize,
-        kv_dim: usize,
-        dtype: KvCacheDtype,
-    ) -> Result<(CudaSlice<half::bf16>, CudaSlice<half::bf16>)> {
-        crate::attention::fp8_dequantize_and_read(
-            stream,
-            &self.per_gpu_kernels[0].fp8_dequantize,
-            page_pool,
-            page_id,
-            page_offset,
-            len,
-            page_size,
-            kv_dim,
-            dtype,
-        )
-    }
-
-    /// Execute INT4 GEMM with on-the-fly dequantization.
-    ///
-    /// Weights stay in INT4-packed format in GPU memory — no dequantized copy exists.
-    /// Dequantization happens in registers during the inner loop.
-    /// See [`infers_cuda::gemm::matmul_int4`] for details.
-    pub fn matmul_int4(
-        &self,
-        stream: &Arc<CudaStream>,
-        config: &Int4GemmConfig,
-        output: &mut CudaSlice<half::bf16>,
-        weight: &CudaSlice<u32>,
-        scales: &CudaSlice<f16>,
-        zeros: &CudaSlice<u32>,
-        input: &CudaSlice<half::bf16>,
-    ) -> Result<()> {
-        infers_cuda::gemm::matmul_int4(
-            stream,
-            &self.per_gpu_kernels[0].int4_gemm,
-            config,
-            output,
-            weight,
-            scales,
-            zeros,
-            input,
-        )
     }
 
     /// Run paged prefill — writes K/V to paged cache for all layers.
@@ -746,7 +653,7 @@ impl ForwardEngine {
                         crate::attention::forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].softmax, &self.per_gpu_kernels[gpu_idx].paged_kv_write,
-                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
+                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm,
                             &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
@@ -1156,7 +1063,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                         crate::attention::decode_forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].paged_kv_write, &self.per_gpu_kernels[gpu_idx].paged_attention_decode,
-                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm, &self.per_gpu_kernels[gpu_idx].add,
+                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm,
                             &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],

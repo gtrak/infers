@@ -1196,7 +1196,6 @@ dependencies = [
  "anyhow",
  "cudarc",
  "half",
- "thiserror 2.0.18",
  "tracing",
 ]
 

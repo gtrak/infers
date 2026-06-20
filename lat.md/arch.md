@@ -45,15 +45,14 @@ CUDA runtime crate for GPU inference. cudarc is always present with no feature g
 
 ### Module Structure
 
-Seven modules cover context, streams, memory, kernels, GEMM, pinned, and NCCL.
+Six modules cover context, streams, kernels, GEMM, pinned, and NCCL.
 
 | Module | Purpose |
 |--------|---------|
 | context | CUDA device context management, CudaRuntime |
 | stream | CUDA stream pool for async execution |
-| memory | Block pool GPU memory allocator |
 | kernels | Kernel registry for pre-compiled .cubin loading |
-| gemm | cuBLASLt GEMM engine with `matmul_f32()`, `matmul_bf16()`, `matmul_fp16()` methods for FP32/BF16/FP16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
+| gemm | cuBLASLt GEMM engine with `matmul_bf16()` method for BF16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
 | pinned | Page-locked host memory (`PinnedHostBuffer`) for fast DMA transfers to GPU — Phase 16 Zero-Copy Weight Streaming |
 | nccl | Multi-GPU collective operations for TP/PP |
 

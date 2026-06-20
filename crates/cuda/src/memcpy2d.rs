@@ -69,25 +69,3 @@ pub fn clone_htod_2d(
 
     Ok(dst)
 }
-
-/// Copy data from GPU to CPU using raw cuMemcpyDtoH_v2.
-///
-/// This is needed when the source CudaSlice was created via transmute (e.g.,
-/// `CudaSlice<u8>` → `CudaSlice<u32>`), where cudarc's `clone_dtoh` fails
-/// with CUDA_ERROR_INVALID_VALUE due to alignment assumptions in DevicePtr.
-pub fn clone_dtoh_raw(
-    dev_ptr: u64,
-    byte_count: usize,
-) -> Result<Vec<u8>> {
-    let mut host_data: Vec<u8> = vec![0u8; byte_count];
-    unsafe {
-        sys::cuMemcpyDtoH_v2(
-            host_data.as_mut_ptr() as *mut ::std::os::raw::c_void,
-            dev_ptr,
-            byte_count,
-        )
-        .result()
-        .map_err(|e| anyhow::anyhow!("cuMemcpyDtoH failed: {:?}", e))?;
-    }
-    Ok(host_data)
-}

@@ -809,7 +809,6 @@ pub fn forward(
 /// - Phase 1: Same K/V computation + RoPE
 /// - Phase 2: Writes to paged cache via `infers_paged_kv_write_bf16` instead of flat buffer
 /// - Phase 3: Same per-head attention using the already-computed K/V buffers
-/// Paged prefill attention: writes K/V to paged cache, uses per-head GEMM.
 pub fn forward_paged(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
@@ -818,7 +817,6 @@ pub fn forward_paged(
     paged_kv_write_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
-    _add_kernel: &CudaFunction,
     attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -1263,7 +1261,6 @@ pub fn decode_forward_paged(
     paged_attention_decode_kernel: &CudaFunction,
     rope_kernel: &CudaFunction,
     rmsnorm_kernel: &CudaFunction,
-    _add_kernel: &CudaFunction,
     attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,

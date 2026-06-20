@@ -45,10 +45,4 @@ impl CudaRuntime {
         Ok(ctx.default_stream())
     }
 
-    /// Get a new async stream for a given device ordinal.
-    pub fn new_stream(&self, ordinal: usize) -> anyhow::Result<Arc<CudaStream>> {
-        let ctx = self.device(ordinal)?;
-        ctx.new_stream()
-            .map_err(|e| anyhow::anyhow!("Failed to create stream for device {ordinal}: {:?}", e))
-    }
 }

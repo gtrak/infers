@@ -2,7 +2,7 @@
 //!
 //! Loads pre-compiled `.cubin` files and extracts kernel function handles.
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,16 +46,6 @@ impl KernelRegistry {
         self.kernels.get(name)
     }
 
-    /// Number of registered kernels.
-    pub fn len(&self) -> usize {
-        self.kernels.len()
-    }
-
-    /// Whether the registry is empty.
-    pub fn is_empty(&self) -> bool {
-        self.kernels.is_empty()
-    }
-
     /// Register the standard set of infers CUDA kernels.
     /// Paths point to .cubin files in the kernels/compiled/ directory.
     /// Uses CARGO_MANIFEST_DIR to resolve paths relative to the infers-cuda crate root.
@@ -68,14 +58,12 @@ impl KernelRegistry {
         self.register("infers_rope_bf16", kdir("rope.cubin"));
         self.register("infers_embedding_gather_bf16", kdir("embedding.cubin"));
         self.register("infers_add_bf16", kdir("elementwise.cubin"));
-        self.register("infers_argmax_f32", kdir("sampling.cubin"));
         self.register("infers_argmax_bf16", kdir("sampling.cubin"));
         self.register("infers_softmax_bf16", kdir("softmax.cubin"));
         self.register("infers_kv_cache_write_bf16", kdir("kv_cache.cubin"));
         self.register("infers_paged_kv_write_bf16", kdir("paged_kv_write.cubin"));
         self.register("infers_paged_kv_read_bf16", kdir("paged_kv_read.cubin"));
-        self.register("infers_gdn_update_bf16", kdir("gdn_update.cubin"));
-        self.register("infers_gdn_prefill_bf16", kdir("gdn_prefill.cubin"));
+   
         self.register("infers_gdn_mamba2_prefill_bf16", kdir("gdn_mamba2_prefill.cubin"));
         self.register("infers_gdn_mamba2_update_bf16", kdir("gdn_mamba2_update.cubin"));
         self.register("infers_gdn_gated_delta_prefill_bf16", kdir("gdn_gated_delta_prefill.cubin"));
@@ -145,29 +133,5 @@ impl LoadedKernelRegistry {
             .ok_or_else(|| anyhow::anyhow!("Module '{}' not loaded", cubin_path))?;
         module.load_function(function_name)
             .map_err(|e| anyhow::anyhow!("Failed to load function '{}': {:?}", function_name, e))
-    }
-
-    /// Launch a kernel with the given config and arguments.
-    ///
-    /// # Safety
-    /// The kernel launch is inherently unsafe (incorrect grid/block dims cause undefined behavior),
-    /// but we treat it as safe here because the caller controls the config.
-    ///
-    /// # Arguments
-    /// * `name` - Kernel function name
-    /// * `stream` - CUDA stream to enqueue on
-    /// * `config` - Grid/block/shared memory config
-    pub fn launch(
-        &self,
-        name: &str,
-        stream: &CudaStream,
-        config: LaunchConfig,
-    ) -> anyhow::Result<()> {
-        let func = self.get_function(name)?;
-        unsafe {
-            let _ = stream.launch_builder(&func).launch(config)
-                .map_err(|e| anyhow::anyhow!("Kernel launch '{}' failed: {:?}", name, e))?;
-        }
-        Ok(())
     }
 }

@@ -46,27 +46,12 @@ impl NcclCommunicator {
         Ok(Self { comms, rank, world_size })
     }
 
-    /// Get the rank of this communicator.
-    pub fn rank(&self) -> usize {
-        self.rank
-    }
-
-    /// Get the world size (total GPUs).
-    pub fn world_size(&self) -> usize {
-        self.world_size
-    }
-
     /// Get the comm for a specific rank/GPU.
     pub fn comm(&self, rank: usize) -> Option<&Comm> {
         self.comms.get(rank)
     }
 
-    /// Get all comms.
-    pub fn comms(&self) -> &[Comm] {
-        &self.comms
-    }
-
-    /// All-reduce across all ranks for a specific GPU's comm.
+   /// All-reduce across all ranks for a specific GPU's comm.
     pub fn all_reduce<T: NcclType>(
         &self,
         rank: usize,
