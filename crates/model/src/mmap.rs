@@ -383,7 +383,7 @@ fn mmap_slice_last_dim(tensor: &MmapTensor, gpu_id: usize, num_gpus: usize) -> R
 
     Ok(MmapTensor::new_strided(
         tensor.mmap_arc().expect("mmap_slice_last_dim requires mmap-backed tensor"),
-        unsafe { tensor.data().as_ptr() }, // base pointer to original mmap data
+        tensor.data().as_ptr(), // base pointer to original mmap data
         src_pitch,
         col_start_bytes,
         strided_width,
@@ -495,8 +495,6 @@ fn mmap_shard_fused_projection_rows(
 }
 
 /// Shard model weights across `num_gpus` devices for tensor parallelism (mmap version).
-///
-/// Follows the same sharding rules as [`shard_weights_tp`](super::sharding::shard_weights_tp) but
 /// operates on MmapTensor references. Contiguous splits (BF16 dim-0, INT4 dim-0) are zero-copy.
 /// Non-contiguous splits (BF16 last-dim, INT4 last-dim) produce strided tensors uploaded via cuMemcpy2D DMA.
 /// Fused QKV projections use per-segment column splitting matching the heap path.

@@ -24,7 +24,7 @@ fn make_request(id: usize, tokens: Vec<u32>) -> Request {
 #[test]
 fn test_full_session_lifecycle() {
     let kv = make_kv();
-    let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+  let mut sched = RoundRobinScheduler::new(4, 4, kv);
 
     // Enqueue 3 requests
     sched.enqueue_request(make_request(0, vec![1, 2, 3, 4, 5]));
@@ -84,7 +84,7 @@ fn test_full_session_lifecycle() {
 #[test]
 fn test_batch_builder_with_real_kv_manager() {
     let mut kv = make_kv();
-    let builder = BatchBuilder::new(4, 256);
+    let builder = BatchBuilder::new(4);
 
     // Create sessions with real KV sequences
     let mut sessions = Vec::new();
@@ -184,7 +184,7 @@ fn test_page_lifecycle_with_sessions() {
 #[test]
 fn test_scheduler_page_reclamation() {
     let kv = make_kv();
-    let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+   let mut sched = RoundRobinScheduler::new(4, 4, kv);
 
     // Get initial free page count
     let initial_free = sched.kv_manager.num_free_pages();
@@ -231,10 +231,10 @@ fn test_priority_queue_integration() {
     let config = SamplingConfig::default();
 
     // Mix priorities: interactive (high=10), background (low=0)
-    queue.enqueue(Request { id: 0, tokens: vec![1], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
-    queue.enqueue(Request { id: 1, tokens: vec![2], session_id: 0, config: config.clone(), priority: 10, routing_id: None });
-    queue.enqueue(Request { id: 2, tokens: vec![3], session_id: 0, config: config.clone(), priority: 5, routing_id: None });
-    queue.enqueue(Request { id: 3, tokens: vec![4], session_id: 0, config, priority: 10, routing_id: None });
+    queue.enqueue(Request { id: 0, tokens: vec![1], config: config.clone(), priority: 0, routing_id: None });
+    queue.enqueue(Request { id: 1, tokens: vec![2], config: config.clone(), priority: 10, routing_id: None });
+    queue.enqueue(Request { id: 2, tokens: vec![3], config: config.clone(), priority: 5, routing_id: None });
+    queue.enqueue(Request { id: 3, tokens: vec![4], config, priority: 10, routing_id: None });
 
     // Order should be: id1(10), id3(10), id2(5), id0(0)
     assert_eq!(queue.dequeue().unwrap().id, 1);

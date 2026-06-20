@@ -75,8 +75,4 @@ impl Session {
         self.num_generated_tokens >= self.max_tokens
     }
 
-    /// Returns the total number of tokens (prompt + generated).
-    pub fn total_tokens(&self) -> usize {
-        self.num_prompt_tokens + self.num_generated_tokens
-    }
-}
+   }

@@ -296,8 +296,6 @@ async fn run() -> Result<()> {
     };
 
     // Step 4: Create PagedKvManager for the scheduler
-    let kv_cache_dtype = infers_kv::KvCacheDtype::from(args.kv_cache_dtype);
-    let _ = &kv_cache_dtype;
 
     let page_size = args.page_size;
     let num_kv_heads = model_config.num_key_value_heads;
@@ -318,12 +316,9 @@ async fn run() -> Result<()> {
     // Step 5: Create RoundRobinScheduler
     let max_concurrent_sessions = 4;
     let max_batch_size = 4;
-    let max_tokens_per_batch = 1024;
-
     let scheduler = RoundRobinScheduler::new(
         max_concurrent_sessions,
         max_batch_size,
-        max_tokens_per_batch,
         kv_manager,
     );
 

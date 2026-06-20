@@ -364,10 +364,6 @@ impl PagedKvManager {
         self.head_dim
     }
 
-    /// Get the KV dimension (num_kv_heads * head_dim).
-    pub fn kv_dim(&self) -> usize {
-        self.num_kv_heads * self.head_dim
-    }
 
     /// Get the number of active sequences.
     pub fn num_sequences(&self) -> usize {

@@ -107,10 +107,6 @@ impl PagePool {
         self.free_list.is_empty()
     }
 
-    /// Check whether all pages are free.
-    pub fn is_empty(&self) -> bool {
-        self.free_list.len() == self.pages.len()
-    }
 
     /// Number of pages currently available for allocation.
     pub fn num_free(&self) -> usize {
@@ -129,12 +125,6 @@ impl PagePool {
         self.pages.get(page_id as usize)
     }
 
-    /// Look up a physical page by its ID with a mutable reference.
-    ///
-    /// Returns `None` if the page ID is out of range.
-    pub fn get_mut(&mut self, page_id: PageId) -> Option<&mut PhysicalPage> {
-        self.pages.get_mut(page_id as usize)
-    }
 
     /// Number of tokens each page can hold.
     pub fn page_size(&self) -> usize {
@@ -170,8 +160,7 @@ mod tests {
         assert_eq!(pool.num_free(), 4);
         assert_eq!(pool.num_total(), 4);
         assert!(!pool.is_full());
-        assert!(pool.is_empty()); // Fresh pool: all pages free
-
+        assert!(pool.num_free() == pool.num_total()); // Fresh pool: all pages free
         // Allocate all pages
         let p0 = pool.allocate().unwrap();
         let p1 = pool.allocate().unwrap();
@@ -186,7 +175,7 @@ mod tests {
         pool.free(p2);
         pool.free(p3);
         assert_eq!(pool.num_free(), 4);
-        assert!(pool.is_empty());
+        assert!(pool.num_free() == pool.num_total());
     }
 
     #[test]

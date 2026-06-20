@@ -2,8 +2,6 @@
 
 use std::collections::VecDeque;
 
-use infers_kv::SequenceId;
-
 // @lat: [[lat.md/lat#Scheduler#Sampling Strategy]]
 /// Sampling strategy selection for token generation.
 #[derive(Debug, Clone)]
@@ -66,8 +64,6 @@ pub struct Request {
     pub id: usize,
     /// Input token IDs (already tokenized).
     pub tokens: Vec<u32>,
-    /// Session ID to use for KV cache lookup (0 if not yet assigned).
-    pub session_id: SequenceId,
     /// Sampling configuration.
     pub config: SamplingConfig,
     /// Scheduling priority (higher = more important).
@@ -82,7 +78,6 @@ impl Request {
         Self {
             id,
             tokens,
-            session_id: 0,
             config,
             priority: 0,
             routing_id: None,
@@ -128,12 +123,7 @@ impl RequestQueue {
         self.queue.pop_front()
     }
 
-    /// Return a reference to the highest-priority request without removing it.
-    pub fn peek(&self) -> Option<&Request> {
-        self.queue.front()
-    }
-
-    /// Returns `true` if the queue is empty.
+   /// Returns `true` if the queue is empty.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -143,16 +133,7 @@ impl RequestQueue {
         self.queue.len()
     }
 
-    /// Remove all requests from the queue.
-    pub fn clear(&mut self) {
-        self.queue.clear();
-    }
-
-    /// Drain all requests from the queue, highest priority first.
-    pub fn drain(&mut self) -> Vec<Request> {
-        self.queue.drain(..).collect()
-    }
-}
+ }
 
 impl Default for RequestQueue {
     fn default() -> Self {
@@ -170,7 +151,6 @@ mod tests {
         let req = Request::new(0, vec![1, 2, 3], config);
         assert_eq!(req.id, 0);
         assert_eq!(req.tokens, vec![1, 2, 3]);
-        assert_eq!(req.session_id, 0);
     }
 
     #[test]
@@ -179,16 +159,15 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
         assert!(queue.dequeue().is_none());
-        assert!(queue.peek().is_none());
     }
 
     #[test]
     fn test_queue_fifo_within_priority() {
         let mut queue = RequestQueue::new();
         let config = SamplingConfig::default();
-        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
-        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 0, routing_id: None });
-        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 0, routing_id: None });
+        queue.enqueue(Request { id: 0, tokens: vec![], config: config.clone(), priority: 0, routing_id: None });
+        queue.enqueue(Request { id: 1, tokens: vec![], config: config.clone(), priority: 0, routing_id: None });
+        queue.enqueue(Request { id: 2, tokens: vec![], config, priority: 0, routing_id: None });
 
         assert_eq!(queue.dequeue().unwrap().id, 0);
         assert_eq!(queue.dequeue().unwrap().id, 1);
@@ -196,12 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_priority_ordering() {
+   fn test_queue_priority_ordering() {
         let mut queue = RequestQueue::new();
         let config = SamplingConfig::default();
-        queue.enqueue(Request { id: 0, tokens: vec![], session_id: 0, config: config.clone(), priority: 1, routing_id: None });
-        queue.enqueue(Request { id: 1, tokens: vec![], session_id: 0, config: config.clone(), priority: 3, routing_id: None });
-        queue.enqueue(Request { id: 2, tokens: vec![], session_id: 0, config, priority: 2, routing_id: None });
+        queue.enqueue(Request { id: 0, tokens: vec![], config: config.clone(), priority: 1, routing_id: None });
+        queue.enqueue(Request { id: 1, tokens: vec![], config: config.clone(), priority: 3, routing_id: None });
+        queue.enqueue(Request { id: 2, tokens: vec![], config, priority: 2, routing_id: None });
 
         // Should be ordered by priority: 3, 2, 1
         assert_eq!(queue.dequeue().unwrap().id, 1); // priority 3
@@ -209,36 +188,7 @@ mod tests {
         assert_eq!(queue.dequeue().unwrap().id, 0); // priority 1
     }
 
-    #[test]
-    fn test_queue_peek() {
-        let mut queue = RequestQueue::new();
-        let config = SamplingConfig::default();
-        queue.enqueue(Request::new(42, vec![1, 2], config));
-        assert_eq!(queue.peek().unwrap().id, 42);
-        assert_eq!(queue.len(), 1); // peek doesn't remove
-    }
-
-    #[test]
-    fn test_queue_clear() {
-        let mut queue = RequestQueue::new();
-        let config = SamplingConfig::default();
-        queue.enqueue(Request::new(0, vec![], config));
-        queue.clear();
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn test_queue_drain() {
-        let mut queue = RequestQueue::new();
-        let config = SamplingConfig::default();
-        queue.enqueue(Request::new(0, vec![], SamplingConfig { strategy: SamplingStrategy::Greedy, ..config.clone() }));
-        queue.enqueue(Request::new(1, vec![], config));
-        let drained = queue.drain();
-        assert_eq!(drained.len(), 2);
-        assert!(queue.is_empty());
-    }
-
-    #[test]
+   #[test]
     fn test_sampling_config_default() {
         let config = SamplingConfig::default();
         assert!(matches!(config.strategy, SamplingStrategy::Greedy));

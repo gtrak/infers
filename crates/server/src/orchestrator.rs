@@ -263,21 +263,4 @@ impl InferenceOrchestrator {
         Ok(())
     }
 
-    /// Number of active sessions.
-    #[allow(dead_code)]
-    pub fn active_count(&self) -> usize {
-        self.scheduler.active_count()
-    }
-
-    /// Number of pending (not yet admitted) requests.
-    #[allow(dead_code)]
-    pub fn pending_count(&self) -> usize {
-        self.scheduler.pending_count()
-    }
-
-    /// Whether the orchestrator has any work pending or in progress.
-    #[allow(dead_code)]
-    pub fn is_busy(&self) -> bool {
-        self.scheduler.is_busy()
-    }
 }

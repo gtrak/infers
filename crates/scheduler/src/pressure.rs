@@ -21,20 +21,6 @@ impl Default for PressureConfig {
     }
 }
 
-/// Outcome of a memory pressure check.
-#[derive(Debug)]
-pub enum PressureAction {
-    /// Pool utilization is below threshold — no action needed.
-    None,
-    /// Pool utilization is above threshold — evict this session.
-    SuggestEvict {
-        /// The session that should be evicted.
-        session_id: usize,
-        /// Its pool utilization at the time of check.
-        utilization: f64,
-    },
-}
-
 /// Check whether the page pool is under memory pressure.
 pub fn is_under_pressure(
     kv_manager: &infers_kv::PagedKvManager,

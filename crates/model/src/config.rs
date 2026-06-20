@@ -226,12 +226,6 @@ impl ModelConfig {
             .count()
     }
 
-    /// Number of GDN layers in the model.
-    pub fn num_gdn_layers(&self) -> usize {
-        (0..self.num_hidden_layers)
-            .filter(|&i| self.get_layer_type(i) == LayerType::GatedDeltaNet)
-            .count()
-    }
 
     /// Whether MTP (Multi-Token Prediction) is enabled.
     pub fn has_mtp(&self) -> bool {
@@ -431,9 +425,8 @@ mod tests {
 
         let config: ModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.num_full_attention_layers(), 16);
-        assert_eq!(config.num_gdn_layers(), 48);
-    }
 
+    }
     #[test]
     fn layer_count_methods_explicit_layer_types() {
         // 8 layers: 2 full attention, 6 GDN
@@ -464,9 +457,8 @@ mod tests {
 
         let config: ModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.num_full_attention_layers(), 2);
-        assert_eq!(config.num_gdn_layers(), 6);
-    }
 
+    }
     #[test]
     fn deserialize_with_text_config() {
         // Multimodal wrapper: architecture params are inside text_config.

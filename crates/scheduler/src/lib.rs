@@ -11,7 +11,7 @@ pub mod session;
 // Re-exports for convenience
 pub use batch::{BatchBuilder, DecodeBatch};
 pub use lifecycle::TransitionError;
-pub use pressure::{is_under_pressure, PressureAction, PressureConfig, select_lru_eviction_candidate};
+pub use pressure::{is_under_pressure, PressureConfig, select_lru_eviction_candidate};
 pub use queue::{Request, RequestQueue, SamplingConfig, SamplingStrategy};
 pub use scheduler::{RoundRobinScheduler, ScheduledWork};
 pub use session::{Session, SessionState};

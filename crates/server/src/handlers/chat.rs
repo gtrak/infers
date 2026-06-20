@@ -251,30 +251,6 @@ fn create_token_stream(
         .chain(done_stream)
 }
 
-/// Determine whether tools should be used based on request parameters.
-///
-/// Respects `enable_auto_tool_choice`: when false, tools are only activated
-/// if `tool_choice` explicitly requires them (i.e., is not "none"). When true
-/// (default), tools are automatically available for the model to call.
-#[allow(dead_code)]
-fn should_use_tools(req: &ChatCompletionRequest) -> bool {
-    let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
-    if !has_tools {
-        return false;
-    }
-
-    // If tool_choice is explicitly set to a string other than "none", use tools
-    if let Some(tool_choice) = &req.tool_choice {
-        match tool_choice {
-            infers_api::ToolChoice::String(s) if s == "none" => return false,
-            _ => return true,
-        }
-    }
-
-    // Otherwise, use tools only if enable_auto_tool_choice is true
-    req.enable_auto_tool_choice
-}
-
 /// Build a QwenChatTemplate from the request's chat_template_kwargs.
 ///
 /// Reads `enable_thinking` (default: true) and `preserve_thinking` (default: false)

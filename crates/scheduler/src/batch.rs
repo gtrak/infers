@@ -28,16 +28,13 @@ pub struct DecodeBatch {
 pub struct BatchBuilder {
     /// Maximum number of sessions in a single batch.
     pub max_batch_size: usize,
-    /// Maximum number of tokens across all sessions in a single batch.
-    pub max_tokens_per_batch: usize,
 }
 
 impl BatchBuilder {
     /// Create a new batch builder with the given limits.
-    pub fn new(max_batch_size: usize, max_tokens_per_batch: usize) -> Self {
+    pub fn new(max_batch_size: usize) -> Self {
         Self {
             max_batch_size,
-            max_tokens_per_batch,
         }
     }
 
@@ -149,7 +146,7 @@ mod tests {
     #[test]
     fn test_decode_batch_empty_for_inactive_sessions() {
         let kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
-        let builder = BatchBuilder::new(4, 128);
+        let builder = BatchBuilder::new(4);
         let sessions = vec![make_session(0, SessionState::Created, vec![1], 1, 0, 100)];
         let batch = builder.build_decode_batch(&sessions, &kv).unwrap();
         assert!(batch.sessions.is_empty());
@@ -165,7 +162,7 @@ mod tests {
         kv.append_page(seq1).unwrap();
         kv.append_page(seq2).unwrap();
 
-        let builder = BatchBuilder::new(2, 128);
+       let builder = BatchBuilder::new(2);
         let sessions = vec![
             make_session(seq1, SessionState::Decoding, vec![1, 2, 3], 2, 1, 100),
             make_session(seq2, SessionState::Decoding, vec![4, 5], 1, 1, 100),
@@ -185,7 +182,7 @@ mod tests {
             kv.append_page(id).unwrap();
         }
 
-        let builder = BatchBuilder::new(3, 128);
+        let builder = BatchBuilder::new(3);
         let sessions: Vec<_> = ids
             .into_iter()
             .map(|id| make_session(id, SessionState::Decoding, vec![id as u32], 1, 1, 100))
@@ -204,7 +201,7 @@ mod tests {
             kv.append_page(seq_id).unwrap();
         }
 
-        let builder = BatchBuilder::new(4, 128);
+        let builder = BatchBuilder::new(4);
         let mut sessions = vec![make_session(seq_id, SessionState::Created, vec![10, 20, 30], 3, 0, 100)];
 
         let batch = builder.build_prefill_batch(&mut sessions, &kv).unwrap();
@@ -217,7 +214,7 @@ mod tests {
     #[test]
     fn test_build_prefill_batch_no_pending() {
         let kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
-        let builder = BatchBuilder::new(4, 128);
+        let builder = BatchBuilder::new(4);
         let mut sessions = vec![];
         let result = builder.build_prefill_batch(&mut sessions, &kv);
         assert!(result.is_err());
@@ -227,16 +224,10 @@ mod tests {
     fn test_build_prefill_batch_skips_non_created() {
         let mut kv = PagedKvManager::new(100, 16, 4, 256, 1024, 65536);
         let seq_id = kv.create_sequence();
-        let builder = BatchBuilder::new(4, 128);
+        let builder = BatchBuilder::new(4);
         let mut sessions = vec![make_session(seq_id, SessionState::Decoding, vec![1], 1, 1, 100)];
         let result = builder.build_prefill_batch(&mut sessions, &kv);
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_batch_builder_new() {
-        let builder = BatchBuilder::new(8, 512);
-        assert_eq!(builder.max_batch_size, 8);
-        assert_eq!(builder.max_tokens_per_batch, 512);
-    }
 }

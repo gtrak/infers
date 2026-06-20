@@ -328,8 +328,7 @@ fn get_weight_or_int4(
     // then fall back to registry.tensors (non-sharded path).
     let qweight_name_ref = &qweight_name;
     if registry.int4_companions.contains_key(qweight_name_ref) {
-        // Sharded path: companions already populated by shard_weights_tp
-        return Ok(qweight);
+        // Sharded path: companions already populated by sharding
     }
 
     // Non-sharded path: extract from tensors and store in int4_companions
@@ -374,8 +373,7 @@ fn get_weight_or_int4_optional(
     // Extract companion tensors — check int4_companions first (populated by sharding),
     // then fall back to registry.tensors (non-sharded path).
     if registry.int4_companions.contains_key(&qweight_name) {
-        // Sharded path: companions already populated by shard_weights_tp
-        return Ok(Some(qweight));
+        // Sharded path: companions already populated by sharding
     }
 
     // Non-sharded path: extract from tensors and store in int4_companions

@@ -63,16 +63,6 @@ pub fn complete_session(session: &mut Session) -> Result<(), TransitionError> {
     transition(session, SessionState::Completed)
 }
 
-/// Transition a session to Paused (temporarily stop processing).
-pub fn pause_session(session: &mut Session) -> Result<(), TransitionError> {
-    transition(session, SessionState::Paused)
-}
-
-/// Transition a paused session back to Decoding (resume generation).
-pub fn resume_session(session: &mut Session) -> Result<(), TransitionError> {
-    transition(session, SessionState::Decoding)
-}
-
 /// Transition a session from Created to Prefilling (begin prompt processing).
 pub fn start_prefill(session: &mut Session) -> Result<(), TransitionError> {
     transition(session, SessionState::Prefilling)
@@ -123,15 +113,6 @@ mod tests {
         let mut s = make_session(SessionState::Decoding);
         assert!(complete_session(&mut s).is_ok());
         assert_eq!(s.state, SessionState::Completed);
-    }
-
-    #[test]
-    fn test_valid_decoding_to_paused_and_back() {
-        let mut s = make_session(SessionState::Decoding);
-        assert!(pause_session(&mut s).is_ok());
-        assert_eq!(s.state, SessionState::Paused);
-        assert!(resume_session(&mut s).is_ok());
-        assert_eq!(s.state, SessionState::Decoding);
     }
 
     #[test]

@@ -50,18 +50,17 @@ pub struct RoundRobinScheduler {
 }
 
 impl RoundRobinScheduler {
-    /// Create a new round-robin scheduler.
+   /// Create a new round-robin scheduler.
     pub fn new(
         max_concurrent_sessions: usize,
         max_batch_size: usize,
-        max_tokens_per_batch: usize,
         kv_manager: PagedKvManager,
     ) -> Self {
         Self {
             request_queue: RequestQueue::new(),
             active_sessions: Vec::new(),
             max_concurrent_sessions,
-            batch_builder: BatchBuilder::new(max_batch_size, max_tokens_per_batch),
+            batch_builder: BatchBuilder::new(max_batch_size),
             kv_manager,
             pressure_config: PressureConfig::default(),
         }
@@ -120,20 +119,6 @@ impl RoundRobinScheduler {
             return Ok(None);
         }
 
-        let candidate_idx =
-            pressure::select_lru_eviction_candidate(&self.active_sessions);
-
-        match candidate_idx {
-            Some(idx) => self.evict_session_at(idx),
-            None => Ok(None),
-        }
-    }
-
-    /// Find and evict an idle session using LRU policy.
-    ///
-    /// Selects the evictable session with the oldest `last_activity` and
-    /// transitions it to `Evicted` state.
-    pub fn select_and_evict_idle_session(&mut self) -> Result<Option<usize>> {
         let candidate_idx =
             pressure::select_lru_eviction_candidate(&self.active_sessions);
 
@@ -258,7 +243,7 @@ mod tests {
     #[test]
     fn test_scheduler_empty_initially() {
         let kv = make_kv_manager();
-        let sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let sched = RoundRobinScheduler::new(4, 4, kv);
         assert_eq!(sched.active_count(), 0);
         assert_eq!(sched.pending_count(), 0);
         assert!(!sched.is_busy());
@@ -267,7 +252,7 @@ mod tests {
     #[test]
     fn test_scheduler_enqueue_and_admit() {
         let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let mut sched = RoundRobinScheduler::new(4, 4, kv);
         sched.enqueue_request(make_request(0, vec![1, 2, 3]));
         sched.enqueue_request(make_request(1, vec![4, 5]));
         assert_eq!(sched.pending_count(), 2);
@@ -284,7 +269,7 @@ mod tests {
     #[test]
     fn test_scheduler_respects_max_concurrent() {
         let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(2, 4, 128, kv);
+       let mut sched = RoundRobinScheduler::new(2, 4, kv);
         for i in 0..5 {
             sched.enqueue_request(make_request(i, vec![i as u32]));
         }
@@ -298,7 +283,7 @@ mod tests {
     fn test_create_session_allocates_pages() {
         let kv = make_kv_manager();
         let free_before = kv.num_free_pages();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let mut sched = RoundRobinScheduler::new(4, 4, kv);
         sched.enqueue_request(make_request(0, vec![1, 2, 3]));
         let _ = sched.schedule().unwrap();
         // Session was admitted and pages allocated
@@ -309,7 +294,7 @@ mod tests {
     #[test]
     fn test_scheduler_cleanup_completed() {
         let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let mut sched = RoundRobinScheduler::new(4, 4, kv);
         sched.enqueue_request(make_request(0, vec![1, 2, 3]));
         sched.enqueue_request(make_request(1, vec![4, 5]));
 
@@ -338,7 +323,7 @@ mod tests {
     #[test]
     fn test_schedule_decode_and_prefill_interleaving() {
         let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let mut sched = RoundRobinScheduler::new(4, 4, kv);
         sched.enqueue_request(make_request(0, vec![1, 2, 3]));
 
         // First schedule: admit and prefill
@@ -360,36 +345,10 @@ mod tests {
     #[test]
     fn test_is_busy_with_pending() {
         let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
+        let mut sched = RoundRobinScheduler::new(4, 4, kv);
         assert!(!sched.is_busy());
         sched.enqueue_request(make_request(0, vec![1]));
         assert!(sched.is_busy());
     }
 
-    #[test]
-    fn test_scheduler_evicts_idle_session() {
-        let kv = make_kv_manager();
-        let mut sched = RoundRobinScheduler::new(4, 4, 128, kv);
-        sched.enqueue_request(make_request(0, vec![1, 2]));
-        let _ = sched.schedule().unwrap();
-
-        // Session was created — recently, so not evictable
-        let evicted = sched.select_and_evict_idle_session().unwrap();
-        assert!(evicted.is_none());
-
-        // Simulate the session being idle for a while
-        if let Some(session) = sched.active_sessions.first_mut() {
-            // Transition to Decoding first (needed for evict transition)
-            let _ = crate::lifecycle::start_prefill(session);
-            let _ = crate::lifecycle::finish_prefill(session);
-            // Manually set last_activity to be old enough to be evictable
-            session.last_activity = Instant::now() - std::time::Duration::from_secs(60);
-        }
-
-        // Now the session is evictable
-        let evicted = sched.select_and_evict_idle_session().unwrap();
-        assert!(evicted.is_some());
-        // Session should be removed from active_sessions
-        assert_eq!(sched.active_count(), 0);
-    }
-}
+ }
