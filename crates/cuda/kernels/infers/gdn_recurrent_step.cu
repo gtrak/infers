@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Single-step Gated Delta Rule recurrent kernel.
 ///
 /// Processes exactly ONE token of the recurrence (all heads in parallel).

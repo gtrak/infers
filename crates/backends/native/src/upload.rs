@@ -102,7 +102,7 @@ pub fn bytes_to_bf16(data: &[u8], dtype: WeightDtype) -> Result<Vec<bf16>> {
 ///
 /// Preserves FP16 data as-is without converting to BF16, maintaining full
 /// 10-bit mantissa precision for INT4 quantization scales.
-// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#INT4 Triplet Upload]]
+// @lat: [[lat.md/lat#Forward Engine#INT4 Triplet Upload]]
 pub fn bytes_to_fp16(data: &[u8], dtype: WeightDtype) -> Result<Vec<f16>> {
     match dtype {
         WeightDtype::Fp16 => {
@@ -138,7 +138,7 @@ pub fn bytes_to_fp16(data: &[u8], dtype: WeightDtype) -> Result<Vec<f16>> {
 ///
 /// # Returns
 /// `(qweight_gpu, scales_gpu, qzeros_gpu)` triple of GPU buffers.
-// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#INT4 Triplet Upload]]
+// @lat: [[lat.md/lat#Forward Engine#INT4 Triplet Upload]]
 pub fn upload_int4_weight(
     stream: &Arc<CudaStream>,
     qweight: &WeightData,

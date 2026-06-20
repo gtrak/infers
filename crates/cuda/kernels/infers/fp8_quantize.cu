@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// FP8 quantize and dequantize kernels for KV cache quantization.
 ///
 /// BF16→FP8 quantize: converts BF16 values to FP8 E4M3 or E5M2 bytes.

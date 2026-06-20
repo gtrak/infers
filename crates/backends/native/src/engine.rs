@@ -579,7 +579,7 @@ impl ForwardEngine {
     ///
     /// # Returns
     /// Tuple of (number of pages allocated, first sampled token ID).
-    // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Prefill Path]]
+    // @lat: [[lat.md/lat#Forward Engine#Paged Prefill Path]]
     pub fn prefill_paged(
         &mut self,
         _stream: &Arc<CudaStream>,
@@ -986,7 +986,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
     ///
     /// # Returns
     /// The sampled token ID for the next generated token.
-    // @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Paged Decode Path]]
+    // @lat: [[lat.md/lat#Forward Engine#Paged Decode Path]]
     pub fn decode_paged(
         &mut self,
         _stream: &Arc<CudaStream>,

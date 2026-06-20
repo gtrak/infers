@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Argmax sampling kernel — greedy token selection from FP32 logits.
 ///
 /// For each row of logits, finds the index of the maximum value.

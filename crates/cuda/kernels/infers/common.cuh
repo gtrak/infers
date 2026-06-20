@@ -1,4 +1,4 @@
-/// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+/// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Common utilities for infers CUDA kernels — BF16 helpers, block size constants,
 /// and shared launch parameters used across all kernel implementations.
 

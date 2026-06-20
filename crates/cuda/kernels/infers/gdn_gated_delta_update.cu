@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Gated Delta Rule single-token update kernel for decode.
 ///
 /// No shared memory — state is kept and modified in global memory.

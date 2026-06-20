@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// RMSNorm kernel — Root Mean Square Layer Normalization for BF16 tensors.
 ///
 /// Qwen3_5 uses zero-initialized weights with additive offset: output = x * rsqrt(mean(x^2) + eps) * (1 + weight)

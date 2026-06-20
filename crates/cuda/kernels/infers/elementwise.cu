@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Element-wise operation kernels for BF16 tensors.
 ///
 /// Simple element-wise operations used for residual connections and

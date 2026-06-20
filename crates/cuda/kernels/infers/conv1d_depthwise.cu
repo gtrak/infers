@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Depthwise 1D convolution with SiLU activation for GDN linear attention.
 ///
 /// Operates on [B, D, T] channels-first layout (PyTorch conv1d convention).

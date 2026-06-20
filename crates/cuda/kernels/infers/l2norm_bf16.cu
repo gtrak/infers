@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// L2 normalization kernel — normalizes each row of a BF16 tensor to unit length.
 ///
 /// For each row: output[i] = input[i] / sqrt(sum(input^2) + eps)

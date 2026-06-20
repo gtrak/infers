@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Gated DeltaNet (GDN) prefill kernel — processes all tokens in a sequence.
 ///
 /// Processes the entire token sequence in a single kernel launch. Each block

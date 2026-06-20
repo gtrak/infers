@@ -15,7 +15,7 @@ use infers_kv::PageId;
 /// Each layer has its own `HashMap<PageId, Vec<u8>>` mapping page IDs to
 /// their raw K/V data bytes. Pages from all layers for the same token
 /// range are stored separately.
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Backend Eviction Store]]
+// @lat: [[lat.md/lat#Paged Attention Implementation#BackendEvictionStore]]
 #[derive(Debug)]
 pub struct BackendEvictionStore {
     /// One map per layer: PageId → raw page data bytes.

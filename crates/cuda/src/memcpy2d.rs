@@ -9,7 +9,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut};
 use cudarc::driver::sys;
 
-// @lat: [[lat#Phase 4.7 Deliverables#Mmap Weight Upload]]
+// @lat: [[lat#Mmap Weight Upload]]
 /// Copy a 2D region from host memory to device memory using DMA.
 ///
 /// `base_ptr` — host pointer to the first row of the source tensor (original tensor base)

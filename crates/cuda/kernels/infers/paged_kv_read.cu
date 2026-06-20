@@ -1,4 +1,4 @@
-// @lat: [[lat#Phase 4.6 Deliverables]]
+// @lat: [[lat#Paged KV Types]]
 /// Paged KV cache read kernel for gathering K and V data from paged storage
 /// into contiguous output buffers.
 ///

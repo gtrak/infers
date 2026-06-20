@@ -3,7 +3,7 @@
 using the same 15 token IDs as our engine.
 
 Output: float32 .npy files in /tmp/ref_attn_l3/
-# @lat: [[lat.md/lat#Re-exports#Full-Attention Reference Tests (Layer 3)]]
+# @lat: [[testing#Re-exports#Full-Attention Reference Tests (Layer 3)]]
 """
 
 import os

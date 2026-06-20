@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// RMSNorm with SiLU-gated output (Qwen3_5RMSNormGated).
 ///
 /// Computes:

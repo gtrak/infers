@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Token embedding gather kernel for BF16 tensors.
 ///
 /// Gathers rows from an embedding weight matrix based on token IDs.

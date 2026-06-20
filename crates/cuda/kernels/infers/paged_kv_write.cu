@@ -1,4 +1,4 @@
-// @lat: [[lat#Phase 4.6 Deliverables]]
+// @lat: [[lat#Paged KV Types]]
 /// Paged KV cache write kernel for writing K and V tensors into the paged KV cache.
 ///
 /// Each thread processes one (token, dimension) pair using a strided loop.

@@ -6,7 +6,7 @@ use infers_kv::{SequenceId, SequencePageTable};
 
 use crate::queue::SamplingConfig;
 
-// @lat: [[lat.md/lat#Scheduler#Session State]]
+// @lat: [[lat.md/lat#Scheduler#Session#Session State]]
 /// The lifecycle state of an inference session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {

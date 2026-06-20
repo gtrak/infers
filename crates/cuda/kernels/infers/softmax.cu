@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Online softmax kernel for attention scores with optional causal masking.
 ///
 /// Uses the numerically stable online softmax algorithm: find row-wise max

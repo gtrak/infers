@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// SiLU and SwiGLU activation kernels for BF16 tensors.
 ///
 /// SiLU: output = x * sigmoid(x)
@@ -51,7 +51,7 @@ __global__ void infers_silu_glu_bf16(
         output[i] = __float2bfloat16(x_val * g_val * sig);
     }
 }
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Attention output gate kernel: output[i] = x[i] * sigmoid(gate[i])
 ///
 /// Unlike SwiGLU (x * gate * sigmoid(gate)), this applies only the sigmoid to the gate.

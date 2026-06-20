@@ -16,7 +16,7 @@ use super::prefix::{PageHash, PrefixCache};
 use super::table::SequencePageTable;
 use thiserror::Error;
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#CowResult]]
+// @lat: [[lat.md/lat#Paged KV Types#CowResult]]
 /// Result of a copy-on-write check.
 ///
 /// Returned by [`ensure_mutable_page`] to indicate whether the caller can write
@@ -42,7 +42,7 @@ pub enum CowResult {
     },
 }
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#CowError]]
+// @lat: [[lat.md/lat#Paged KV Types#CowError]]
 /// Errors produced by COW operations.
 #[derive(Debug, Error)]
 pub enum CowError {
@@ -54,7 +54,7 @@ pub enum CowError {
     InvalidPageId(PageId),
 }
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#ensure_mutable_page]]
+// @lat: [[lat.md/lat#Paged KV Types#ensure_mutable_page]]
 /// Ensure that the tail page of a sequence is exclusively owned and mutable.
 ///
 /// Checks the current tail page's refcount and state:
@@ -129,7 +129,7 @@ pub fn ensure_mutable_page(
     }
 }
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#decrement_page_refcount]]
+// @lat: [[lat.md/lat#Paged KV Types#decrement_page_refcount]]
 /// Decrement the refcount of a page in the pool.
 ///
 /// Returns the new refcount value after decrementing. Used when a sequence
@@ -146,7 +146,7 @@ pub fn decrement_page_refcount(pool: &mut PagePool, page_id: PageId) -> u32 {
     page.refcount.fetch_sub(1, SeqCst)
 }
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#try_share_from_prefix_cache]]
+// @lat: [[lat.md/lat#Paged KV Types#try_share_from_prefix_cache]]
 /// Attempt to share an existing page from the prefix cache.
 ///
 /// Looks up `hash` in the prefix cache. If found:
@@ -446,7 +446,7 @@ mod tests {
 
     /// Verify that after COW on a shared page, the original page remains
     /// completely unchanged: state, refcount, and identity are preserved.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#ensure_mutable_page]]
+    // @lat: [[lat.md/lat#Paged KV Types#ensure_mutable_page]]
     #[test]
     fn test_cow_immutable_original() {
         let mut pool = PagePool::new(8, 16, 8, 128);

@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// KV cache write kernel for writing K and V tensors into a paged KV cache.
 ///
 /// Each thread writes one element of K and V at its assigned position in the

@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Mamba2 SSM single-token decode kernel for Qwen3.6-27B GDN layers.
 ///
 /// Implements the Mamba2-style SSM recurrence on pre-computed BF16 projections

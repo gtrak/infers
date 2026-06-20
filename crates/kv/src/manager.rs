@@ -14,11 +14,11 @@ use super::prefix::{hash_page, PrefixCache};
 use super::table::SequencePageTable;
 use thiserror::Error;
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#SequenceId]]
+// @lat: [[lat.md/lat#Paged KV Types#SequenceId]]
 /// Identifier for a sequence in the manager.
 pub type SequenceId = usize;
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#ManagerError]]
+// @lat: [[lat.md/lat#Paged KV Types#ManagerError]]
 /// Errors produced by the [`PagedKvManager`].
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -33,7 +33,7 @@ pub enum ManagerError {
     Eviction(#[from] super::eviction::EvictionError),
 }
 
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
+// @lat: [[lat.md/lat#Paged KV Types#PagedKvManager]]
 /// Orchestrates paged KV cache management.
 ///
 /// Manages sequences, page allocation, prefix caching, copy-on-write,
@@ -375,7 +375,7 @@ impl PagedKvManager {
     }
 
     /// Get the size of a single page in bytes.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager]]
     pub fn page_bytes(&self) -> usize {
         self.page_bytes
     }
@@ -397,7 +397,7 @@ impl PagedKvManager {
     /// # Errors
     /// Returns `InvalidSequence` if the sequence doesn't exist.
     /// Returns `Eviction` if the CPU pool is full or data sizes mismatch.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     pub fn evict_sequence(
         &mut self,
         seq_id: SequenceId,
@@ -466,7 +466,7 @@ impl PagedKvManager {
     /// # Errors
     /// Returns `PoolExhausted` if not enough pages are available.
     /// Returns `Eviction` if page data is missing from the CPU pool.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     pub fn restore_sequence(
         &mut self,
         evicted: EvictedSequence,
@@ -790,7 +790,7 @@ mod tests {
     /// Verify logical token position maps correctly to physical page ID
     /// via the block table: logical_page = token_pos / page_size,
     /// token_in_page = token_pos % page_size.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#SequencePageTable]]
+    // @lat: [[lat.md/lat#Paged KV Types#SequencePageTable]]
     #[test]
     fn test_block_table_mapping() {
         let page_size = 16;
@@ -840,7 +840,7 @@ mod tests {
 
     /// Verify pages returned to pool after prefix cache eviction
     /// are reclaimable for new allocations.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagePool]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagePool]]
     #[test]
     fn test_page_reclamation() {
         let page_size = 16;
@@ -881,7 +881,7 @@ mod tests {
 
     /// Integration test: two sequences sharing same prefix cache entry
     /// should end up referencing the same physical page ID.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PrefixCache]]
+    // @lat: [[lat.md/lat#Paged KV Types#PrefixCache]]
     #[test]
     fn test_prefix_cache_hit_integration() {
         let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
@@ -928,7 +928,7 @@ mod tests {
 
     /// Integration test: root sequence, branch sequence sharing prefix pages,
     /// COW on branch write, root's pages unchanged.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager]]
     #[test]
     fn test_deep_branching() {
         let mut manager = PagedKvManager::new(16, 16, 8, 128, 1024, 65536);
@@ -1003,7 +1003,7 @@ mod tests {
     }
 
     /// End-to-end eviction and restoration of a sequence with two pages.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     #[test]
     fn test_evict_and_restore_sequence() {
         let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     /// Evicting an empty sequence fails.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     #[test]
     fn test_evict_empty_sequence_fails() {
         let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     /// Restoration allocates new pages and retrieves data from CPU pool.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     #[test]
     fn test_restore_reuses_pages() {
         let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     /// Eviction tracking methods report correct utilization.
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged KV Types#PagedKvManager#Eviction]]
+    // @lat: [[lat.md/lat#Paged KV Types#PagedKvManager#Eviction]]
     #[test]
     fn test_eviction_utilization() {
         let mut manager = PagedKvManager::new(8, 16, 8, 128, 1024, 65536);

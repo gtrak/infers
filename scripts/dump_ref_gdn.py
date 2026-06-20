@@ -5,7 +5,7 @@ using the same prompt as the smoke test.
 
 Output: float32 .npy files in /tmp/ref_gdn_new/
 Matching file names and shapes against our engine's TP=2 dump format.
-# @lat: [[lat.md/lat#Re-exports#GDN Reference Tests]]
+# @lat: [[testing#Re-exports#GDN Reference Tests]]
 """
 
 import os

@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Gated Delta Rule prefill kernel — processes all tokens in a sequence.
 ///
 /// State is kept in global memory (no shared memory dependency).

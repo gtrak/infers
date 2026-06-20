@@ -108,7 +108,7 @@ pub struct ModelConfig {
     pub mtp_use_dedicated_embeddings: bool,
 
     /// Whether the Q projection includes an attention output gate (doubled Q output).
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+// @lat: [[lat.md/lat#Paged Attention Implementation#Attention Output Gate]]
     #[serde(default)]
     pub attn_output_gate: bool,
 

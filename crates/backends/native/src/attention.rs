@@ -87,7 +87,7 @@ impl KvCache {
 /// - Prefix sharing across sequences
 /// - Copy-on-write page sharing
 ///
-/// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#PagedKvCache]]
+/// @lat: [[lat.md/lat#Paged Attention Implementation#PagedKvCache]]
 #[derive(Debug)]
 pub struct PagedKvCache {
     /// GPU buffer holding all paged KV data: [num_pages * 2 * page_size * kv_dim].
@@ -176,7 +176,7 @@ impl PagedKvCache {
 /// * `seq_len` — Number of tokens to write
 /// * `kv_dim` — num_kv_heads × head_dim
 /// * `page_size` — Tokens per page
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Paged Kernel Dispatch]]
+// @lat: [[lat.md/lat#Paged Attention Implementation#Paged Kernel Dispatch]]
 pub fn paged_kv_write(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -236,7 +236,7 @@ pub fn paged_kv_write(
 /// * `num_cached_tokens` — Number of cached tokens to gather
 /// * `kv_dim` — num_kv_heads × head_dim
 /// * `page_size` — Tokens per page
-// @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Paged Kernel Dispatch]]
+// @lat: [[lat.md/lat#Paged Attention Implementation#Paged Kernel Dispatch]]
 pub fn paged_kv_read(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -758,7 +758,7 @@ pub fn forward(
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
     // =========================================================================
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+    // @lat: [[lat.md/lat#Paged Attention Implementation#Attention Output Gate]]
     let gated_attn = if let Some(ref gate_heads) = gate_heads {
         let mut gated = stream.alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
@@ -1202,7 +1202,7 @@ pub fn forward_paged(
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
     // =========================================================================
-    // @lat: [[lat.md/lat#Phase 4.6 Deliverables#Paged Attention Implementation#Attention Output Gate]]
+    // @lat: [[lat.md/lat#Paged Attention Implementation#Attention Output Gate]]
     let gated_attn = if let Some(ref gate_heads) = gate_heads {
         let mut gated = stream
             .alloc_zeros::<bf16>(attn_combined_size)

@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Gated DeltaNet (GDN) decode kernel — recurrent state update for a single token.
 ///
 /// One block per state row. Each block cooperatively computes the dot product

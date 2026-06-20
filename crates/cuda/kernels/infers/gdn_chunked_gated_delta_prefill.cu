@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Chunked parallel Gated Delta Rule prefill kernel.
 ///
 /// Implements the chunked parallel GDN attention algorithm matching HF's

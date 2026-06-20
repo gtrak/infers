@@ -20,7 +20,7 @@ use crate::norm;
 use crate::sample;
 use crate::sync;
 
-// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Prefill Path]]
+// @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
 /// Kernel handles needed for the prefill pass.
 pub struct PrefillKernels {
     pub rmsnorm: CudaFunction,
@@ -43,7 +43,7 @@ pub struct PrefillKernels {
     pub attn_output_gate: CudaFunction,
 }
 
-// @lat: [[lat.md/lat#Phase 4 Deliverables#Forward Engine#Prefill Path]]
+// @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
 /// Execute the full prefill forward pass.
 ///
 /// 1. Embed all prompt tokens

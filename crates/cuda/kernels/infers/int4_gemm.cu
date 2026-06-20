@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Custom INT4 GEMM kernel with per-group dequantization in registers.
 ///
 /// Computes: output = dequant(weight) @ input

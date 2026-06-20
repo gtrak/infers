@@ -1,4 +1,4 @@
-// @lat: [[lat#Kernel Extraction and Build System#Kernel Source Files]]
+// @lat: [[arch#Kernel Extraction and Build System#Kernel Source Files]]
 /// Rotary Position Embedding (RoPE) kernel for BF16 tensors.
 ///
 /// Applies standard RoPE to query and key tensors. Operates on

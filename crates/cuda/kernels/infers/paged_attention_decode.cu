@@ -1,4 +1,4 @@
-// @lat: [[lat#Phase 4.6 Deliverables]]
+// @lat: [[lat#Paged KV Types]]
 /// Paged attention decode kernel for single-token inference.
 ///
 /// Computes attention for one query token against all cached K/V tokens
