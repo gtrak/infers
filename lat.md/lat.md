@@ -315,7 +315,7 @@ Configuration for token sampling including temperature, top_p, top_k parameters.
 
 ## Request
 
-Scheduler request type wrapping a session ID, prompt tokens, and sampling configuration. See [[crates/scheduler/src/queue.rs#Request]].
+Scheduler request type wrapping prompt tokens, sampling configuration, priority, and routing ID. See [[crates/scheduler/src/queue.rs#Request]].
 
 ## RequestQueue
 

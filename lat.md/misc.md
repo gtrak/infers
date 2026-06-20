@@ -121,9 +121,6 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 
 After `clear_data()` (heap path) and `clear_owned_data()` (mmap path), `trim_memory()` calls `malloc_trim(0)` to force glibc to return freed memory to the OS, reducing VmData. On Linux only — no-op on other platforms. See [[crates/backends/native/src/engine.rs#trim_memory]].
 
-## GpuAllocator Encapsulation
-
-`GpuAllocator` fields are now private with accessor methods. The `free()` method has overflow protection and derives `Debug` and `Clone`.
 
 ## Build Script Safety
 
@@ -269,11 +266,11 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CUDA crate (`infers-cuda`) with cudarc always present — no feature gating
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
-- KernelRegistry for .cubin loading (20 infers kernels: rmsnorm, silu, silu_glu, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- KernelRegistry for .cubin loading (23 infers kernels: rmsnorm, silu, silu_glu, attn_output_gate, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_gated_delta_update, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, conv1d_depthwise_silu, rms_norm_gated, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
 - GemmEngine wrapping cuBLASLt with BF16 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_bf16()` accepts `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_recurrent_step.cu, gdn_gated_delta_prefill.cu, gdn_chunked_gated_delta_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, common.cuh
+- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_recurrent_step.cu, gdn_gated_delta_prefill.cu, gdn_gated_delta_update.cu, gdn_chunked_gated_delta_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, argmax.cu, conv1d_depthwise.cu, l2norm_bf16.cu, rms_norm_gated.cu, common.cuh
 - Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 - Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
 

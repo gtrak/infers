@@ -2,7 +2,7 @@
 
 Convenience re-exports from `infers_scheduler` crate root for ergonomic downstream usage.
 
-The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Request`, `RequestQueue`, `SamplingConfig`, `SamplingStrategy`, `RoundRobinScheduler`, `ScheduledWork`, `Session`, `SessionState`, `PressureConfig`, `PressureAction`, `is_under_pressure`, and `select_lru_eviction_candidate` so consumers can import directly from `infers_scheduler::` without nested module paths. See [[crates/scheduler/src/lib.rs]].
+The crate root re-exports `BatchBuilder`, `DecodeBatch`, `TransitionError`, `Request`, `RequestQueue`, `SamplingConfig`, `SamplingStrategy`, `RoundRobinScheduler`, `ScheduledWork`, `Session`, `SessionState`, `PressureConfig`, `is_under_pressure`, and `select_lru_eviction_candidate` so consumers can import directly from `infers_scheduler::` without nested module paths. See [[crates/scheduler/src/lib.rs]].
 
 ## Integration Tests
 
