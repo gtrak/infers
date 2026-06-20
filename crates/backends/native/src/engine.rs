@@ -62,8 +62,6 @@ struct PerGpuKernels {
     gdn_prefill: CudaFunction,
     gdn_update: CudaFunction,
     paged_kv_write: CudaFunction,
-    #[allow(dead_code)]
-    paged_kv_read: CudaFunction,
     paged_attention_decode: CudaFunction,
     fp8_quantize: CudaFunction,
     fp8_dequantize: CudaFunction,
@@ -148,7 +146,6 @@ impl ForwardEngine {
                 gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
                 gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
                 paged_kv_write: kernels.get_function("infers_paged_kv_write_bf16")?,
-                paged_kv_read: kernels.get_function("infers_paged_kv_read_bf16")?,
                 paged_attention_decode: kernels.get_function("infers_paged_attention_decode_bf16")?,
                 fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
                 fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,

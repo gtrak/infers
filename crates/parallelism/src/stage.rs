@@ -55,16 +55,6 @@ impl PipelineStage {
             comm: StageComm::new(nccl, rank, peer_rank),
         }
     }
-
-    /// Number of layers in this stage.
-    pub fn num_layers(&self) -> usize {
-        self.end_layer - self.start_layer
-    }
-
-    /// Whether this stage manages the given layer index.
-    pub fn contains_layer(&self, layer_idx: usize) -> bool {
-        (self.start_layer..self.end_layer).contains(&layer_idx)
-    }
 }
 
 /// Lightweight GDN state descriptor used for state tracking.
@@ -94,11 +84,6 @@ impl GdnStateRef {
             hidden_size,
             is_initialized: false,
         }
-    }
-
-    /// Mark this state as initialized.
-    pub fn mark_initialized(&mut self) {
-        self.is_initialized = true;
     }
 }
 
@@ -203,16 +188,6 @@ mod tests {
         let state = GdnStateRef::new();
         assert_eq!(state.hidden_size, 0);
         assert!(!state.is_initialized);
-    }
-
-    #[test]
-    fn test_gdn_state_ref_with_hidden_size() {
-        let mut state = GdnStateRef::with_hidden_size(5120);
-        assert_eq!(state.hidden_size, 5120);
-        assert!(!state.is_initialized);
-
-        state.mark_initialized();
-        assert!(state.is_initialized);
     }
 
     #[test]

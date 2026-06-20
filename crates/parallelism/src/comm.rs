@@ -9,10 +9,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
-use half::bf16;
 use infers_cuda::nccl::NcclCommunicator;
-use infers_cuda::CudaSlice;
 
 /// Stage-to-stage hidden state transfer via NCCL P2P.
 ///
@@ -38,25 +35,6 @@ impl StageComm {
         Self { nccl, rank, peer_rank }
     }
 
-    /// Send hidden states to the next pipeline stage.
-    ///
-    /// `hidden` is a BF16 tensor on the GPU, typically the output of
-    /// `forward_stage0` before being passed to `forward_stage1`.
-    pub fn send_hidden(&self, hidden: &CudaSlice<bf16>) -> Result<()> {
-        self.nccl
-            .send(self.rank, hidden, self.peer_rank as i32)
-            .map_err(|e| anyhow::anyhow!("StageComm send failed: {e}"))
-    }
-
-    /// Receive hidden states from the previous pipeline stage.
-    ///
-    /// `hidden` is a pre-allocated mutable BF16 tensor on the GPU that
-    /// will be filled with the received hidden states.
-    pub fn recv_hidden(&self, hidden: &mut CudaSlice<bf16>) -> Result<()> {
-        self.nccl
-            .recv(self.rank, hidden, self.peer_rank as i32)
-            .map_err(|e| anyhow::anyhow!("StageComm recv failed: {e}"))
-    }
 
     /// The NCCL communicator for this stage.
     pub fn comm(&self) -> &NcclCommunicator {

@@ -34,18 +34,6 @@ pub struct InferenceOrchestrator {
     pending_tx: HashMap<usize, mpsc::Sender<u32>>,
     /// Counter for assigning unique routing IDs.
     next_routing_id: usize,
-    /// Number of transformer layers (for eviction store).
-    #[allow(dead_code)]
-    num_layers: usize,
-    /// Whether MTP speculative decoding is enabled.
-    #[allow(dead_code)]
-    enable_mtp: bool,
-    /// MTP speculative decoding engine (optional).
-    #[allow(dead_code)]
-    mtp: Option<infers_mtp::MtpEngine>,
-    /// MTP metrics tracker (optional).
-    #[allow(dead_code)]
-    mtp_metrics: Option<infers_mtp::MtpMetrics>,
     /// Per-session RNG for reproducible sampling.
     session_rngs: HashMap<SequenceId, Xoshiro256PlusPlus>,
 }
@@ -58,10 +46,6 @@ impl InferenceOrchestrator {
         engine: ForwardEngine,
         eviction_store: BackendEvictionStore,
         stream: Arc<CudaStream>,
-        num_layers: usize,
-        enable_mtp: bool,
-        mtp: Option<infers_mtp::MtpEngine>,
-        mtp_metrics: Option<infers_mtp::MtpMetrics>,
     ) -> Self {
         Self {
             scheduler,
@@ -71,10 +55,6 @@ impl InferenceOrchestrator {
             response_tx: HashMap::new(),
             pending_tx: HashMap::new(),
             next_routing_id: 1,
-            num_layers,
-            enable_mtp,
-            mtp,
-            mtp_metrics,
             session_rngs: HashMap::new(),
         }
     }

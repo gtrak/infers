@@ -20,12 +20,8 @@ pub enum PageState {
 /// Where the page data physically resides. CPU offload deferred to future phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageLocation {
-    /// Page data is on the GPU.
     Gpu,
-    /// Page data is on the CPU (reserved for future offload).
-    Cpu,
 }
-
 /// A physical page in the KV cache page pool.
 ///
 /// Each page holds `page_size` token slots worth of K/V data for a single layer.

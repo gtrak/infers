@@ -189,23 +189,11 @@ impl CpuPagePool {
         self.max_bytes
     }
 
-    /// Remaining bytes before the budget is exhausted.
-    pub fn remaining_bytes(&self) -> usize {
-        self.max_bytes.saturating_sub(self.used_bytes)
-    }
-
     /// Whether the pool has reached its memory budget.
     pub fn is_full(&self) -> bool {
         self.used_bytes >= self.max_bytes
     }
 
-    /// Clear all evicted data from the pool.
-    pub fn clear(&mut self) {
-        for slot in &mut self.storage {
-            *slot = None;
-        }
-        self.used_bytes = 0;
-    }
 }
 
 #[cfg(test)]
@@ -279,16 +267,6 @@ mod tests {
         pool.store(0, vec![0u8; 1024]).unwrap();
         pool.remove(0);
         assert!(!pool.is_evicted(0));
-        assert_eq!(pool.used_bytes(), 0);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut pool = CpuPagePool::new(10, 1024, 10_240);
-        pool.store(0, vec![0u8; 1024]).unwrap();
-        pool.store(1, vec![0u8; 1024]).unwrap();
-        pool.clear();
-        assert_eq!(pool.num_evicted(), 0);
         assert_eq!(pool.used_bytes(), 0);
     }
 

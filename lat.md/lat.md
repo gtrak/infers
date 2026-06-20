@@ -186,13 +186,6 @@ Errors from copy-on-write page operations including allocation failures and inva
 
 Copies a shared page to a private mutable buffer when write access is needed, preserving prefix cache sharing until mutation occurs. See [[crates/kv/src/cow.rs#ensure_mutable_page]].
 
-## decrement_page_refcount
-
-Decrements the reference count for a paged KV cache page and triggers deallocation when count reaches zero. See [[crates/kv/src/cow.rs#decrement_page_refcount]].
-
-## try_share_from_prefix_cache
-
-Attempts to share an existing page from the prefix cache instead of allocating a new one, reducing memory pressure for common prefixes. See [[crates/kv/src/cow.rs#try_share_from_prefix_cache]].
 # Paged Attention Implementation
 
 CUDA kernel implementations for paged attention with block-table address translation.

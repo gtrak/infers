@@ -326,19 +326,12 @@ async fn run() -> Result<()> {
     let eviction_store = BackendEvictionStore::new(num_layers);
 
     // Step 7: Create InferenceOrchestrator
-    let enable_mtp = args.enable_mtp;
-    let mtp = None;
-    let mtp_metrics = None;
 
     let orchestrator = InferenceOrchestrator::new(
         scheduler,
         engine,
         eviction_store,
         stream,
-        num_layers,
-        enable_mtp,
-        mtp,
-        mtp_metrics,
     );
 
     // Step 8: Create Tokenizer

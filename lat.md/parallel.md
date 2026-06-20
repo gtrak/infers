@@ -8,7 +8,7 @@ P2P hidden state transfer between pipeline stages via NCCL. See [[crates/paralle
 
 ### StageComm
 
-P2P hidden state transfer between pipeline stages via NCCL. `send_hidden()` and `recv_hidden()` delegate to `NcclCommunicator` P2P methods. See [[crates/parallelism/src/comm.rs#StageComm]].
+P2P hidden state transfer between pipeline stages via NCCL. See [[crates/parallelism/src/comm.rs#StageComm]].
 
 For PP=2, stage 0 (rank 0) sends to peer rank 1, and stage 1 (rank 1) receives from peer rank 0.
 
@@ -28,11 +28,11 @@ Per-stage types for pipeline parallelism: stage identity, weights, KV cache, and
 
 Holds a stage's ID, GPU assignment, layer range, sharded weights, and P2P communicator. See [[crates/parallelism/src/stage.rs#PipelineStage]].
 
-`new()` takes stage index, GPU ID, layer boundaries, weight registry, and NCCL communicator. `num_layers()` returns layer count; `contains_layer()` checks layer membership. For PP=2, stage 0 covers layers 0-31 and stage 1 covers layers 32-63.
+`new()` takes stage index, GPU ID, layer boundaries, weight registry, and NCCL communicator. For PP=2, stage 0 covers layers 0-31 and stage 1 covers layers 32-63.
 
 ### GdnStateRef
 
-Lightweight GDN state descriptor for tracking recurrent state allocation. `new()` creates an uninitialized state; `with_hidden_size()` sets the hidden dimension. `mark_initialized()` flags the state as GPU-initialized. See [[crates/parallelism/src/stage.rs#GdnStateRef]].
+Lightweight GDN state descriptor for tracking recurrent state allocation. `new()` creates an uninitialized state; `with_hidden_size()` sets the hidden dimension. See [[crates/parallelism/src/stage.rs#GdnStateRef]].
 
 ### StageState
 
@@ -66,7 +66,7 @@ Main orchestration module for PP=2 with microbatching. Assembles pipeline stages
 
 Orchestrates PP=2 across two GPUs using stage partitioning, NCCL P2P communication, and microbatch scheduling to hide pipeline bubbles. See [[crates/parallelism/src/pp.rs#PipelineEngine]].
 
-`new()` creates the engine: splits the model into two pipeline stages via `split_layers_pp`, wraps the NCCL communicator in `Arc` for sharing between stages, creates `PipelineStage` instances for each GPU, and initializes per-stage `StageState` for KV cache and GDN state management. `forward_batch()` splits requests into microbatches, processes them through the pipeline loop, and returns sampled tokens with timing. `create_sessions()` and `free_sessions()` manage lifecycle across both stages.
+`new()` creates the engine: splits the model into two pipeline stages via `split_layers_pp`, wraps the NCCL communicator in `Arc` for sharing between stages, creates `PipelineStage` instances for each GPU, and initializes per-stage `StageState` for KV cache and GDN state management. `forward_batch()` splits requests into microbatches, processes them through the pipeline loop, and returns sampled tokens with timing.
 
 ### PipelineTiming
 
@@ -77,10 +77,6 @@ Timing information for a single pipeline forward pass. Tracks total wall-clock t
 ### PipelineOutput
 
 Result of a pipeline forward pass containing sampled token IDs for each request and timing information. See [[crates/parallelism/src/pp.rs#PipelineOutput]].
-
-### compute_bubble_fraction
-
-Theoretical bubble fraction for PP=2: `1 / (num_microbatches + 1)`. One microbatch gives 50% bubble; more microbatches reduce the fraction. See [[crates/parallelism/src/pp.rs#compute_bubble_fraction]].
 
 ## Tensor Parallelism Engine
 

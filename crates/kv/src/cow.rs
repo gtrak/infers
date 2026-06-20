@@ -12,7 +12,6 @@ use std::sync::atomic::Ordering::SeqCst;
 
 use super::page::{PageId, PageState, INVALID_PAGE_ID};
 use super::pool::PagePool;
-use super::prefix::{PageHash, PrefixCache};
 use super::table::SequencePageTable;
 use thiserror::Error;
 
@@ -129,69 +128,9 @@ pub fn ensure_mutable_page(
     }
 }
 
-// @lat: [[lat.md/lat#Paged KV Types#decrement_page_refcount]]
-/// Decrement the refcount of a page in the pool.
-///
-/// Returns the new refcount value after decrementing. Used when a sequence
-/// is deleted and its pages need to be released.
-///
-/// # Arguments
-/// * `pool` — The page pool containing the page.
-/// * `page_id` — The ID of the page whose refcount to decrement.
-///
-/// # Panics
-/// Panics if the page ID is invalid (out of range).
-pub fn decrement_page_refcount(pool: &mut PagePool, page_id: PageId) -> u32 {
-    let page = pool.get(page_id).expect("Invalid page ID");
-    page.refcount.fetch_sub(1, SeqCst)
-}
-
-// @lat: [[lat.md/lat#Paged KV Types#try_share_from_prefix_cache]]
-/// Attempt to share an existing page from the prefix cache.
-///
-/// Looks up `hash` in the prefix cache. If found:
-/// 1. Increments the cached page's refcount in the pool.
-/// 2. Appends the cached page ID to the sequence table.
-/// 3. Returns `true`.
-///
-/// If `hash` is not found in the cache, returns `false` — the caller must
-/// allocate a new page.
-///
-/// # Arguments
-/// * `cache` — The prefix cache to search.
-/// * `hash` — The content hash of the prefix to look up.
-/// * `pool` — The page pool (used to increment refcount on cache hit).
-/// * `table` — The sequence page table (used to append the shared page).
-pub fn try_share_from_prefix_cache(
-    cache: &mut PrefixCache,
-    hash: &PageHash,
-    pool: &mut PagePool,
-    table: &mut SequencePageTable,
-) -> Result<bool, CowError> {
-    let Some(cached_page_id) = cache.lookup(hash) else {
-        return Ok(false);
-    };
-
-    let page = pool
-        .get(cached_page_id)
-        .ok_or(CowError::InvalidPageId(cached_page_id))?;
-
-    page.refcount.fetch_add(1, SeqCst);
-    table.push_page(cached_page_id);
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefix::PrefixCache;
-
-    fn make_hash(i: u8) -> PageHash {
-        let mut h = [0u8; 32];
-        h[0] = i;
-        h
-    }
-
     #[test]
     fn test_ensure_mutable_empty_table() {
         let mut pool = PagePool::new(4, 16, 8, 128);
@@ -344,59 +283,6 @@ mod tests {
         } else {
             panic!("Expected CowPerformed");
         }
-    }
-
-    #[test]
-    fn test_try_share_from_cache_hit() {
-        let mut pool = PagePool::new(4, 16, 8, 128);
-        let mut table = SequencePageTable::new(16);
-        let mut cache = PrefixCache::new(1024, pool.page_bytes());
-
-        let page_id = pool.allocate().unwrap();
-        let hash = make_hash(1);
-        cache.insert(hash, page_id);
-
-        // Page starts with refcount 1 (from pool allocation)
-        assert_eq!(pool.get(page_id).unwrap().refcount.load(SeqCst), 1);
-
-        let result =
-            try_share_from_prefix_cache(&mut cache, &hash, &mut pool, &mut table).unwrap();
-
-        assert!(result); // Cache hit
-        assert_eq!(table.num_pages(), 1);
-        assert_eq!(table.tail_page_id(), Some(page_id));
-        // Refcount incremented to 2
-        assert_eq!(pool.get(page_id).unwrap().refcount.load(SeqCst), 2);
-    }
-
-    #[test]
-    fn test_try_share_from_cache_miss() {
-        let mut pool = PagePool::new(4, 16, 8, 128);
-        let mut table = SequencePageTable::new(16);
-        let mut cache = PrefixCache::new(1024, pool.page_bytes());
-
-        let hash = make_hash(99); // Not in cache
-
-        let result =
-            try_share_from_prefix_cache(&mut cache, &hash, &mut pool, &mut table).unwrap();
-
-        assert!(!result); // Cache miss
-        assert_eq!(table.num_pages(), 0); // No page added
-        assert_eq!(pool.num_free(), 4); // No allocation
-    }
-
-    #[test]
-    fn test_decrement_page_refcount() {
-        let mut pool = PagePool::new(4, 16, 8, 128);
-
-        let page_id = pool.allocate().unwrap();
-        // Start with refcount 1
-        assert_eq!(pool.get(page_id).unwrap().refcount.load(SeqCst), 1);
-
-        let prev_refcount = decrement_page_refcount(&mut pool, page_id);
-        // fetch_sub returns the previous value (1), not the new value
-        assert_eq!(prev_refcount, 1);
-        assert_eq!(pool.get(page_id).unwrap().refcount.load(SeqCst), 0);
     }
 
     #[test]

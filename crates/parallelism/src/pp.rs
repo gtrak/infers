@@ -275,59 +275,10 @@ impl PipelineEngine {
         Ok(Vec::new())
     }
 
-    /// Create sessions in both stages for each request.
-    pub fn create_sessions(&mut self, microbatch: &Microbatch) -> Result<Vec<usize>> {
-        let mut session_ids = Vec::new();
-        for _req in &microbatch.requests {
-            let seq_id = self.stage_states[0].create_session();
-            let _seq_id1 = self.stage_states[1].create_session();
-            session_ids.push(seq_id);
-        }
-        Ok(session_ids)
-    }
-
-    /// Free sessions in both stages.
-    pub fn free_sessions(&mut self, session_ids: &[usize]) {
-        for &sid in session_ids {
-            self.stage_states[0].free_session(sid);
-            self.stage_states[1].free_session(sid);
-        }
-    }
 }
-
-/// Compute the bubble fraction for a given number of microbatches with PP=2.
-///
-/// Bubble fraction = (num_stages - 1) / (num_microbatches + num_stages - 1)
-///
-/// For PP=2: bubble = 1 / (num_microbatches + 1)
-pub fn compute_bubble_fraction(num_microbatches: usize) -> f64 {
-    if num_microbatches == 0 {
-        return 1.0;
-    }
-    1.0 / (num_microbatches as f64 + 1.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_bubble_fraction_formula() {
-        // For PP=2 with 1 microbatch: bubble = 1/2 = 0.5
-        assert!((compute_bubble_fraction(1) - 0.5).abs() < 1e-10);
-
-        // For PP=2 with 3 microbatches: bubble = 1/4 = 0.25
-        assert!((compute_bubble_fraction(3) - 0.25).abs() < 1e-10);
-
-        // For PP=2 with 7 microbatches: bubble = 1/8 = 0.125
-        assert!((compute_bubble_fraction(7) - 0.125).abs() < 1e-10);
-
-        // For PP=2 with 15 microbatches: bubble = 1/16 = 0.0625
-        assert!((compute_bubble_fraction(15) - 0.0625).abs() < 1e-10);
-
-        // Edge case: 0 microbatches → 1.0 (100% bubble, no work done)
-        assert!((compute_bubble_fraction(0) - 1.0).abs() < 1e-10);
-    }
 
     #[test]
     fn test_pipeline_timing_default() {
