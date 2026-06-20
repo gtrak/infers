@@ -45,6 +45,36 @@ fn build_prompt() -> String {
     "user\nWhat is the capital of France?\n\n".to_string()
 }
 
+/// Read current process RSS (resident set size) in bytes from /proc/self/status.
+fn current_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                // VmRSS is in kB
+                let kb: u64 = parts[1].parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+    }
+    None
+}
+
+/// Format bytes as human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    }
+}
+
 /// Run prefill + 30 decode steps on an initialized engine.
 /// Returns (first_token, generated_tokens).
 fn run_prefill_decode(
@@ -97,7 +127,8 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("[heap-only] Config loaded: {} layers", config.num_hidden_layers);
-
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[heap-only] RSS after config: {}", format_bytes(rss));
     // 2. Load safetensors via heap path
     let mut raw_weights = load_safetensors(&model_dir)?;
     strip_language_model_prefix(&mut raw_weights);
@@ -115,6 +146,9 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
         build_main_layers(&mut registry, &config)?;
         weight_registries.push(registry);
     }
+
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[heap-only] RSS after load+shard: {}", format_bytes(rss));
 
     // 5. CUDA init
     let runtime = CudaRuntime::new()?;
@@ -144,6 +178,8 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
         group_size,
     )?;
     eprintln!("[heap-only] Engine created");
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[heap-only] RSS after engine: {}", format_bytes(rss));
 
     // 8. Tokenize prompt
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -174,6 +210,8 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
         let text = tok.decode(&generated)?;
         eprintln!("[heap-only] Generated text: {}", text.trim());
     }
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[heap-only] RSS after inference: {}", format_bytes(rss));
 
     Ok(())
 }
@@ -188,6 +226,8 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("[mmap-only] Config loaded: {} layers", config.num_hidden_layers);
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[mmap-only] RSS after config: {}", format_bytes(rss));
 
     // 2. Load safetensors via mmap path
     use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry};
@@ -211,6 +251,9 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
         build_main_layers(&mut meta, &config)?;
         metadata_registries.push(meta);
     }
+
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[mmap-only] RSS after load+shard: {}", format_bytes(rss));
 
     // 5. CUDA init
     let runtime = CudaRuntime::new()?;
@@ -243,6 +286,8 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
         group_size,
     )?;
     eprintln!("[mmap-only] Engine created");
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[mmap-only] RSS after engine: {}", format_bytes(rss));
 
     // 8. Tokenize prompt
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -273,6 +318,8 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
         let text = tok.decode(&generated)?;
         eprintln!("[mmap-only] Generated text: {}", text.trim());
     }
+    let rss = current_rss_bytes().unwrap_or(0);
+    eprintln!("[mmap-only] RSS after inference: {}", format_bytes(rss));
 
     Ok(())
 }

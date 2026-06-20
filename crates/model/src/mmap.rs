@@ -270,6 +270,37 @@ impl MmapWeightRegistry {
             }
         }).sum()
     }
+
+    /// Drop heap-owned weight data from all tensors, keeping mmap-backed data alive.
+    ///
+    /// After GPU upload, the CPU-side copies of owned (non-mmap) tensor data are
+    /// no longer needed. This method replaces owned data with empty slices,
+    /// freeing ~2 GB of heap residency for the Qwen3.6-27B model.
+    ///
+    /// Mmap-backed tensors are left untouched — their Arc<Mmap> references
+    /// must stay alive to prevent the kernel from unmapping the files.
+    pub fn clear_owned_data(&mut self) {
+        let empty = Arc::new(Vec::new());
+        for tensor in self.tensors.values_mut() {
+            if let DataOwner::Owned(_) = &tensor.owner {
+                tensor.owner = DataOwner::Owned(empty.clone());
+                tensor.data_ptr = empty.as_ptr();
+                tensor.data_len = 0;
+            }
+        }
+        for companions in self.int4_companions.values_mut() {
+            if let DataOwner::Owned(_) = &companions.qzeros.owner {
+                companions.qzeros.owner = DataOwner::Owned(empty.clone());
+                companions.qzeros.data_ptr = empty.as_ptr();
+                companions.qzeros.data_len = 0;
+            }
+            if let DataOwner::Owned(_) = &companions.scales.owner {
+                companions.scales.owner = DataOwner::Owned(empty.clone());
+                companions.scales.data_ptr = empty.as_ptr();
+                companions.scales.data_len = 0;
+            }
+        }
+    }
 }
 
 impl Default for MmapWeightRegistry {

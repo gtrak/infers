@@ -1237,6 +1237,10 @@ Zero-copy companion tensors (qzeros, scales) for INT4 quantized weights. See [[c
 
 Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap and INT4 companions. Each MmapTensor's DataOwner keeps mmaps alive — no separate `_mmaps` tracking needed. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
 
+#### clear_owned_data
+
+After GPU upload, replaces owned (non-mmap) tensor data with empty slices to free ~2 GB of heap residency on Qwen3.6-27B. Mmap-backed tensors are preserved — their Arc<Mmap> references must stay alive. See [[crates/model/src/mmap.rs#MmapWeightRegistry#clear_owned_data]].
+
 ### load_safetensors_mmap
 
 Zero-copy safetensors loader storing raw pointers into mmap regions as `MmapTensor` references instead of copying data. Auto-detects single vs sharded files. See [[crates/model/src/mmap.rs#load_safetensors_mmap]].

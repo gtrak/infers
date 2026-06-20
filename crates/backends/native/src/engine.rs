@@ -298,6 +298,7 @@ impl ForwardEngine {
         group_size: usize,
     ) -> Result<Self> {
        let num_gpus = streams.len();
+        let mut mmap_registries = mmap_registries; // mutable for clear_owned_data after upload
         let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
         let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
         let nccl = Self::create_nccl(&streams)?;
@@ -311,6 +312,12 @@ impl ForwardEngine {
             let cache = GpuWeightCache::new_from_mmap(&gpu_stream, registry, pinned)?;
             tracing::info!("GPU {}: cached {} weights (mmap)", gpu_idx, cache.len());
             weight_caches.push(cache);
+        }
+
+        // Free heap-owned sharded data now that it's on the GPU.
+        // This drops ~2 GB of persistent heap residency from fused QKV per-segment shards.
+        for registry in &mut mmap_registries {
+            registry.clear_owned_data();
         }
 
         // Initialize per-GPU, per-layer caches and states
