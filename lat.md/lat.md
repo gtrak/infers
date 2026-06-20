@@ -2287,7 +2287,9 @@ I/O latency spans instrument weight upload, NCCL synchronization, logits downloa
 Eliminates DRAM residency for model weights by streaming directly from disk via mmap + pinned staging buffer.
 ## Mmap Constructor on ForwardEngine
 
-`new_from_mmap()` takes `Vec<MmapWeightRegistry>` and `Vec<WeightRegistry>` metadata registries for name lookups, plus a mutable `PinnedHostBuffer`. The `_mmap_registries` field retains Arc-based mmap handles. See [[crates/backends/native/src/engine.rs#ForwardEngine#new_from_mmap]].
+After GPU upload, mmap handles are dropped to free page cache (~17 GB). Only GPU weight caches and metadata are retained. See [[crates/backends/native/src/engine.rs#ForwardEngine#new_from_mmap]].
+
+The sequence: `clear_owned_data()` frees heap shard data, `trim_memory()` returns memory to the OS, then `drop(mmap_registries)` releases all Arc-based mmap handles, unmapping safetensor files. The `_mmap_registries` field is initialized with `Vec::new()`.
 
 ## Server Binary Wiring
 The server has four loading branches: mmap + TP>1, heap + TP>1, TP=1, and no-model fallback. The `--no-mmap` flag forces the heap path. See [[crates/server/src/main.rs#run]].

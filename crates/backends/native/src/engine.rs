@@ -347,19 +347,25 @@ impl ForwardEngine {
 
         trim_memory();
 
+        // Drop all mmap references to unmap the safetensor files from page cache.
+        // The GPU weight cache holds the actual buffers; CPU-side data is no longer needed.
+        // This frees ~17 GB of shared page cache for the Qwen3.6-27B model.
+        let num_shards = mmap_registries.len();
+        drop(mmap_registries);
+
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
         tracing::info!(
             "ForwardEngine initialized (mmap): {} layers, {} GPU shards",
             config.num_hidden_layers,
-            mmap_registries.len()
+            num_shards
         );
 
         Ok(Self {
             config,
             metadata: metadata_registries, // metadata registries for name lookups during inference
-            _mmap_registries: mmap_registries,
+            _mmap_registries: Vec::new(), // mmap data dropped after GPU upload
             weight_caches,
             per_gpu_kernels,
             paged_kv_manager: None,

@@ -339,6 +339,10 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
         metadata_registries.push(meta);
     }
 
+    // Drop the original mmap registry — the shards have their own Arc references.
+    // After GPU upload, the engine will drop those too.
+    drop(mmap_reg);
+
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[mmap-only] RSS after load+shard: {}", format_bytes(rss));
 
@@ -564,6 +568,10 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
         build_main_layers(&mut meta, &config)?;
         metadata_registries.push(meta);
     }
+
+    // Drop the original mmap registry — the shards have their own Arc references.
+    // After GPU upload, the engine will drop those too.
+    drop(mmap_reg);
 
     eprintln!("[mmap-vs-heap] Creating ForwardEngine (mmap)...");
     let mut pinned = infers_cuda::PinnedHostBuffer::new(256 * 1024 * 1024)?;
