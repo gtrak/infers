@@ -16,3 +16,6 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "shard_equiv"

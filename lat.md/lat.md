@@ -1336,6 +1336,41 @@ Tensor names determine sharding type. Q/K/V/gate/up/GDN are column-parallel; O/d
 The GDN forward pass derives head counts from actual sharded weight shapes, not config constants.
 
 With TP=2, `in_proj_a` and `in_proj_b` are column-parallel — each GPU has shape [num_v_heads_per_gpu, hidden_size] instead of the full model's [48, hidden_size]. The fix computes `num_v_heads = weight_output_dim(&weights.in_proj_b)` (e.g. 24 at TP=2), then derives `num_k_heads = num_v_heads / kv_ratio` and all downstream dimensions accordingly. See [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
+
+## Sharding Equivalence Tests
+
+CPU-side equivalence tests verifying that heap and mmap sharding paths produce identical results.
+
+The `tests/shard_equiv.rs` suite creates synthetic safetensors files with a tiny 2-layer Qwen3.6-like config (1 GDN + 1 full attention layer, hidden_size=64) covering all sharding cases: BF16 column-parallel, INT4 column-parallel, INT4 row-parallel, fused QKV projections (in_proj_qkv), and conv1d.weight. Weights are loaded via both `load_safetensors` (heap copy) and `load_safetensors_mmap` (zero-copy mmap), sharded for TP=2, and compared byte-for-byte on contiguous shards (shape + data), or by shape only for strided shards (INT4 column-parallel non-fused splits use cuMemcpy2D).
+
+These tests caught the conv1d.weight fused QKV sharding bug that produced all-220 tokens when using the mmap path — the same bug visible in `smoke_test_mmap_vs_heap_gpu_data`. They run without GPUs and exercise the real loading code via safetensors serialization.
+
+Test specifications:
+
+### TP=2 All Weights
+
+End-to-end comparison of all sharded weights at TP=2 across both paths. Verifies tensor keys, shapes, dtypes, and data bytes (for contiguous shards). See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_all_weights]].
+
+### TP=1 All Weights
+
+No-sharding baseline verifying both loading paths produce identical registries when num_gpus=1. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp1_all_weights]].
+
+### TP=2 conv1d Fused QKV
+
+Specifically verifies conv1d.weight sharding with the correct per-segment split (Q/2 + K/2 + V/2 = 32 for test config). This is the exact bug pattern from the all-220 token issue. Both paths produce contiguous owned data, so bytes are compared. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_conv1d_fused_qkv]].
+
+### TP=2 INT4 Column-Parallel
+
+Verifies INT4 qweight and companion sharding for column-parallel splits (e.g., layer 1's q_proj: [8,64] → [8,32]). Non-fused column-parallel uses strided tensors in mmap path — shape verified, data compared only for contiguous shards. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_int4_column_parallel]].
+
+### TP=2 INT4 Row-Parallel
+
+Verifies INT4 qweight and companion sharding for row-parallel splits (e.g., layer 1's o_proj: [8,64] → [4,64]). See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_int4_row_parallel]].
+
+### TP=2 GDN Fused QKV in_proj
+
+Specifically verifies GDN in_proj_qkv fused QKV sharding including companion tensors (scales, qzeros). Both paths produce contiguous owned data — full byte comparison. See [[crates/model/tests/shard_equiv.rs#shard_equiv_tp2_gdn_fused_qkv_in_proj]].
+
 # Tech Debt Fixes
 
 Production hardening changes applied to improve error handling, safety, and code quality.
