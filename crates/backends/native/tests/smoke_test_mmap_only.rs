@@ -75,6 +75,91 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Print detailed memory metrics from /proc/self/status, statm, and maps.
+fn print_memory_detail(label: &str) {
+    // From /proc/self/status
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") || line.starts_with("VmSize:") || line.starts_with("VmData:")
+                || line.starts_with("VmHWM:") || line.starts_with("VmPTE:") || line.starts_with("VmSwap:")
+                || line.starts_with("VmPin:") || line.starts_with("VmLck:") {
+                eprintln!("[mem] {}: {}", label, line.trim());
+            }
+        }
+    }
+
+    // From /proc/self/statm (all values in pages)
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+        let parts: Vec<u64> = statm.split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if parts.len() >= 7 {
+            let page_kb = 4; // 4 KB pages on x86_64
+            let vsize_mb = parts[0] * page_kb / 1024;
+            let rss_mb = parts[1] * page_kb / 1024;
+            let shared_mb = parts[2] * page_kb / 1024;
+            let text_mb = parts[3] * page_kb / 1024;
+            let data_mb = parts[5] * page_kb / 1024;
+            eprintln!("[mem] {}: statm: vsize={}MB rss={}MB shared={}MB text={}MB data={}MB",
+                label, vsize_mb, rss_mb, shared_mb, text_mb, data_mb);
+        }
+    }
+
+    // Count mmap'd file bytes from /proc/self/maps
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        let mut nvidia_count = 0usize;
+        let mut nvidia_total_kb: u64 = 0;
+        let mut heap_count = 0usize;
+        let mut heap_total_kb: u64 = 0;
+        let mut file_count = 0usize;
+        let mut file_total_kb: u64 = 0;
+        let mut anon_count = 0usize;
+        let mut anon_total_kb: u64 = 0;
+        let mut other_count = 0usize;
+        let mut other_total_kb: u64 = 0;
+
+        for line in maps.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 1 { continue; }
+            let addr_range = parts[0];
+            let addrs: Vec<&str> = addr_range.split('-').collect();
+            if addrs.len() != 2 { continue; }
+            let start = u64::from_str_radix(addrs[0], 16).unwrap_or(0);
+            let end = u64::from_str_radix(addrs[1], 16).unwrap_or(0);
+            let size_kb = (end - start) / 1024;
+
+            let path = if parts.len() >= 6 { parts[5] } else { "" };
+
+            if path.contains("nvidia") || path.contains("NVIDIA") || path.contains("dri") || path.contains("uvm") {
+                nvidia_count += 1;
+                nvidia_total_kb += size_kb;
+            } else if path.contains("[heap]") {
+                heap_count += 1;
+                heap_total_kb += size_kb;
+            } else if !path.is_empty() && !path.starts_with('[') {
+                file_count += 1;
+                file_total_kb += size_kb;
+            } else if path == "[anon]" || path.is_empty() {
+                anon_count += 1;
+                anon_total_kb += size_kb;
+            } else {
+                other_count += 1;
+                other_total_kb += size_kb;
+            }
+        }
+
+        let to_gb = |kb: u64| format!("{:.2} GB", kb as f64 / (1024.0 * 1024.0));
+        let to_mb = |kb: u64| format!("{:.0} MB", kb as f64 / 1024.0);
+
+        eprintln!("[mem] {}: Virtual address space (from maps):", label);
+        eprintln!("[mem]   nvidia/uvm: {} regions, {}", nvidia_count, if nvidia_total_kb > 1024*1024 { to_gb(nvidia_total_kb) } else { to_mb(nvidia_total_kb) });
+        eprintln!("[mem]   heap:       {} regions, {}", heap_count, to_mb(heap_total_kb));
+        eprintln!("[mem]   file mmap:  {} regions, {}", file_count, to_mb(file_total_kb));
+        eprintln!("[mem]   anonymous:  {} regions, {}", anon_count, to_mb(anon_total_kb));
+        eprintln!("[mem]   other:      {} regions, {}", other_count, to_mb(other_total_kb));
+    }
+}
+
 /// Run prefill + 30 decode steps on an initialized engine.
 /// Returns (first_token, generated_tokens).
 fn run_prefill_decode(
@@ -180,6 +265,7 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[heap-only] Engine created");
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[heap-only] RSS after engine: {}", format_bytes(rss));
+    print_memory_detail("heap_engine");
 
     // 8. Tokenize prompt
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -212,6 +298,7 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
     }
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[heap-only] RSS after inference: {}", format_bytes(rss));
+    print_memory_detail("heap_inference");
 
     Ok(())
 }
@@ -288,6 +375,7 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[mmap-only] Engine created");
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[mmap-only] RSS after engine: {}", format_bytes(rss));
+    print_memory_detail("mmap_engine");
 
     // 8. Tokenize prompt
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -320,6 +408,7 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
     }
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[mmap-only] RSS after inference: {}", format_bytes(rss));
+    print_memory_detail("mmap_inference");
 
     Ok(())
 }
