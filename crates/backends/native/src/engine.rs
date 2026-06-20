@@ -29,10 +29,26 @@ use infers_kv::KvCacheDtype;
 use infers_cuda::CudaSlice;
 
 use infers_cuda::{group_end, group_start};
-
 use crate::sync;
 use crate::sample::{Xoshiro256PlusPlus, sample_with_config};
 
+/// Force the C allocator to return freed memory to the OS.
+///
+/// After dropping large allocations (weight data), glibc's malloc keeps
+/// the virtual address space mapped in thread-local arenas. This calls
+/// `malloc_trim(0)` which returns all possible memory to the OS,
+/// significantly reducing VmData and VmRSS.
+#[cfg(target_os = "linux")]
+fn trim_memory() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_memory() {
+    // No-op on non-Linux
+}
 
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
@@ -249,6 +265,8 @@ impl ForwardEngine {
             registry.clear_data();
         }
 
+        trim_memory();
+
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
@@ -326,6 +344,8 @@ impl ForwardEngine {
         for registry in &mut mmap_registries {
             registry.clear_owned_data();
         }
+
+        trim_memory();
 
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);

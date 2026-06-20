@@ -1372,6 +1372,10 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 
 `WeightRegistry::clear_data()` frees ~5 GB per GPU of persistent heap residency by dropping CPU-side weight data after GPU upload. See [[crates/model/src/weights.rs#WeightRegistry#clear_data]], [[crates/backends/native/src/engine.rs#ForwardEngine#new]].
 
+### malloc_trim after Weight Clearing
+
+After `clear_data()` (heap path) and `clear_owned_data()` (mmap path), `trim_memory()` calls `malloc_trim(0)` to force glibc to return freed memory to the OS, reducing VmData. On Linux only — no-op on other platforms. See [[crates/backends/native/src/engine.rs#trim_memory]].
+
 ## GpuAllocator Encapsulation
 
 `GpuAllocator` fields are now private with accessor methods. The `free()` method has overflow protection and derives `Debug` and `Clone`.
