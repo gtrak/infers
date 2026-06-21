@@ -1,15 +1,18 @@
 # Phase 8: Quantization Polish
 
 ---
-**Status**: PARTIAL
-**Last Updated**: 2026-06-11
-**Rationale**: AutoRound INT4 works end-to-end. BUT: GGUF, PrismaSCOUT, FP8/NVFP4 not implemented.
+**Status**: PARTIAL — AutoRound INT4 works, FP8 infrastructure built but not wired
+**Last Updated**: 2026-06-21
+**Rationale**: AutoRound INT4 works end-to-end. FP8 KV cache infrastructure (QuantizedKvCache, quantize/dequantize helpers) exists but is never instantiated. QuantizationFormat::detect() exists but is never called.
 **Actual Deliverables**:
 - [x] AutoRound INT4 end-to-end test
+- [x] FP8 quantize/dequantize helpers in kv/quant.rs — implemented with roundtrip tests
+- [x] `QuantizedKvCache` struct in kv/quant.rs — allocated but never used by engine (engine uses BF16 PagedKvCache)
+- [x] `QuantizationFormat::detect()` in model/formats.rs — auto-detects format from model files, never called
 - [ ] GGUF parser and loader
 - [ ] llama.cpp backend integration
 - [ ] NVFP4 KV cache implementation
-- [ ] FP8 KV cache implementation
+- [ ] Wire FP8 KV cache into engine (toggle from BF16 to FP8)
 - [ ] Cross-format benchmarking
 - [ ] Backend routing (auto-detect → native or llama.cpp)
 ---

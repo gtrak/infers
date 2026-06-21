@@ -1,13 +1,15 @@
 # Phase 6.6: Eviction Wiring — GPU Data Movement Through Backend
 
 ---
-**Status**: NOT DONE
-**Last Updated**: 2026-06-11
-**Rationale**: Blocked by Phase 6 (continuous batching). GPU data movement for eviction not wired.
+**Status**: PARTIAL — engine methods exist, not wired
+**Last Updated**: 2026-06-21
+**Rationale**: Engine has evict_session/restore_session and BackendEvictionStore, but orchestrator bypasses them. Phase B cleanup confirmed these are dead code (zero callers) but kept them for future wiring.
 **Actual Deliverables**:
-- [ ] `BackendEvictionStore`
-- [ ] `mark_evicted()` / `allocate_for_restore()` in `PagedKvManager`
-- [ ] `evict_session()` / `restore_session()` in `ForwardEngine`
+- [x] `BackendEvictionStore` in `infers-backend-native/eviction.rs`
+- [x] `mark_evicted()` / `allocate_for_restore()` in `PagedKvManager`
+- [x] `evict_session()` / `restore_session()` in `ForwardEngine` — implemented but zero callers
+- [ ] Wire orchestrator: pass BackendEvictionStore to engine methods during eviction
+- [ ] Wire orchestrator: call restore_session when re-admitting evicted sequences
 ---
 
 **Duration:** 3 days  

@@ -1,19 +1,19 @@
 # Phase 9: Tool Calls + Final Polish
 
 ---
-**Status**: NOT DONE
-**Last Updated**: 2026-06-11
-**Rationale**: Server API scaffold exists but not wired to tool calling logic. Blocked by server not using real inference engine.
+**Status**: PARTIAL — parser implemented and tested, not wired to chat handler
+**Last Updated**: 2026-06-21
+**Rationale**: ToolCallParser is complete with streaming and non-streaming parsing, 6 unit tests all pass. But the server's chat handler never imports or uses it. should_use_tools() gate function exists but is dead code.
 **Actual Deliverables**:
-- [ ] Qwen3.6 chat template integration
-- [ ] Tool call streaming
+- [x] Qwen3.6 chat template integration
+- [x] Tool call parser (`ToolCallParser` in api/tool_parser.rs) — complete, tested
+- [x] `PartialToolCall` streaming state management — complete
+- [ ] Wire ToolCallParser into chat handler response pipeline
+- [ ] Tool call streaming (delta format for `tool_calls`)
 - [ ] `enable-auto-tool-choice` API parameter
-- [ ] Tool call parser
 - [ ] OpenAI-compatible tool call responses
 - [ ] End-to-end benchmark vs vLLM baseline
 - [ ] 24-hour stability test
-- [ ] Documentation
-- [ ] Performance optimization pass
 ---
 
 **Duration:** 2 weeks  

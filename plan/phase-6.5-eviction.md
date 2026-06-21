@@ -1,14 +1,16 @@
 # Phase 6.5: Session Eviction to CPU + Memory Pressure Handling
 
 ---
-**Status**: NOT DONE
-**Last Updated**: 2026-06-11
-**Rationale**: Blocked by Phase 6 (continuous batching). CPU-side eviction infrastructure planned but not implemented.
+**Status**: PARTIAL — infrastructure built, not wired
+**Last Updated**: 2026-06-21
+**Rationale**: CPU-side eviction infrastructure exists but is disconnected from production code. Phase A/B cleanup removed dead methods (remaining_bytes, clear, PageLocation::Cpu variant).
 **Actual Deliverables**:
-- [ ] `CpuPagePool` in `infers-kv/eviction.rs`
-- [ ] `PagedKvManager::evict_sequence` / `restore_sequence`
-- [ ] Scheduler memory pressure + LRU eviction policy
-- [ ] Unit + integration tests
+- [x] `CpuPagePool` in `infers-kv/eviction.rs` — implemented with budget tracking
+- [x] `PagedKvManager::evict_sequence` / `restore_sequence` — implemented in kv/manager.rs
+- [x] Scheduler memory pressure + LRU eviction policy — implemented in scheduler/pressure.rs
+- [x] Unit + integration tests — all pass
+- [ ] Wire eviction path: orchestrator must call `engine.evict_session()` before `delete_sequence()` (currently bypassed — pages are freed without GPU→CPU copy)
+- [ ] Wire restoration path: orchestrator must call `engine.restore_session()` when re-admitting evicted sequences
 ---
 
 **Duration:** 1 week  
