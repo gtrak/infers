@@ -283,6 +283,309 @@ mod all_kernels {
         }
     }
 
+    /// GDN recurrent step: single-token decode kernel.
+    ///
+    /// One thread per (head, v_idx) element. No shared memory.
+    /// Uses libm for expf, logf, sqrtf. L2-normalizes query and key,
+    /// computes decay/beta from projections, performs 5-step recurrence.
+    #[kernel]
+    pub fn gdn_recurrent_step(
+        query: &[u16],          // [H, K] bf16
+        key: &[u16],            // [H, K] bf16
+        value: &[u16],          // [H, V] bf16
+        a_proj: &[u16],         // [H] bf16
+        b_proj: &[u16],         // [H] bf16
+        A_log: &[f32],          // [H] f32
+        dt_bias: &[f32],        // [H] f32
+        state: &mut [f32],      // [H, K, V] f32 — read + write
+        mut output: DisjointSlice<u16>, // [H, V] bf16
+        num_heads: u32,
+        head_k_dim: u32,
+        head_v_dim: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+        let total = (num_heads * head_v_dim) as usize;
+        let idx = thread::index_1d();
+        let tid = idx.get() as usize;
+        if tid >= total { return; }
+
+        let h = tid / head_v_dim as usize;
+        let v = tid % head_v_dim as usize;
+        let K = head_k_dim as usize;
+        let V = head_v_dim as usize;
+        let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
+
+        // ── Compute g[h] and beta[h] from projections ──
+        let decay_rate_h = libm::expf(A_log[h]);
+        let a_val = f32::from_bits((a_proj[h] as u32) << 16);
+        let sp_val = a_val + dt_bias[h];
+
+        let softplus_val: f32;
+        if sp_val > 20.0f32 {
+            softplus_val = sp_val;
+        } else if sp_val < -20.0f32 {
+            softplus_val = 0.0f32;
+        } else {
+            softplus_val = libm::logf(1.0f32 + libm::expf(sp_val));
+        }
+
+        let g_val = -decay_rate_h * softplus_val;
+        let decay = libm::expf(g_val);
+
+        // beta[h] = sigmoid(b_proj[h])
+        let b_val = f32::from_bits((b_proj[h] as u32) << 16);
+        let beta_val = 1.0f32 / (1.0f32 + libm::expf(-b_val));
+
+        // ── L2-normalize key and query ──
+        let mut k_l2_sq = 0.0f32;
+        let mut q_l2_sq = 0.0f32;
+        for k in 0..K {
+            let kv = f32::from_bits((key[h * K + k] as u32) << 16);
+            let qv = f32::from_bits((query[h * K + k] as u32) << 16);
+            k_l2_sq += kv * kv;
+            q_l2_sq += qv * qv;
+        }
+
+        let eps = 1e-6f32;
+        let k_rcp = 1.0f32 / (k_l2_sq + eps).sqrt();
+        let q_rcp = 1.0f32 / (q_l2_sq + eps).sqrt();
+
+        // ── State index: state[h*K*V + k*V + v] ──
+        let state_base = h * K * V + v;
+
+        // ── Step 1: State decay ──
+        for k in 0..K {
+            state[state_base + k * V] *= decay;
+        }
+
+        // ── Step 2: kv_mem = sum_k S[h][k][v] * key_normed[h][k] ──
+        let mut kv_mem = 0.0f32;
+        for k in 0..K {
+            let s_val = state[state_base + k * V];
+            let k_val = f32::from_bits((key[h * K + k] as u32) << 16) * k_rcp;
+            kv_mem += s_val * k_val;
+        }
+
+        // ── Step 3: delta = beta * (value - kv_mem) ──
+        let v_val = f32::from_bits((value[h * V + v] as u32) << 16);
+        let delta = beta_val * (v_val - kv_mem);
+
+        // ── Step 4: State update ──
+        for k in 0..K {
+            let k_val = f32::from_bits((key[h * K + k] as u32) << 16) * k_rcp;
+            state[state_base + k * V] += k_val * delta;
+        }
+
+        // ── Step 5: Output ──
+        let mut y_val = 0.0f32;
+        for k in 0..K {
+            let s_val = state[state_base + k * V];
+            let q_val = f32::from_bits((query[h * K + k] as u32) << 16) * q_rcp * rcp_sqrt_k;
+            y_val += s_val * q_val;
+        }
+
+        // Write output
+        unsafe {
+            *output.get_unchecked_mut(h * V + v) = f32_to_bf16(y_val);
+        }
+    }
+
+    /// GDN Mamba2 SSM single-token update kernel.
+    ///
+    /// One thread per element. No shared memory.
+    /// sigmoid decay, softplus delta, state update, SiLU gating.
+    #[kernel]
+    pub fn gdn_mamba2_update(
+        x_proj: &[u16],          // [num_heads] bf16
+        b_proj: &[u16],          // [num_heads] bf16
+        dt_proj: &[u16],         // [total_dim] bf16
+        z_gate: &[u16],          // [total_dim] bf16
+        A_log: &[u16],           // [num_heads] bf16
+        dt_bias: &[u16],         // [num_heads] bf16
+        state: &mut [u16],       // [total_dim] bf16 — read + write
+        mut output: DisjointSlice<u16>, // [total_dim] bf16
+        num_heads: u32,
+        head_dim: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+        let total_dim = (num_heads * head_dim) as usize;
+        let idx = thread::index_1d();
+        let tid = idx.get() as usize;
+        if tid >= total_dim { return; }
+
+        let head = tid / head_dim as usize;
+
+        // Pre-compute per-head constants
+        let a_val = f32::from_bits((A_log[head] as u32) << 16);
+        let decay = 1.0f32 / (1.0f32 + libm::expf(-a_val));
+        let bias_val = f32::from_bits((dt_bias[head] as u32) << 16);
+
+        // delta = softplus(dt_proj + dt_bias)
+        let dt_val = f32::from_bits((dt_proj[tid] as u32) << 16) + bias_val;
+        let delta: f32;
+        if dt_val > 2.0f32 {
+            delta = dt_val;
+        } else if dt_val < -20.0f32 {
+            delta = 0.0f32;
+        } else {
+            delta = libm::logf(1.0f32 + libm::expf(dt_val));
+        }
+
+        // b contribution (per-head, broadcast)
+        let b_val = f32::from_bits((b_proj[head] as u32) << 16);
+
+        // State update: s = decay * s + delta * b
+        let mut s = f32::from_bits((state[tid] as u32) << 16);
+        s = decay * s + delta * b_val;
+
+        // Output: state * x_proj * silu(z)
+        let x_val = f32::from_bits((x_proj[head] as u32) << 16);
+        let z_val = f32::from_bits((z_gate[tid] as u32) << 16);
+
+        // SiLU: numerically stable formulation
+        let silu_z: f32;
+        if z_val > 0.0f32 {
+            silu_z = z_val / (1.0f32 + libm::expf(-z_val));
+        } else {
+            let exp_z = libm::expf(z_val);
+            silu_z = z_val * exp_z / (1.0f32 + exp_z);
+        }
+
+        unsafe { *output.get_unchecked_mut(tid) = f32_to_bf16(s * x_val * silu_z); }
+
+        // Store updated state back
+        state[tid] = f32_to_bf16(s);
+    }
+
+    /// Dynamic shared memory size test.
+    ///
+    /// Takes the total number of f32 elements and the smem partition sizes,
+    /// writes patterns to each partition, syncs, reads back and verifies.
+    /// This answers: "Does cuda-oxide support large dynamic shared memory?"
+    #[kernel]
+    pub fn dynamic_smem_test(
+        n_f32: u32,               // total f32 elements allocated
+        size_p1: u32,            // partition 1 size in f32 elements
+        size_p2: u32,            // partition 2 size (0 if not used)
+        mut out: DisjointSlice<u32>, // [2] — [errors, bytes_tested]
+    ) {
+        let total_threads = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+
+        let smem_base: *mut f32 = DynamicSharedArray::<f32>::get();
+        let n_f32_usize = n_f32 as usize;
+        let size_p1_usize = size_p1 as usize;
+        let size_p2_usize = size_p2 as usize;
+
+        // Write pattern: partition 1 uses i*7+3, partition 2 uses i*13+5
+        for i in (tid..size_p1_usize).step_by(total_threads) {
+            unsafe { *smem_base.add(i) = (i * 7 + 3) as f32; }
+        }
+        if size_p2_usize > 0 {
+            let p2_offset = size_p1_usize;
+            for i in (tid..size_p2_usize).step_by(total_threads) {
+                unsafe { *smem_base.add(p2_offset + i) = (i * 13 + 5) as f32; }
+            }
+        }
+
+        thread::sync_threads();
+
+        // Read back and verify
+        let mut errors: u32 = 0;
+
+        for i in (tid..size_p1_usize).step_by(total_threads) {
+            let expected = (i * 7 + 3) as f32;
+            let actual = unsafe { *smem_base.add(i) };
+            if actual != expected { errors += 1; }
+        }
+
+        if size_p2_usize > 0 {
+            let p2_offset = size_p1_usize;
+            for i in (tid..size_p2_usize).step_by(total_threads) {
+                let expected = (i * 13 + 5) as f32;
+                let actual = unsafe { *smem_base.add(p2_offset + i) };
+                if actual != expected { errors += 1; }
+            }
+        }
+
+        thread::sync_threads();
+
+        // Thread 0 writes result
+        if tid == 0 {
+            unsafe { *out.get_unchecked_mut(0) = errors; }
+            unsafe { *out.get_unchecked_mut(1) = n_f32; }
+        }
+    }
+
+    /// Dynamic shared memory 80KB test (full partitioned layout).
+    #[kernel]
+    pub fn dynamic_smem_80kb(
+        mut out: DisjointSlice<u32>, // [4] — test results
+    ) {
+        let total_threads = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+
+        let smem_base: *mut f32 = DynamicSharedArray::<f32>::get();
+
+        let size_k_normed = 8192;
+        let size_k_beta = 4096;
+        let size_attn = 6144;
+        let size_beta_arr = 2048;
+
+        let offset_k_normed: usize = 0;
+        let offset_k_beta: usize = size_k_normed;
+        let offset_attn: usize = size_k_normed + size_k_beta;
+        let offset_beta_arr: usize = size_k_normed + size_k_beta + size_attn;
+
+        for i in (tid..size_k_normed).step_by(total_threads) {
+            unsafe { *smem_base.add(offset_k_normed + i) = (i * 7 + 3) as f32; }
+        }
+        for i in (tid..size_k_beta).step_by(total_threads) {
+            unsafe { *smem_base.add(offset_k_beta + i) = (i * 13 + 5) as f32; }
+        }
+        for i in (tid..size_attn).step_by(total_threads) {
+            unsafe { *smem_base.add(offset_attn + i) = (i * 19 + 7) as f32; }
+        }
+        for i in (tid..size_beta_arr).step_by(total_threads) {
+            unsafe { *smem_base.add(offset_beta_arr + i) = (i * 23 + 11) as f32; }
+        }
+
+        thread::sync_threads();
+
+        let mut errors: u32 = 0;
+
+        for i in (tid..size_k_normed).step_by(total_threads) {
+            let expected = (i * 7 + 3) as f32;
+            let actual = unsafe { *smem_base.add(offset_k_normed + i) };
+            if actual != expected { errors += 1; }
+        }
+        for i in (tid..size_k_beta).step_by(total_threads) {
+            let expected = (i * 13 + 5) as f32;
+            let actual = unsafe { *smem_base.add(offset_k_beta + i) };
+            if actual != expected { errors += 1; }
+        }
+        for i in (tid..size_attn).step_by(total_threads) {
+            let expected = (i * 19 + 7) as f32;
+            let actual = unsafe { *smem_base.add(offset_attn + i) };
+            if actual != expected { errors += 1; }
+        }
+        for i in (tid..size_beta_arr).step_by(total_threads) {
+            let expected = (i * 23 + 11) as f32;
+            let actual = unsafe { *smem_base.add(offset_beta_arr + i) };
+            if actual != expected { errors += 1; }
+        }
+
+        thread::sync_threads();
+
+        if tid == 0 {
+            unsafe { *out.get_unchecked_mut(0) = errors; }
+            unsafe { *out.get_unchecked_mut(1) = size_k_normed as u32; }
+            unsafe { *out.get_unchecked_mut(2) = size_k_beta as u32; }
+            unsafe { *out.get_unchecked_mut(3) = size_attn as u32; }
+        }
+    }
+
+
 }
 
 // =============================================================================
@@ -417,6 +720,167 @@ fn int4_gemm_cpu(
         }
     }
     out
+}
+
+/// CPU reference for GDN recurrent step.
+fn gdn_recurrent_step_cpu(
+    query: &[u16],
+    key: &[u16],
+    value: &[u16],
+    a_proj: &[u16],
+    b_proj: &[u16],
+    A_log: &[f32],
+    dt_bias: &[f32],
+    state: &mut [f32],
+    num_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> Vec<u16> {
+    let mut output = vec![0u16; num_heads * head_v_dim];
+    let total = num_heads * head_v_dim;
+
+    for idx in 0..total {
+        let h = idx / head_v_dim;
+        let v = idx % head_v_dim;
+        let K = head_k_dim;
+        let V = head_v_dim;
+        let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
+
+        // Compute g[h] and beta[h]
+        let decay_rate_h = A_log[h].exp();
+        let a_val = bf16_to_f32_cpu(a_proj[h]);
+        let sp_val = a_val + dt_bias[h];
+
+        let softplus_val: f32;
+        if sp_val > 20.0f32 {
+            softplus_val = sp_val;
+        } else if sp_val < -20.0f32 {
+            softplus_val = 0.0f32;
+        } else {
+            softplus_val = (1.0f32 + sp_val.exp()).ln();
+        }
+
+        let g_val = -decay_rate_h * softplus_val;
+        let decay = g_val.exp();
+
+        // beta[h] = sigmoid(b_proj[h])
+        let b_val = bf16_to_f32_cpu(b_proj[h]);
+        let beta_val = 1.0f32 / (1.0f32 + (-b_val).exp());
+
+        // L2-normalize key and query
+        let mut k_l2_sq = 0.0f32;
+        let mut q_l2_sq = 0.0f32;
+        for k in 0..K {
+            let kv = bf16_to_f32_cpu(key[h * K + k]);
+            let qv = bf16_to_f32_cpu(query[h * K + k]);
+            k_l2_sq += kv * kv;
+            q_l2_sq += qv * qv;
+        }
+
+        let eps = 1e-6f32;
+        let k_rcp = 1.0f32 / (k_l2_sq + eps).sqrt();
+        let q_rcp = 1.0f32 / (q_l2_sq + eps).sqrt();
+
+        let state_base = h * K * V + v;
+
+        // Step 1: State decay
+        for k in 0..K {
+            state[state_base + k * V] *= decay;
+        }
+
+        // Step 2: kv_mem
+        let mut kv_mem = 0.0f32;
+        for k in 0..K {
+            let s_val = state[state_base + k * V];
+            let k_val = bf16_to_f32_cpu(key[h * K + k]) * k_rcp;
+            kv_mem += s_val * k_val;
+        }
+
+        // Step 3: delta
+        let v_val = bf16_to_f32_cpu(value[h * V + v]);
+        let delta = beta_val * (v_val - kv_mem);
+
+        // Step 4: State update
+        for k in 0..K {
+            let k_val = bf16_to_f32_cpu(key[h * K + k]) * k_rcp;
+            state[state_base + k * V] += k_val * delta;
+        }
+
+        // Step 5: Output
+        let mut y_val = 0.0f32;
+        for k in 0..K {
+            let s_val = state[state_base + k * V];
+            let q_val = bf16_to_f32_cpu(query[h * K + k]) * q_rcp * rcp_sqrt_k;
+            y_val += s_val * q_val;
+        }
+
+        output[h * V + v] = f32_to_bf16_cpu(y_val);
+    }
+
+    output
+}
+
+/// CPU reference for GDN Mamba2 update.
+fn gdn_mamba2_update_cpu(
+    x_proj: &[u16],
+    b_proj: &[u16],
+    dt_proj: &[u16],
+    z_gate: &[u16],
+    A_log: &[u16],
+    dt_bias: &[u16],
+    state: &mut [u16],
+    num_heads: usize,
+    head_dim: usize,
+) -> Vec<u16> {
+    let total_dim = num_heads * head_dim;
+    let mut output = vec![0u16; total_dim];
+
+    for idx in 0..total_dim {
+        let head = idx / head_dim;
+
+        // Pre-compute per-head constants
+        let a_val = bf16_to_f32_cpu(A_log[head]);
+        let decay = 1.0f32 / (1.0f32 + (-a_val).exp());
+        let bias_val = bf16_to_f32_cpu(dt_bias[head]);
+
+        // delta = softplus(dt_proj + dt_bias)
+        let dt_val = bf16_to_f32_cpu(dt_proj[idx]) + bias_val;
+        let delta: f32;
+        if dt_val > 2.0f32 {
+            delta = dt_val;
+        } else if dt_val < -20.0f32 {
+            delta = 0.0f32;
+        } else {
+            delta = (1.0f32 + dt_val.exp()).ln();
+        }
+
+        // b contribution
+        let b_val = bf16_to_f32_cpu(b_proj[head]);
+
+        // State update: s = decay * s + delta * b
+        let mut s = bf16_to_f32_cpu(state[idx]);
+        s = decay * s + delta * b_val;
+
+        // Output: state * x_proj * silu(z)
+        let x_val = bf16_to_f32_cpu(x_proj[head]);
+        let z_val = bf16_to_f32_cpu(z_gate[idx]);
+
+        // SiLU: numerically stable formulation
+        let silu_z: f32;
+        if z_val > 0.0f32 {
+            silu_z = z_val / (1.0f32 + (-z_val).exp());
+        } else {
+            let exp_z = z_val.exp();
+            silu_z = z_val * exp_z / (1.0f32 + exp_z);
+        }
+
+        output[idx] = f32_to_bf16_cpu(s * x_val * silu_z);
+
+        // Store updated state back
+        state[idx] = f32_to_bf16_cpu(s);
+    }
+
+    output
 }
 
 
@@ -652,6 +1116,262 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             all_pass = false;
+        }
+    }
+
+    // Test 10: gdn_recurrent_step (GDN recurrent step kernel with libm math)
+    {
+        const H: usize = 2;
+        const K: usize = 4;
+        const V: usize = 4;
+
+        let mut rng_seed: u32 = 999;
+        let mut next_u32 = || { rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223); rng_seed };
+
+        // bf16 inputs
+        let query_bf16: Vec<u16> = (0..H * K).map(|_| f32_to_bf16_cpu(((next_u32() % 17) as f32 + 1.0) / 5.0)).collect();
+        let key_bf16: Vec<u16> = (0..H * K).map(|_| f32_to_bf16_cpu(((next_u32() % 19) as f32 + 1.0) / 6.0)).collect();
+        let value_bf16: Vec<u16> = (0..H * V).map(|_| f32_to_bf16_cpu(((next_u32() % 13) as f32 + 1.0) / 4.0)).collect();
+        let a_proj_bf16: Vec<u16> = (0..H).map(|i| f32_to_bf16_cpu(i as f32 - 0.5)).collect();
+        let b_proj_bf16: Vec<u16> = (0..H).map(|i| f32_to_bf16_cpu(i as f32 * 0.5 + 0.3)).collect();
+        // f32 constants
+        let A_log: Vec<f32> = [-0.5f32, -0.3f32].to_vec();
+        let dt_bias: Vec<f32> = [0.1f32, 0.2f32].to_vec();
+
+        // State: f32, initialize with small values
+        let mut state_cpu: Vec<f32> = (0..H * K * V).map(|i| ((i % 7) as f32 + 1.0) / 10.0).collect();
+        let state_gpu: Vec<f32> = state_cpu.clone();
+
+        // Launch GPU kernel
+        let query_dev = DeviceBuffer::from_host(&stream, &query_bf16)?;
+        let key_dev = DeviceBuffer::from_host(&stream, &key_bf16)?;
+        let value_dev = DeviceBuffer::from_host(&stream, &value_bf16)?;
+        let a_proj_dev = DeviceBuffer::from_host(&stream, &a_proj_bf16)?;
+        let b_proj_dev = DeviceBuffer::from_host(&stream, &b_proj_bf16)?;
+        let A_log_dev = DeviceBuffer::from_host(&stream, &A_log)?;
+        let dt_bias_dev = DeviceBuffer::from_host(&stream, &dt_bias)?;
+        let mut state_dev = DeviceBuffer::from_host(&stream, &state_gpu)?;
+        let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, H * V)?;
+
+        let total_threads = H * V;
+        module.gdn_recurrent_step(
+            &stream,
+            LaunchConfig::for_num_elems(total_threads as u32),
+            &query_dev, &key_dev, &value_dev,
+            &a_proj_dev, &b_proj_dev,
+            &A_log_dev, &dt_bias_dev,
+            &mut state_dev,
+            &mut out_dev,
+            H as u32, K as u32, V as u32,
+        )?;
+
+        let gpu_output = out_dev.to_host_vec(&stream)?;
+
+        // CPU reference
+        let cpu_output = gdn_recurrent_step_cpu(
+            &query_bf16, &key_bf16, &value_bf16,
+            &a_proj_bf16, &b_proj_bf16,
+            &A_log, &dt_bias,
+            &mut state_cpu,
+            H, K, V,
+        );
+
+        // Compare outputs (bit-exact bf16)
+        let mut errors = 0usize;
+        for i in 0..H * V {
+            if gpu_output[i] != cpu_output[i] {
+                errors += 1;
+                if errors <= 4 {
+                    eprintln!("  output[{}] GPU={} (bf16 {:>8}) CPU={} (bf16 {:>8})",
+                        i, bf16_to_f32_cpu(gpu_output[i]), gpu_output[i],
+                        bf16_to_f32_cpu(cpu_output[i]), cpu_output[i]);
+                }
+            }
+        }
+
+        if errors == 0 {
+            println!("[PASS] gdn_recurrent_step: {}x{}x{} correct (bit-exact)", H, K, V);
+        } else {
+            eprintln!("[FAIL] gdn_recurrent_step: {} mismatches out of {}", errors, H * V);
+            all_pass = false;
+        }
+    }
+
+    // Test 11: gdn_mamba2_update (Mamba2 SSM single-token with libm math)
+    {
+        const NUM_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        let total_dim = NUM_HEADS * HEAD_DIM; // 8
+
+        let mut rng_seed: u32 = 777;
+        let mut next_u32 = || { rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223); rng_seed };
+
+        // bf16 inputs
+        let x_proj_bf16: Vec<u16> = (0..NUM_HEADS).map(|i| f32_to_bf16_cpu(((i % 5) as f32 + 1.0) / 3.0)).collect();
+        let b_proj_bf16: Vec<u16> = (0..NUM_HEADS).map(|i| f32_to_bf16_cpu(i as f32 * 0.4 + 0.5)).collect();
+        let dt_proj_bf16: Vec<u16> = (0..total_dim).map(|_| f32_to_bf16_cpu(((next_u32() % 7) as f32 - 3.0) / 4.0)).collect();
+        let z_gate_bf16: Vec<u16> = (0..total_dim).map(|_| f32_to_bf16_cpu(((next_u32() % 9) as f32 - 4.0) / 5.0)).collect();
+        let A_log_bf16: Vec<u16> = (0..NUM_HEADS).map(|i| f32_to_bf16_cpu(-0.2f32 * (i as f32 + 1.0))).collect();
+        let dt_bias_bf16: Vec<u16> = (0..NUM_HEADS).map(|_| f32_to_bf16_cpu(0.1f32)).collect();
+
+        // State: bf16, initialize with small values
+        let state_cpu: Vec<u16> = (0..total_dim).map(|i| f32_to_bf16_cpu(((i % 5) as f32 + 1.0) / 8.0)).collect();
+        let state_gpu: Vec<u16> = state_cpu.clone();
+
+        // Launch GPU kernel
+        let x_proj_dev = DeviceBuffer::from_host(&stream, &x_proj_bf16)?;
+        let b_proj_dev = DeviceBuffer::from_host(&stream, &b_proj_bf16)?;
+        let dt_proj_dev = DeviceBuffer::from_host(&stream, &dt_proj_bf16)?;
+        let z_gate_dev = DeviceBuffer::from_host(&stream, &z_gate_bf16)?;
+        let A_log_dev = DeviceBuffer::from_host(&stream, &A_log_bf16)?;
+        let dt_bias_dev = DeviceBuffer::from_host(&stream, &dt_bias_bf16)?;
+        let mut state_dev = DeviceBuffer::from_host(&stream, &state_gpu)?;
+        let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, total_dim)?;
+
+        module.gdn_mamba2_update(
+            &stream,
+            LaunchConfig::for_num_elems(total_dim as u32),
+            &x_proj_dev, &b_proj_dev, &dt_proj_dev, &z_gate_dev,
+            &A_log_dev, &dt_bias_dev,
+            &mut state_dev, &mut out_dev,
+            NUM_HEADS as u32, HEAD_DIM as u32,
+        )?;
+
+        let gpu_output = out_dev.to_host_vec(&stream)?;
+
+        // CPU reference
+        let cpu_output = gdn_mamba2_update_cpu(
+            &x_proj_bf16, &b_proj_bf16, &dt_proj_bf16, &z_gate_bf16,
+            &A_log_bf16, &dt_bias_bf16,
+            &mut state_cpu.clone(),
+            NUM_HEADS, HEAD_DIM,
+        );
+
+        // Compare outputs (bit-exact bf16)
+        let mut errors = 0usize;
+        for i in 0..total_dim {
+            if gpu_output[i] != cpu_output[i] {
+                errors += 1;
+                if errors <= 4 {
+                    eprintln!("  output[{}] GPU={} (bf16 {:>8}) CPU={} (bf16 {:>8})",
+                        i, bf16_to_f32_cpu(gpu_output[i]), gpu_output[i],
+                        bf16_to_f32_cpu(cpu_output[i]), cpu_output[i]);
+                }
+            }
+        }
+
+        if errors == 0 {
+            println!("[PASS] gdn_mamba2_update: {} heads x {} dim correct (bit-exact)", NUM_HEADS, HEAD_DIM);
+        } else {
+            eprintln!("[FAIL] gdn_mamba2_update: {} mismatches out of {}", errors, total_dim);
+            all_pass = false;
+        }
+    }
+
+    // Test 12: dynamic_smem_80kb (80KB dynamic shared memory test — baseline)
+    {
+        // Progressive size test using the dedicated kernel.
+        // NOTE: On sm_120 (RTX 5060 Ti), cuda-oxide's default maxSharedMemoryPerBlock
+        // is ~48KB. To go above this, you need cudaFuncSetAttribute which cuda-oxide
+        // does not currently expose. The original gdn_chunked_gated_delta_prefill.cu
+        // works because it calls cudaFuncSetAttribute before launch.
+        let sizes_kb: Vec<u32> = vec![1, 4, 16, 32, 48, 56, 64, 72, 80];
+
+        let mut largest_ok_kb: u32 = 0;
+        for &size_kb in &sizes_kb {
+            let smem_bytes = size_kb * 1024;
+            let n_f32 = (smem_bytes / 4) as u32;
+            println!("  Testing {} bytes ({:.0} KB)...", smem_bytes, size_kb as f32);
+
+            let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, 2)?;
+            match module.dynamic_smem_test(
+                &stream,
+                LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem_bytes as u32 },
+                n_f32, n_f32, 0,
+                &mut out_dev,
+            ) {
+                Ok(()) => {
+                    largest_ok_kb = size_kb;
+                    let results = out_dev.to_host_vec(&stream)?;
+                    if results[0] == 0 {
+                        println!("    ✓ OK ({} bytes verified)", smem_bytes);
+                    } else {
+                        println!("    ✗ DATA ERROR: {} errors", results[0]);
+                        break;
+                    }
+                },
+                Err(e) => { println!("    ✗ LAUNCH FAILED: {}", e); break; }
+            }
+        }
+
+        // Report the finding (not a fail — this is a hardware + cuda-oxide API limitation)
+        if largest_ok_kb >= 80 {
+            println!("[PASS] dynamic_smem_80kb: up to {} KB works, data verified", largest_ok_kb);
+        } else {
+            // This is expected on sm_120 without cudaFuncSetAttribute support
+            println!("[INFO] dynamic_smem_80kb: max = {} KB (cuda-oxide lacks cudaFuncSetAttribute for >48KB on sm_120)", largest_ok_kb);
+        }
+    }
+
+    // Test 13: cuFuncSetAttribute workaround — raise max dynamic shared memory above 48KB
+    {
+        println!("\n=== Test 13: cuFuncSetAttribute for >48KB dynamic smem ===");
+
+        // Access the raw CUDA driver API through cuda-core's sys re-export of cuda-bindings.
+        use cuda_core::sys;
+
+        let sizes_kb: Vec<u32> = vec![56, 80, 96];
+
+        for &size_kb in &sizes_kb {
+            let smem_bytes = size_kb * 1024usize as u32;
+            let n_f32 = (smem_bytes / 4) as u32;
+            println!("  Testing {} bytes ({:.0} KB) with cuFuncSetAttribute...", smem_bytes, size_kb as f32);
+
+            // Load the kernel function by name to get a CudaFunction handle.
+            let func = module.as_cuda_module().load_function("dynamic_smem_test")?;
+            let raw_func: sys::CUfunction = unsafe { func.cu_function() };
+
+            // Set max dynamic shared memory for this function to at least smem_bytes.
+            // cuFuncSetAttribute signature: (CUfunction, CUfunction_attribute, int value)
+            // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8 (from cuda.h line 1083)
+            let result = unsafe {
+                sys::cuFuncSetAttribute(
+                    raw_func,
+                    8, // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+                    smem_bytes as i32,
+                )
+            };
+
+            if result != 0 {
+                println!("    ✗ cuFuncSetAttribute failed with error code {}", result);
+                all_pass = false;
+                break;
+            }
+
+            // Launch the kernel with the requested shared memory size.
+            let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, 2)?;
+            match module.dynamic_smem_test(
+                &stream,
+                LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem_bytes },
+                n_f32, n_f32, 0,
+                &mut out_dev,
+            ) {
+                Ok(()) => {
+                    let results = out_dev.to_host_vec(&stream)?;
+                    if results[0] == 0 {
+                        println!("    ✓ OK ({} bytes verified, {} f32 elements read/written)", smem_bytes, results[1]);
+                    } else {
+                        println!("    ✗ DATA ERROR: {} errors", results[0]);
+                        all_pass = false;
+                        break;
+                    }
+                },
+                Err(e) => {
+                    println!("    ✗ LAUNCH FAILED: {}", e);
+                    all_pass = false;
+                    break;
+                }
+            }
         }
     }
 

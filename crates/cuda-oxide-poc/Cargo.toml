@@ -21,3 +21,6 @@ cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
 
 # Host-side CUDA runtime (CudaContext, DeviceBuffer, LaunchConfig)
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
+
+# Math functions for device kernels (expf, logf, sqrtf etc.)
+libm = "0.2"

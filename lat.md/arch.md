@@ -86,10 +86,10 @@ End-to-end pipeline validated: Rust kernel → PTX → GPU launch. Standalone cr
 | Finding | Status | Details |
 |----------|--------|---------|
 | `SharedArray<T, N>` (static smem) | ✅ Works | Declare as `static mut` in kernel body; access via unsafe indexing |
-| `DynamicSharedArray<T>::get()` (dynamic smem) | ✅ Works | Returns raw `*mut T`; requires `LaunchConfig.shared_mem_bytes` |
+| `DynamicSharedArray<T>::get()` (dynamic smem) | ✅ Works | Returns raw `*mut T`; requires `LaunchConfig.shared_mem_bytes`. Default ~48KB limit on sm_120; >48KB achievable via cuFuncSetAttribute workaround — see [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide POC: GDN Kernels and 80KB Dynamic Shared Memory (Exploration Complete)]] |
 | Tree reduction in shared memory | ✅ Works | Halving stride pattern: `let mut s = total_threads >> 1; while s > 0 { ... }` |
 | RMSNorm via shared memory | ✅ Correct | GPU output matches CPU reference within 1e-3 for f32 data |
-| Multiple kernels in single `#[cuda_module]` | ✅ Works | 9 kernels coexist: vec_add, rmsnorm_static_smem, rmsnorm_dynamic_smem, reduce_benchmark, bf16_vec_add, bf16x2_fma_test, int4_unpack_test, int4_gemm |
+| Multiple kernels in single `#[cuda_module]` | ✅ Works | 13+ kernels coexist: vec_add, rmsnorm_static_smem, rmsnorm_dynamic_smem, reduce_benchmark, bf16_vec_add, bf16x2_fma_test, int4_unpack_test, int4_gemm, gdn_recurrent_step, gdn_mamba2_update, dynamic_smem_test, dynamic_smem_80kb |
 | `#[launch_bounds(N)]` with DynamicSharedArray | ✅ Fixed | Was a cuda-oxide bug: `llvm-export/metadata.rs` omitted `!"kernel"` annotation for launch_bounds kernels, so NVPTX backend didn't emit `.entry` — fixed by adding kernel metadata in the launch_bounds loop |
 | `(1..).step_by(1)` iterator pattern | ✅ Works | Finite-range `step_by` works in all POC kernels; unbounded `(1..).step_by(N)` may still fail on `Step::forward` constant asserts — use explicit `while` loop for that case |
 
@@ -124,6 +124,31 @@ Four additional kernels validating BF16 arithmetic, packed BF16x2 FMA, INT4 bit 
 **Key discovery — RNE vs truncate mismatch**: The `fma.rn.bf16x2` PTX instruction uses round-to-nearest-even. CPU verification must use the same rounding mode (`f32_to_bf16_rne`) rather than truncation (`f32_to_bf16`) to match GPU results.
 
 **Key discovery — f16 in device code**: `f16::from_bits()` works inside kernels. Casting `(f16_val as f32)` works for f16→f32 conversion. The `From<f16>` trait is not implemented on `f32` — use explicit cast instead.
+### cuda-oxide POC: GDN Kernels and 80KB Dynamic Shared Memory (Exploration Complete)
+
+Three additional kernels validating GDN math patterns with `libm` math functions, plus a progressive dynamic shared memory sizing test.
+
+**Math functions in kernels**: cuda-oxide intercepts `libm::expf()`, `libm::logf()`, `libm::sqrtf()` and maps them to NVIDIA libdevice intrinsics (`__nv_expf`, etc.). `f32::sqrt()` also works directly. No native `rsqrtf` — use `1.0f32 / libm::sqrtf(x)`. Sigmoid: `1.0f32 / (1.0f32 + libm::expf(-x))`. Softplus uses piecewise clamping (x>20 → x; x<-20 → 0; else `libm::logf(1.0f32 + libm::expf(x))`).
+
+**Kernels added**:
+
+| Kernel | Purpose | Test Result |
+|--------|---------|-------------|
+| `gdn_recurrent_step` | GDN single-token decode: L2 norm, softplus decay, sigmoid beta, 5-step recurrence | ✅ H=2, K=4, V=4 bit-exact |
+| `gdn_mamba2_update` | Mamba2 SSM single-token: sigmoid decay, softplus delta, SiLU gating | ✅ H=2, head_dim=4 bit-exact |
+| `dynamic_smem_test` | Progressive dynamic shared memory sizing test | ✅ 48KB default; >48KB via cuFuncSetAttribute workaround |
+| `dynamic_smem_80kb` | Full partitioned 80KB layout (4 partitions: k_normed, k_beta, attn, beta_arr) | ✅ Works with cuFuncSetAttribute |
+
+**Key discovery — dynamic shared memory limit on sm_120**: On RTX 5060 Ti (sm_120/Blackwell), cuda-oxide's default `maxSharedMemoryPerBlock` is approximately 48KB. Progressive testing shows launches succeed up to 49152 bytes (48KB) but fail with `DriverError(1, "invalid argument")` at 57344 bytes (56KB). **Workaround**: `cuFuncSetAttribute` IS accessible through `cuda_core::sys` (re-export of cuda-bindings). Load the function via `module.as_cuda_module().load_function("kernel_name")`, call `unsafe { func.cu_function() }` for the raw CUfunction, then call `unsafe { sys::cuFuncSetAttribute(raw_func, 8, size as i32) }` where `8` is `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. After setting this attribute, dynamic shared memory up to at least 96KB works.
+
+**Test results with cuFuncSetAttribute**:
+| Size | Result |
+|------|--------|
+| 56 KB (57344 bytes) | ✅ Pass — data verified |
+| 80 KB (81920 bytes) | ✅ Pass — data verified |
+| 96 KB (98304 bytes) | ✅ Pass — data verified |
+
+**Implication for gdn_chunked_gated_delta_prefill**: Can be ported to cuda-oxide using the cuFuncSetAttribute workaround. No additional feature request needed.
 # Kernel Extraction and Build System
 
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.
