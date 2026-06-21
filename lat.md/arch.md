@@ -77,7 +77,7 @@ End-to-end pipeline validated: Rust kernel → PTX → GPU launch. Standalone cr
 
 **Build command**: `RUSTFLAGS="-Z codegen-backend=/home/gary/.cargo/cuda-oxide/librustc_codegen_cuda.so" cargo build --release` from within the POC crate directory. **Not** `cargo oxide build -p cuda-oxide-poc` — that targets the workspace root and builds everything.
 
-**Test results**: Both simple kernel (1 thread/element) and grid-stride kernel (256 threads for 1024 elements) pass verification with f32 data. BF16 not yet testable — cuda-oxide supports Rust's native `f16` type but not `bf16`; would require packed u32 bit manipulation via `cvt_f32x2_bf16x2` intrinsic.
+**Test results**: Both simple kernel (1 thread/element) and grid-stride kernel (256 threads for 1024 elements) pass verification with f32 data. BF16 arithmetic now validated via u16 bit manipulation — see [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide POC: BF16 and INT4 Kernels (Exploration Complete)]].
 
 **Existing build unaffected**: `cargo build --release -p infers-cuda` (without oxide) still compiles successfully with cudarc + nvcc pipeline.
 
@@ -89,9 +89,41 @@ End-to-end pipeline validated: Rust kernel → PTX → GPU launch. Standalone cr
 | `DynamicSharedArray<T>::get()` (dynamic smem) | ✅ Works | Returns raw `*mut T`; requires `LaunchConfig.shared_mem_bytes` |
 | Tree reduction in shared memory | ✅ Works | Halving stride pattern: `let mut s = total_threads >> 1; while s > 0 { ... }` |
 | RMSNorm via shared memory | ✅ Correct | GPU output matches CPU reference within 1e-3 for f32 data |
-| Multiple kernels in single `#[cuda_module]` | ✅ Works | vec_add, rmsnorm_static_smem, rmsnorm_dynamic_smem, reduce_benchmark all coexist |
+| Multiple kernels in single `#[cuda_module]` | ✅ Works | 9 kernels coexist: vec_add, rmsnorm_static_smem, rmsnorm_dynamic_smem, reduce_benchmark, bf16_vec_add, bf16x2_fma_test, int4_unpack_test, int4_gemm |
 | `#[launch_bounds(N)]` with DynamicSharedArray | ✅ Fixed | Was a cuda-oxide bug: `llvm-export/metadata.rs` omitted `!"kernel"` annotation for launch_bounds kernels, so NVPTX backend didn't emit `.entry` — fixed by adding kernel metadata in the launch_bounds loop |
 | `(1..).step_by(1)` iterator pattern | ✅ Works | Finite-range `step_by` works in all POC kernels; unbounded `(1..).step_by(N)` may still fail on `Step::forward` constant asserts — use explicit `while` loop for that case |
+
+### cuda-oxide POC: BF16 and INT4 Kernels (Exploration Complete)
+
+Four additional kernels validating BF16 arithmetic, packed BF16x2 FMA, INT4 bit manipulation, and full INT4 GEMM with dequantization — all passing with bit-exact CPU verification.
+
+**BF16 conversion pipeline**: cuda-oxide has no native `bf16` type. bf16 values are stored as `u16` on host/device, converted via:
+
+| Direction | Method | Details |
+|-----------|--------|---------|
+| bf16→f32 (read) | `f32::from_bits((u16_bits as u32) << 16)` | Reinterpret upper 16 bits of f32; exact, no loss |
+| f32→bf16 (write) | `cuda_device::tcgen05::f32_to_bf16(val)` | Truncate mode — matches CUDA's `__float2bfloat16` |
+| f32→bf16 (RNE) | `cuda_device::tcgen05::f32_to_bf16_rne(val)` | Round-to-nearest-even — matches PTX `rn` rounding mode |
+| f32→packed bf16x2 | `cvt_f32x2_bf16x2(lo, hi)` | Single PTX instruction, two f32s into one u32 |
+
+**Packed bf16x2 FMA**: `cuda_device::bf16x2::fma_bf16x2(a, b, c)` compiles to `fma.rn.bf16x2` (sm_80+). Multiplication via FMA with zero accumulator: `fma_bf16x2(a, b, 0)`.
+
+**INT4 dequantization pattern**: Extract from packed u32 (8 INT4 per u32), sign-extend via `(val as i8).wrapping_sub(8)`, dequantize as `f32::from(w_int4 - zero_i8) * scale_f32`. All in registers, no shared memory.
+
+**Native f16 type**: Rust's unstable `#![feature(f16)]` works inside cuda-oxide kernels. f16→f32 via `(f16_val as f32)` — **not** via `f32::from(f16)` (trait not implemented). Requires `#![feature(f16)]` at crate root for both host and device code.
+
+**Kernels added**:
+
+| Kernel | Purpose | Test Result |
+|--------|---------|-------------|
+| `bf16_vec_add` | bf16→f32 add→bf16 pipeline, bit-exact | ✅ 1024 elements |
+| `bf16x2_fma_test` | Packed bf16x2 multiply via FMA | ✅ 256 packed pairs |
+| `int4_unpack_test` | INT4 unpack + dequantize (f16 scales) | ✅ 512 values |
+| `int4_gemm` | Full INT4 GEMM (16×16, bf16 I/O) | ✅ Bit-exact |
+
+**Key discovery — RNE vs truncate mismatch**: The `fma.rn.bf16x2` PTX instruction uses round-to-nearest-even. CPU verification must use the same rounding mode (`f32_to_bf16_rne`) rather than truncation (`f32_to_bf16`) to match GPU results.
+
+**Key discovery — f16 in device code**: `f16::from_bits()` works inside kernels. Casting `(f16_val as f32)` works for f16→f32 conversion. The `From<f16>` trait is not implemented on `f32` — use explicit cast instead.
 # Kernel Extraction and Build System
 
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.
