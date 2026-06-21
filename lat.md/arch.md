@@ -80,6 +80,18 @@ End-to-end pipeline validated: Rust kernel → PTX → GPU launch. Standalone cr
 **Test results**: Both simple kernel (1 thread/element) and grid-stride kernel (256 threads for 1024 elements) pass verification with f32 data. BF16 not yet testable — cuda-oxide supports Rust's native `f16` type but not `bf16`; would require packed u32 bit manipulation via `cvt_f32x2_bf16x2` intrinsic.
 
 **Existing build unaffected**: `cargo build --release -p infers-cuda` (without oxide) still compiles successfully with cudarc + nvcc pipeline.
+
+**Key findings**:
+
+| Finding | Status | Details |
+|----------|--------|---------|
+| `SharedArray<T, N>` (static smem) | ✅ Works | Declare as `static mut` in kernel body; access via unsafe indexing |
+| `DynamicSharedArray<T>::get()` (dynamic smem) | ✅ Works | Returns raw `*mut T`; requires `LaunchConfig.shared_mem_bytes` |
+| Tree reduction in shared memory | ✅ Works | Halving stride pattern: `let mut s = total_threads >> 1; while s > 0 { ... }` |
+| RMSNorm via shared memory | ✅ Correct | GPU output matches CPU reference within 1e-3 for f32 data |
+| Multiple kernels in single `#[cuda_module]` | ✅ Works | vec_add, rmsnorm_static_smem, rmsnorm_dynamic_smem, reduce_benchmark all coexist |
+| `#[launch_bounds(N)]` with DynamicSharedArray | ✅ Fixed | Was a cuda-oxide bug: `llvm-export/metadata.rs` omitted `!"kernel"` annotation for launch_bounds kernels, so NVPTX backend didn't emit `.entry` — fixed by adding kernel metadata in the launch_bounds loop |
+| `(1..).step_by(1)` iterator pattern | ✅ Works | Finite-range `step_by` works in all POC kernels; unbounded `(1..).step_by(N)` may still fail on `Step::forward` constant asserts — use explicit `while` loop for that case |
 # Kernel Extraction and Build System
 
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.
