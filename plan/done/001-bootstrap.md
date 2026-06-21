@@ -1,9 +1,9 @@
 # Phase 1: Bootstrap
 
 ---
-**Status**: PARTIAL
-**Last Updated**: 2026-06-11
-**Rationale**: Workspace exists, crates exist, server has mock responses. BUT: Server NOT wired to real inference. Some API types exist.
+**Status**: DONE
+**Last Updated**: 2026-06-21
+**Rationale**: Workspace, crates, toolchain, API types, server skeleton all exist. Superseded by later phases that wired real inference.
 **Actual Deliverables**:
 - [x] Workspace `Cargo.toml` with nightly toolchain
 - [x] `rust-toolchain.toml`

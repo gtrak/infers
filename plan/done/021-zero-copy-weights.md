@@ -1,11 +1,11 @@
 # Phase 16: Zero-Copy Weight Streaming (Eliminate DRAM Residency)
 
 ---
-**Status**: NOT STARTED
-**Last Updated**: 2026-06-19
+**Status**: DONE
+**Last Updated**: 2026-06-21
 **Blocks**: DRAM usage reduction, faster cold-start
 **Blocked by**: Nothing
-**Rationale**: The current weight loading pipeline copies every tensor from mmap'd safetensors files into heap memory (`Bytes::copy_from_slice()`), then uploads from heap to GPU. For the Qwen3.6-27B INT4 model (~14GB), this means 14GB of permanent heap residency + 14GB GPU VRAM = 28GB total. The heap copy is unnecessary — the data already exists on disk via mmap. Eliminating it halves peak DRAM usage and makes the GPU the sole long-term weight store.
+**Rationale**: MmapTensor, MmapWeightRegistry, PinnedHostBuffer, cuMemcpy2D zero-copy upload all implemented. Heap loader extracted to separate crate. Sharding equivalence tests verify byte-identical output. DRAM reduced from 18 GB to 1.1 GB. Conv1d.weight fused QKV sharding bug fixed.
 ---
 
 ## Current Data Flow

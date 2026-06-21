@@ -2,7 +2,10 @@
 
 ## Status
 
-The GDN rewrite (Mamba2 SSM → Gated Delta Rule) compiles and runs with valid outputs (no NaN). Phase 1 diagnosis complete — the rms_norm_gated weight formula was corrected, and cubin cache rebuild resolved stale binary issues. Phase 2 validation complete — all 12 computable intermediates match HF reference (cos > 0.98), output correctly shows as ROW-PAR partial sum before all-reduce. Smoke test passes with 30 generated tokens. Remaining work: decode forward, and INT4 GEMM investigation.
+**Status**: DONE
+**Last Updated**: 2026-06-21
+
+The GDN rewrite (Mamba2 SSM → Gated Delta Rule) compiles and runs with valid outputs (no NaN). All 12 computable intermediates match HF reference (cos > 0.98). Smoke test passes with 30 generated tokens.
 
 ## Fixed Bugs
 

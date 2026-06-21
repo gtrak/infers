@@ -1,9 +1,9 @@
 # Phase 2: CUDA Backend
 
 ---
-**Status**: PARTIAL
-**Last Updated**: 2026-06-11
-**Rationale**: cudarc works, kernels compile, NCCL works. cuda-oxide is OUT OF SCOPE — we use cudarc exclusively. Memory allocator (block pool) may not exist.
+**Status**: DONE
+**Last Updated**: 2026-06-21
+**Rationale**: cudarc works, kernels compile, NCCL works. Memory allocator not needed — cudarc handles GPU memory. cuda-oxide exploration deferred to Phase 023.
 **Actual Deliverables**:
 - [n] cuda-oxide workspace integration — OUT OF SCOPE (cudarc only)
 - [x] cudarc cuBLASLt bindings

@@ -1,11 +1,11 @@
 # Phase 15: Tracing Integration + OTLP Export
 
 ---
-**Status**: NOT STARTED
-**Last Updated**: 2026-06-19
+**Status**: DONE
+**Last Updated**: 2026-06-21
 **Blocks**: Performance profiling, bottleneck identification
 **Blocked by**: Nothing
-**Rationale**: The engine runs at ~0.1 tok/s on hardware that should support 20 tok/s. Without distributed tracing, bottleneck identification requires manual `eprintln!` timing and guesswork. OTLP-exported traces give flame graphs showing CPU vs GPU time, NCCL overhead, weight upload latency, and per-layer cost — the data needed to find and fix the 200× performance gap. The existing `probe` module (Phase 13) dumps tensor intermediates for correctness comparison; this phase adds *timing* instrumentation for performance analysis.
+**Rationale**: OTLP tracing integrated. Layer spans, GPU timing via CudaEvent, I/O latency spans, scheduler/orchestrator spans all wired. Integration test passes.
 ---
 
 ## Goals
