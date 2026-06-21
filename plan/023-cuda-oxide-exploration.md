@@ -1,8 +1,8 @@
 # Phase 18: cuda-oxide Exploration — Replace CUDA Kernels with Rust
 
 ---
-**Status**: NOT STARTED
-**Last Updated**: 2026-06-19
+**Status**: COMPLETE — Migration assessment: **MIGRATE LATER**
+**Last Updated**: 2026-06-21
 **Blocks**: Nothing (exploration only — no implementation commitment)
 **Blocked by**: Nothing
 **Rationale**: The project has 25 custom `.cu` kernel files compiled via nvcc's `build.rs`. cuda-oxide is a Rust→PTX compiler that could eliminate the nvcc dependency, let us write GPU kernels in Rust, and unify host+device code in one language. This phase explores feasibility, maps kernel features to cuda-oxide capabilities, and produces a migration assessment. The project already uses the exact same nightly (`nightly-2026-04-03`) and components (`rust-src`, `rustc-dev`, `llvm-tools`) that cuda-oxide requires — the toolchain alignment is already done.

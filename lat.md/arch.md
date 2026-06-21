@@ -227,3 +227,11 @@ Compiles `.cu` in `kernels/infers/` to .cubin via nvcc `-O3`. Non-GDN kernels us
 **Precision policy**: `--use_fast_math` causes `expf()`/`logf()`/`rsqrtf()` to use reduced-precision approximations (~2 ULP vs ~1 ULP). In the GDN recurrence kernel (`gdn_gated_delta_prefill.cu`), these small per-step errors compound through the sequential state update, causing cosine similarity of only ~0.94 vs PyTorch reference after 15 tokens (token 0 matches perfectly at 1.0, worst at token 9 = 0.84). To prevent this, all GDN kernel files (`gdn_*.cu`) are compiled **without** `--use_fast_math`, while the remaining kernels (softmax, silu, conv1d_depthwise, etc.) retain the flag for performance. The build script determines this by checking whether the file stem starts with `"gdn"` in `compile_kernel()`.
 
 The `find_nvcc()` function checks PATH first, then falls back to common CUDA install locations (`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.2/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, `/usr/bin/nvcc`). Missing nvcc or source files produce warnings but do not fail the build. Compiled kernels are placed in `kernels/compiled/` with matching names and loaded at runtime by the KernelRegistry.
+
+### cuda-oxide Migration Assessment (Phase 18 Complete)
+
+Migration assessment: **MIGRATE LATER.** All kernel features technically feasible (13 POC kernels pass), but alpha quality, no native bf16 type, and workspace friction make production migration premature. Full analysis in `plan/research/cuda-oxide.md`.
+
+**Key results**: 13 kernels across 5 exploration commits pass on RTX 5060 Ti (sm_120): vec_add, rmsnorm (static+dynamic smem), reduce, bf16_vec_add, bf16x2_fma, int4_unpack, int4_gemm, gdn_recurrent_step, gdn_mamba2_update, dynamic_smem_test, dynamic_smem_80kb, plus 5 cudarc coexistence tests. Bugfix in cuda-oxide `llvm-export/metadata.rs` for launch_bounds kernel metadata (upstream pending). 80KB+ dynamic shared memory works via `cuFuncSetAttribute` workaround.
+
+**Blockers**: (1) No native bf16 type — all bf16 I/O via u16 bit manipulation. (2) Workspace integration friction — standalone crate required. (3) cudarc→oxide memory copy overhead per kernel call. (4) Alpha API instability (v0.2.1). See `plan/research/cuda-oxide.md` for full analysis.
