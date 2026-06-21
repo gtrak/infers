@@ -60,6 +60,26 @@ Six modules cover context, streams, kernels, GEMM, pinned, and NCCL.
 
 Rust→PTX compiler for three quantization-sensitive kernels with trait-based dispatch. Enables AutoRound, GGUF, AWQ, GPTQ with one kernel. Rust source is portable to rust-gpu (SPIR-V) and amdgcn (HIP) for multi-hardware.
 
+### cuda-oxide POC: Vector Add Kernel (Exploration Complete)
+
+End-to-end pipeline validated: Rust kernel → PTX → GPU launch. Standalone crate at `crates/cuda-oxide-poc/` isolated from parent workspace to avoid codegen conflicts with stable builds.
+
+| Attribute | Value | Description |
+|-----------|-------|-------------|
+| `#[kernel]` | marks function as CUDA kernel | Compiles to PTX via rustc-codegen-cuda |
+| `#[cuda_module]` | wraps kernel functions | Generates typed module loader with per-kernel launch methods |
+| `thread::index_1d()` | thread index | Type-safe `ThreadIndex<'kernel, Index1D>` witness for DisjointSlice access |
+| `DisjointSlice<T>` | GPU output buffer | Bounds-checked writes; each thread gets unique memory location via ThreadIndex |
+| `thread::blockDim_x()`, `thread::gridDim_x()` | grid-stride intrinsics | CamelCase (not snake_case) — key API discovery finding |
+| `CudaContext::new(0)` | host CUDA context | Device 0, creates default stream |
+| `DeviceBuffer::from_host()` / `zeroed()` | GPU memory | Host-to-device transfer or zero-initialized allocation |
+| `LaunchConfig::for_num_elems(N)` | launch config | Auto-calculates block/grid from element count (256 threads/block) |
+
+**Build command**: `RUSTFLAGS="-Z codegen-backend=/home/gary/.cargo/cuda-oxide/librustc_codegen_cuda.so" cargo build --release` from within the POC crate directory. **Not** `cargo oxide build -p cuda-oxide-poc` — that targets the workspace root and builds everything.
+
+**Test results**: Both simple kernel (1 thread/element) and grid-stride kernel (256 threads for 1024 elements) pass verification with f32 data. BF16 not yet testable — cuda-oxide supports Rust's native `f16` type but not `bf16`; would require packed u32 bit manipulation via `cvt_f32x2_bf16x2` intrinsic.
+
+**Existing build unaffected**: `cargo build --release -p infers-cuda` (without oxide) still compiles successfully with cudarc + nvcc pipeline.
 # Kernel Extraction and Build System
 
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.

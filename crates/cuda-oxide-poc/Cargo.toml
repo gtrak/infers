@@ -1,0 +1,23 @@
+[package]
+name = "cuda-oxide-poc"
+version = "0.1.0"
+edition = "2024"
+authors = ["infers"]
+license = "Apache-2.0"
+
+# Standalone crate for cuda-oxide proof-of-concept exploration.
+# Uses the unified single-source compilation model: host + device in one file.
+# Build with: cargo oxide build -p cuda-oxide-poc
+# Run with:   cargo oxide run cuda-oxide-poc
+
+[workspace]
+
+[dependencies]
+# Device-side intrinsics (thread indexing, DisjointSlice, etc.)
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
+
+# Host-side kernel launch traits and cuda_module macro support
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
+
+# Host-side CUDA runtime (CudaContext, DeviceBuffer, LaunchConfig)
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
