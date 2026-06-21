@@ -1,0 +1,16 @@
+[package]
+name = "cuda-oxide-coexist"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone test: can cuda-oxide kernels and cudarc cuBLASLt coexist
+# on the same CUDA context, stream, and device memory?
+
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
+cudarc = { version = "0.19", features = ["cublaslt", "cuda-13020", "f16"] }

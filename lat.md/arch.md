@@ -149,6 +149,32 @@ Three additional kernels validating GDN math patterns with `libm` math functions
 | 96 KB (98304 bytes) | ✅ Pass — data verified |
 
 **Implication for gdn_chunked_gated_delta_prefill**: Can be ported to cuda-oxide using the cuFuncSetAttribute workaround. No additional feature request needed.
+
+### cuda-oxide + cudarc Coexistence (Validated)
+
+cuda-oxide kernels and cudarc cuBLASLt/NCCL coexist on the same CUDA primary context, sharing device memory via raw pointers.
+
+**Test crate**: `crates/cuda-oxide-coexist/` — standalone workspace with both dependencies: cuda-core, cuda-device, cuda-host (git) + cudarc 0.19 (cublaslt, cuda-13020, f16 features). Build requires the cuda-oxide codegen backend.
+
+**Key findings**:
+
+| Question | Answer | Details |
+|----------|--------|---------|
+| Same CUDA context? | ✅ Yes | Both libraries operate on the primary CUcontext for device 0; no conflict |
+| Shared device memory? | ✅ Yes | cudarc `CudaSlice` and cuda-oxide `DeviceBuffer` allocate from same pool; raw pointers via `cuMemcpyDtoH_v2` / `cuMemcpyDtoD_v2` cross library boundaries |
+| Stream coexistence? | ✅ Yes | Separate streams from each library's context default_stream() operate without conflict on the same device |
+| cuBLASLt GEMM alongside oxide kernels? | ✅ Yes | cudarc cuBLASLt GEMM (tf32) runs correctly in same process as cuda-oxide kernel launches |
+| Raw pointer interop? | ✅ Yes | `CudaSlice.device_ptr()` + `DeviceBuffer.cu_deviceptr()` allow cross-library memcpy and verification |
+
+**Coexistence pattern**: Create cudarc context first, then cuda-oxide context on the same device. Allocate buffers via whichever library's allocator fits. Use cuMemcpyDtoD_v2 for cross-library buffer transfers when kernel arguments require it (cuda-oxide kernels accept `&[T]` / `DisjointSlice<T>`, not raw pointers — so cudarc data must be copied into a cuda-oxide DeviceBuffer before kernel launch).
+
+**API differences requiring workarounds**:
+- cudarc allocates via `stream.alloc_zeros()` / `stream.clone_htod()`, reads back via `stream.clone_dtoh()` and `CudaSlice.to_cuda_vec()`
+- cuda-oxide allocates via `DeviceBuffer::zeroed(&stream, N)` / `DeviceBuffer::from_host()`, reads back via `to_host_vec(&stream)`
+- Raw device pointers: cudarc via `DevicePtr` trait's `device_ptr(&stream)`, cuda-oxide via `cu_deviceptr()`
+- No direct raw pointer passing from cudarc into cuda-oxide kernels — data must be copied to a DeviceBuffer first
+
+**Build command**: `RUSTFLAGS="-Z codegen-backend=/home/gary/.cargo/cuda-oxide/librustc_codegen_cuda.so" cargo run --release` from within the coexist crate directory.
 # Kernel Extraction and Build System
 
 Pipeline for compiling infers CUDA kernel source to .cubin binaries.
