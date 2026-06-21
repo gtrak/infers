@@ -1,7 +1,6 @@
 //! NCCL communicator for multi-GPU collective operations.
 //!
-//! Provides all-reduce, broadcast, reduce, and all-gather primitives
-//! across multiple GPUs via cudarc's safe NCCL bindings.
+//! Provides all-reduce primitives across multiple GPUs via cudarc's safe NCCL bindings.
 
 use cudarc::driver::CudaSlice;
 use cudarc::nccl::safe::{Comm, NcclType, ReduceOp};
@@ -68,41 +67,6 @@ impl NcclCommunicator {
         Ok(())
     }
 
-    /// Broadcast from a root rank to all other ranks for a specific GPU's comm.
-    pub fn broadcast<T: NcclType>(
-        &self,
-        rank: usize,
-        send: Option<&CudaSlice<T>>,
-        recv: &mut CudaSlice<T>,
-        root: i32,
-    ) -> anyhow::Result<()> {
-        let comm = self
-            .comms
-            .get(rank)
-            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
-        comm.broadcast(send, recv, root)
-            .map_err(|e| anyhow::anyhow!("NCCL broadcast failed: {:?}", e))?;
-        Ok(())
-    }
-
-    /// Reduce to a single root rank.
-    pub fn reduce<T: NcclType>(
-        &self,
-        rank: usize,
-        send: &CudaSlice<T>,
-        recv: Option<&mut CudaSlice<T>>,
-        op: ReduceOp,
-        root: i32,
-    ) -> anyhow::Result<()> {
-        let comm = self
-            .comms
-            .get(rank)
-            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
-        comm.reduce(send, recv, &op, root)
-            .map_err(|e| anyhow::anyhow!("NCCL reduce failed: {:?}", e))?;
-        Ok(())
-    }
-
     /// All-reduce in-place across all ranks for a specific GPU's comm.
     pub fn all_reduce_in_place<T: NcclType>(
         &self,
@@ -116,22 +80,6 @@ impl NcclCommunicator {
             .ok_or_else(|| anyhow::anyhow!("Rank {} out of range (world_size={})", rank, self.world_size))?;
         comm.all_reduce_in_place(buffer, &op)
             .map_err(|e| anyhow::anyhow!("NCCL all_reduce_in_place failed: {:?}", e))?;
-        Ok(())
-    }
-
-    /// All-gather: gather data from all ranks into recv buffer.
-    pub fn all_gather<T: NcclType>(
-        &self,
-        rank: usize,
-        send: &CudaSlice<T>,
-        recv: &mut CudaSlice<T>,
-    ) -> anyhow::Result<()> {
-        let comm = self
-            .comms
-            .get(rank)
-            .ok_or_else(|| anyhow::anyhow!("Rank {} out of range", rank))?;
-        comm.all_gather(send, recv)
-            .map_err(|e| anyhow::anyhow!("NCCL all_gather failed: {:?}", e))?;
         Ok(())
     }
 
