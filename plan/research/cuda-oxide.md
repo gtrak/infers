@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-**Recommendation: MIGRATE LATER** — cuda-oxide's Rust→PTX pipeline works end-to-end and all kernel features are technically feasible, but the alpha quality (v0.2.1), workspace integration friction, and memory API mismatches make production migration premature. Begin a staged migration once cuda-oxide reaches v0.3+ with stabilized APIs.
+**Recommendation: DON'T MIGRATE YET** — cuda-oxide's Rust→PTX pipeline works end-to-end for monomorphic kernels, but **trait-based generic dispatch (the primary motivation for this migration) does not work** due to two upstream bugs. The dispatch-based workaround (u32 enum parameter) works but doesn't deliver the unified quant-format design. Wait for: (1) generic kernel PTX embedding fix, (2) const generic symbol resolution fix, (3) native bf16 type.
 
 ## What Was Tested
 
@@ -47,9 +47,74 @@
 
 2. **Unbounded `step_by` fails in PTX translation** — `(1..).step_by(1)` triggers `Step::forward` constant assertion. Use `while` loops instead. Finite-range `step_by` works fine.
 
+3. **Generic kernels: NVVM IR vs PTX payload mismatch** — When a `#[cuda_module]` contains generic kernels, the macro switches to `load_all_ptx_bundles_merged()` which expects PTX payloads. The codegen backend embeds NVVM IR instead. This causes a runtime error: `NoModules` or `"named symbol not found"`. The `cross_crate_embedded` example works because it uses `cargo oxide` which runs the full NVVM→PTX pipeline. The `RUSTFLAGS` codegen backend path skips NVVM linking.
+
+4. **Const generics: symbol resolution fails** — `#[kernel] pub fn foo<const N: i32>(...)` compiles but fails at runtime with `"named symbol not found"`. The monomorphized symbol isn't found by the module loader.
+
+## Critical Finding: Trait-Based Generic Dispatch Does NOT Work
+
+This is the feature that motivated the entire migration. It does not work due to two independent bugs:
+
+### What we wanted
+
+```rust
+trait Dequant {
+    fn dequant_group(packed: u32, scale: f32, zero: i8) -> [f32; 8];
+}
+
+struct Int4Dequant;
+impl Dequant for Int4Dequant { /* ... */ }
+
+struct Int8Dequant;
+impl Dequant for Int8Dequant { /* ... */ }
+
+#[kernel]
+pub fn quant_gemm<D: Dequant>(weights: &[u32], scales: &[u16], ...) {
+    let dequantized = D::dequant_group(packed, scale, zero);
+    // monomorphizes into quant_gemm::<Int4Dequant>, quant_gemm::<Int8Dequant>
+}
+```
+
+Then launch as `module.quant_gemm::<Int4Dequant>(...)` for one model config, `module.quant_gemm::<Int8Dequant>(...)` for another. ONE kernel, multiple quant formats.
+
+### Why it fails
+
+**Bug 1: E0282 "type annotations needed"** — `D` is a phantom type parameter. It doesn't appear in any function argument, so Rust can't infer it at the call site. The `cross_crate_embedded` example's `scale<T>` works because `T` appears in `input: &[T]`. Our `D` only dispatches behavior. Workaround: add a `PhantomData<D>` to the kernel args — but that's ugly and still hits Bug 2.
+
+**Bug 2: NoModules runtime error** — Generic kernels cause `#[cuda_module]` to use `load_all_ptx_bundles_merged()` instead of `load_embedded_module()`. The merged loader expects PTX payloads in the binary, but the `RUSTFLAGS` codegen backend path embeds NVVM IR. Result: the monomorphized symbol can't be found at runtime.
+
+**Bug 3: Const generics also fail** — Even `#[kernel] pub fn foo<const N: i32>(...)` fails with `"named symbol not found"` at runtime. Same root cause: symbol resolution for monomorphized variants is broken.
+
+### Workaround that works
+
+```rust
+#[kernel]
+pub fn quant_gemm_dispatch(weights: &[u32], scales: &[u16], ..., dequant_kind: u32) {
+    #[inline(always)]
+    fn dequant_int4(packed: u32, scale: f32, zero: i8) -> [f32; 8] { ... }
+    #[inline(always)]
+    fn dequant_int8(packed: u32, scale: f32, zero: i8) -> [f32; 8] { ... }
+    
+    let dequantized = if dequant_kind == 0 {
+        dequant_int4(packed, scale, zero)
+    } else {
+        dequant_int8(packed, scale, zero)
+    };
+}
+```
+
+This passes with bit-exact results. The GPU branch predictor handles the single `if` check. The `#[inline(always)]` functions get inlined by the LLVM pipeline. But it's **not** the clean trait-based design — it's a runtime switch inside one kernel.
+
+**What this means**: The dispatch approach works but doesn't deliver the compile-time safety and ergonomics that motivated the migration. You get ONE kernel with a runtime switch instead of N monomorphized kernels with compile-time dispatch. The type system can't enforce "this model config uses INT4, that one uses FP8" — it becomes a runtime parameter that can be set wrong.
+
 ## Blockers for Production Migration
 
-### 1. No native bf16 type (Medium severity)
+### 1. Generic kernel trait dispatch does not work (Critical — defeats the purpose)
+The primary motivation for migration was trait-based generic dispatch for quant formats. This does not work due to two cuda-oxide bugs (generic PTX embedding, const generic symbol resolution). The dispatch-based workaround (u32 enum parameter) works but loses the compile-time type safety benefit. Without trait dispatch, we're writing the same per-quant kernels we have now, just in Rust instead of CUDA.
+
+**Impact**: This was the whole point. Without it, there's no strong reason to migrate individual kernels.
+
+### 2. No native bf16 type (Medium severity)
 cuda-oxide has no `bf16` first-class type. All bf16 data must be stored as `u16` (bits) and converted to/from `f32` via bit manipulation (`f32::from_bits((u16 as u32) << 16)` and `f32_to_bf16()`). This works correctly but:
 - Adds verbosity to every kernel
 - Requires custom host-side packing/unpacking
@@ -120,11 +185,18 @@ Note: This does not include the time to upstream the `launch_bounds` bugfix, add
 
 ## Decision
 
-**MIGRATE LATER** when:
-1. cuda-oxide reaches v0.3+ with stabilized API
-2. A native `bf16` type is added (or a `bfloat16` crate is integrated)
-3. The `launch_bounds` metadata bugfix is upstreamed
-4. `cuFuncSetAttribute` is wrapped in a proper cuda-oxide API
-5. The `libm` interception is documented as stable
+**DON'T MIGRATE YET** — the primary motivation (trait-based quant dispatch) is blocked by two upstream bugs. Migrate when:
 
-Until then, keep the exploration code in `crates/cuda-oxide-poc/` and `crates/cuda-oxide-coexist/` as a reference for future migration. The `cuda-oxide` source checkout at `../cuda-oxide` contains our bugfix and should be upstreamed as a PR.
+1. **Generic kernel PTX embedding is fixed** — `#[cuda_module]` with generic kernels must work via the codegen backend path (not just `cargo oxide`). This is the critical blocker.
+2. **Const generic symbol resolution is fixed** — monomorphized `foo::<N>` symbols must be loadable.
+3. A native `bf16` type is added (or a `bfloat16` crate is integrated)
+4. The `launch_bounds` metadata bugfix is upstreamed
+5. `cuFuncSetAttribute` is wrapped in a proper cuda-oxide API
+
+Until #1 and #2 are fixed, the migration doesn't deliver on its core promise. The dispatch-based workaround (u32 enum) works but can be implemented in CUDA C++ with a switch statement too — there's no advantage to doing it in Rust.
+
+**What to do now**:
+- Upstream the `launch_bounds` bugfix as a PR to NVlabs/cuda-oxide
+- File issues for generic kernel PTX embedding and const generic symbol resolution
+- Keep the POC crates as reference code
+- Re-evaluate when cuda-oxide releases a version that supports generic `#[kernel]` functions via the `RUSTFLAGS` codegen backend path
