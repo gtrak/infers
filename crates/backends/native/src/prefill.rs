@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaStream};
+use infers_cuda::{CudaStream, OxideKernels};
 use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_model::{LayerType, ModelConfig, WeightRegistry};
@@ -23,17 +23,8 @@ use crate::sync;
 // @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
 /// Kernel handles needed for the prefill pass.
 pub struct PrefillKernels {
-    /// Oxide bridge for add, embedding, norm, rope, silu_glu, and attention kernels.
-    pub oxide: Arc<infers_cuda::OxideKernels>,
-    pub rmsnorm: CudaFunction,
-    pub silu_glu: CudaFunction,
-    pub rope: CudaFunction,
-    pub embedding: CudaFunction,
-    pub add: CudaFunction,
-    pub gdn_prefill: CudaFunction,
-    pub gdn_gated_delta_prefill: CudaFunction,
-    /// INT4 GEMM kernel for quantized weight dispatch.
-    pub int4_gemm: CudaFunction,
+    /// Oxide bridge for all kernel launches.
+    pub oxide: Arc<OxideKernels>,
 }
 
 // @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
@@ -136,10 +127,9 @@ pub fn prefill(
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
               gdn::forward(
                      gemm,
-                     &kernels.int4_gemm,
-                     stream,
-                     &kernels.oxide,
-                    gdn_weights,
+        stream,
+                      &kernels.oxide,
+                     gdn_weights,
                     &norm1_out,
                     &mut gdn_states[layer_idx],
                     hidden_size,
@@ -156,9 +146,8 @@ pub fn prefill(
                     .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
                 attention::forward(
                     gemm,
-                    &kernels.int4_gemm,
-                    stream,
-                    &kernels.oxide,
+             stream,
+                     &kernels.oxide,
                     attn_weights,
                     &norm1_out,
                     &mut kv_caches[layer_idx],
@@ -205,7 +194,7 @@ pub fn prefill(
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, &kernels.int4_gemm, stream,
+            gemm, &kernels.oxide, stream,
             cache, &mlp_weights.gate_proj.name, &norm2_out, &mut gate,
             seq_len, intermediate_size, hidden_size, group_size,
         )?;
@@ -215,7 +204,7 @@ pub fn prefill(
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate up buffer: {e}"))?;
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, &kernels.int4_gemm, stream,
+            gemm, &kernels.oxide, stream,
             cache, &mlp_weights.up_proj.name, &norm2_out, &mut up,
             seq_len, intermediate_size, hidden_size, group_size,
         )?;
@@ -233,7 +222,7 @@ pub fn prefill(
             .alloc_zeros::<bf16>(output_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate MLP output: {e}"))?;
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, &kernels.int4_gemm, stream,
+            gemm, &kernels.oxide, stream,
             cache, &mlp_weights.down_proj.name, &silu_out, &mut mlp_out,
             seq_len, hidden_size, intermediate_size, group_size,
         )?;
@@ -272,7 +261,7 @@ pub fn prefill(
         .alloc_zeros::<bf16>(logits_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, &kernels.int4_gemm, stream,
+        gemm, &kernels.oxide, stream,
         cache, &lm_head_weight.name, &hidden, &mut logits,
         seq_len, config.vocab_size, hidden_size, group_size,
     )?;

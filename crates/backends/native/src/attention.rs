@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, OxideKernels};
 use infers_cuda::gemm::{GemmConfig, GemmEngine};
 use infers_model::AttentionWeights;
 
@@ -284,9 +284,8 @@ pub fn paged_attention_decode(
 /// Attention output `[seq_len × hidden_size]`
 pub fn forward(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    oxide: &infers_cuda::OxideKernels,
+    oxide: &OxideKernels,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -321,7 +320,7 @@ pub fn forward(
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut k_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
@@ -331,7 +330,7 @@ pub fn forward(
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
@@ -391,7 +390,7 @@ pub fn forward(
         .alloc_zeros::<bf16>(seq_len * q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
         seq_len, q_out_dim, hidden_size, group_size,
     )?;
@@ -605,7 +604,7 @@ pub fn forward(
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
@@ -629,9 +628,8 @@ pub fn forward(
 /// - Phase 3: Same per-head attention using the already-computed K/V buffers
 pub fn forward_paged(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    oxide: &infers_cuda::OxideKernels,
+    oxide: &OxideKernels,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -672,7 +670,7 @@ pub fn forward_paged(
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut k_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
@@ -684,7 +682,7 @@ pub fn forward_paged(
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
     )?;
@@ -755,7 +753,7 @@ pub fn forward_paged(
         .alloc_zeros::<bf16>(seq_len * q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
         seq_len, q_out_dim, hidden_size, group_size,
     )?;
@@ -1010,7 +1008,7 @@ pub fn forward_paged(
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
     )?;
@@ -1032,9 +1030,8 @@ pub fn forward_paged(
 /// 5. Apply O-projection to attention output
 pub fn decode_forward_paged(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    oxide: &infers_cuda::OxideKernels,
+    oxide: &OxideKernels,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -1075,7 +1072,7 @@ pub fn decode_forward_paged(
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut k_single,
         1, kv_dim, hidden_size, group_size,
     )?;
@@ -1086,7 +1083,7 @@ pub fn decode_forward_paged(
         .alloc_zeros::<bf16>(kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut v_single,
         1, kv_dim, hidden_size, group_size,
     )?;
@@ -1154,7 +1151,7 @@ pub fn decode_forward_paged(
         .alloc_zeros::<bf16>(q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
         1, q_out_dim, hidden_size, group_size,
     )?;
@@ -1273,7 +1270,7 @@ pub fn decode_forward_paged(
         .alloc_zeros::<bf16>(hidden_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream,
+        gemm, oxide, stream,
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         1, hidden_size, per_gpu_head_dim, group_size,
     )?;

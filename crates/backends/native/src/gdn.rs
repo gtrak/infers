@@ -204,7 +204,6 @@ fn repeat_interleave_heads(
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
-/// * `int4_kernel` — INT4 GEMM kernel
 /// * `stream` — CUDA stream
 /// * `oxide` — OxideKernels bridge for GDN kernel launches
 /// * `weights` — GDN layer weights (includes in_proj_qkv, conv1d, etc.)
@@ -220,7 +219,6 @@ fn repeat_interleave_heads(
 #[allow(unused_assignments, clippy::too_many_arguments)]
   pub fn forward(
     gemm: &mut GemmEngine,
-    int4_kernel: &infers_cuda::CudaFunction,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &GdnWeights,
@@ -256,7 +254,7 @@ fn repeat_interleave_heads(
     let mut mixed_qkv = stream.alloc_zeros::<bf16>(seq_len * conv_dim)?;
     if let Some(ref qkv_weight) = weights.in_proj_qkv {
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, int4_kernel, stream, cache,
+            gemm, oxide, stream, cache,
             &qkv_weight.name, input, &mut mixed_qkv,
             seq_len, conv_dim, hidden_size, group_size,
         )?;
@@ -355,7 +353,7 @@ fn repeat_interleave_heads(
     // =========================================================================
     let mut a_proj = stream.alloc_zeros::<bf16>(seq_len * num_v_heads)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.in_proj_a.name, input, &mut a_proj,
         seq_len, num_v_heads, hidden_size, group_size,
     )?;
@@ -364,7 +362,7 @@ fn repeat_interleave_heads(
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(seq_len * b_dim)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.in_proj_b.name, input, &mut b_proj_raw,
         seq_len, b_dim, hidden_size, group_size,
     )?;
@@ -424,7 +422,7 @@ fn repeat_interleave_heads(
         let z_dim = weight_output_dim(z_weight);
         let mut z_gate_raw = stream.alloc_zeros::<bf16>(seq_len * z_dim)?;
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, int4_kernel, stream, cache,
+            gemm, oxide, stream, cache,
             &z_weight.name, input, &mut z_gate_raw,
             seq_len, z_dim, hidden_size, group_size,
         )?;
@@ -460,7 +458,7 @@ fn repeat_interleave_heads(
     // =========================================================================
     let mut output = stream.alloc_zeros::<bf16>(seq_len * hidden_size)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.out_proj_weight.name, &norm_output, &mut output,
         seq_len, hidden_size, value_dim, group_size,
     )?;
@@ -477,7 +475,6 @@ fn repeat_interleave_heads(
 #[allow(unused_assignments, clippy::too_many_arguments)]
 pub fn decode_forward(
     gemm: &mut GemmEngine,
-    int4_kernel: &infers_cuda::CudaFunction,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &GdnWeights,
@@ -511,7 +508,7 @@ pub fn decode_forward(
     let mut mixed_qkv = stream.alloc_zeros::<bf16>(conv_dim)?;
     if let Some(ref qkv_weight) = weights.in_proj_qkv {
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, int4_kernel, stream, cache,
+            gemm, oxide, stream, cache,
             &qkv_weight.name, input, &mut mixed_qkv,
             1, conv_dim, hidden_size, group_size,
         )?;
@@ -608,7 +605,7 @@ pub fn decode_forward(
     // =========================================================================
     let mut a_proj = stream.alloc_zeros::<bf16>(num_v_heads)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.in_proj_a.name, input, &mut a_proj,
         1, num_v_heads, hidden_size, group_size,
     )?;
@@ -617,7 +614,7 @@ pub fn decode_forward(
     let b_dim = weight_output_dim(&weights.in_proj_b);
     let mut b_proj_raw = stream.alloc_zeros::<bf16>(b_dim)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.in_proj_b.name, input, &mut b_proj_raw,
         1, b_dim, hidden_size, group_size,
     )?;
@@ -670,7 +667,7 @@ pub fn decode_forward(
         let z_dim = weight_output_dim(z_weight);
         let mut z_gate_raw = stream.alloc_zeros::<bf16>(z_dim)?;
         crate::gemm_dispatch::gemm_projection_cached(
-            gemm, int4_kernel, stream, cache,
+            gemm, oxide, stream, cache,
             &z_weight.name, input, &mut z_gate_raw,
             1, z_dim, hidden_size, group_size,
         )?;
@@ -700,7 +697,7 @@ pub fn decode_forward(
     // =========================================================================
     let mut output = stream.alloc_zeros::<bf16>(hidden_size)?;
     crate::gemm_dispatch::gemm_projection_cached(
-        gemm, int4_kernel, stream, cache,
+        gemm, oxide, stream, cache,
         &weights.out_proj_weight.name, &norm_output, &mut output,
         1, hidden_size, value_dim, group_size,
     )?;

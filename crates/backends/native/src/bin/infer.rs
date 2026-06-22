@@ -12,7 +12,6 @@ use clap::Parser;
 use infers_backend_native::chat_template::{ChatTemplate, extract_template};
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
-use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_model::config::ModelConfig;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
@@ -200,18 +199,13 @@ fn main() -> Result<()> {
     // --- 6. Create stream pool ---
     let stream_pool = StreamPool::new(&gpu_contexts)?;
 
-    // --- 7. Register and load kernels ---
-    let mut kernel_registry = KernelRegistry::new();
-    kernel_registry.register_infers_kernels();
-
-    // --- 8. Create the forward engine ---
+    // --- 7. Create the forward engine ---
     let config = Arc::new(config);
     let engine_start = Instant::now();
     let mut engine = ForwardEngine::new(
         config.clone(),
         weight_registries,
         gpu_contexts,
-        kernel_registry,
         stream_pool,
         args.group_size,
     )?;

@@ -348,7 +348,7 @@ If the model path exists on disk, `load_model()` reads `config.json` and safeten
 
 ### Kernel Registration
 
-`KernelRegistry::register_infers_kernels()` registers all 15 infers kernels by name and cubin path. `ForwardEngine::new()` loads them into GPU memory via `LoadedKernelRegistry::load_all()`. See [[crates/cuda/src/kernels.rs#KernelRegistry#register_infers_kernels]].
+All kernels are loaded from a single OxideKernels bridge (`oxide_kernels.cubin`). The old `KernelRegistry` system was removed — kernels go through oxide bridge's typed launch methods. See [[crates/cuda/src/oxide_bridge.rs#OxideKernels]].
 
 ### AppState Evolution
 

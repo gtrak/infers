@@ -9,11 +9,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use infers_cuda::gemm::GemmEngine;
-use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
 use infers_cuda::PinnedHostBuffer;
-use infers_cuda::{CudaContext, CudaFunction, CudaStream};
+use infers_cuda::{CudaContext, CudaStream};
 use infers_model::{LayerType, MmapWeightRegistry, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
@@ -49,22 +48,9 @@ fn trim_memory() {
 }
 
 /// Per-GPU cached kernel function handles.
-/// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
-    /// Oxide bridge for add, embedding, norm, rope, silu_glu, and attention kernels.
+    /// Oxide bridge for all kernel launches.
     oxide: Arc<infers_cuda::OxideKernels>,
-    rmsnorm: CudaFunction,
-    silu_glu: CudaFunction,
-    rope: CudaFunction,
-    embedding: CudaFunction,
-    add: CudaFunction,
-    gdn_prefill: CudaFunction,
-    gdn_update: CudaFunction,
-    // New GDN kernels (gated delta rule) — kept for PrefillKernels mapping
-    gdn_gated_delta_prefill: CudaFunction,
-    fp8_quantize: CudaFunction,
-    fp8_dequantize: CudaFunction,
-    int4_gemm: CudaFunction,
 }
 
 /// Central engine for forward-pass inference.
@@ -115,7 +101,6 @@ impl ForwardEngine {
     /// Load CUDA kernel modules on each GPU and return per-GPU kernel handles.
     fn load_per_gpu_kernels(
         contexts: &[Arc<CudaContext>],
-        kernel_registry: &KernelRegistry,
         num_gpus: usize,
     ) -> Result<Vec<PerGpuKernels>> {
         let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
@@ -128,24 +113,10 @@ impl ForwardEngine {
         );
 
         for gpu_idx in 0..num_gpus {
-            let ctx = contexts.get(gpu_idx)
+            let _ = contexts.get(gpu_idx)
                 .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
-            let kernels = LoadedKernelRegistry::load_all(ctx.clone(), kernel_registry)
-                .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
-
             let pk = PerGpuKernels {
                 oxide: oxide.clone(),
-                rmsnorm: kernels.get_function("infers_rmsnorm_bf16")?,
-                silu_glu: kernels.get_function("infers_silu_glu_bf16")?,
-                rope: kernels.get_function("infers_rope_bf16")?,
-                embedding: kernels.get_function("infers_embedding_gather_bf16")?,
-                add: kernels.get_function("infers_add_bf16")?,
-                gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
-                gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
-                fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
-                fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
-                int4_gemm: kernels.get_function("int4_gemm_kernel")?,
-                gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
             };
             per_gpu_kernels.push(pk);
         }
@@ -190,21 +161,19 @@ impl ForwardEngine {
     /// # Arguments
     /// * `config` — Model architecture parameters
     /// * `weights` — Per-GPU weight registries (one per tensor-parallel rank)
-    /// * `ctx` — CUDA context for kernel loading
-    /// * `kernel_registry` — Names and paths of CUDA kernels to load
+    /// * `contexts` — CUDA contexts for kernel loading
     /// * `streams` — Pool of async CUDA streams
     /// * `nccl` — NCCL communicator for multi-GPU collectives
     pub fn new(
         config: Arc<ModelConfig>,
         weights: Vec<WeightRegistry>,
         contexts: Vec<Arc<CudaContext>>,
-        kernel_registry: KernelRegistry,
         streams: StreamPool,
         group_size: usize,
     ) -> Result<Self> {
         let num_gpus = streams.len();
         let mut weights = weights; // mutable for clear_data() after GPU upload
-        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
+        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, num_gpus)?;
         let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
         let nccl = Self::create_nccl(&streams)?;
 
@@ -278,7 +247,6 @@ impl ForwardEngine {
     /// * `config` — Model architecture parameters
     /// * `mmap_registries` — Per-GPU mmap weight registries (one per tensor-parallel rank)
     /// * `contexts` — CUDA contexts for kernel loading
-    /// * `kernel_registry` — Names and paths of CUDA kernels to load
     /// * `streams` — Pool of async CUDA streams
     /// * `pinned` — Pinned host buffer for dtype conversion during upload
     /// * `group_size` — INT4 quantization group size for on-the-fly dequantization
@@ -287,14 +255,13 @@ impl ForwardEngine {
         mmap_registries: Vec<MmapWeightRegistry>,
         metadata_registries: Vec<WeightRegistry>,
         contexts: Vec<Arc<CudaContext>>,
-        kernel_registry: KernelRegistry,
         streams: StreamPool,
         pinned: &mut PinnedHostBuffer,
         group_size: usize,
     ) -> Result<Self> {
        let num_gpus = streams.len();
         let mut mmap_registries = mmap_registries; // mutable for clear_owned_data after upload
-        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, &kernel_registry, num_gpus)?;
+        let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, num_gpus)?;
         let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;
         let nccl = Self::create_nccl(&streams)?;
 
@@ -365,14 +332,6 @@ impl ForwardEngine {
 
         let kernels = crate::prefill::PrefillKernels {
             oxide: self.per_gpu_kernels[0].oxide.clone(),
-            rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
-            silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
-            rope: self.per_gpu_kernels[0].rope.clone(),
-            embedding: self.per_gpu_kernels[0].embedding.clone(),
-            add: self.per_gpu_kernels[0].add.clone(),
-            gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
-            gdn_gated_delta_prefill: self.per_gpu_kernels[0].gdn_gated_delta_prefill.clone(),
-            int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
         crate::prefill::prefill(
@@ -602,10 +561,10 @@ impl ForwardEngine {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                        crate::gdn::forward(
-                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                             &self.per_gpu_kernels[gpu_idx].oxide,
-                            gdn_weights, &norm1_out,
+                crate::gdn::forward(
+                              gemm, &gpu_stream,
+                              &self.per_gpu_kernels[gpu_idx].oxide,
+                             gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
@@ -617,9 +576,9 @@ impl ForwardEngine {
                     LayerType::FullAttention => {
                         let attn_weights = layer.attn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-                        crate::attention::forward_paged(
-                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].oxide,
+               crate::attention::forward_paged(
+                             gemm, &gpu_stream,
+                             &self.per_gpu_kernels[gpu_idx].oxide,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx], &positions,
@@ -692,7 +651,7 @@ impl ForwardEngine {
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.gate_proj.name,
                     &norm2_out, &mut gate,
@@ -705,7 +664,7 @@ impl ForwardEngine {
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.up_proj.name,
                     &norm2_out, &mut up,
@@ -726,7 +685,7 @@ impl ForwardEngine {
                 // Down projection (row-parallel: full hidden_size output, sharded_intermediate inner dim)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(seq_len * config.hidden_size)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.down_proj.name,
                     &silu_out, &mut mlp_out,
@@ -801,7 +760,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         let mut logits = final_stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
         crate::gemm_dispatch::gemm_projection_cached(
-            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
+            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
             &self.weight_caches[0],
             &lm_head_weight.name,
             &final_hidden, &mut logits,
@@ -1002,10 +961,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                       crate::gdn::decode_forward(
-                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                             &self.per_gpu_kernels[gpu_idx].oxide,
-                            gdn_weights, &norm1_out,
+              crate::gdn::decode_forward(
+                              gemm, &gpu_stream,
+                              &self.per_gpu_kernels[gpu_idx].oxide,
+                             gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
@@ -1017,9 +976,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     LayerType::FullAttention => {
                         let attn_weights = layer.attn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-                        crate::attention::decode_forward_paged(
-                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].oxide,
+             crate::attention::decode_forward_paged(
+                             gemm, &gpu_stream,
+                             &self.per_gpu_kernels[gpu_idx].oxide,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
@@ -1092,7 +1051,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 // Gate projection (column-parallel: sharded_intermediate output dim)
                 let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.gate_proj.name,
                     &norm2_out, &mut gate,
@@ -1105,7 +1064,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 // Up projection (column-parallel: sharded_intermediate output dim)
                 let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.up_proj.name,
                     &norm2_out, &mut up,
@@ -1126,7 +1085,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 // Down projection (row-parallel: full hidden_size output)
                 let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
                 crate::gemm_dispatch::gemm_projection_cached(
-                    gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                    gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.down_proj.name,
                     &silu_out, &mut mlp_out,
@@ -1194,7 +1153,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         let mut logits = final_stream.alloc_zeros::<bf16>(config.vocab_size)?;
         crate::gemm_dispatch::gemm_projection_cached(
-            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].int4_gemm, &final_stream,
+            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
             &self.weight_caches[0],
             &lm_head_weight.name,
             &final_hidden, &mut logits,

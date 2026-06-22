@@ -19,7 +19,6 @@ use std::sync::Arc;
 use half::bf16;
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
-use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
@@ -243,9 +242,6 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
 
     let streams = StreamPool::new(&[ctx0.clone(), ctx1.clone()])?;
 
-    let mut kr = KernelRegistry::new();
-    kr.register_infers_kernels();
-
     // 6. Limit max_position_embeddings for the test
     let mut config = config;
     config.max_position_embeddings = 4096.min(config.max_position_embeddings);
@@ -258,7 +254,6 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
         config.clone(),
         weight_registries,
         vec![ctx0, ctx1],
-        kr,
         streams,
         group_size,
     )?;
@@ -354,9 +349,6 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
 
     let streams = StreamPool::new(&[ctx0.clone(), ctx1.clone()])?;
 
-    let mut kr = KernelRegistry::new();
-    kr.register_infers_kernels();
-
     // 6. Limit max_position_embeddings for the test
     let mut config = config;
     config.max_position_embeddings = 4096.min(config.max_position_embeddings);
@@ -371,7 +363,6 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
         mmap_registries,
         metadata_registries,
         vec![ctx0, ctx1],
-        kr,
         streams,
         &mut pinned,
         group_size,
@@ -459,9 +450,6 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
 
     let streams_heap = StreamPool::new(&[ctx0_h.clone(), ctx1_h.clone()])?;
 
-    let mut kr_heap = KernelRegistry::new();
-    kr_heap.register_infers_kernels();
-
     // Limit max_position_embeddings for the test
     let mut config = config;
     config.max_position_embeddings = 4096.min(config.max_position_embeddings);
@@ -473,7 +461,6 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
         config.clone(),
         weight_registries,
         vec![ctx0_h, ctx1_h],
-        kr_heap,
         streams_heap,
         group_size,
     )?;
@@ -545,9 +532,6 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
 
     let streams_mmap = StreamPool::new(&[ctx0_m.clone(), ctx1_m.clone()])?;
 
-    let mut kr_mmap = KernelRegistry::new();
-    kr_mmap.register_infers_kernels();
-
     use infers_model::mmap::{
         load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry,
     };
@@ -580,7 +564,6 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
         mmap_registries,
         metadata_registries,
         vec![ctx0_m, ctx1_m],
-        kr_mmap,
         streams_mmap,
         &mut pinned,
         group_size,

@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
-use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
@@ -92,11 +91,7 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Create stream pool with one stream per GPU
     let stream_pool = StreamPool::new(&[ctx0.clone(), ctx1.clone()])?;
 
-    // 7. Register and load kernels
-    let mut kernel_registry = KernelRegistry::new();
-    kernel_registry.register_infers_kernels();
-
-    // 8. Create the forward engine with TP=2
+    // 7. Create the forward engine with TP=2
     let mut config = config;
     let test_max_seq_len = 4096usize.min(config.max_position_embeddings);
     config.max_position_embeddings = test_max_seq_len;
@@ -107,7 +102,6 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
         config.clone(),
         weight_registries,
         vec![ctx0, ctx1],
-        kernel_registry,
         stream_pool,
         group_size,
     )?;

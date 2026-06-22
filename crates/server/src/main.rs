@@ -16,7 +16,6 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 
 use infers_cuda::context::CudaRuntime;
-use infers_cuda::kernels::KernelRegistry;
 use infers_cuda::stream::StreamPool;
 use infers_kv::PagedKvManager;
 use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap};
@@ -228,16 +227,12 @@ async fn run() -> Result<()> {
         let mut pinned = infers_cuda::PinnedHostBuffer::new(256 * 1024 * 1024)
             .context("Failed to allocate pinned host buffer")?;
 
-        let mut kernel_registry = KernelRegistry::new();
-        kernel_registry.register_infers_kernels();
-
         let model_config = Arc::new(config);
         let engine = ForwardEngine::new_from_mmap(
             model_config.clone(),
             mmap_registries,
             metadata_registries,
             contexts,
-            kernel_registry,
             streams,
             &mut pinned,
             128,
@@ -279,15 +274,11 @@ async fn run() -> Result<()> {
         let weights = WeightRegistry::new();
         let num_layers = config.num_hidden_layers;
 
-        let mut kernel_registry = KernelRegistry::new();
-        kernel_registry.register_infers_kernels();
-
         let model_config = Arc::new(config);
         let engine = ForwardEngine::new(
             model_config.clone(),
             vec![weights],
             contexts,
-            kernel_registry,
             streams,
             128,
         ).context("Failed to create ForwardEngine")?;

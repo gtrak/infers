@@ -10,18 +10,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::gemm::{GemmConfig, GemmEngine, Int4GemmConfig};
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
+use infers_cuda::gemm::{GemmConfig, GemmEngine};
+use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 
 /// Dispatch a single projection GEMM using cached GPU-resident weights.
 ///
 /// Looks up the weight by name from the `GpuWeightCache`. For BF16 weights,
-/// calls `gemm.matmul_bf16` directly. For INT4 weights, calls `matmul_int4`
-/// using the cached qweight/scales/qzeros buffers.
+/// calls `gemm.matmul_bf16` directly. For INT4 weights, dispatches through
+/// `OxideKernels::launch_int4_gemm_auto_round` using the cached qweight/scales/qzeros buffers.
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
-/// * `int4_kernel` — INT4 GEMM kernel handle (only used for INT4 weights)
+/// * `oxide` — Oxide bridge for INT4 GEMM dispatch
 /// * `stream` — CUDA stream
 /// * `cache` — GPU weight cache
 /// * `weight_name` — Name of the weight to look up (same as WeightData.name)
@@ -36,7 +36,7 @@ use infers_cuda::{CudaFunction, CudaSlice, CudaStream};
 /// The output buffer (same `output` that was passed in).
 pub fn gemm_projection_cached(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
+    oxide: &OxideKernels,
     stream: &Arc<CudaStream>,
     cache: &crate::gpu_cache::GpuWeightCache,
     weight_name: &str,
@@ -92,15 +92,16 @@ pub fn gemm_projection_cached(
             // Determine transposition from shape and K dimension — same logic as gemm_projection
             let is_transposed = int4_bufs.shape.len() >= 2 && int4_bufs.shape[0] * 8 == k;
 
-            infers_cuda::gemm::matmul_int4(
-                stream,
-                int4_kernel,
-                &Int4GemmConfig { m, n, k, group_size, transposed: is_transposed },
-                output,
-                &int4_bufs.qweight,
-                &int4_bufs.scales,
-                &int4_bufs.qzeros,
-                input,
+            // Scales are stored as f16 (IEEE half) but the kernel reads raw u16 bits.
+            // bf16 and f16 have identical memory layout (both are repr(transparent) over u16),
+            // so we can safely transmute the reference for the bridge call.
+            let scales_bf16: &CudaSlice<bf16> = unsafe {
+                &*(std::ptr::addr_of!(int4_bufs.scales) as *const CudaSlice<bf16>)
+            };
+
+            oxide.launch_int4_gemm_auto_round(
+                stream, output, &int4_bufs.qweight, scales_bf16, &int4_bufs.qzeros, input,
+                m as u32, n as u32, k as u32, group_size as u32, is_transposed as u32,
             )?;
         }
         None => {
