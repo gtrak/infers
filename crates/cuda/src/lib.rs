@@ -8,6 +8,7 @@ pub mod gemm;
 pub mod nccl;
 pub mod pinned;
 pub mod memcpy2d;
+pub mod oxide_bridge;
 
 // Re-export key cudarc types so consumers don't need `cudarc` directly.
 pub use cudarc::driver::{
@@ -24,3 +25,4 @@ pub use cudarc::nccl::safe::{
 };
 pub use cudarc::nccl::result::{group_end, group_start};
 pub use pinned::PinnedHostBuffer;
+pub use oxide_bridge::OxideKernels;

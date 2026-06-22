@@ -13,9 +13,9 @@ half = { workspace = true }
 
 cudarc = { workspace = true }
 
-# CUDA (cuda-oxide) — deferred to future phase; requires cargo-oxide toolchain
-# cuda-core = { workspace = true }
+# CUDA (cuda-oxide) — bridge module for loading pre-compiled kernels
+cuda-core = { workspace = true }
 # cuda-async = { workspace = true }
-# cuda-host = { workspace = true }
+cuda-host = { workspace = true }
 
 [dev-dependencies]

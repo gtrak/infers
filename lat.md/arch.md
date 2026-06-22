@@ -45,7 +45,7 @@ CUDA runtime crate for GPU inference. cudarc is always present with no feature g
 
 ### Module Structure
 
-Six modules cover context, streams, kernels, GEMM, pinned, and NCCL.
+Seven modules cover context, streams, kernels, GEMM, pinned, NCCL, and oxide_bridge.
 
 | Module | Purpose |
 |--------|---------|
@@ -55,9 +55,15 @@ Six modules cover context, streams, kernels, GEMM, pinned, and NCCL.
 | gemm | cuBLASLt GEMM engine with `matmul_bf16()` method for BF16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
 | pinned | Page-locked host memory (`PinnedHostBuffer`) for fast DMA transfers to GPU — Phase 16 Zero-Copy Weight Streaming |
 | nccl | Multi-GPU collective operations for TP/PP |
+| oxide_bridge | Loads pre-compiled cuda-oxide kernels from `.cubin` at runtime and launches them via cudarc `CudaSlice<T>` buffers and `CudaStream`
+
+### Oxide Bridge: Runtime Kernel Loading
+
+Loads pre-compiled `oxide_kernels.cubin` (28 kernels) at runtime via cuda-oxide's `CudaContext::load_module_from_file`.
+
+  Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
 ### cuda-oxide: Quantization-Generic Kernels (Phase 18)
-
 Rust→PTX compiler for three quantization-sensitive kernels with trait-based dispatch. Enables AutoRound, GGUF, AWQ, GPTQ with one kernel. Rust source is portable to rust-gpu (SPIR-V) and amdgcn (HIP) for multi-hardware.
 
 ### cuda-oxide POC: Vector Add Kernel (Exploration Complete)

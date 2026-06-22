@@ -1957,7 +1957,7 @@ fn save_cubin(out_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     std::process::exit(1);
 }
 
-/// Load a cubin file and verify all 27 kernel function names resolve.
+/// Load a cubin file and verify all 28 kernel function names resolve.
 fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let ctx: Arc<CudaContext> = CudaContext::new(0)?;
     let module = ctx.load_module_from_file(cubin_path.to_str().ok_or("invalid cubin path")?)?;
@@ -1990,6 +1990,7 @@ fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "infers_gdn_update_bf16",
         "infers_gdn_gated_delta_update_bf16",
         "infers_gdn_gated_delta_prefill_bf16",
+        "infers_gdn_chunked_gated_delta_prefill_bf16",
     ];
 
     let mut failed = Vec::new();
@@ -2217,7 +2218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fail_count += 1;
     }
 
-    println!("\n=== Summary: {} tests, {} failed ===", 27, fail_count);
+    println!("\n=== Summary: {} tests, {} failed ===", 28, fail_count);
 
     if fail_count > 0 {
         std::process::exit(1);
