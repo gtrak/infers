@@ -104,7 +104,7 @@ The divergence cascades from early tokens (positions 0-5) to later tokens (posit
 
 HuggingFace-based reference capturing full-attention (Qwen3_5Attention) intermediates at layer 3 as .npy ground truth, using the engine's 15 token IDs.
 
-Script [[scripts/dump_ref_attn_l3.py]] monkey-patches layer 3 self_attn.forward to dump Q/K/V projections, RoPE-embedded tensors, head-0 scores/softmax/output, and gated output as float32 .npy in `/tmp/ref_attn_l3/`. Layer 3 is full attention (not GDN): num_heads=24, num_kv_heads=4, head_dim=256, partial_rotary_factor=0.25. The q_proj output uses per-head interleaved layout `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` — the engine now matches this layout correctly (fixed from contiguous `[Q_all, G_all]`). Engine comparison: softmax matches exactly (ratio=1.000), V values differ 51-66% (INT4 GEMM scaling?), Q/K differ 6-10%.
+Script `scripts/dump_ref_attn_l3.py` (superseded by v2) monkey-patched layer 3 self_attn.forward to dump Q/K/V projections, RoPE-embedded tensors, head-0 scores/softmax/output, and gated output as float32 .npy in `/tmp/ref_attn_l3/`. Layer 3 is full attention (not GDN): num_heads=24, num_kv_heads=4, head_dim=256, partial_rotary_factor=0.25. The q_proj output uses per-head interleaved layout `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]` — the engine now matches this layout correctly (fixed from contiguous `[Q_all, G_all]`). Engine comparison: softmax matches exactly (ratio=1.000), V values differ 51-66% (INT4 GEMM scaling?), Q/K differ 6-10%.
 
 # Debugging: Per-Layer Comparison with HF Reference
 

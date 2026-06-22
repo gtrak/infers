@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -15,7 +14,6 @@ cudarc = { workspace = true }
 
 # CUDA (cuda-oxide) — bridge module for loading pre-compiled kernels
 cuda-core = { workspace = true }
-# cuda-async = { workspace = true }
 cuda-host = { workspace = true }
 
 [dev-dependencies]

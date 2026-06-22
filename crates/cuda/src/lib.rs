@@ -3,7 +3,6 @@
 
 pub mod context;
 pub mod stream;
-pub mod kernels;
 pub mod gemm;
 pub mod nccl;
 pub mod pinned;

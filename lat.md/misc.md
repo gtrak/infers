@@ -122,10 +122,6 @@ Metric creation `.unwrap()` calls changed to `.expect()` with descriptive error 
 After `clear_data()` (heap path) and `clear_owned_data()` (mmap path), `trim_memory()` calls `malloc_trim(0)` to force glibc to return freed memory to the OS, reducing VmData. On Linux only — no-op on other platforms. See [[crates/backends/native/src/engine.rs#trim_memory]].
 
 
-## Build Script Safety
-
-`build.rs` uses `parent().unwrap_or(Path::new("."))` instead of `parent().unwrap()` for output path directory creation. See [[crates/cuda/build.rs]].
-
 ## GEMM Leading Dimension Fix
 
 `GemmConfig` to `MatmulConfig` conversion in `gemm_impl` had incorrect column-major leading dimension defaults. Fixed `lda` branches (transa=true→k, transa=false→m) and `ldc` default (m, not n) to match cuBLASLt column-major convention. See [[crates/cuda/src/gemm.rs#gemm_impl]].
@@ -160,7 +156,7 @@ Chat handler uses `SSE_DONE` constant from `infers_api` instead of hardcoded `"[
 
 ## Kernel Registry Documentation
 
-`LoadedKernelRegistry` documents its role in GPU kernel execution, loading pre-compiled .cubin files via cudarc.
+The `OxideKernels` system in `oxide_bridge` module documents its role in GPU kernel execution, loading pre-compiled `oxide_kernels.cubin` via cudarc and providing typed launch wrappers.
 
 ## Kernel Dispatch Fixes
 
@@ -198,16 +194,16 @@ Two critical bugs fixed in `infers_paged_attention_decode_bf16` in `paged_attent
 
 ### Softmax Kernel Fixes
 
-Three bugs fixed in `crates/cuda/kernels/infers/softmax.cu`:
+Three bugs fixed in the softmax CUDA kernel (now superseded by the Rust oxide bridge implementation):
 1. **Max value overwritten by sum** (CRITICAL): Phase 2's sum reduction overwrote `sdata[0]`, causing Phase 3 normalization to subtract the sum instead of the max. Fixed by saving `sdata[0]` to a `max_val` register after Phase 1, then using `max_val` in Phase 2 (exp computation) and Phase 3 (normalization).
 2. **Race condition** (implicit in bug 1): Reading `sdata[0]` for the max during Phase 2 created a race with concurrent sum reduction writes. Resolved by using the `max_val` register instead of shared memory.
 3. **Non-power-of-2 reduction** (MINOR): Tree reduction with `stride >>= 1` silently drops tail elements for non-power-of-2 block sizes. Fixed by rounding `block_size` up to the next power of 2 and adding `tid + stride < blockDim.x` bounds checks in both reduction loops.
 
 ### GDN Kernel Fixes
 
-Two bugs fixed in both `gdn_update.cu` and `gdn_prefill.cu`:
-1. **Non-power-of-2 reduction** (MINOR): Host wrappers used `hidden_size` directly as block size, causing tree reduction to silently drop tail elements for non-power-of-2 hidden sizes. Fixed by restructuring kernels: `__global__` kernels are now placed inside `extern "C"` with names matching the registry (`infers_gdn_update_bf16`, `infers_gdn_prefill_bf16`), eliminating host wrappers. Rust-side launch configuration computes power-of-2 block sizes. Reduction loops use `tid + stride < blockDim.x` bounds checks.
-2. **Kernel name mismatch** (CRITICAL): `LoadedKernelRegistry` registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
+Two bugs fixed in the GDN CUDA kernels (now superseded by the Rust oxide bridge implementation):
+1. **Non-power-of-2 reduction** (MINOR): Host wrappers used `hidden_size` directly as block size, causing tree reduction to silently drop tail elements for non-power-of-2 hidden sizes. Fixed by restructuring kernels: `__global__` kernels are now placed inside `extern "C"` with names matching the oxide bridge registry (`infers_gdn_update_bf16`, `infers_gdn_prefill_bf16`), eliminating host wrappers. Rust-side launch configuration computes power-of-2 block sizes. Reduction loops use `tid + stride < blockDim.x` bounds checks.
+2. **Kernel name mismatch** (CRITICAL): The old registry registered `infers_gdn_update_bf16` and `infers_gdn_prefill_bf16`, but the cubins only contained C++-mangled `__global__` kernels (`gdn_update_kernel`, `gdn_prefill_kernel`) and host wrappers (not compiled into cubins). Fixed by renaming `__global__` kernels to match registered names and wrapping them in `extern "C"` for unambiguous C linkage in the cubin.
 
 ### GDN QKV Split Bug Fix
 
@@ -266,12 +262,9 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CUDA crate (`infers-cuda`) with cudarc always present — no feature gating
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
-- KernelRegistry for .cubin loading (23 infers kernels: rmsnorm, silu, silu_glu, attn_output_gate, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_gated_delta_update, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, conv1d_depthwise_silu, rms_norm_gated, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm) and LoadedKernelRegistry for GPU-loaded kernels with deduplication (same .cubin loaded once even when referenced by multiple kernel functions)
+- OxideKernels loading `oxide_kernels.cubin` with typed launch wrappers via the oxide bridge module (27 kernels: rmsnorm, silu, silu_glu, attn_output_gate, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_gated_delta_update, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, conv1d_depthwise_silu, rms_norm_gated, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm)
 - GemmEngine wrapping cuBLASLt with BF16 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_bf16()` accepts `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
-- build.rs for nvcc kernel compilation (default sm_120, configurable via INFERS_CUDA_ARCH env var)
-- CUDA kernel source files in `kernels/infers/`: rmsnorm.cu, silu.cu, rope.cu, embedding.cu, elementwise.cu, sampling.cu, softmax.cu, kv_cache.cu, paged_kv_write.cu, paged_kv_read.cu, gdn_update.cu, gdn_prefill.cu, gdn_recurrent_step.cu, gdn_gated_delta_prefill.cu, gdn_gated_delta_update.cu, gdn_chunked_gated_delta_prefill.cu, gdn_mamba2_prefill.cu, gdn_mamba2_update.cu, paged_attention_decode.cu, fp8_quantize.cu, int4_gemm.cu, argmax.cu, conv1d_depthwise.cu, l2norm_bf16.cu, rms_norm_gated.cu, common.cuh
-- Kernel directory structure (flashinfer-gdn, flashinfer-attn, compiled) preserved for organization; custom kernels use infers/
 - Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
 
 # Phase 3 Deliverables

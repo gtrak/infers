@@ -65,7 +65,6 @@ cudarc = { version = "0.19.7", features = ["cublaslt", "nccl", "cuda-13020", "f1
 
 # CUDA (cuda-oxide - nightly)
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
-cuda-async = { git = "https://github.com/NVlabs/cuda-oxide" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
 
 # ML / Data
