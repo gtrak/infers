@@ -251,3 +251,18 @@ Experimented whether trait-based dequant dispatch is possible in cuda-oxide gene
 **Experiment 2 — Const generics**: Still fail at runtime (`"named symbol not found"`). Not needed for trait dispatch — use type parameters instead.
 
 **Revised assessment**: Trait-based generic dispatch IS the right approach. Use `cargo oxide` as the build tool, `PhantomData<D>` for E0282, and named monomorphized wrappers for cudarc PTX loading. See [[plan/024-cuda-oxide-quant.md]] for the production plan.
+
+### cuda-oxide Kernel Library (Phase 18 — Build Pipeline Validated)
+
+Standalone workspace at `crates/cuda-oxide-kernels/` for production kernels compiled via cuda-oxide. Cross-crate kernel library pattern with `kernel-lib` subcrate and host test binary.
+
+**Workspace structure**: `Cargo.toml` defines `[workspace]` with `members = ["kernel-lib"]`. Root crate is the host test binary; `kernel-lib/` holds the `#[cuda_module]` kernel definitions. Not a member of the infers parent workspace — avoids codegen backend conflicts during stable builds.
+
+**Kernel: infers_add_bf16**: Ported from `crates/cuda/kernels/infers/elementwise.cu`. Grid-stride loop, 256 threads per block (`#[launch_bounds(256)]`). bf16 stored as u16 — converts to f32 for compute, truncates back via `cuda_device::tcgen05::f32_to_bf16()`. Bit-exact verification against CPU reference passes (1024 elements).
+
+**Build commands**:
+```bash
+cd crates/cuda-oxide-kernels
+cargo oxide build    # compile kernels to PTX
+cargo oxide run      # build + run test binary
+```

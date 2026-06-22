@@ -1,0 +1,6 @@
+/target/
+*.ll
+*.opt.ll
+*.ptx
+.oxide-artifacts/
+Cargo.lock

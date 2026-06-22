@@ -1,0 +1,16 @@
+[package]
+name = "infers-cuda-oxide-kernels"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone workspace for cuda-oxide kernels (not a member of the infers workspace).
+# kernel-lib holds the device kernels; this root crate is the host test binary.
+# Build with:  cargo oxide build
+# Run test:   cargo oxide run
+
+[workspace]
+members = ["kernel-lib"]
+
+[dependencies]
+infers-kernel-lib = { path = "kernel-lib" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
