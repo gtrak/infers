@@ -11,6 +11,52 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, DynamicSharedArray, SharedArray, cuda_module, kernel, launch_bounds, thread};
 
 // =============================================================================
+// GENERIC KERNEL SUPPORT — Trait-based dequant dispatch
+// =============================================================================
+
+/// Trait for dequantizing packed weights in registers.
+/// Each quant format implements this differently.
+trait Dequant {
+    /// Dequantize one group of 8 weights.
+    /// `packed` is the raw packed u32 from weight memory.
+    /// `scale` is the group scale (f32).
+    /// `zero` is the zero point offset for this column group (i8).
+    /// Returns 8 dequantized f32 values.
+    fn dequant_group(packed: u32, scale: f32, zero: i8) -> [f32; 8];
+}
+
+/// INT4 dequantization: 8 values per u32, 4 bits each.
+struct Int4Dequant;
+
+impl Dequant for Int4Dequant {
+    fn dequant_group(packed: u32, scale: f32, zero: i8) -> [f32; 8] {
+        let mut out = [0.0f32; 8];
+        for w in 0..8 {
+            let shift = (w * 4) as u32;
+            let w_int4_raw: u32 = (packed >> shift) & 0xF;
+            let w_int4: i8 = (w_int4_raw as i8).wrapping_sub(8);
+            out[w] = f32::from(w_int4 - zero) * scale;
+        }
+        out
+    }
+}
+
+/// INT8 dequantization: 4 values per u32, 8 bits each (pad to 8 for uniform interface).
+struct Int8Dequant;
+
+impl Dequant for Int8Dequant {
+    fn dequant_group(packed: u32, scale: f32, zero: i8) -> [f32; 8] {
+        let mut out = [0.0f32; 8];
+        for w in 0..4 {
+            let w_int8: i8 = ((packed >> (w * 8)) & 0xFF) as i8;
+            out[w] = f32::from(w_int8 - zero) * scale;
+        }
+        // Upper 4 remain zero for INT8 format
+        out
+    }
+}
+
+// =============================================================================
 // KERNELS — compiled to PTX by rustc-codegen-cuda
 // =============================================================================
 
@@ -584,6 +630,193 @@ mod all_kernels {
             unsafe { *out.get_unchecked_mut(3) = size_attn as u32; }
         }
     }
+
+    /// Generic kernel test: scale operation with Copy+Mul traits (like cross_crate_embedded).
+    /// This tests whether generic #[kernel] functions compile and run at all.
+    // NOTE: Causes NoModules error at runtime because cuda_module macro switches to
+    // load_all_ptx_bundles_merged() for generic kernels, but the codegen backend
+    // embeds NVVM IR payloads (not PTX). See finding #2 in experiment results.
+    /*
+    #[kernel]
+    pub fn generic_scale<T: Copy + std::ops::Mul<Output = T>>(
+        factor: T,
+        input: &[T],
+        mut out: DisjointSlice<T>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = input[i] * factor;
+        }
+    }
+    */
+
+    // NOTE: Generic quantized GEMM with trait-based dequant dispatch attempted but E0282 error.
+    // Rust cannot infer D because it doesn't appear in any argument type.
+    // This is a fundamental limitation of generic kernels without trait-bounded args.
+    // See Experiment 1a below for workaround attempts.
+    /*
+    #[kernel]
+    pub fn quant_gemm<D: Dequant>(
+        a: &[u16],               // bf16 input (M×K), stored as u16
+        w_packed: &[u32],       // packed weights via D
+        scales: &[u16],         // f16 scales as u16, one per group of columns
+        zeros: &[i8],           // zero points, one per group of columns
+        mut out: DisjointSlice<u16>, // bf16 output (M×N), stored as u16
+        m: u32,                 // rows of A / output
+        n: u32,                 // cols of W / output
+        k: u32,                 // inner dimension
+        group_size: u32,       // number of columns per scale/zero group
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+        let row = thread::blockIdx_y() * 16 + thread::threadIdx_y();
+        let col = thread::blockIdx_x() * 16 + thread::threadIdx_x();
+        let row_usize = row as usize;
+        let col_usize = col as usize;
+        let m_usize = m as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+        if row_usize >= m_usize || col_usize >= n_usize {
+            return;
+        }
+        let mut acc = 0.0f32;
+        for ki in 0..k_usize {
+            // Read a[row][ki] as bf16 → f32
+            let a_bf16_bits = a[row_usize * k_usize + ki];
+            let a_f32 = f32::from_bits((a_bf16_bits as u32) << 16);
+            // Find which packed u32 and shift for w[ki][col]
+            // Weight is stored flat: W[k_i * N + col] → packed at index (k_i * N + col) / 8
+            let flat_w_idx = col_usize * k_usize + ki;
+            let packed_col = flat_w_idx / 8;
+            let w_packed_val = w_packed[packed_col];
+            // Get scale and zero for this column group
+            let group_idx = col_usize / group_size_usize;
+            let scale_f16_bits = scales[group_idx];
+            let scale_f32 = (f16::from_bits(scale_f16_bits)) as f32;
+            let zero_i8 = zeros[group_idx];
+            // Dequantize this weight using the trait-dispatched method
+            let dequantized = D::dequant_group(w_packed_val, scale_f32, zero_i8);
+            let w_offset = flat_w_idx % 8;
+            acc += a_f32 * dequantized[w_offset];
+        }
+        // Convert result to bf16 and write output
+        unsafe {
+            *out.get_unchecked_mut(row_usize * n_usize + col_usize) = f32_to_bf16(acc);
+        }
+    }
+    */
+
+    // ========================================================================
+    // Experiment 1c: Dispatch-based kernel (workaround for E0282)
+    // Instead of generic trait dispatch, use a u32 discriminant to select
+    // dequant format at runtime. This avoids both E0282 and NoModules issues.
+    // ========================================================================
+
+    /// Quantized GEMM with dispatch-based dequant (no generics, no traits).
+    ///
+    /// `dequant_kind`: 0 = INT4, 1 = INT8
+    #[kernel]
+    pub fn quant_gemm_dispatch(
+        a: &[u16],                  // bf16 input (M×K), stored as u16
+        w_packed: &[u32],           // packed weights
+        scales: &[u16],             // f16 scales as u16, one per group of columns
+        zeros_i8: &[i8],            // zero points, one per group of columns
+        mut out: DisjointSlice<u16>, // bf16 output (M×N), stored as u16
+        m: u32,                     // rows of A / output
+        n: u32,                     // cols of W / output
+        k: u32,                     // inner dimension
+        group_size: u32,            // number of columns per scale/zero group
+        dequant_kind: u32,          // 0=INT4, 1=INT8
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+        let row = thread::blockIdx_y() * 16 + thread::threadIdx_y();
+        let col = thread::blockIdx_x() * 16 + thread::threadIdx_x();
+        let row_usize = row as usize;
+        let col_usize = col as usize;
+        let m_usize = m as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+        if row_usize >= m_usize || col_usize >= n_usize {
+            return;
+        }
+        let mut acc = 0.0f32;
+
+        // Dequant functions (inlined by compiler)
+        #[inline(always)]
+        fn dequant_int4(packed: u32, scale: f32, zero: i8) -> [f32; 8] {
+            let mut out = [0.0f32; 8];
+            for w in 0..8 {
+                let shift = (w * 4) as u32;
+                let raw: u32 = (packed >> shift) & 0xF;
+                let val: i8 = (raw as i8).wrapping_sub(8);
+                out[w] = f32::from(val - zero) * scale;
+            }
+            out
+        }
+
+        #[inline(always)]
+        fn dequant_int8(packed: u32, scale: f32, zero: i8) -> [f32; 8] {
+            let mut out = [0.0f32; 8];
+            for w in 0..4 {
+                let val: i8 = ((packed >> (w * 8)) & 0xFF) as i8;
+                out[w] = f32::from(val - zero) * scale;
+            }
+            out
+        }
+
+        for ki in 0..k_usize {
+            let a_bf16_bits = a[row_usize * k_usize + ki];
+            let a_f32 = f32::from_bits((a_bf16_bits as u32) << 16);
+
+            let flat_w_idx = col_usize * k_usize + ki;
+            let packed_col = flat_w_idx / 8;
+            let w_packed_val = w_packed[packed_col];
+
+            let group_idx = col_usize / group_size_usize;
+            let scale_f16_bits = scales[group_idx];
+            let scale_f32 = (f16::from_bits(scale_f16_bits)) as f32;
+            let zero_i8 = zeros_i8[group_idx];
+
+            // Dispatch based on dequant_kind
+            let dequantized = if dequant_kind == 0 {
+                dequant_int4(w_packed_val, scale_f32, zero_i8)
+            } else {
+                dequant_int8(w_packed_val, scale_f32, zero_i8)
+            };
+
+            let w_offset = flat_w_idx % 8;
+            acc += a_f32 * dequantized[w_offset];
+        }
+
+        unsafe {
+            *out.get_unchecked_mut(row_usize * n_usize + col_usize) = f32_to_bf16(acc);
+        }
+    }
+
+    // ========================================================================
+    // Experiment 2: Const generics in #[kernel]
+    // Tests whether const generics compile inside device kernels.
+    // ========================================================================
+
+    // Simple kernel with const generic to verify const generics support.
+    // Note: only integers, bool, and char are allowed as const generic types.
+    // NOTE: Causes "named symbol not found" at runtime - cuda-oxide doesn't
+    // properly generate/find monomorphized symbols for const generic kernels.
+    /*
+    #[kernel]
+    pub fn const_generic_test<const MULTIPLIER: i32>(
+        input: &[f32],
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = input[i] * (MULTIPLIER as f32);
+        }
+    }
+    */
 
 
 }
@@ -1373,6 +1606,128 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // Experiment Results: Generic #[kernel] with trait-based Dequant dispatch
+    // ========================================================================
+    {
+        println!("\n=== Experiment 1: Trait-based Dequant dispatch (trait generics) ===");
+        // Finding: FAILS at compile time with E0282
+        // quant_gemm<D: Dequant> cannot infer D because it doesn't appear in any argument type.
+        // Rust requires T to be inferrable from function arguments, but D is only used
+        // for trait dispatch (phantom type parameter).
+        println!("[FAIL] Generic #[kernel] with Dequant trait: E0282 compile error");
+        println!("       Error: 'type annotations needed - cannot infer type of D'");
+        println!("       Reason: D is a phantom type param, not inferrable from kernel args");
+
+        // Finding: Even if we could compile it, runtime would fail with NoModules error
+        // because #[cuda_module] switches to load_all_ptx_bundles_merged() for generic kernels,
+        // but the codegen backend embeds NVVM IR payloads (not PTX).
+        println!("       Additional blocker: NoModules at runtime (NVVM IR vs PTX payload mismatch)");
+    }
+
+    // ========================================================================
+    // Experiment 1c: Dispatch-based kernel workaround
+    // ========================================================================
+    {
+        println!("\n=== Experiment 1c: Dispatch-based quant GEMM (dequant_kind param) ===");
+
+        const M: usize = 16;
+        const K: usize = 16;
+        const N: usize = 16;
+        const GROUP_SIZE: usize = 8;
+
+        let mut rng_seed: u32 = 456;
+        let mut next_u32 = || { rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223); rng_seed };
+
+        // bf16 input A (M×K)
+        let a_f32: Vec<f32> = (0..M * K).map(|i| ((i % 7) as f32 + 1.0) / 3.0).collect();
+        let a_bf16: Vec<u16> = a_f32.iter().map(|&x| f32_to_bf16_cpu(x)).collect();
+
+        // INT4 weight W (K×N), packed 8 per u32
+        let w_total = K * N;
+        let w_packed_count = (w_total + 7) / 8;
+        let mut w_packed: Vec<u32> = vec![0; w_packed_count];
+        for i in 0..w_total {
+            let val = next_u32() & 0xF;
+            let packed_idx = i / 8;
+            let shift = (i % 8) * 4;
+            w_packed[packed_idx] |= val << shift;
+        }
+
+        // scales: f16, one per group_size columns
+        let num_groups = (N + GROUP_SIZE - 1) / GROUP_SIZE;
+        let scales: Vec<u16> = (0..num_groups).map(|i| {
+            let val = ((i % 3) as f32 + 1.0) / 3.0;
+            (val as f16).to_bits()
+        }).collect();
+
+        // zeros: i8 per group
+        let zeros_i8: Vec<i8> = (0..num_groups).map(|_| next_u32() as i8).collect();
+
+        // Launch dispatch kernel with INT4 mode (dequant_kind=0)
+        let a_dev = DeviceBuffer::from_host(&stream, &a_bf16)?;
+        let w_dev = DeviceBuffer::from_host(&stream, &w_packed)?;
+        let scales_dev = DeviceBuffer::from_host(&stream, &scales)?;
+        let zeros_dev = DeviceBuffer::from_host(&stream, &zeros_i8)?;
+        let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, M * N)?;
+
+        module.quant_gemm_dispatch(
+            &stream,
+            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (16, 16, 1), shared_mem_bytes: 0 },
+            &a_dev, &w_dev, &scales_dev, &zeros_dev, &mut out_dev,
+            M as u32, N as u32, K as u32, GROUP_SIZE as u32,
+            0, // dequant_kind = INT4
+        )?;
+
+        let out_host = out_dev.to_host_vec(&stream)?;
+
+        // CPU reference: manual INT4 dequant (matching dequant_int4 logic)
+        let mut expected = vec![0u16; M * N];
+        for row in 0..M {
+            for col in 0..N {
+                let mut acc = 0.0f32;
+                for ki in 0..K {
+                    let a_f32 = bf16_to_f32_cpu(a_bf16[row * K + ki]);
+                    let flat_w_idx = col * K + ki;
+                    let packed_col = flat_w_idx / 8;
+                    let shift = (flat_w_idx % 8) * 4;
+                    let raw: u32 = (w_packed[packed_col] >> shift) & 0xF;
+                    let val: i8 = (raw as i8).wrapping_sub(8);
+                    let group_idx = col / GROUP_SIZE;
+                    let scale_f32 = (f16::from_bits(scales[group_idx])) as f32;
+                    let zero_i8 = zeros_i8[group_idx];
+                    acc += a_f32 * f32::from(val - zero_i8) * scale_f32;
+                }
+                expected[row * N + col] = f32_to_bf16_cpu(acc);
+            }
+        }
+
+        if (0..M * N).filter(|&i| out_host[i] != expected[i]).count() == 0 {
+            println!("[PASS] quant_gemm_dispatch INT4: {}x{} correct", M, N);
+        } else {
+            let errors = (0..M * N).filter(|&i| out_host[i] != expected[i]).count();
+            eprintln!("[FAIL] quant_gemm_dispatch INT4: {} mismatches", errors);
+            all_pass = false;
+        }
+    }
+
+    // ========================================================================
+    // Experiment 2: Const generics in #[kernel]
+    // ========================================================================
+    {
+        println!("\n=== Experiment 2: Const generics in #[kernel] ===");
+        // Finding 1: f32 is NOT allowed as const generic type (Rust compiler error).
+        // Only integers, bool, and char are supported. So const generics can only
+        // be used for integer-based parameters (group sizes, dimensions, etc.).
+
+        // Finding 2: Even with i32 const generic, cuda-oxide fails at runtime with
+        // "named symbol not found" - the codegen doesn't properly generate/find
+        // monomorphized symbols for const generic kernels.
+        println!("[FAIL] Const generics in #[kernel]: runtime 'named symbol not found' error");
+        println!("       Finding 1: f32 forbidden as const generic type (compiler error)");
+        println!("       Finding 2: i32 const generics fail at runtime (symbol resolution issue)");
     }
 
     println!("\n=== All tests complete ===");
