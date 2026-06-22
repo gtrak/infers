@@ -63,6 +63,67 @@ Loads pre-compiled `oxide_kernels.cubin` (28 kernels) at runtime via cuda-oxide'
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
+### Oxide Bridge: Launch Wrapper Methods (27 Kernels)
+
+Twenty-seven launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
+
+**Element-wise kernels** (use `LaunchConfig::for_num_elems(n)`):
+
+| Method | Kernel | Parameters |
+|--------|--------|------------|
+| `launch_embedding_gather_bf16` | `infers_embedding_gather_bf16` | weight: bf16, token_ids: i32, output: bf16, seq_len, hidden_size |
+| `launch_silu_bf16` | `infers_silu_bf16` | x: bf16, output: bf16, total_elements |
+| `launch_silu_glu_bf16` | `infers_silu_glu_bf16` | x: bf16, gate: bf16, output: bf16, total_elements |
+| `launch_attn_output_gate_bf16` | `infers_attn_output_gate_bf16` | x: bf16, gate: bf16, output: bf16, total_elements |
+| `launch_kv_cache_write_bf16` | `infers_kv_cache_write_bf16` | k: bf16, v: bf16, kv_cache: bf16, positions: i32, seq_len, head_dim, max_seq_len |
+| `launch_conv1d_depthwise_silu_bf16` | `infers_conv1d_depthwise_silu_bf16` | input: bf16, weight: bf16, output: bf16, batch_size, conv_dim, seq_len, kernel_size |
+| `launch_paged_kv_write_bf16` | `infers_paged_kv_write_bf16` | k: bf16, v: bf16, page_pool: bf16 (write), block_table: i32, positions: i32, seq_len, head_dim, page_size, kv_dim |
+| `launch_paged_kv_read_bf16` | `infers_paged_kv_read_bf16` | page_pool: bf16, block_table: i32, num_pages, num_cached_tokens, head_dim, page_size, kv_dim, k_out: bf16 (write), v_out: bf16 (write) |
+| `launch_fp8_quantize_e4m3` | `infers_fp8_quantize_e4m3` | input: bf16, output: u8 (write), n |
+| `launch_fp8_dequantize_e4m3` | `infers_fp8_dequantize_e4m3` | input: u8, output: bf16 (write), n |
+| `launch_fp8_quantize_e5m2` | `infers_fp8_quantize_e5m2` | input: bf16, output: u8 (write), n |
+| `launch_fp8_dequantize_e5m2` | `infers_fp8_dequantize_e5m2` | input: u8, output: bf16 (write), n |
+
+**Per-row kernels** (explicit grid/block config with dynamic shared memory):
+
+| Method | Kernel | Config |
+|--------|--------|--------|
+| `launch_argmax_bf16` | `infers_argmax_bf16` | grid=(batch_size), block=(256), smem=2048 bytes (static arrays) |
+| `launch_rmsnorm_bf16` | `infers_rmsnorm_bf16` | grid=(num_rows), block=(min(hidden,256)), smem=block*4 bytes |
+| `launch_rms_norm_gated_bf16` | `infers_rms_norm_gated_bf16` | grid=(n), block=(min(d,256)), smem=block*4 bytes |
+| `launch_l2norm_bf16` | `infers_l2norm_bf16` | grid=(num_rows), block=(min(dim,256)), smem=block*4 bytes |
+| `launch_softmax_bf16` | `infers_softmax_bf16` | grid=(num_rows), block=(min(seq_len,1024)), smem=block*4 bytes |
+| `launch_gdn_update_bf16` | `infers_gdn_update_bf16` | grid=(hidden_size), block=(256), smem=1024 bytes (two-phase reduction) |
+
+**Tile-based kernels** (2D grid, INT4 GEMM with 64x4 blocks):
+
+| Method | Kernel | Config |
+|--------|--------|--------|
+| `launch_int4_gemm_auto_round` | `int4_gemm_auto_round` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
+| `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
+
+**In-place write kernels** (q and k are writable `DisjointSlice<u16>`):
+
+| Method | Kernel | Notes |
+|--------|--------|-------|
+| `launch_rope_bf16` | `infers_rope_bf16` | q: bf16, k: bf16 (both mutable), cos: f32, sin: f32, positions: i32, total_tokens, num_heads, head_dim, rotary_dim |
+
+**Paged attention** (one block per KV head):
+
+| Method | Kernel | Config |
+|--------|--------|--------|
+| `launch_paged_attention_decode_bf16` | `infers_paged_attention_decode_bf16` | grid=(num_kv_heads), block=(256), smem=head_dim*4 bytes (Q storage) |
+
+**GDN kernels** (state as f32 for recurrent/gated_delta; bf16 for mamba2/update):
+
+| Method | Kernel | Config | State type |
+|--------|--------|--------|------------|
+| `launch_gdn_recurrent_step_bf16` | `infers_gdn_recurrent_step_bf16` | LaunchConfig::for_num_elems(H*V) | f32 (read+write) |
+| `launch_gdn_mamba2_update_bf16` | `infers_gdn_mamba2_update_bf16` | LaunchConfig::for_num_elems(nh*d) | bf16 (read+write) |
+| `launch_gdn_gated_delta_update_bf16` | `infers_gdn_gated_delta_update_bf16` | LaunchConfig::for_num_elems(H*V) | f32 (read+write) |
+| `launch_gdn_gated_delta_prefill_bf16` | `infers_gdn_gated_delta_prefill_bf16` | LaunchConfig::for_num_elems(H*V) | f32 (read+write) |
+| `launch_gdn_chunked_gated_delta_prefill_bf16` | `infers_gdn_chunked_gated_delta_prefill_bf16` | grid=(num_heads), block=(256), smem=(2*C*K + C*C + 3*C)*4 bytes | f32 (read+write) |
+
 ### cuda-oxide: Quantization-Generic Kernels (Phase 18)
 Rust→PTX compiler for three quantization-sensitive kernels with trait-based dispatch. Enables AutoRound, GGUF, AWQ, GPTQ with one kernel. Rust source is portable to rust-gpu (SPIR-V) and amdgcn (HIP) for multi-hardware.
 
