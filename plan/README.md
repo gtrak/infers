@@ -68,7 +68,7 @@ CUDA Kernels
 | [Phase 15](phase-15-tracing-otlp.md) | NOT STARTED | 1 week | Tracing integration + OTLP export | Distributed tracing with CUDA event timing for bottleneck identification |
 | [Phase 16](phase-16-zero-copy-weights.md) | DONE | 1 week | Zero-copy weight streaming from mmap to GPU | Eliminate DRAM residency — stream directly from disk via mmap + pinned staging buffer |
 | [Phase 17](phase-17-paged-prefill-wiring.md) | NOT STARTED | 2–3 days | Wire paged prefill into server orchestrator | Unified KV state, prefix caching enabled |
-| [Phase 18](phase-18-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: quantization-generic INT4 GEMM + hardware portability | Rust kernels with trait-based quant dispatch (AutoRound, GGUF, GPTQ) |
+| [Phase 24](024-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: end-to-end inference with trait-based quant dispatch | Rust→PTX→cudarc pipeline. INT4 GEMM + Dequantize trait. FP8 + PagedAttn with format traits. |
 
 **Critical Path**: Phase 4.7 (GPU Weight Cache) → Phase 4 (hit 20 tok/s) → Phase 6 (continuous batching) → Phase 7 (MTP) → Phase 10 (wire server)
 

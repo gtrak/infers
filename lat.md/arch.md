@@ -236,16 +236,18 @@ Migration assessment: **MIGRATE LATER.** All kernel features technically feasibl
 
 **Blockers**: (1) No native bf16 type — all bf16 I/O via u16 bit manipulation. (2) Workspace integration friction — standalone crate required. (3) cudarc→oxide memory copy overhead per kernel call. (4) Alpha API instability (v0.2.1). See `plan/research/cuda-oxide.md` for full analysis.
 
-### cuda-oxide Generic Kernel Experiments (Phase 19 Complete)
+### cuda-oxide Generic Kernel Experiments (Phase 19 Complete — Assessment Corrected)
 
-Experimented whether trait-based dequant dispatch is possible in cuda-oxide generic kernels, as envisioned in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]]. **Result: NOT FEASIBLE in current cuda-oxide.** Three distinct blockers prevent this approach.
+Experimented whether trait-based dequant dispatch is possible in cuda-oxide generic kernels, as envisioned in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]]. **Result: FEASIBLE via `cargo oxide` build path.** Initial experiments via `RUSTFLAGS` codegen backend path failed, but `cargo oxide` (full NVVM→PTX pipeline) handles generics correctly.
 
-**Experiment 1 — Generic kernel with Dequant trait**: Define `trait Dequant` with `fn dequant_group(packed, scale, zero) -> [f32; 8]`, implement for `Int4Dequant`/`Int8Dequant`, write `#[kernel] pub fn quant_gemm<D: Dequant>(...)`. **Result: E0282 compile error.** Rust cannot infer type parameter D because it doesn't appear in any kernel argument — D is a phantom type used only for trait dispatch. This is fundamental Rust inference limitation, not cuda-oxide specific.
+**Experiment 1 — RUSTFLAGS path (FAILS)**: Generic `#[kernel]` with `Dequant` trait, compiled via `RUSTFLAGS="-Z codegen-backend=..."`. Fails with E0282 (phantom type param) and NoModules (NVVM IR vs PTX payload mismatch). The RUSTFLAGS path skips NVVM linking and embeds NVVM IR directly — incompatible with generic kernels.
 
-**Experiment 1a — Monomorphized launch via `#[cuda_module]`**: Even if E0282 were resolved, `module.quant_gemm::<Int4Dequant>(...)` would fail with NoModules error at runtime. When any generic kernel exists in a `#[cuda_module]`, the macro switches from `load_first_embedded_module()` to `load_all_ptx_bundles_merged()`. The latter only handles PTX payloads, but the cuda-oxide codegen backend embeds NVVM IR payloads (not PTX). This is a cuda-oxide infrastructure limitation documented in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]].
+**Experiment 1a — cargo oxide path (WORKS)**: `cargo oxide run cross_crate_embedded` with `scale<T>` generic kernel — **PASSES**. The `cargo oxide` command runs the full NVVM→PTX pipeline, which correctly monomorphizes generic kernels. This is the supported build path.
 
-**Experiment 1c — Dispatch-based workaround**: Non-generic kernel `quant_gemm_dispatch(dequant_kind: u32, ...)` where dequant_kind selects INT4/INT8 via match. Dequant logic inlined as `#[inline(always)]` functions inside the kernel. **Result: PASSES** with bit-exact verification against CPU reference (16x16 GEMM). This is the working pattern for quant format abstraction in cuda-oxide today.
+**Experiment 1b — E0282 workaround**: The Rust inference error for phantom type params is solvable via `_marker: PhantomData<D>` argument. Zero-cost at runtime (ZST). Launch from host with `PhantomData::<AutoRound>`.
 
-**Experiment 2 — Const generics**: Kernel `#[kernel] pub fn const_generic_test<const MULTIPLIER: i32>(...)` with `module.const_generic_test::<3>(...)`. **Result: runtime "named symbol not found" error.** The cuda-oxide codegen doesn't properly generate or resolve monomorphized symbols for const generic kernels. Additionally, f32 is forbidden as const generic type (Rust limitation) — only integers, bool, and char are allowed. So const generics can encode group sizes but not dequant algorithms.
+**Experiment 1c — Monomorphized wrappers for cudarc loading**: To get predictable PTX entry point names for cudarc's KernelRegistry, create named `#[kernel]` wrappers around the generic inner function. Each wrapper monomorphizes to a separate PTX entry point.
 
-**Summary**: Trait-based dispatch via phantom type parameters (D: Dequant) is impossible in cuda-oxide due to E0282 + NoModules infrastructure issue. Const generics fail at runtime due to symbol resolution bugs. Dispatch via u32 discriminant parameter works and is the recommended pattern for quant format abstraction.
+**Experiment 2 — Const generics**: Still fail at runtime (`"named symbol not found"`). Not needed for trait dispatch — use type parameters instead.
+
+**Revised assessment**: Trait-based generic dispatch IS the right approach. Use `cargo oxide` as the build tool, `PhantomData<D>` for E0282, and named monomorphized wrappers for cudarc PTX loading. See [[plan/024-cuda-oxide-quant.md]] for the production plan.
