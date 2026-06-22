@@ -348,7 +348,7 @@ If the model path exists on disk, `load_model()` reads `config.json` and safeten
 
 ### Kernel Registration
 
-All kernels are loaded from a single OxideKernels bridge (`oxide_kernels.cubin`). The old `KernelRegistry` system was removed — kernels go through oxide bridge's typed launch methods. See [[crates/cuda/src/oxide_bridge.rs#OxideKernels]].
+One `OxideKernels` instance per GPU loads the same cubin (`oxide_kernels.cubin`) on each device's primary context. The old `KernelRegistry` system was removed — kernels go through oxide bridge's typed launch methods. See [[crates/cuda/src/oxide_bridge.rs#OxideKernels]].
 
 ### AppState Evolution
 

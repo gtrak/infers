@@ -105,18 +105,18 @@ impl ForwardEngine {
     ) -> Result<Vec<PerGpuKernels>> {
         let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
 
-        // Pre-create the oxide bridge (shared across GPUs since kernels are device-agnostic)
+        // Create one oxide bridge per GPU — each loads the cubin on its device's context
         let cubin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cuda/kernels/compiled/oxide_kernels.cubin");
-        let oxide: Arc<infers_cuda::OxideKernels> = Arc::new(
-            infers_cuda::OxideKernels::new(cubin_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load OxideKernels from {}: {e}", cubin_path))?
-        );
 
         for gpu_idx in 0..num_gpus {
             let _ = contexts.get(gpu_idx)
                 .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
+            let oxide: Arc<infers_cuda::OxideKernels> = Arc::new(
+                infers_cuda::OxideKernels::new(gpu_idx, cubin_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load OxideKernels for GPU {gpu_idx} from {}: {e}", cubin_path))?
+            );
             let pk = PerGpuKernels {
-                oxide: oxide.clone(),
+                oxide,
             };
             per_gpu_kernels.push(pk);
         }

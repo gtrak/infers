@@ -20,9 +20,9 @@ pub struct OxideKernels {
 
 impl OxideKernels {
     /// Load all kernels from the given cubin file path.
-    pub fn new(cubin_path: &str) -> anyhow::Result<Self> {
-        // Create cuda-oxide context on device 0 (primary context shared with cudarc)
-        let ctx = CudaContext::new(0)?;
+    pub fn new(ordinal: usize, cubin_path: &str) -> anyhow::Result<Self> {
+        // Create cuda-oxide context on the specified device (primary context shared with cudarc)
+        let ctx = CudaContext::new(ordinal)?;
         // Bind the context to the current thread before loading
         ctx.bind_to_thread()?;
 
@@ -1747,7 +1747,7 @@ mod tests {
 
         // 2. Load oxide kernels from cubin
         let cubin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/compiled/oxide_kernels.cubin");
-        let oxide = OxideKernels::new(cubin_path).unwrap();
+        let oxide = OxideKernels::new(0, cubin_path).unwrap();
 
         // 3. Alloc + fill test data (use values exactly representable in bf16)
         let n = 128;

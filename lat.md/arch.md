@@ -59,7 +59,7 @@ Seven modules cover context, streams, kernels, GEMM, pinned, NCCL, and oxide_bri
 
 ### Oxide Bridge: Runtime Kernel Loading
 
-Loads pre-compiled `oxide_kernels.cubin` (28 kernels) at runtime via cuda-oxide's `CudaContext::load_module_from_file`.
+One `OxideKernels` instance per GPU loads the cubin on the correct device's primary context, preventing cross-GPU context errors in tensor-parallel inference.
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
