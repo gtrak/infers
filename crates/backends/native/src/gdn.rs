@@ -234,7 +234,7 @@ fn repeat_interleave_heads(
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = input.len() / hidden_size;
 
-    // Dump the layer input hidden state for reference comparison
+   // Dump the layer input hidden state for reference comparison
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.hidden_input", input, &[seq_len, hidden_size], "prefill");
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
@@ -260,7 +260,6 @@ fn repeat_interleave_heads(
         )?;
     }
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[seq_len, conv_dim], "prefill");
-
     // =========================================================================
     // Phase 2: Depthwise conv1d on mixed_qkv (SiLU activation)
     // =========================================================================
@@ -274,7 +273,7 @@ fn repeat_interleave_heads(
         stream, &mixed_qkv, conv1d_gpu, &mut conv_out,
         1, conv_dim as u32, seq_len as u32, config.linear_conv_kernel_dim as u32,
     ).map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
+ probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
 
     // Save conv state: last (kernel_size - 1) tokens' mixed_qkv for decode causal conv1d.
     // Matches HF: cache_params.update_conv_state(new_conv_state)
@@ -446,7 +445,7 @@ fn repeat_interleave_heads(
                 n_rows as u32, norm_dim as u32, 1e-6f32,
             ).map_err(|e| anyhow::anyhow!("RMSNormGated kernel launch failed: {e}"))?;
         }
-        norm_out
+      norm_out
     } else {
         gdn_output.try_clone()
             .map_err(|e| anyhow::anyhow!("Failed to clone GDN output: {e}"))?
@@ -462,7 +461,7 @@ fn repeat_interleave_heads(
         &weights.out_proj_weight.name, &norm_output, &mut output,
         seq_len, hidden_size, value_dim, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[seq_len, hidden_size], "prefill");
+   probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[seq_len, hidden_size], "prefill");
 
     Ok(output)
 }

@@ -167,13 +167,18 @@ fn run_prefill_decode(
     config: Arc<infers_model::config::ModelConfig>,
     token_ids: &[u32],
 ) -> Result<(u32, Vec<u32>), Box<dyn std::error::Error>> {
-    // Initialize paged KV cache
+    // Print input info
+   // Initialize paged KV cache
     let page_size = 16;
     let num_pages = (config.max_position_embeddings / page_size) * 2;
+ 
     engine.init_paged(num_pages, page_size, 512 * 1024 * 1024)?;
+  
 
     // Create a sequence
+   
     let seq_id: SequenceId = engine.create_sequence();
+    
 
     // Get external stream (GPU 0)
     let ext_stream = runtime.default_stream(0)?;
@@ -183,7 +188,16 @@ fn run_prefill_decode(
     let mut rng = infers_backend_native::Xoshiro256PlusPlus::from_seed(42);
 
     // Prefill
+    
     let (_, first_token) = engine.prefill_paged(&ext_stream, token_ids, seq_id, &sampling_config, &mut rng)?;
+    
+
+    // Sync CUDA to surface any kernel errors from prefill
+    ext_stream.synchronize().map_err(|e| {
+   
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("CUDA sync failed: {:?}", e)))
+    })?;
+    
 
     // Decode for 30 steps
     let mut generated: Vec<u32> = Vec::with_capacity(30);
@@ -192,7 +206,9 @@ fn run_prefill_decode(
     let mut current = first_token;
     for step in 0..30 {
         let pos = (token_ids.len() + step) as u32;
+    
         current = engine.decode_paged(&ext_stream, current, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng)?;
+     
         all_tokens.push(current);
         assert!(current < config.vocab_size as u32, "Token {} >= vocab_size at step {}", current, step);
         generated.push(current);

@@ -65,8 +65,9 @@ impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.size > 0 {
             unsafe {
-                sys::cuMemFreeHost(self.ptr as *mut ::core::ffi::c_void).result()
-                    .expect("cuMemFreeHost failed");
+                if let Err(e) = sys::cuMemFreeHost(self.ptr as *mut ::core::ffi::c_void).result() {
+                    eprintln!("[PinnedHostBuffer] WARNING: cuMemFreeHost failed (CUDA state may be corrupt): {:?}", e);
+                }
             }
         }
     }

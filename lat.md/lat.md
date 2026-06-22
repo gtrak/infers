@@ -218,6 +218,12 @@ Full-sequence prefill path: runs embedding lookup through all layers (GDN or ful
 
 Prefill using paged KV cache: writes K/V into pages during the forward pass via block-table address translation instead of contiguous cache buffers. See [[crates/backends/native/src/engine.rs]].
 
+### Prefill Debug Checkpoints
+
+eprintln! checkpoints at key stages in [[crates/backends/native/src/engine.rs]] to pinpoint CUDA_ERROR_ILLEGAL_ADDRESS crashes.
+
+Run with `cargo test -- --nocapture`. Seven checkpoints: events recorded, pages allocated, block tables uploaded, page pools allocated, embedding complete, per-layer norm1, and per-layer GDN/attention.
+
 ## Paged Decode Path
 
 Decode using paged KV cache: reads K/V from pages during attention computation via block tables, supports single-token generation with paged attention kernels. See [[crates/backends/native/src/engine.rs]].

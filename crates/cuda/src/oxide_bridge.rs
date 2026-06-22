@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cuda_core::sys;
 use cuda_core::{CudaContext, CudaModule, CudaFunction, LaunchConfig};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
@@ -32,6 +33,24 @@ impl OxideKernels {
         let mut functions: HashMap<&'static str, CudaFunction> = HashMap::new();
         for name in KERNEL_NAMES {
             functions.insert(name, module.load_function(name)?);
+        }
+
+        // Set max dynamic shared memory for chunked GDN kernel (~80KB needed, exceeds 48KB default)
+        if let Some(chunked_gdn_func) = functions.get("infers_gdn_chunked_gated_delta_prefill_bf16") {
+            let raw_func: sys::CUfunction = unsafe { chunked_gdn_func.cu_function() };
+            let result = unsafe {
+                sys::cuFuncSetAttribute(
+                    raw_func,
+                    8, // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+                    100_000, // match the .cu source's maxdynamicsharedmemsize(100000)
+                )
+            };
+            if result != 0 {
+                anyhow::bail!(
+                    "cuFuncSetAttribute failed for infers_gdn_chunked_gated_delta_prefill_bf16 (error code {})",
+                    result
+                );
+            }
         }
 
         Ok(Self { ctx, module, functions })

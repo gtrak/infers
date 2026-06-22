@@ -508,7 +508,27 @@ pub fn shard_weights_tp_mmap(
 
     if num_gpus == 1 {
         // No sharding needed for single GPU — cheap Arc clones.
-        return Ok(vec![MmapWeightShard { gpu_id: 0, registry: registry.clone() }]);
+        let mut shard_registry = MmapWeightRegistry {
+            tensors: registry.tensors.clone(),
+            int4_companions: HashMap::new(),
+        };
+        for name in shard_registry.tensors.keys() {
+            if name.ends_with(".qweight") {
+                let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                let scales_name = format!("{}.scales", base);
+                let qzeros_name = format!("{}.qzeros", base);
+
+                if let Some(scales) = shard_registry.tensors.get(&scales_name)
+                    && let Some(qzeros) = shard_registry.tensors.get(&qzeros_name)
+                {
+                    shard_registry.int4_companions.insert(
+                        name.clone(),
+                        MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() },
+                    );
+                }
+            }
+        }
+        return Ok(vec![MmapWeightShard { gpu_id: 0, registry: shard_registry }]);
     }
 
     let mut shards: Vec<MmapWeightShard> = (0..num_gpus)

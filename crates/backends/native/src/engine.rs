@@ -448,8 +448,7 @@ impl ForwardEngine {
             gpu_start_events[gpu_idx].record(&gpu_stream)
                 .map_err(|e| anyhow::anyhow!("Failed to record start event on GPU {gpu_idx}: {:?}", e))?;
         }
-
-        let manager = self.paged_kv_manager.as_mut()
+       let manager = self.paged_kv_manager.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
 
         let num_gpus = self.metadata.len();
@@ -469,6 +468,7 @@ impl ForwardEngine {
         }
 
         // Upload block table and positions to ALL GPUs
+
         let block_table = manager.block_table(seq_id)?;
         let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
         let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
@@ -484,13 +484,13 @@ impl ForwardEngine {
         }
 
         // Ensure page pools allocated on each GPU
-        for gpu_idx in 0..num_gpus {
+      for gpu_idx in 0..num_gpus {
             for cache in &mut self.paged_kv_caches[gpu_idx] {
                 cache.ensure_allocated(self.streams.get(gpu_idx).unwrap())?;
             }
         }
-
         // Embed tokens on each GPU
+
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
@@ -506,6 +506,7 @@ impl ForwardEngine {
             probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[seq_len, config.hidden_size], "prefill");
             hidden_states.push(h);
         }
+
 
         // Per-GPU sharded head counts
         let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
@@ -553,8 +554,7 @@ impl ForwardEngine {
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
-
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[seq_len, config.hidden_size], "prefill");
+              probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[seq_len, config.hidden_size], "prefill");
 
                 // Attention or GDN with sharded weights
                 let attn_out = match config.get_layer_type(layer_idx) {
@@ -593,8 +593,7 @@ impl ForwardEngine {
                         )?
                     }
                 };
-
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[seq_len, config.hidden_size], "prefill");
+             probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[seq_len, config.hidden_size], "prefill");
 
                 attn_outputs.push(attn_out);
             }
@@ -609,6 +608,7 @@ impl ForwardEngine {
             }
             group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
+
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[seq_len, config.hidden_size], "prefill");
@@ -621,6 +621,7 @@ impl ForwardEngine {
                     &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
                 )?;
             }
+
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
@@ -708,6 +709,7 @@ impl ForwardEngine {
             }
 group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
+
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[seq_len, config.hidden_size], "prefill");
@@ -726,6 +728,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
+
 
         }
 

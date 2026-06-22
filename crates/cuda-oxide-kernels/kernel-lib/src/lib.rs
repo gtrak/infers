@@ -345,12 +345,12 @@ pub mod kernels {
         unsafe { *smem.add(tid) = local_sum_sq; }
         cuda_device::sync_threads();
 
-        // Phase 2: halving reduction
-        let mut s = 128u32;
+        // Phase 2: halving reduction (start from d/2, not hardcoded 128)
+        let mut s = d_usize / 2;
         while s > 0 {
-            if tid < s as usize {
+            if tid < s {
                 unsafe {
-                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s as usize);
+                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s);
                 }
             }
             cuda_device::sync_threads();
@@ -1818,6 +1818,7 @@ pub mod kernels {
                 // Step 1: load key into k_normed shared buffer
                 for offset in (0..C * K).step_by(thread::blockDim_x() as usize) {
                     let idx = tid + offset;
+                    if idx >= C * K { continue; }
                     let row = idx / K;
                     let col = idx % K;
                     if row >= actual_len {
@@ -1852,6 +1853,7 @@ pub mod kernels {
                 // Step 3: compute k_beta = k_normed * beta, zero padded rows
                 for offset in (0..C * K).step_by(thread::blockDim_x() as usize) {
                     let idx = tid + offset;
+                    if idx >= C * K { continue; }
                     let row = idx / K;
                     let col = idx % K;
 

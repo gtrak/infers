@@ -323,6 +323,8 @@ impl GpuWeightCache {
 
 
         for (key, tensor) in &registry.tensors {
+            // Skip companion tensors — they are handled as part of the parent .qweight upload.
+            if key.ends_with(".qzeros") || key.ends_with(".scales") { continue; }
             upload_mmap_tensor(stream, tensor, key, &registry.int4_companions, pinned, &mut weights)?;
         }
 

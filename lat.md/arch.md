@@ -53,7 +53,7 @@ Seven modules cover context, streams, kernels, GEMM, pinned, NCCL, and oxide_bri
 | stream | CUDA stream pool for async execution |
 | kernels | Kernel registry for pre-compiled .cubin loading |
 | gemm | cuBLASLt GEMM engine with `matmul_bf16()` method for BF16 matrix multiplication, plus `matmul_int4()` for INT4-packed weight GEMM with per-group dequantization and native transposed layout support via `Int4GemmConfig.transposed` |
-| pinned | Page-locked host memory (`PinnedHostBuffer`) for fast DMA transfers to GPU — Phase 16 Zero-Copy Weight Streaming |
+| pinned | Page-locked host memory (`PinnedHostBuffer`) for fast DMA transfers to GPU — Phase 16 Zero-Copy Weight Streaming. `Drop` does **not** panic on `cuMemFreeHost` failure; it prints a warning instead, so kernel errors during prefill are not masked by cleanup panics |
 | nccl | Multi-GPU collective operations for TP/PP |
 | oxide_bridge | Loads pre-compiled cuda-oxide kernels from `.cubin` at runtime and launches them via cudarc `CudaSlice<T>` buffers and `CudaStream`
 
@@ -61,7 +61,7 @@ Seven modules cover context, streams, kernels, GEMM, pinned, NCCL, and oxide_bri
 
 One `OxideKernels` instance per GPU loads the cubin on the correct device's primary context, preventing cross-GPU context errors in tensor-parallel inference.
 
-  Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
+  Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
 ### Oxide Bridge: Launch Wrapper Methods (27 Kernels)
 
