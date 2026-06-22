@@ -235,3 +235,17 @@ Migration assessment: **MIGRATE LATER.** All kernel features technically feasibl
 **Key results**: 13 kernels across 5 exploration commits pass on RTX 5060 Ti (sm_120): vec_add, rmsnorm (static+dynamic smem), reduce, bf16_vec_add, bf16x2_fma, int4_unpack, int4_gemm, gdn_recurrent_step, gdn_mamba2_update, dynamic_smem_test, dynamic_smem_80kb, plus 5 cudarc coexistence tests. Bugfix in cuda-oxide `llvm-export/metadata.rs` for launch_bounds kernel metadata (upstream pending). 80KB+ dynamic shared memory works via `cuFuncSetAttribute` workaround.
 
 **Blockers**: (1) No native bf16 type — all bf16 I/O via u16 bit manipulation. (2) Workspace integration friction — standalone crate required. (3) cudarc→oxide memory copy overhead per kernel call. (4) Alpha API instability (v0.2.1). See `plan/research/cuda-oxide.md` for full analysis.
+
+### cuda-oxide Generic Kernel Experiments (Phase 19 Complete)
+
+Experimented whether trait-based dequant dispatch is possible in cuda-oxide generic kernels, as envisioned in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]]. **Result: NOT FEASIBLE in current cuda-oxide.** Three distinct blockers prevent this approach.
+
+**Experiment 1 — Generic kernel with Dequant trait**: Define `trait Dequant` with `fn dequant_group(packed, scale, zero) -> [f32; 8]`, implement for `Int4Dequant`/`Int8Dequant`, write `#[kernel] pub fn quant_gemm<D: Dequant>(...)`. **Result: E0282 compile error.** Rust cannot infer type parameter D because it doesn't appear in any kernel argument — D is a phantom type used only for trait dispatch. This is fundamental Rust inference limitation, not cuda-oxide specific.
+
+**Experiment 1a — Monomorphized launch via `#[cuda_module]`**: Even if E0282 were resolved, `module.quant_gemm::<Int4Dequant>(...)` would fail with NoModules error at runtime. When any generic kernel exists in a `#[cuda_module]`, the macro switches from `load_first_embedded_module()` to `load_all_ptx_bundles_merged()`. The latter only handles PTX payloads, but the cuda-oxide codegen backend embeds NVVM IR payloads (not PTX). This is a cuda-oxide infrastructure limitation documented in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]].
+
+**Experiment 1c — Dispatch-based workaround**: Non-generic kernel `quant_gemm_dispatch(dequant_kind: u32, ...)` where dequant_kind selects INT4/INT8 via match. Dequant logic inlined as `#[inline(always)]` functions inside the kernel. **Result: PASSES** with bit-exact verification against CPU reference (16x16 GEMM). This is the working pattern for quant format abstraction in cuda-oxide today.
+
+**Experiment 2 — Const generics**: Kernel `#[kernel] pub fn const_generic_test<const MULTIPLIER: i32>(...)` with `module.const_generic_test::<3>(...)`. **Result: runtime "named symbol not found" error.** The cuda-oxide codegen doesn't properly generate or resolve monomorphized symbols for const generic kernels. Additionally, f32 is forbidden as const generic type (Rust limitation) — only integers, bool, and char are allowed. So const generics can encode group sizes but not dequant algorithms.
+
+**Summary**: Trait-based dispatch via phantom type parameters (D: Dequant) is impossible in cuda-oxide due to E0282 + NoModules infrastructure issue. Const generics fail at runtime due to symbol resolution bugs. Dispatch via u32 discriminant parameter works and is the recommended pattern for quant format abstraction.
