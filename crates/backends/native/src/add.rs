@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use infers_cuda::{OxideKernels, CudaSlice, CudaStream};
 
 /// Element-wise addition of two BF16 tensors (residual connection).
 ///
@@ -14,7 +14,7 @@ use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelA
 ///
 /// # Arguments
 /// * `stream` — CUDA stream
-/// * `kernel` — Loaded function handle for `infers_add_bf16`
+/// * `oxide` — Loaded OxideKernels bridge handle for `infers_add_bf16`
 /// * `a` — First input tensor
 /// * `b` — Second input tensor (must be same size as `a`)
 ///
@@ -22,7 +22,7 @@ use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelA
 /// Newly allocated `CudaSlice<bf16>` containing `a + b`
 pub fn add(
     stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
+    oxide: &OxideKernels,
     a: &CudaSlice<bf16>,
     b: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
@@ -30,27 +30,10 @@ pub fn add(
     anyhow::ensure!(elem_count > 0, "Add input must not be empty");
     anyhow::ensure!(a.len() == b.len(), "Add inputs must have same size ({} != {})", a.len(), b.len());
 
-    let mut output = stream
-        .alloc_zeros::<bf16>(elem_count)
+    let mut output = stream.alloc_zeros::<bf16>(elem_count)
         .map_err(|e| anyhow::anyhow!("Failed to allocate add output: {e}"))?;
 
-    let elem_count_i32 = elem_count as i32;
-    let config = LaunchConfig {
-        grid_dim: ((elem_count as u32).div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        stream
-            .launch_builder(kernel)
-            .arg(a)                  // input a
-            .arg(b)                  // input b
-            .arg(&mut output)        // output
-            .arg(&elem_count_i32)   // total_elements
-            .launch(config)
-            .map_err(|e| anyhow::anyhow!("Add kernel launch failed: {e}"))?;
-    }
+    oxide.launch_add_bf16(stream, a, b, &mut output)?;
 
     Ok(output)
 }

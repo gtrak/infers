@@ -51,6 +51,8 @@ fn trim_memory() {
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
+    /// Oxide bridge for add, embedding, norm, rope, and silu_glu kernels.
+    oxide: Arc<infers_cuda::OxideKernels>,
     rmsnorm: CudaFunction,
     silu_glu: CudaFunction,
     rope: CudaFunction,
@@ -128,6 +130,14 @@ impl ForwardEngine {
         num_gpus: usize,
     ) -> Result<Vec<PerGpuKernels>> {
         let mut per_gpu_kernels = Vec::with_capacity(num_gpus);
+
+        // Pre-create the oxide bridge (shared across GPUs since kernels are device-agnostic)
+        let cubin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cuda/kernels/compiled/oxide_kernels.cubin");
+        let oxide: Arc<infers_cuda::OxideKernels> = Arc::new(
+            infers_cuda::OxideKernels::new(cubin_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load OxideKernels from {}: {e}", cubin_path))?
+        );
+
         for gpu_idx in 0..num_gpus {
             let ctx = contexts.get(gpu_idx)
                 .ok_or_else(|| anyhow::anyhow!("Missing context for GPU {gpu_idx}"))?;
@@ -135,6 +145,7 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to load CUDA kernels on GPU {gpu_idx}: {e}"))?;
 
             let pk = PerGpuKernels {
+                oxide: oxide.clone(),
                 rmsnorm: kernels.get_function("infers_rmsnorm_bf16")?,
                 silu_glu: kernels.get_function("infers_silu_glu_bf16")?,
                 rope: kernels.get_function("infers_rope_bf16")?,
@@ -384,6 +395,7 @@ impl ForwardEngine {
         let weights = &self.metadata[0];
 
         let kernels = crate::prefill::PrefillKernels {
+            oxide: self.per_gpu_kernels[0].oxide.clone(),
             rmsnorm: self.per_gpu_kernels[0].rmsnorm.clone(),
             silu_glu: self.per_gpu_kernels[0].silu_glu.clone(),
             rope: self.per_gpu_kernels[0].rope.clone(),
@@ -568,7 +580,7 @@ impl ForwardEngine {
             let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
                 .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
             let h = crate::embedding::embed_tokens(
-                &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, token_ids, &embed_table,
+                &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, token_ids, &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
             probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[seq_len, config.hidden_size], "prefill");
@@ -618,7 +630,7 @@ impl ForwardEngine {
                 let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
                 let norm1_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
@@ -650,7 +662,7 @@ impl ForwardEngine {
                         crate::attention::forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].softmax, &self.per_gpu_kernels[gpu_idx].paged_kv_write,
-                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm,
+                            &self.per_gpu_kernels[gpu_idx].oxide,
                             &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
@@ -690,7 +702,7 @@ impl ForwardEngine {
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
                     &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
                 )?;
             }
@@ -715,7 +727,7 @@ impl ForwardEngine {
                 let norm2_weight = self.weight_caches[gpu_idx].get_bf16(&w.layers[layer_idx].norm2.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", w.layers[layer_idx].norm2.name))?;
                 let norm2_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
@@ -749,16 +761,9 @@ impl ForwardEngine {
 
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
-                let elem_i32 = (seq_len * sharded_intermediate) as i32;
-                unsafe {
-                    gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
-                        .arg(&up).arg(&gate).arg(&mut silu_out).arg(&elem_i32)
-                        .launch(infers_cuda::LaunchConfig {
-                            grid_dim: (((seq_len * sharded_intermediate) as u32).div_ceil(256), 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
-                }
+                self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
+                    &gpu_stream, &up, &gate, &mut silu_out, (seq_len * sharded_intermediate) as u32,
+                )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[seq_len, config.intermediate_size / num_gpus], "prefill");
 
@@ -793,11 +798,11 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
 
-            // Phase D: Residual add on each GPU
+        // Phase D: Residual add on each GPU
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
                     &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
                 )?;
             }
@@ -806,6 +811,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[seq_len, config.hidden_size], "prefill");
             }
+
         }
 
         // Record prefill tokens in the KV manager so decode sees the correct count
@@ -827,7 +833,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
             .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
         final_hidden = crate::norm::rms_norm(
-            &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
+            &final_stream, &self.per_gpu_kernels[0].oxide, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
 
@@ -981,7 +987,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
                 .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
             let h = crate::embedding::embed_tokens(
-                &gpu_stream, &self.per_gpu_kernels[gpu_idx].embedding, &[token_id], &embed_table,
+                &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &[token_id], &embed_table,
                 config.hidden_size, config.vocab_size,
             )?;
             probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[1, config.hidden_size], "decode");
@@ -1029,7 +1035,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
                 let norm1_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm1_weight,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
@@ -1060,7 +1066,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                         crate::attention::decode_forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
                             &self.per_gpu_kernels[gpu_idx].paged_kv_write, &self.per_gpu_kernels[gpu_idx].paged_attention_decode,
-                            &self.per_gpu_kernels[gpu_idx].rope, &self.per_gpu_kernels[gpu_idx].rmsnorm,
+                            &self.per_gpu_kernels[gpu_idx].oxide,
                             &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
@@ -1102,7 +1108,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
                     &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
                 )?;
             }
@@ -1125,7 +1131,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 let norm2_weight = self.weight_caches[gpu_idx].get_bf16(&w.layers[layer_idx].norm2.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", w.layers[layer_idx].norm2.name))?;
                 let norm2_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].rmsnorm, &hidden_states[gpu_idx], &norm2_weight,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
@@ -1159,16 +1165,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
                 // up * SiLU(gate) = SwiGLU (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
-                let elem_i32 = sharded_intermediate as i32;
-                unsafe {
-                    gpu_stream.launch_builder(&self.per_gpu_kernels[gpu_idx].silu_glu)
-                        .arg(&up).arg(&gate).arg(&mut silu_out).arg(&elem_i32)
-                        .launch(infers_cuda::LaunchConfig {
-                            grid_dim: ((sharded_intermediate as u32).div_ceil(256), 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
-                }
+                self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
+                    &gpu_stream, &up, &gate, &mut silu_out, sharded_intermediate as u32,
+                )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[1, config.intermediate_size / num_gpus], "decode");
 
@@ -1207,7 +1206,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 hidden_states[gpu_idx] = crate::add::add(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].add,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
                     &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
                 )?;
             }
@@ -1231,7 +1230,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
             .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
         final_hidden = crate::norm::rms_norm(
-            &final_stream, &self.per_gpu_kernels[0].rmsnorm, &final_hidden, &final_norm_gpu,
+            &final_stream, &self.per_gpu_kernels[0].oxide, &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
 

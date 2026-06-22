@@ -23,6 +23,8 @@ use crate::sync;
 // @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
 /// Kernel handles needed for the prefill pass.
 pub struct PrefillKernels {
+    /// Oxide bridge for add, embedding, norm, rope, and silu_glu kernels.
+    pub oxide: Arc<infers_cuda::OxideKernels>,
     pub rmsnorm: CudaFunction,
     pub silu_glu: CudaFunction,
     pub rope: CudaFunction,
@@ -109,7 +111,7 @@ pub fn prefill(
 
     let mut hidden = embedding::embed_tokens(
         stream,
-        &kernels.embedding,
+        &kernels.oxide,
         token_ids,
         &embed_table,
         hidden_size,
@@ -129,7 +131,7 @@ pub fn prefill(
             .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
         let norm1_out = norm::rms_norm(
             stream,
-            &kernels.rmsnorm,
+            &kernels.oxide,
             &hidden,
             &norm1_weight,
             rms_norm_eps,
@@ -170,8 +172,7 @@ pub fn prefill(
                     stream,
                     &kernels.softmax,
                     &kernels.kv_cache_write,
-                    &kernels.rope,
-                    &kernels.rmsnorm,
+                    &kernels.oxide,
                     &kernels.attn_output_gate,
                     attn_weights,
                     &norm1_out,
@@ -196,14 +197,14 @@ pub fn prefill(
         sync::all_reduce_attention(nccl, stream, &mut attn_or_gdn_out)?;
 
         // --- Residual add (attention/GDN output + hidden) ---
-        hidden = add::add(stream, &kernels.add, &hidden, &attn_or_gdn_out)?;
+        hidden = add::add(stream, &kernels.oxide, &hidden, &attn_or_gdn_out)?;
 
         // --- Norm2 (pre-MLP) ---
         let norm2_weight = cache.get_bf16(&layer.norm2.name)
             .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", layer.norm2.name))?;
         let norm2_out = norm::rms_norm(
             stream,
-            &kernels.rmsnorm,
+            &kernels.oxide,
             &hidden,
             &norm2_weight,
             rms_norm_eps,
@@ -238,24 +239,8 @@ pub fn prefill(
         let mut silu_out = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate silu_out buffer: {e}"))?;
-        {
-            let elem_count_i32 = gate_size as i32;
-            let config = infers_cuda::LaunchConfig {
-                grid_dim: ((gate_size as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&kernels.silu_glu)
-                    .arg(&up)
-                    .arg(&gate)
-                    .arg(&mut silu_out)
-                    .arg(&elem_count_i32)
-                    .launch(config)
-                    .map_err(|e| anyhow::anyhow!("SiLU+GLU kernel launch failed: {e}"))?;
-            }
-        }
+        kernels.oxide.launch_silu_glu_bf16(stream, &up, &gate, &mut silu_out, gate_size as u32)
+            .map_err(|e| anyhow::anyhow!("SiLU+GLU kernel launch failed: {e}"))?;
 
         // output = GEMM(silu_out, down_proj^T)  [seq_len × hidden_size]
         let output_size = seq_len * hidden_size;
@@ -272,7 +257,7 @@ pub fn prefill(
         sync::all_reduce_mlp(nccl, stream, &mut mlp_out)?;
 
         // --- Residual add (MLP output + hidden) ---
-        hidden = add::add(stream, &kernels.add, &hidden, &mlp_out)?;
+        hidden = add::add(stream, &kernels.oxide, &hidden, &mlp_out)?;
     }
 
     // =========================================================================
@@ -285,7 +270,7 @@ pub fn prefill(
         .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
     let hidden = norm::rms_norm(
         stream,
-        &kernels.rmsnorm,
+        &kernels.oxide,
         &hidden,
         &final_norm_gpu,
         rms_norm_eps,

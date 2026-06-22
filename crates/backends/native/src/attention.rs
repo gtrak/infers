@@ -322,7 +322,7 @@ pub fn paged_attention_decode(
 /// * `stream` — CUDA stream for kernel launches
 /// * `softmax_kernel` — CUDA kernel for softmax
 /// * `kv_cache_write_kernel` — CUDA kernel for KV cache write
-/// * `rope_kernel` — CUDA kernel for RoPE
+/// * `oxide` — Oxide bridge for norm and rope kernels
 /// * `add_kernel` — CUDA kernel for element-wise addition
 /// * `weights` — Attention weights for this layer
 /// * `input` — Input tensor `[seq_len × hidden_size]`
@@ -343,8 +343,7 @@ pub fn forward(
     stream: &Arc<CudaStream>,
     softmax_kernel: &CudaFunction,
     kv_cache_write_kernel: &CudaFunction,
-    rope_kernel: &CudaFunction,
-    rmsnorm_kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -400,7 +399,7 @@ pub fn forward(
         let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_full = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
     }
 
@@ -409,17 +408,18 @@ pub fn forward(
     let mut q_dummy = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
-    rope::apply_rope(
-        stream,
-        rope_kernel,
-        &mut q_dummy,
-        &mut k_full,
-        positions,
-        num_kv_heads as i32,
-        head_dim,
-        rope_theta,
-        partial_rotary_factor,
-    )?;
+   rope::apply_rope(
+            stream,
+            oxide,
+            &mut q_dummy,
+            &mut k_full,
+            positions,
+            num_kv_heads as i32,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+        )?;
+
 
     // Write K and V to KV cache
     let kv_buf = kv_cache.ensure_allocated(stream, max_seq_len, kv_dim)?;
@@ -492,7 +492,7 @@ pub fn forward(
             }
         }
         let q_normed = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
         // Write normalized Q back into interleaved positions
         for s in 0..seq_len {
@@ -583,7 +583,7 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
         rope::apply_rope(
             stream,
-            rope_kernel,
+            oxide,
             &mut q_h,
             &mut k_h_dummy,  // dummy — k_h already has RoPE from Phase 1
             positions,
@@ -747,8 +747,7 @@ pub fn forward_paged(
     stream: &Arc<CudaStream>,
     softmax_kernel: &CudaFunction,
     paged_kv_write_kernel: &CudaFunction,
-    rope_kernel: &CudaFunction,
-    rmsnorm_kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -813,7 +812,7 @@ pub fn forward_paged(
         let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_full = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &k_full, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
             probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_full, &[seq_len, kv_dim], "prefill");
     }
@@ -825,7 +824,7 @@ pub fn forward_paged(
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_full, &[seq_len, kv_dim], "prefill");
     rope::apply_rope(
         stream,
-        rope_kernel,
+        oxide,
         &mut q_dummy,
         &mut k_full,
         positions,
@@ -900,7 +899,7 @@ pub fn forward_paged(
             }
         }
         let q_normed = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &q_only, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_normed, &[seq_len, per_gpu_head_dim], "prefill");
         // Write normalized Q back into q_full (per-head interleaved)
@@ -1014,7 +1013,7 @@ pub fn forward_paged(
             .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
         rope::apply_rope(
             stream,
-            rope_kernel,
+            oxide,
             &mut q_h,
             &mut k_h_dummy,  // dummy — k_h already has RoPE from Phase 1
             positions,
@@ -1191,8 +1190,7 @@ pub fn decode_forward_paged(
     stream: &Arc<CudaStream>,
     paged_kv_write_kernel: &CudaFunction,
     paged_attention_decode_kernel: &CudaFunction,
-    rope_kernel: &CudaFunction,
-    rmsnorm_kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
@@ -1256,7 +1254,7 @@ pub fn decode_forward_paged(
         let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
         k_single = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_single, &[1, kv_dim], "decode");
     }
@@ -1268,7 +1266,7 @@ pub fn decode_forward_paged(
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_single, &[1, kv_dim], "decode");
     rope::apply_rope(
         stream,
-        rope_kernel,
+        oxide,
         &mut q_dummy,
         &mut k_single,
         &[position],
@@ -1360,7 +1358,7 @@ pub fn decode_forward_paged(
         let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
         q_single = crate::norm::rms_norm(
-            stream, rmsnorm_kernel, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
+            stream, oxide, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_single, &[1, per_gpu_head_dim], "decode");
     }
@@ -1372,7 +1370,7 @@ pub fn decode_forward_paged(
         .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
     rope::apply_rope(
         stream,
-        rope_kernel,
+        oxide,
         &mut q_single,
         &mut k_rope_dummy,
         &[position],

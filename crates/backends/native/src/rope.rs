@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use infers_cuda::{OxideKernels, CudaSlice, CudaStream};
 
 /// Precompute RoPE sin/cos embedding tables.
 ///
@@ -59,7 +59,7 @@ fn precompute_rope_tables(
 ///
 /// # Arguments
 /// * `stream` — CUDA stream
-/// * `kernel` — Loaded function handle for `infers_rope_bf16`
+/// * `oxide` — Loaded OxideKernels bridge handle for `infers_rope_bf16`
 /// * `q` — Query tensor `[total_tokens × num_heads × head_dim]`, modified in-place
 /// * `k` — Key tensor `[total_tokens × num_heads × head_dim]`, modified in-place
 /// * `positions` — Per-token position indices (host slice)
@@ -69,7 +69,7 @@ fn precompute_rope_tables(
 /// * `partial_rotary_factor` — Fraction of head_dim to apply RoPE to (typically 0.25)
 pub fn apply_rope(
     stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
+    oxide: &OxideKernels,
     q: &mut CudaSlice<bf16>,
     k: &mut CudaSlice<bf16>,
     positions: &[u32],
@@ -87,56 +87,34 @@ pub fn apply_rope(
     // Precompute sin/cos tables on host — indexed by position value, not sequential index
     let (cos_table, sin_table) = precompute_rope_tables(max_position, head_dim, rope_theta, partial_rotary_factor);
 
+    // The kernel expects i32 for positions, but we receive u32.
+    // Convert to i32 before copying to device.
+    let positions_i32: Vec<i32> = positions.iter().map(|&x| x as i32).collect();
+
     // Copy data to device
-    let positions_gpu = stream
-        .clone_htod(positions)
+    let positions_gpu = stream.clone_htod(&positions_i32)
         .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
     // CRITICAL: Sync after each upload to prevent cudaMallocAsync
     // from returning overlapping addresses on the same stream.
     stream.synchronize()
         .map_err(|e| anyhow::anyhow!("Failed to sync stream after positions: {e}"))?;
 
-    let cos_gpu = stream
-        .clone_htod(&cos_table)
+    let cos_gpu = stream.clone_htod(&cos_table)
         .map_err(|e| anyhow::anyhow!("Failed to copy cos table to device: {e}"))?;
     stream.synchronize()
         .map_err(|e| anyhow::anyhow!("Failed to sync stream after cos table: {e}"))?;
 
-    let sin_gpu = stream
-        .clone_htod(&sin_table)
+    let sin_gpu = stream.clone_htod(&sin_table)
         .map_err(|e| anyhow::anyhow!("Failed to copy sin table to device: {e}"))?;
     stream.synchronize()
         .map_err(|e| anyhow::anyhow!("Failed to sync stream after sin table: {e}"))?;
 
-    let total_tokens = positions.len() as i32;
-    let head_dim_i32 = head_dim as i32;
-
-    // Calculate grid size based on total_tokens * num_heads * half_rotary work items
     let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
-    let half_rotary = rotary_dim / 2;
-    let total_pairs = positions.len() * num_heads as usize * half_rotary;
-    let config = LaunchConfig {
-        grid_dim: ((total_pairs as u32).div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let rotary_dim_i32 = rotary_dim as i32;
 
-    unsafe {
-        stream
-            .launch_builder(kernel)
-            .arg(q)                // query (mutable, in-place)
-            .arg(k)                // key (mutable, in-place)
-            .arg(&cos_gpu)        // cos table
-            .arg(&sin_gpu)        // sin table
-            .arg(&positions_gpu)   // position IDs
-            .arg(&total_tokens)    // total_tokens
-            .arg(&num_heads)       // num_heads
-            .arg(&head_dim_i32)   // head_dim
-            .arg(&rotary_dim_i32) // rotary_dim (may be < head_dim for partial RoPE)
-            .launch(config)
-            .map_err(|e| anyhow::anyhow!("RoPE kernel launch failed: {e}"))?;
-    }
+    oxide.launch_rope_bf16(
+        stream, q, k, &cos_gpu, &sin_gpu, &positions_gpu,
+        positions.len() as u32, num_heads as u32, head_dim as u32, rotary_dim as u32,
+    )?;
 
     Ok(())
 }
