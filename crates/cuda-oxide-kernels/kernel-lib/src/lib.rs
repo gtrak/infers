@@ -407,11 +407,12 @@ pub mod kernels {
         cuda_device::sync_threads();
 
         // Phase 2: halving reduction
-        let mut s = 128u32;
+        let block_dim_x = thread::blockDim_x() as usize;
+        let mut s = block_dim_x / 2;
         while s > 0 {
-            if tid < s as usize {
+            if tid < s && tid + s < block_dim_x {
                 unsafe {
-                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s as usize);
+                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s);
                 }
             }
             cuda_device::sync_threads();
@@ -468,12 +469,13 @@ pub mod kernels {
         cuda_device::sync_threads();
 
         // Halving max reduction
-        let mut s = 128u32;
+        let block_dim_x = thread::blockDim_x() as usize;
+        let mut s = block_dim_x / 2;
         while s > 0 {
-            if tid < s as usize {
+            if tid < s && tid + s < block_dim_x {
                 unsafe {
                     let own = *smem.add(tid);
-                    let other = *smem.add(tid + s as usize);
+                    let other = *smem.add(tid + s);
                     *smem.add(tid) = if other > own { other } else { own };
                 }
             }
@@ -496,11 +498,11 @@ pub mod kernels {
         cuda_device::sync_threads();
 
         // Halving sum reduction
-        let mut s2 = 128u32;
+        let mut s2 = block_dim_x / 2;
         while s2 > 0 {
-            if tid < s2 as usize {
+            if tid < s2 && tid + s2 < block_dim_x {
                 unsafe {
-                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s2 as usize);
+                    *smem.add(tid) = *smem.add(tid) + *smem.add(tid + s2);
                 }
             }
             cuda_device::sync_threads();

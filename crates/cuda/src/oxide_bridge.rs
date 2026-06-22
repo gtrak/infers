@@ -593,7 +593,7 @@ impl OxideKernels {
         use_causal: u32,
     ) -> anyhow::Result<()> {
         let num_rows = scores.len() as u32 / seq_len;
-        let block_size = (seq_len.min(1024)) as u32;
+        let block_size = (seq_len.min(256)) as u32;
 
         let s_len_val = scores.len() as u64;
         let out_len_val = output.len() as u64;
@@ -1198,7 +1198,7 @@ impl OxideKernels {
         let config = LaunchConfig {
             grid_dim: (num_kv_heads, 1, 1),
             block_dim: (256, 1, 1),
-            shared_mem_bytes: (head_dim * 4) as u32,
+            shared_mem_bytes: 3 * 256 * 4,  // 3 regions: Q values + max scratch + sum scratch
         };
         self.raw_launch("infers_paged_attention_decode_bf16", stream, config, &mut args)
     }
