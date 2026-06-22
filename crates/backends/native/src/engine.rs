@@ -13,7 +13,7 @@ use infers_cuda::kernels::{KernelRegistry, LoadedKernelRegistry};
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
 use infers_cuda::PinnedHostBuffer;
-use infers_cuda::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
+use infers_cuda::{CudaContext, CudaFunction, CudaStream};
 use infers_model::{LayerType, MmapWeightRegistry, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
@@ -28,7 +28,7 @@ use infers_cuda::CudaSlice;
 
 use infers_cuda::{group_end, group_start};
 use crate::sync;
-use crate::sample::{Xoshiro256PlusPlus, sample_with_config};
+use crate::sample::Xoshiro256PlusPlus;
 
 /// Force the C allocator to return freed memory to the OS.
 ///
@@ -60,16 +60,11 @@ struct PerGpuKernels {
     add: CudaFunction,
     gdn_prefill: CudaFunction,
     gdn_update: CudaFunction,
+    // New GDN kernels (gated delta rule) — kept for PrefillKernels mapping
+    gdn_gated_delta_prefill: CudaFunction,
     fp8_quantize: CudaFunction,
     fp8_dequantize: CudaFunction,
     int4_gemm: CudaFunction,
-    // New GDN kernels (gated delta rule)
-    gdn_gated_delta_prefill: CudaFunction,
-    gdn_gated_delta_update: CudaFunction,
-    gdn_recurrent_step: CudaFunction,
-    gdn_chunked_prefill: CudaFunction,
-    conv1d_depthwise: CudaFunction,
-    rms_norm_gated: CudaFunction,
 }
 
 /// Central engine for forward-pass inference.
@@ -151,20 +146,6 @@ impl ForwardEngine {
                 fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
                 int4_gemm: kernels.get_function("int4_gemm_kernel")?,
                 gdn_gated_delta_prefill: kernels.get_function("infers_gdn_gated_delta_prefill_bf16")?,
-                gdn_gated_delta_update: kernels.get_function("infers_gdn_gated_delta_update_bf16")?,
-                gdn_recurrent_step: kernels.get_function("infers_gdn_recurrent_step_bf16")?,
-                gdn_chunked_prefill: {
-                    let f = kernels.get_function("infers_gdn_chunked_gated_delta_prefill_bf16")?;
-                    // Allow up to 100KB dynamic shared memory for the chunked GDN kernel
-                    // (default is 48KB; the kernel uses ~81KB for C=64, K=128)
-                    f.set_attribute(
-                        infers_cuda::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        100000,
-                    ).ok(); // ok() — ignore error if attribute not supported
-                    f
-                },
-                conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
-                rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
             };
             per_gpu_kernels.push(pk);
         }
@@ -391,10 +372,6 @@ impl ForwardEngine {
             add: self.per_gpu_kernels[0].add.clone(),
             gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
             gdn_gated_delta_prefill: self.per_gpu_kernels[0].gdn_gated_delta_prefill.clone(),
-            gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
-            gdn_chunked_prefill: self.per_gpu_kernels[0].gdn_chunked_prefill.clone(),
-            conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
-            rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
         };
 
@@ -626,11 +603,8 @@ impl ForwardEngine {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
                         crate::gdn::forward(
-                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
-                            &self.per_gpu_kernels[gpu_idx].gdn_chunked_prefill,
-                            &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
-                            &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
+                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                             &self.per_gpu_kernels[gpu_idx].oxide,
                             gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
@@ -1028,11 +1002,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-                        crate::gdn::decode_forward(
-                            gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].gdn_recurrent_step,
-                            &self.per_gpu_kernels[gpu_idx].conv1d_depthwise,
-                            &self.per_gpu_kernels[gpu_idx].rms_norm_gated,
+                       crate::gdn::decode_forward(
+                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
+                             &self.per_gpu_kernels[gpu_idx].oxide,
                             gdn_weights, &norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,

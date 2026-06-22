@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use infers_cuda::gemm::{GemmConfig, GemmEngine};
+use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
+use infers_cuda::gemm::GemmEngine;
 use infers_model::{GdnWeights, ModelConfig, WeightDtype};
 use crate::probe;
 use crate::probe::ProbeConfig;
@@ -151,7 +151,7 @@ fn extract_columns(
 fn bf16_to_f32_gpu(
     stream: &Arc<CudaStream>,
     src: &CudaSlice<bf16>,
-    count: usize,
+    _count: usize,
 ) -> Result<CudaSlice<f32>> {
     let cpu_bf16: Vec<bf16> = stream.clone_dtoh(src)
         .map_err(|e| anyhow::anyhow!("Failed to download BF16 buffer: {e}"))?;
@@ -206,9 +206,7 @@ fn repeat_interleave_heads(
 /// * `gemm` — cuBLASLt engine
 /// * `int4_kernel` — INT4 GEMM kernel
 /// * `stream` — CUDA stream
-/// * `gdn_recurrent_step_kernel` — `infers_gdn_recurrent_step_bf16` (single-token step, bf16 inputs)
-/// * `conv1d_kernel` — `infers_conv1d_depthwise_silu_bf16`
-/// * `rms_norm_gated_kernel` — `infers_rms_norm_gated_bf16`
+/// * `oxide` — OxideKernels bridge for GDN kernel launches
 /// * `weights` — GDN layer weights (includes in_proj_qkv, conv1d, etc.)
 /// * `input` — `[seq_len × hidden_size]` BF16
 /// * `gdn_state` — Mutable recurrent state
@@ -222,12 +220,9 @@ fn repeat_interleave_heads(
 #[allow(unused_assignments, clippy::too_many_arguments)]
   pub fn forward(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
+    int4_kernel: &infers_cuda::CudaFunction,
     stream: &Arc<CudaStream>,
-    gdn_recurrent_step_kernel: &CudaFunction,
-    gdn_chunked_prefill_kernel: &CudaFunction,
-    conv1d_kernel: &CudaFunction,
-    rms_norm_gated_kernel: &CudaFunction,
+    oxide: &OxideKernels,
     weights: &GdnWeights,
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
@@ -277,29 +272,10 @@ fn repeat_interleave_heads(
         .ok_or_else(|| anyhow::anyhow!("conv1d weight '{}' not in cache", weights.conv1d_weight.name))?;
 
     // Note: conv1d_weight is a weight, not an intermediate — skipped for probing
-    let batch_i32 = 1i32;
-    let conv_dim_i32 = conv_dim as i32;
-    let seq_len_i32 = seq_len as i32;
-    let kernel_size = config.linear_conv_kernel_dim as i32;
-    let total = seq_len * conv_dim;
-    let grid = (total as u32).div_ceil(256);
-
-    unsafe {
-        stream.launch_builder(conv1d_kernel)
-            .arg(&mixed_qkv)
-            .arg(conv1d_gpu)
-            .arg(&mut conv_out)
-            .arg(&batch_i32)
-            .arg(&conv_dim_i32)
-            .arg(&seq_len_i32)
-            .arg(&kernel_size)
-            .launch(LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
-    }
+    oxide.launch_conv1d_depthwise_silu_bf16(
+        stream, &mixed_qkv, conv1d_gpu, &mut conv_out,
+        1, conv_dim as u32, seq_len as u32, config.linear_conv_kernel_dim as u32,
+    ).map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
 
     // Save conv state: last (kernel_size - 1) tokens' mixed_qkv for decode causal conv1d.
@@ -428,35 +404,16 @@ fn repeat_interleave_heads(
     let head_v_dim_i32 = head_v_dim as i32;
     let chunk_size: i32 = 64;
 
-    // Launch chunked parallel kernel: one block per head, 256 threads per block
-    // Shared memory: k_normed[C][K] + k_beta[C][K] + attn[C][C] + g_cs[C] + beta_arr[C] + row_buf[C]
-    let smem_size = ((2 * chunk_size as usize * head_k_dim
-        + chunk_size as usize * chunk_size as usize
-        + 3 * chunk_size as usize) * std::mem::size_of::<f32>()) as u32;
+    // Launch chunked parallel kernel via oxide bridge
+    let chunk_size_u32 = 64u32;
 
-    unsafe {
-        stream.launch_builder(gdn_chunked_prefill_kernel)
-            .arg(&query_expanded)      // [S, H, K] BF16
-            .arg(&key_expanded)        // [S, H, K] BF16
-            .arg(&value_flat)          // [S, H, V] BF16
-            .arg(&a_proj)              // [S, H] BF16
-            .arg(&b_proj)              // [S, H] BF16
-            .arg(&a_log_f32)           // [H] float32
-            .arg(&dt_bias_f32)         // [H] float32
-            .arg(&mut *state_ref)      // [H, K, V] float32 mutable
-            .arg(&mut gdn_output)      // [S, H, V] BF16 output
-            .arg(&(seq_len as i32))
-            .arg(&num_v_heads_i32)
-            .arg(&head_k_dim_i32)
-            .arg(&head_v_dim_i32)
-            .arg(&chunk_size)
-            .launch(LaunchConfig {
-                grid_dim: (num_v_heads as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: smem_size,
-            })
-            .map_err(|e| anyhow::anyhow!("GDN chunked prefill kernel launch failed: {e}"))?;
-    }
+    oxide.launch_gdn_chunked_gated_delta_prefill_bf16(
+        stream, &query_expanded, &key_expanded, &value_flat,
+        &a_proj, &b_proj, &a_log_f32, &dt_bias_f32,
+        state_ref, &mut gdn_output,
+        seq_len as u32, num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
+        chunk_size_u32,
+    ).map_err(|e| anyhow::anyhow!("GDN chunked prefill kernel launch failed: {e}"))?;
 
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[seq_len, num_v_heads * head_v_dim], "prefill");
 
@@ -486,20 +443,10 @@ fn repeat_interleave_heads(
         probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &z_gate_raw, &[seq_len, z_dim], "prefill");
 
         unsafe {
-            stream.launch_builder(rms_norm_gated_kernel)
-                .arg(&gdn_output)
-                .arg(&z_gate_raw)
-                .arg(norm_weight)
-                .arg(&mut norm_out)
-                .arg(&(n_rows as i32))
-                .arg(&(norm_dim as i32))
-                .arg(&1e-6f32)
-                .launch(LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (norm_dim.min(256) as u32, 1, 1),
-                    shared_mem_bytes: (norm_dim.min(256) * 4) as u32,
-                })
-                .map_err(|e| anyhow::anyhow!("RMSNormGated kernel launch failed: {e}"))?;
+            oxide.launch_rms_norm_gated_bf16(
+                stream, &gdn_output, &z_gate_raw, norm_weight, &mut norm_out,
+                n_rows as u32, norm_dim as u32, 1e-6f32,
+            ).map_err(|e| anyhow::anyhow!("RMSNormGated kernel launch failed: {e}"))?;
         }
         norm_out
     } else {
@@ -530,11 +477,9 @@ fn repeat_interleave_heads(
 #[allow(unused_assignments, clippy::too_many_arguments)]
 pub fn decode_forward(
     gemm: &mut GemmEngine,
-    int4_kernel: &CudaFunction,
+    int4_kernel: &infers_cuda::CudaFunction,
     stream: &Arc<CudaStream>,
-    gdn_recurrent_step_kernel: &CudaFunction,
-    conv1d_kernel: &CudaFunction,
-    rms_norm_gated_kernel: &CudaFunction,
+    oxide: &OxideKernels,
     weights: &GdnWeights,
     input: &CudaSlice<bf16>,
     gdn_state: &mut GdnState,
@@ -619,26 +564,10 @@ pub fn decode_forward(
     let mut conv_out = stream.alloc_zeros::<bf16>(kernel_size_usize * conv_dim)?;
     let conv1d_gpu = cache.get_bf16(&weights.conv1d_weight.name)
         .ok_or_else(|| anyhow::anyhow!("conv1d weight not in cache"))?;
-    let batch_i32 = 1i32;
-    let conv_dim_i32 = conv_dim as i32;
-    let conv_seq_len_i32 = kernel_size;  // conv_input has kernel_size positions
-
-    unsafe {
-        stream.launch_builder(conv1d_kernel)
-            .arg(&conv_input)
-            .arg(conv1d_gpu)
-            .arg(&mut conv_out)
-            .arg(&batch_i32)
-            .arg(&conv_dim_i32)
-            .arg(&conv_seq_len_i32)
-            .arg(&kernel_size)
-            .launch(LaunchConfig {
-                grid_dim: ((kernel_size_usize * conv_dim as usize).div_ceil(256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
-    }
+    oxide.launch_conv1d_depthwise_silu_bf16(
+        stream, &conv_input, conv1d_gpu, &mut conv_out,
+        1, conv_dim as u32, kernel_size_usize as u32, kernel_size as u32,
+    ).map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
 
     // Extract the last position's output (the conv result for the current token)
     // conv_out is [kernel_size, conv_dim], take the last row
@@ -726,30 +655,12 @@ pub fn decode_forward(
     let num_v_heads_i32 = num_v_heads as i32;
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
-    // No shared memory needed — state lives in global memory
-    let total_threads = num_v_heads * head_v_dim;
-
-   unsafe {
-        stream.launch_builder(gdn_recurrent_step_kernel)
-            .arg(&query_expanded)     // [H, K] BF16
-            .arg(&key_expanded)      // [H, K] BF16
-            .arg(&value_flat)        // [H, V] BF16
-            .arg(&a_proj)            // [H] BF16
-            .arg(&b_proj)            // [H] BF16
-            .arg(&a_log_f32)         // [H] float32
-            .arg(&dt_bias_f32)       // [H] float32
-            .arg(state_ref)          // [H, K, V] float32 mutable
-            .arg(&mut gdn_output)    // [H, V] BF16 output
-            .arg(&num_v_heads_i32)
-            .arg(&head_k_dim_i32)
-            .arg(&head_v_dim_i32)
-            .launch(LaunchConfig {
-                grid_dim: ((total_threads as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed: {e}"))?;
-    }
+  oxide.launch_gdn_recurrent_step_bf16(
+        stream, &query_expanded, &key_expanded, &value_flat,
+        &a_proj, &b_proj, &a_log_f32, &dt_bias_f32,
+        state_ref, &mut gdn_output,
+        num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
+    ).map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed: {e}"))?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[1, num_v_heads * head_v_dim], "decode");
 
     // =========================================================================
@@ -773,20 +684,10 @@ pub fn decode_forward(
 
         let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         unsafe {
-            stream.launch_builder(rms_norm_gated_kernel)
-                .arg(&gdn_output)
-                .arg(&z_gate_raw)
-                .arg(norm_weight)
-                .arg(&mut norm_out)
-                .arg(&(n_rows as i32))
-                .arg(&(norm_dim as i32))
-                .arg(&1e-6f32)
-                .launch(LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (norm_dim.min(256) as u32, 1, 1),
-                    shared_mem_bytes: (norm_dim.min(256) * 4) as u32,
-                })
-                .map_err(|e| anyhow::anyhow!("Decode RMSNormGated kernel launch failed: {e}"))?;
+            oxide.launch_rms_norm_gated_bf16(
+                stream, &gdn_output, &z_gate_raw, norm_weight, &mut norm_out,
+                n_rows as u32, norm_dim as u32, 1e-6f32,
+            ).map_err(|e| anyhow::anyhow!("Decode RMSNormGated kernel launch failed: {e}"))?;
         }
         norm_out
     } else {

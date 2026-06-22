@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use half::bf16;
-use infers_cuda::{CudaFunction, CudaStream, PushKernelArg};
+use infers_cuda::{CudaFunction, CudaStream};
 use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_model::{LayerType, ModelConfig, WeightRegistry};
@@ -32,10 +32,6 @@ pub struct PrefillKernels {
     pub add: CudaFunction,
     pub gdn_prefill: CudaFunction,
     pub gdn_gated_delta_prefill: CudaFunction,
-    pub gdn_recurrent_step: CudaFunction,
-    pub gdn_chunked_prefill: CudaFunction,
-    pub conv1d_depthwise: CudaFunction,
-    pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
     pub int4_gemm: CudaFunction,
 }
@@ -138,14 +134,11 @@ pub fn prefill(
             LayerType::GatedDeltaNet => {
                 let gdn_weights = layer.gdn.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-               gdn::forward(
-                    gemm,
-                    &kernels.int4_gemm,
-                    stream,
-                    &kernels.gdn_recurrent_step,
-                    &kernels.gdn_chunked_prefill,
-                    &kernels.conv1d_depthwise,
-                    &kernels.rms_norm_gated,
+              gdn::forward(
+                     gemm,
+                     &kernels.int4_gemm,
+                     stream,
+                     &kernels.oxide,
                     gdn_weights,
                     &norm1_out,
                     &mut gdn_states[layer_idx],
