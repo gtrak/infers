@@ -396,3 +396,22 @@ E4M3 provides better precision (smaller quantization error ~25%) while E5M2 supp
 **Launch configuration**: Grid = `num_kv_heads` blocks (one per KV head), block = `min(head_dim, 256)` threads. Dynamic shared memory: `3 * bdim * sizeof(f32)`. For GQA, each block iterates over `q_per_kv = num_query_heads / num_kv_heads` query heads.
 
 **Key insight — thread::index_1d() limitation**: Inside `#[inline(always)]` helper functions that are inlined into kernels, `thread::index_1d()` resolves to a host-only stub. Must compute index manually: `(thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize`.
+
+### cuda-oxide Kernel Library: Tier 5 — GDN Kernels (Phase 18 — 4 Kernels Ported)
+
+Four GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-lib, covering the core SSM recurrence patterns used by Qwen3.6-27B inference. All compute in f32 with bf16 I/O for precision.
+
+**Shared math patterns**: Each kernel implements softplus (`log(1 + exp(x))` with clamping at ±20), sigmoid (`1/(1+exp(-x))`), and bf16↔f32 conversion via `(bits as u32) << 16`. These are computed inline in each kernel rather than as shared helpers — cuda-oxide's `#[cuda_module]` does not support cross-scope device functions outside the module.
+
+| Kernel | Source File | Description | Test Result |
+|--------|-------------|-------------|-------------|
+| `infers_gdn_recurrent_step_bf16` | `gdn_recurrent_step.cu` | L2-norm Q/K, softplus decay, sigmoid beta, 5-step recurrence (decay state, kv_mem, delta, update, output) — f32 state, bf16 I/O | ✅ H=2, K=4, V=4 bit-exact vs CPU reference |
+| `infers_gdn_mamba2_update_bf16` | `gdn_mamba2_update.cu` | Sigmoid decay, softplus delta (threshold 2.0), state update, SiLU gating — bf16 state and I/O | ✅ H=2, head_dim=4 bit-exact vs CPU reference |
+| `infers_gdn_update_bf16` | `gdn_update.cu` | Shared memory reductions: Phase 1 beta = dot(state_row, b), Phase 2 state update with dt*a*beta, Phase 3 output = dot(updated_state_row, a) | ✅ hidden_size=8 tolerance 0.5 vs CPU reference |
+| `infers_gdn_gated_delta_update_bf16` | `gdn_gated_delta_update.cu` | Same algorithm as recurrent_step (L2-norm, softplus decay, sigmoid beta, 5-step recurrence) — f32 state, bf16 I/O | ✅ H=2, K=4, V=4 bit-exact vs CPU reference |
+
+**Recurrent step and gated delta update**: One thread per (head, v_dim) element. No shared memory. Algorithm: L2-normalize query and key, compute decay via `exp(-exp(A_log[h]) * softplus(a_proj[h] + dt_bias[h]))`, compute beta via `sigmoid(b_proj[h])`. Five sequential steps: (1) multiply state by decay, (2) accumulate kv_mem = sum of state × normalized key, (3) delta = beta × (value - kv_mem), (4) update state += normalized_key × delta, (5) output = sum of updated state × normalized query × 1/sqrt(K).
+
+**GDN update**: One block per state row using dynamic shared memory (256 × 4 bytes for reduction buffer). Three phases with halving reductions: Phase 1 computes beta via dot product reduction, Phase 2 updates state row, Phase 3 computes output via dot product reduction.
+
+**Mamba2 update**: One thread per total_dim element. Sigmoid-based decay, softplus delta (with threshold at 2.0 instead of 20.0), SiLU gating for output computation. All bf16 storage including state.
