@@ -51,20 +51,15 @@ fn trim_memory() {
 /// Per-GPU cached kernel function handles.
 /// Each GPU context needs its own set since CudaFunction handles are context-bound.
 struct PerGpuKernels {
-    /// Oxide bridge for add, embedding, norm, rope, and silu_glu kernels.
+    /// Oxide bridge for add, embedding, norm, rope, silu_glu, and attention kernels.
     oxide: Arc<infers_cuda::OxideKernels>,
     rmsnorm: CudaFunction,
     silu_glu: CudaFunction,
     rope: CudaFunction,
     embedding: CudaFunction,
     add: CudaFunction,
-    argmax: CudaFunction,
-    softmax: CudaFunction,
-    kv_cache_write: CudaFunction,
     gdn_prefill: CudaFunction,
     gdn_update: CudaFunction,
-    paged_kv_write: CudaFunction,
-    paged_attention_decode: CudaFunction,
     fp8_quantize: CudaFunction,
     fp8_dequantize: CudaFunction,
     int4_gemm: CudaFunction,
@@ -75,7 +70,6 @@ struct PerGpuKernels {
     gdn_chunked_prefill: CudaFunction,
     conv1d_depthwise: CudaFunction,
     rms_norm_gated: CudaFunction,
-    attn_output_gate: CudaFunction,
 }
 
 /// Central engine for forward-pass inference.
@@ -151,13 +145,8 @@ impl ForwardEngine {
                 rope: kernels.get_function("infers_rope_bf16")?,
                 embedding: kernels.get_function("infers_embedding_gather_bf16")?,
                 add: kernels.get_function("infers_add_bf16")?,
-                argmax: kernels.get_function("infers_argmax_bf16")?,
-                softmax: kernels.get_function("infers_softmax_bf16")?,
-                kv_cache_write: kernels.get_function("infers_kv_cache_write_bf16")?,
                 gdn_prefill: kernels.get_function("infers_gdn_mamba2_prefill_bf16")?,
                 gdn_update: kernels.get_function("infers_gdn_mamba2_update_bf16")?,
-                paged_kv_write: kernels.get_function("infers_paged_kv_write_bf16")?,
-                paged_attention_decode: kernels.get_function("infers_paged_attention_decode_bf16")?,
                 fp8_quantize: kernels.get_function("infers_fp8_quantize_bf16")?,
                 fp8_dequantize: kernels.get_function("infers_fp8_dequantize_bf16")?,
                 int4_gemm: kernels.get_function("int4_gemm_kernel")?,
@@ -176,7 +165,6 @@ impl ForwardEngine {
                 },
                 conv1d_depthwise: kernels.get_function("infers_conv1d_depthwise_silu_bf16")?,
                 rms_norm_gated: kernels.get_function("infers_rms_norm_gated_bf16")?,
-                attn_output_gate: kernels.get_function("infers_attn_output_gate_bf16")?,
             };
             per_gpu_kernels.push(pk);
         }
@@ -401,9 +389,6 @@ impl ForwardEngine {
             rope: self.per_gpu_kernels[0].rope.clone(),
             embedding: self.per_gpu_kernels[0].embedding.clone(),
             add: self.per_gpu_kernels[0].add.clone(),
-            argmax: self.per_gpu_kernels[0].argmax.clone(),
-            softmax: self.per_gpu_kernels[0].softmax.clone(),
-            kv_cache_write: self.per_gpu_kernels[0].kv_cache_write.clone(),
             gdn_prefill: self.per_gpu_kernels[0].gdn_prefill.clone(),
             gdn_gated_delta_prefill: self.per_gpu_kernels[0].gdn_gated_delta_prefill.clone(),
             gdn_recurrent_step: self.per_gpu_kernels[0].gdn_recurrent_step.clone(),
@@ -411,7 +396,6 @@ impl ForwardEngine {
             conv1d_depthwise: self.per_gpu_kernels[0].conv1d_depthwise.clone(),
             rms_norm_gated: self.per_gpu_kernels[0].rms_norm_gated.clone(),
             int4_gemm: self.per_gpu_kernels[0].int4_gemm.clone(),
-            attn_output_gate: self.per_gpu_kernels[0].attn_output_gate.clone(),
         };
 
         crate::prefill::prefill(
@@ -661,9 +645,7 @@ impl ForwardEngine {
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
                         crate::attention::forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].softmax, &self.per_gpu_kernels[gpu_idx].paged_kv_write,
                             &self.per_gpu_kernels[gpu_idx].oxide,
-                            &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx], &positions,
@@ -859,7 +841,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let last_row_start = (seq_len - 1) * config.vocab_size;
         let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
         let sampled = crate::sample::sample_with_config(
-            &final_stream, &last_row_logits, &self.per_gpu_kernels[0].argmax,
+            &final_stream, &last_row_logits, &self.per_gpu_kernels[0].oxide,
             sampling_config, token_ids, token_ids.len(), rng,
         )?;
 
@@ -1065,9 +1047,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
                         crate::attention::decode_forward_paged(
                             gemm, &self.per_gpu_kernels[gpu_idx].int4_gemm, &gpu_stream,
-                            &self.per_gpu_kernels[gpu_idx].paged_kv_write, &self.per_gpu_kernels[gpu_idx].paged_attention_decode,
                             &self.per_gpu_kernels[gpu_idx].oxide,
-                            &self.per_gpu_kernels[gpu_idx].attn_output_gate,
                             attn_weights, &norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
@@ -1254,7 +1234,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::sample_with_config(
-            &final_stream, &logits.as_view(), &self.per_gpu_kernels[0].argmax,
+            &final_stream, &logits.as_view(), &self.per_gpu_kernels[0].oxide,
             sampling_config, token_history, num_prompt_tokens, rng,
         )?;
 

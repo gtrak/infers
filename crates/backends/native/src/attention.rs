@@ -167,22 +167,23 @@ impl PagedKvCache {
 ///
 /// # Arguments
 /// * `stream` — CUDA stream
-/// * `kernel` — Loaded function handle for `infers_paged_kv_write_bf16`
+/// * `oxide` — Oxide bridge for kernel dispatch
 /// * `k` — K tensor `[seq_len × kv_dim]`
 /// * `v` — V tensor `[seq_len × kv_dim]`
 /// * `page_pool` — Flat GPU buffer for paged KV data
 /// * `block_table_gpu` — Block table (page IDs) on GPU `[num_pages]`
 /// * `positions_gpu` — Token positions on GPU `[seq_len]`
 /// * `seq_len` — Number of tokens to write
+/// * `head_dim` — Per-head dimension
 /// * `kv_dim` — num_kv_heads × head_dim
 /// * `page_size` — Tokens per page
 // @lat: [[lat.md/lat#Paged Attention Implementation#Paged Kernel Dispatch]]
 pub fn paged_kv_write(
     stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     k: &CudaSlice<bf16>,
     v: &CudaSlice<bf16>,
-    page_pool: &CudaSlice<bf16>,
+    page_pool: &mut CudaSlice<bf16>,
     block_table_gpu: &CudaSlice<i32>,
     positions_gpu: &CudaSlice<i32>,
     seq_len: usize,
@@ -190,34 +191,10 @@ pub fn paged_kv_write(
     kv_dim: usize,
     page_size: usize,
 ) -> Result<()> {
-    let total_elements = seq_len * kv_dim;
-    let grid = (total_elements as u32).div_ceil(256);
-    let config = LaunchConfig {
-        grid_dim: (grid, 1, 1),
-        block_dim: (BLOCK_SIZE as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    let seq_len_i32 = seq_len as i32;
-    let head_dim_i32 = head_dim as i32;
-    let kv_dim_i32 = kv_dim as i32;
-    let page_size_i32 = page_size as i32;
-
-    unsafe {
-        stream
-            .launch_builder(kernel)
-            .arg(k)
-            .arg(v)
-            .arg(page_pool)
-            .arg(block_table_gpu)
-            .arg(positions_gpu)
-            .arg(&seq_len_i32)
-            .arg(&head_dim_i32)
-            .arg(&page_size_i32)
-            .arg(&kv_dim_i32)
-            .launch(config)
-            .map_err(|e| anyhow::anyhow!("Paged KV write kernel launch failed: {e}"))?;
-    }
+    oxide.launch_paged_kv_write_bf16(
+        stream, k, v, page_pool, block_table_gpu, positions_gpu,
+        seq_len as u32, head_dim as u32, page_size as u32, kv_dim as u32,
+    ).map_err(|e| anyhow::anyhow!("Paged KV write kernel launch failed: {e}"))?;
 
     Ok(())
 }
@@ -230,7 +207,7 @@ pub fn paged_kv_write(
 ///
 /// # Arguments
 /// * `stream` — CUDA stream
-/// * `kernel` — Loaded function handle for `infers_paged_attention_decode_bf16`
+/// * `oxide` — Oxide bridge for kernel dispatch
 /// * `q` — Query tensor `[num_kv_heads × head_dim]` (single token)
 /// * `page_pool` — Flat GPU buffer for paged KV data
 /// * `block_table_gpu` — Block table on GPU `[num_pages]`
@@ -243,7 +220,7 @@ pub fn paged_kv_write(
 /// * `kv_dim` — num_kv_heads × head_dim
 pub fn paged_attention_decode(
     stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     q: &CudaSlice<bf16>,
     page_pool: &CudaSlice<bf16>,
     block_table_gpu: &CudaSlice<i32>,
@@ -260,43 +237,11 @@ pub fn paged_attention_decode(
         .alloc_zeros::<bf16>(output_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate attention output buffer: {e}"))?;
 
-    // One block per KV head
-    let grid = (num_kv_heads as u32, 1, 1);
-    let block = (BLOCK_SIZE as u32, 1, 1);
-    // Shared memory: 3 × blockDim × sizeof(float)
-    let shared_mem_bytes = (3 * BLOCK_SIZE * std::mem::size_of::<f32>()) as u32;
-
-    let config = LaunchConfig {
-        grid_dim: grid,
-        block_dim: block,
-        shared_mem_bytes,
-    };
-
-    let num_pages_i32 = num_pages as i32;
-    let num_cached_tokens_i32 = num_cached_tokens as i32;
-    let head_dim_i32 = head_dim as i32;
-    let num_query_heads_i32 = num_query_heads as i32;
-    let num_kv_heads_i32 = num_kv_heads as i32;
-    let page_size_i32 = page_size as i32;
-    let kv_dim_i32 = kv_dim as i32;
-
-    unsafe {
-        stream
-            .launch_builder(kernel)
-            .arg(q)
-            .arg(page_pool)
-            .arg(block_table_gpu)
-            .arg(&num_pages_i32)
-            .arg(&num_cached_tokens_i32)
-            .arg(&head_dim_i32)
-            .arg(&num_kv_heads_i32)
-            .arg(&num_query_heads_i32)
-            .arg(&page_size_i32)
-            .arg(&kv_dim_i32)
-            .arg(&mut output)
-            .launch(config)
-            .map_err(|e| anyhow::anyhow!("Paged attention decode kernel launch failed: {e}"))?;
-    }
+    oxide.launch_paged_attention_decode_bf16(
+        stream, q, page_pool, block_table_gpu, &mut output,
+        num_pages as u32, num_cached_tokens as u32, head_dim as u32,
+        num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
+    ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel launch failed: {e}"))?;
 
     Ok(output)
 }
@@ -341,10 +286,7 @@ pub fn forward(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    softmax_kernel: &CudaFunction,
-    kv_cache_write_kernel: &CudaFunction,
     oxide: &infers_cuda::OxideKernels,
-    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     kv_cache: &mut KvCache,
@@ -421,37 +363,17 @@ pub fn forward(
         )?;
 
 
-    // Write K and V to KV cache
-    let kv_buf = kv_cache.ensure_allocated(stream, max_seq_len, kv_dim)?;
+   // Write K and V to KV cache
+    let _ = kv_cache.ensure_allocated(stream, max_seq_len, kv_dim)?;
+    let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
     let positions_gpu = stream
-        .clone_htod(positions)
+        .clone_htod(&positions_i32)
         .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
 
-    let kv_total = seq_len * kv_dim;
-    let kv_grid = (kv_total as u32).div_ceil(256);
-    let kv_config = LaunchConfig {
-        grid_dim: (kv_grid, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    let kv_seq_len_i32 = seq_len as i32;
-    let kv_head_dim_i32 = kv_dim as i32;
-    let kv_max_seq_len_i32 = max_seq_len as i32;
-
-    unsafe {
-        stream
-            .launch_builder(kv_cache_write_kernel)
-            .arg(&k_full)
-            .arg(&v_full)
-            .arg(kv_buf)
-            .arg(&positions_gpu)
-            .arg(&kv_seq_len_i32)
-            .arg(&kv_head_dim_i32)
-            .arg(&kv_max_seq_len_i32)
-            .launch(kv_config)
-            .map_err(|e| anyhow::anyhow!("KV cache write kernel launch failed: {e}"))?;
-    }
+   oxide.launch_kv_cache_write_bf16(
+        stream, &k_full, &v_full, kv_cache.buffer.as_mut().unwrap(), &positions_gpu,
+        seq_len as u32, kv_dim as u32, max_seq_len as u32,
+    ).map_err(|e| anyhow::anyhow!("KV cache write kernel launch failed: {e}"))?;
 
     // =========================================================================
     // Phase 2: Full Q projection + combined attention output buffer
@@ -622,35 +544,9 @@ pub fn forward(
             .alloc_zeros::<bf16>(scores_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
 
-        let block_size = {
-            let mut sz = 1usize;
-            while sz < seq_len && sz < 256 {
-                sz *= 2;
-            }
-            sz
-        };
-
-        let shared_mem_bytes = block_size * std::mem::size_of::<f32>();
-
-        let softmax_config = LaunchConfig {
-            grid_dim: (seq_len as u32, 1, 1),
-            block_dim: (block_size as u32, 1, 1),
-            shared_mem_bytes: shared_mem_bytes as u32,
-        };
-
-        let seq_len_i32 = seq_len as i32;
-        let use_causal = 1i32;
-
-        unsafe {
-            stream
-                .launch_builder(softmax_kernel)
-                .arg(&scores_h)
-                .arg(&mut softmax_out_h)
-                .arg(&seq_len_i32)
-                .arg(&use_causal)
-                .launch(softmax_config)
-                .map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
-        }
+        oxide.launch_softmax_bf16(
+            stream, &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
+        ).map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
 
         // --- Attention output: softmax_out_h @ V_h → [seq_len × head_dim] ---
         let mut attn_out_h = stream
@@ -690,23 +586,13 @@ pub fn forward(
     // =========================================================================
     // Gate application: attn_output = attn_output * sigmoid(gate)
     // =========================================================================
-    // @lat: [[lat.md/lat#Paged Attention Implementation#Attention Output Gate]]
+     // @lat: [[lat.md/lat#Paged Attention Implementation#Attention Output Gate]]
     let gated_attn = if let Some(ref gate_heads) = gate_heads {
         let mut gated = stream.alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
-        unsafe {
-            stream.launch_builder(attn_output_gate_kernel)
-                .arg(&attn_combined)
-                .arg(gate_heads)
-                .arg(&mut gated)
-                .arg(&(attn_combined_size as i32))
-                .launch(LaunchConfig {
-                    grid_dim: ((attn_combined_size as u32).div_ceil(256), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
-        }
+        oxide.launch_attn_output_gate_bf16(
+            stream, &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
+        ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         gated
     } else {
         attn_combined
@@ -745,10 +631,7 @@ pub fn forward_paged(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    softmax_kernel: &CudaFunction,
-    paged_kv_write_kernel: &CudaFunction,
     oxide: &infers_cuda::OxideKernels,
-    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -839,18 +722,18 @@ pub fn forward_paged(
     // Phase 2: Paged KV write
     // =========================================================================
 
-    let page_pool = paged_cache.ensure_allocated(stream)?;
+   let _ = paged_cache.ensure_allocated(stream)?;
 
     // Probe: K and V data right before writing to paged KV cache (after norm+RoPE)
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", &k_full, &[seq_len, kv_dim], "prefill");
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &v_full, &[seq_len, kv_dim], "prefill");
 
-    paged_kv_write(
+   paged_kv_write(
         stream,
-        paged_kv_write_kernel,
+        oxide,
         &k_full,
         &v_full,
-        page_pool,
+        paged_cache.page_pool.as_mut().unwrap(),
         block_table_gpu,
         positions_gpu,
         seq_len,
@@ -1059,34 +942,9 @@ pub fn forward_paged(
             .alloc_zeros::<bf16>(scores_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
 
-        let block_size = {
-            let mut sz = 1usize;
-            while sz < seq_len && sz < 256 {
-                sz *= 2;
-            }
-            sz
-        };
-        let shared_mem_bytes = block_size * std::mem::size_of::<f32>();
-
-        let softmax_config = LaunchConfig {
-            grid_dim: (seq_len as u32, 1, 1),
-            block_dim: (block_size as u32, 1, 1),
-            shared_mem_bytes: shared_mem_bytes as u32,
-        };
-
-        let seq_len_i32 = seq_len as i32;
-        let use_causal = 1i32;
-
-        unsafe {
-            stream
-                .launch_builder(softmax_kernel)
-                .arg(&scores_h)
-                .arg(&mut softmax_out_h)
-                .arg(&seq_len_i32)
-                .arg(&use_causal)
-                .launch(softmax_config)
-                .map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
-        }
+        oxide.launch_softmax_bf16(
+            stream, &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
+        ).map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
             probe::dump(stream, probe, layer_idx, gpu_idx, "attn.softmax_h0", &softmax_out_h, &[seq_len, seq_len], "prefill");
         }
@@ -1136,21 +994,9 @@ pub fn forward_paged(
         let mut gated = stream
             .alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
-        let total_i32 = attn_combined_size as i32;
-        unsafe {
-            stream
-                .launch_builder(attn_output_gate_kernel)
-                .arg(&attn_combined)
-                .arg(gate_heads)
-                .arg(&mut gated)
-                .arg(&total_i32)
-                .launch(infers_cuda::LaunchConfig {
-                    grid_dim: ((attn_combined_size as u32).div_ceil(256), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
-        }
+        oxide.launch_attn_output_gate_bf16(
+            stream, &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
+        ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         gated
     } else {
         attn_combined
@@ -1188,10 +1034,7 @@ pub fn decode_forward_paged(
     gemm: &mut GemmEngine,
     int4_kernel: &CudaFunction,
     stream: &Arc<CudaStream>,
-    paged_kv_write_kernel: &CudaFunction,
-    paged_attention_decode_kernel: &CudaFunction,
     oxide: &infers_cuda::OxideKernels,
-    attn_output_gate_kernel: &CudaFunction,
     weights: &AttentionWeights,
     input: &CudaSlice<bf16>,
     paged_cache: &mut PagedKvCache,
@@ -1281,18 +1124,18 @@ pub fn decode_forward_paged(
     // Phase 2: Paged KV write — write new token to page pool
     // =========================================================================
 
-    let page_pool = paged_cache.ensure_allocated(stream)?;
+   let _ = paged_cache.ensure_allocated(stream)?;
 
     // Probe: K and V data right before writing to paged KV cache (after norm+RoPE)
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", &k_single, &[1, kv_dim], "decode");
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &v_single, &[1, kv_dim], "decode");
 
-    paged_kv_write(
+   paged_kv_write(
         stream,
-        paged_kv_write_kernel,
+        oxide,
         &k_single,
         &v_single,
-        page_pool,
+        paged_cache.page_pool.as_mut().unwrap(),
         block_table_gpu,
         positions_gpu,
         1, // seq_len = 1 for decode
@@ -1388,9 +1231,9 @@ pub fn decode_forward_paged(
 
     let attn_output = paged_attention_decode(
         stream,
-        paged_attention_decode_kernel,
+        oxide,
         &q_single,
-        page_pool,
+        paged_cache.page_pool.as_ref().unwrap(),
         block_table_gpu,
         num_pages,
         num_cached_tokens as usize,
@@ -1409,21 +1252,9 @@ pub fn decode_forward_paged(
         let mut gated = stream
             .alloc_zeros::<bf16>(per_gpu_head_dim)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
-        let total_i32 = per_gpu_head_dim as i32;
-        unsafe {
-            stream
-                .launch_builder(attn_output_gate_kernel)
-                .arg(&attn_output)
-                .arg(gate)
-                .arg(&mut gated)
-                .arg(&total_i32)
-                .launch(infers_cuda::LaunchConfig {
-                    grid_dim: ((per_gpu_head_dim as u32).div_ceil(256), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
-        }
+        oxide.launch_attn_output_gate_bf16(
+            stream, &attn_output, gate, &mut gated, per_gpu_head_dim as u32,
+        ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         gated
      } else {
         attn_output

@@ -242,7 +242,7 @@ fn weighted_sample(probs: &[f32], rng: &mut Xoshiro256PlusPlus) -> usize {
 pub fn sample_with_config(
     stream: &Arc<CudaStream>,
     gpu_logits: &CudaView<'_, bf16>,
-    argmax_kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     config: &SamplingConfig,
     token_history: &[u32],
     num_prompt_tokens: usize,
@@ -254,7 +254,7 @@ pub fn sample_with_config(
         && config.presence_penalty == 0.0
         && config.frequency_penalty == 0.0
     {
-        return greedy_sample_bf16(stream, argmax_kernel, gpu_logits);
+        return greedy_sample_bf16(stream, oxide, gpu_logits);
     }
 
     // Slow path: download logits and sample on CPU
@@ -319,6 +319,7 @@ pub fn should_stop(token: u32, config: &SamplingConfig) -> bool {
 ///
 /// # Returns
 /// The token ID with the highest logit
+#[allow(dead_code)]
 pub fn greedy_sample(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -367,14 +368,14 @@ pub fn greedy_sample(
 ///
 /// # Arguments
 /// * `stream` — CUDA stream for kernel launch
-/// * `kernel` — Loaded function handle for `infers_argmax_bf16`
+/// * `oxide` — Oxide bridge for kernel dispatch
 /// * `logits` — BF16 logit view `[vocab_size]`
 ///
 /// # Returns
 /// The token ID with the highest logit
 pub fn greedy_sample_bf16(
     stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
+    oxide: &infers_cuda::OxideKernels,
     logits: &CudaView<'_, bf16>,
 ) -> Result<u32> {
     let vocab_size = logits.len();
@@ -385,25 +386,17 @@ pub fn greedy_sample_bf16(
         .alloc_zeros::<i32>(1)
         .map_err(|e| anyhow::anyhow!("Failed to allocate argmax result: {e}"))?;
 
-    let vocab_size_i32 = vocab_size as i32;
-    let batch_size_i32 = 1i32;
+    // The oxide bridge requires CudaSlice, but we received a CudaView (from .slice()).
+    // Copy the view into a new CudaSlice buffer for the kernel dispatch.
+    let mut logits_slice = stream
+        .alloc_zeros::<bf16>(vocab_size)
+        .map_err(|e| anyhow::anyhow!("Failed to allocate argmax input: {e}"))?;
+    stream.memcpy_dtod(logits, &mut logits_slice)
+        .map_err(|e| anyhow::anyhow!("Failed to copy logits for argmax: {e}"))?;
 
-    let config = LaunchConfig {
-        grid_dim: (1, 1, 1), // single block for argmax
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: (256 * 8) as u32, // shared mem for reduction (2 values per thread: val + idx)
-    };
-
-    unsafe {
-        stream
-            .launch_builder(kernel)
-            .arg(logits)
-            .arg(&mut result_gpu)
-            .arg(&batch_size_i32)
-            .arg(&vocab_size_i32)
-            .launch(config)
-            .map_err(|e| anyhow::anyhow!("Argmax BF16 kernel launch failed: {e}"))?;
-    }
+    oxide.launch_argmax_bf16(
+        stream, &logits_slice, &mut result_gpu, 1u32, vocab_size as u32,
+    ).map_err(|e| anyhow::anyhow!("Argmax BF16 kernel launch failed: {e}"))?;
 
     // Copy result back to host (single i32 — minimal transfer)
     let result_host = stream

@@ -23,16 +23,13 @@ use crate::sync;
 // @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
 /// Kernel handles needed for the prefill pass.
 pub struct PrefillKernels {
-    /// Oxide bridge for add, embedding, norm, rope, and silu_glu kernels.
+    /// Oxide bridge for add, embedding, norm, rope, silu_glu, and attention kernels.
     pub oxide: Arc<infers_cuda::OxideKernels>,
     pub rmsnorm: CudaFunction,
     pub silu_glu: CudaFunction,
     pub rope: CudaFunction,
     pub embedding: CudaFunction,
     pub add: CudaFunction,
-    pub argmax: CudaFunction,
-    pub softmax: CudaFunction,
-    pub kv_cache_write: CudaFunction,
     pub gdn_prefill: CudaFunction,
     pub gdn_gated_delta_prefill: CudaFunction,
     pub gdn_recurrent_step: CudaFunction,
@@ -41,8 +38,6 @@ pub struct PrefillKernels {
     pub rms_norm_gated: CudaFunction,
     /// INT4 GEMM kernel for quantized weight dispatch.
     pub int4_gemm: CudaFunction,
-    /// Gate application kernel for attention output gating.
-    pub attn_output_gate: CudaFunction,
 }
 
 // @lat: [[lat.md/lat#Forward Engine#Prefill Path]]
@@ -170,10 +165,7 @@ pub fn prefill(
                     gemm,
                     &kernels.int4_gemm,
                     stream,
-                    &kernels.softmax,
-                    &kernels.kv_cache_write,
                     &kernels.oxide,
-                    &kernels.attn_output_gate,
                     attn_weights,
                     &norm1_out,
                     &mut kv_caches[layer_idx],
@@ -301,7 +293,7 @@ pub fn prefill(
     let last_row_logits = logits.slice(last_row_start..last_row_start + config.vocab_size);
 
     // Argmax directly on BF16 logits on GPU
-    let sampled = sample::greedy_sample_bf16(stream, &kernels.argmax, &last_row_logits)?;
+        let sampled = sample::greedy_sample_bf16(stream, &kernels.oxide, &last_row_logits)?;
 
     Ok(sampled)
 }
