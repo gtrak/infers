@@ -266,3 +266,22 @@ cd crates/cuda-oxide-kernels
 cargo oxide build    # compile kernels to PTX
 cargo oxide run      # build + run test binary
 ```
+
+### cuda-oxide Kernel Library: Tier 1 Kernels (Phase 18 — 6 Kernels Ported)
+
+Six additional Tier 1 CUDA kernels ported from nvcc to Rust in cuda-oxide-kernel-lib. All pass bit-exact verification.
+
+**Kernels added**:
+
+| Kernel | Source File | Description | Test Result |
+|--------|-------------|-------------|-------------|
+| `infers_embedding_gather_bf16` | `embedding.cu` | Token embedding gather: `output[i] = weight[token_ids[pos] * hidden_size + dim]` | ✅ 4 tokens × 8 hidden, positions [0, 2] |
+| `infers_silu_bf16` | `silu.cu` | SiLU activation: `x * sigmoid(x)` using `libm::expf(-val)` | ✅ 256 elements bit-exact |
+| `infers_silu_glu_bf16` | `silu.cu` | SwiGLU gating: `x * gate * sigmoid(gate)` | ✅ 256 elements bit-exact |
+| `infers_attn_output_gate_bf16` | `silu.cu` | Attention output gate: `x * sigmoid(gate)` (no gate multiply) | ✅ 256 elements bit-exact |
+| `infers_argmax_bf16` | `sampling.cu` | Per-row argmax via shared memory halving-stride reduction, one block per row | ✅ 2 rows × 16 vocab, known max positions |
+| `infers_kv_cache_write_bf16` | `kv_cache.cu` | Scattered KV cache write by position: K at `pos * head_dim + dim`, V at offset + same | ✅ 2 tokens × 4 head_dim, positions [2, 5] |
+
+**Shared memory patterns**: `infers_argmax_bf16` uses two `static mut SharedArray<f32, 256>` (one for values, one for indices stored as f32). Thread 0 writes the final argmax index. Launch config: one block per row via direct `LaunchConfig { grid_dim, block_dim }` construction (no `for_num_elems` convenience for multi-block launches).
+
+**Sigmoid implementation**: All three sigmoid kernels (`silu_bf16`, `silu_glu_bf16`, `attn_output_gate_bf16`) use the same pattern: bf16→f32 conversion, `libm::expf(-val)` for sigmoid denominator, f32→bf16 truncation via `cuda_device::tcgen05::f32_to_bf16()`. CPU verification uses matching `libm::expf()` for bit-exact comparison.
