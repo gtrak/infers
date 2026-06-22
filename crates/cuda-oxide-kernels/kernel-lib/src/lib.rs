@@ -649,6 +649,180 @@ pub mod kernels {
         }
     }
 
+    // ─── INT4 GEMM with trait-based dequantization dispatch ─────────────
+
+    /// Trait for dequantizing INT4 weights. Each quant format implements this
+    /// with its specific zero-point offset and dequant formula.
+    pub trait Dequantize {
+        /// Dequantize one INT4 value.
+        /// `w_int4` is the raw 4-bit value [0, 15] cast to i8.
+        /// `raw_zero` is the raw 4-bit zero point [0, 15] extracted from packed zeros.
+        /// `scale` is the FP16 group scale converted to f32.
+        /// Returns the dequantized f32 value.
+        fn dequant(w_int4: i8, raw_zero: i8, scale: f32) -> f32;
+    }
+
+    /// AutoRound INT4: zero = stored_zero + 1
+    /// Formula: (w - (stored_zero + 1)) * scale
+    pub struct AutoRound;
+    impl Dequantize for AutoRound {
+        fn dequant(w_int4: i8, raw_zero: i8, scale: f32) -> f32 {
+            let zero = raw_zero + 1;
+            f32::from(w_int4 - zero) * scale
+        }
+    }
+
+    /// GGUF INT4: zero = stored_zero (no offset)
+    /// Formula: (w - stored_zero) * scale
+    pub struct Gguf;
+    impl Dequantize for Gguf {
+        fn dequant(w_int4: i8, raw_zero: i8, scale: f32) -> f32 {
+            f32::from(w_int4 - raw_zero) * scale
+        }
+    }
+
+    /// Convert half-precision (FP16) bits to f32.
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = (bits >> 15) as u32;
+        let exp = ((bits >> 10) & 0x1F) as u32;
+        let frac = bits & 0x3FF;
+
+        if exp == 0 {
+            // Subnormal or zero: convert to normal f32 with exponent -14
+            let mantissa = (frac as u32) << 13;
+            let e_bits = if frac != 0 { 0x7F - 14 } else { 0 };
+            f32::from_bits((sign << 31) | (e_bits << 23) | mantissa)
+        } else if exp == 31 {
+            // Inf or NaN
+            f32::from_bits((sign << 31) | (0xFFu32 << 23))
+        } else {
+            // Normal: bias adjustment (15→127), shift mantissa by 13
+            let e_bits = exp + (127 - 15);
+            f32::from_bits((sign << 31) | (e_bits << 23) | ((frac as u32) << 13))
+        }
+    }
+
+    /// Generic INT4 GEMM inner function. Monomorphized per Dequantize impl.
+    /// NOT a #[kernel] — called from #[kernel] wrappers.
+    #[inline(always)]
+    fn int4_gemm_inner<Q: Dequantize>(
+        output: &mut DisjointSlice<u16>,
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        m: i32, n: i32, k: i32,
+        group_size: i32,
+        transposed: i32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let row = (thread::blockIdx_y() * thread::blockDim_y() + thread::threadIdx_y()) as i32;
+        let col = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+
+        if row >= m || col >= n {
+            return;
+        }
+
+        let mut acc: f32 = 0.0;
+        let k_usize = k as usize;
+        let n_usize = n as usize;
+        let group_size_usize = group_size as usize;
+
+        for kg in (0i32..k).step_by(group_size as usize) {
+            let group_idx = (kg / group_size) as usize;
+
+            // Load scale (FP16 → F32)
+            let scale_bits: u16;
+            if transposed != 0 {
+                scale_bits = scales[group_idx * n_usize + col as usize];
+            } else {
+                let num_groups = k_usize / group_size_usize;
+                scale_bits = scales[col as usize * num_groups + group_idx];
+            }
+            let scale = f16_to_f32(scale_bits);
+
+            // Unpack zero point (8 per u32)
+            let (zero_packed_idx, zero_shift): (usize, usize);
+            if transposed != 0 {
+                let n_packed = (n_usize + 7) / 8;
+                zero_packed_idx = group_idx * n_packed + col as usize / 8;
+                zero_shift = (col % 8) as usize * 4;
+            } else {
+                let num_groups = k_usize / group_size_usize;
+                let flat_idx = col as usize * num_groups + group_idx;
+                zero_packed_idx = flat_idx / 8;
+                zero_shift = (flat_idx % 8) * 4;
+            }
+            let zero_packed = zeros[zero_packed_idx];
+            let raw_zero = ((zero_packed >> zero_shift) & 0xF) as i8;
+
+            for kk in (0i32..group_size).step_by(8) {
+                // Load 8 INT4 weights from one u32
+                let weight_idx: usize;
+                if transposed != 0 {
+                    weight_idx = ((kg + kk) >> 3) as usize * n_usize + col as usize;
+                } else {
+                    weight_idx = (col as usize * k_usize + kg as usize + kk as usize) / 8;
+                }
+                let packed = weight[weight_idx];
+
+                for w in 0..8i32 {
+                    let shift = w * 4;
+                    let w_int4 = ((packed >> shift) & 0xF) as i8;
+                    let w_fp32 = Q::dequant(w_int4, raw_zero, scale);
+
+                    // Load activation (BF16 → f32)
+                    let a_val = f32::from_bits((input[row as usize * k_usize + kg as usize + kk as usize + w as usize] as u32) << 16);
+
+                    // Multiply and accumulate
+                    acc += w_fp32 * a_val;
+                }
+            }
+        }
+
+        // Write output in BF16
+        unsafe {
+            *output.get_unchecked_mut(row as usize * n_usize + col as usize) = f32_to_bf16(acc);
+        }
+    }
+
+    /// INT4 GEMM kernel for AutoRound format (zero offset +1).
+    #[kernel]
+    pub fn int4_gemm_auto_round(
+        mut output: DisjointSlice<u16>,
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        m: u32, n: u32, k: u32,
+        group_size: u32, transposed: u32,
+    ) {
+        int4_gemm_inner::<AutoRound>(
+            &mut output, weight, scales, zeros, input,
+            m as i32, n as i32, k as i32,
+            group_size as i32, transposed as i32,
+        );
+    }
+
+    /// INT4 GEMM kernel for GGUF format (no zero offset).
+    #[kernel]
+    pub fn int4_gemm_gguf(
+        mut output: DisjointSlice<u16>,
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        m: u32, n: u32, k: u32,
+        group_size: u32, transposed: u32,
+    ) {
+        int4_gemm_inner::<Gguf>(
+            &mut output, weight, scales, zeros, input,
+            m as i32, n as i32, k as i32,
+            group_size as i32, transposed as i32,
+        );
+    }
+
     /// Rotary Position Embedding with precomputed sin/cos.
     /// Applies rotation to both Q and K in-place using half-split pairing (rotate_half).
     #[kernel]

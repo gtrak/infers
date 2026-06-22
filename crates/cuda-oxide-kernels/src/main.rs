@@ -691,6 +691,315 @@ fn test_rope(ctx: &Arc<CudaContext>) -> bool {
         (k1_actual - k1_expected).abs() < 1.0
 }
 
+// ─── int4_gemm_auto_round (transposed layout) ────────────
+
+fn test_int4_gemm_autoround(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    // M=2, N=16, K=64, group_size=32, transposed=1
+    const M: usize = 2;
+    const N: usize = 16;
+    const K: usize = 64;
+    const GROUP_SIZE: usize = 32;
+    let num_groups = K / GROUP_SIZE; // 2
+
+    // --- Generate deterministic test data ---
+    // Scales: FP16 in [K/group_size, N] for transposed layout
+    let mut rng_state = 42u32;
+    fn next_u8(state: &mut u32) -> u8 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 16) as u8
+    }
+
+    // Scales: small positive values for stability
+    let scales_f32: Vec<f32> = (0..num_groups * N)
+        .map(|_| {
+            let v = next_u8(&mut rng_state) as f32 / 512.0 + 0.5; // [0.5, ~1.5]
+            v
+        })
+        .collect();
+    let scales_f16: Vec<u16> = scales_f32.iter().map(|&v| {
+        // f32→f16 bit manipulation for device comparison
+        let bits = v.to_bits();
+        let sign = ((bits >> 31) & 0x1) as u16;
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+        let frac = (bits & 0x7FFFFF) as u16;
+        if exp <= -16 { 0u16 }
+        else if exp >= 15 { (sign << 15) | 0x7C00 }
+        else {
+            let e10 = (exp + 15) as u16;
+            let f10 = (frac >> 13) & 0x3FF;
+            (sign << 15) | (e10 << 10) | f10
+        }
+    }).collect();
+
+    // Weights: packed INT4 in [K/8, N] for transposed layout → K/8=8, N=16
+    let weight_size = (K / 8) * N; // 8 * 16 = 128
+    let weights: Vec<u32> = (0..weight_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Zeros: packed INT4 in [K/group_size, ceil(N/8)] → [2, 2] = 4 entries
+    let zeros_size = num_groups * ((N + 7) / 8); // 2 * 2 = 4
+    let zeros: Vec<u32> = (0..zeros_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Input: BF16 in [M, K]
+    let input_f32: Vec<f32> = (0..M * K)
+        .map(|_i| {
+            ((next_u8(&mut rng_state) as f32) - 127.5) / 512.0 // small values [-0.24, ~0.0]
+        })
+        .collect();
+    let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // Output buffer
+    let output_size = M * N;
+    let weight_dev = DeviceBuffer::from_host(&stream, &weights).unwrap();
+    let scales_dev = DeviceBuffer::from_host(&stream, &scales_f16).unwrap();
+    let zeros_dev = DeviceBuffer::from_host(&stream, &zeros).unwrap();
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, output_size).unwrap();
+
+    // Launch with 16x16 thread blocks (M>1 prefill case)
+    let launch = LaunchConfig {
+        grid_dim: (((N + 15) / 16) as u32, ((M + 15) / 16) as u32, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.int4_gemm_auto_round(
+        &stream, launch, &mut out_dev, &weight_dev, &scales_dev, &zeros_dev, &input_dev,
+        M as u32, N as u32, K as u32, GROUP_SIZE as u32, 1u32, // transposed=1
+    ).unwrap();
+
+    let out_host = out_dev.to_host_vec(&stream).unwrap();
+
+    // --- CPU reference: AutoRound formula (zero = raw_zero + 1) ---
+    // Transposed layout: weight [K/8, N], scales [K/group_size, N], zeros [K/group_size, ceil(N/8)]
+    let mut expected: Vec<f32> = vec![0.0; M * N];
+    for row in 0..M {
+        for col in 0..N {
+            let mut acc: f32 = 0.0;
+            for kg in (0..K).step_by(GROUP_SIZE) {
+                let group_idx = kg / GROUP_SIZE;
+
+                // Scale: scales[group_idx * N + col]
+                let scale_bits = scales_f16[group_idx * N + col];
+                let scale = f16_to_f32_cpu(scale_bits);
+
+                // Zero point from zeros[group_idx * n_packed + col/8], shift = (col%8)*4
+                let n_packed = (N + 7) / 8;
+                let zp_idx = group_idx * n_packed + col / 8;
+                let zp_shift = (col % 8) * 4;
+                let raw_zero = ((zeros[zp_idx] >> zp_shift) & 0xF) as i8;
+
+                // Process 8 weights at a time
+                for kk in (0..GROUP_SIZE).step_by(8) {
+                    let widx = ((kg + kk) / 8) * N + col;
+                    let packed = weights[widx];
+                    for w in 0..8i32 {
+                        let shift = w * 4;
+                        let w_int4 = ((packed >> shift) & 0xF) as i8;
+                        // AutoRound: zero = raw_zero + 1
+                        let zero = raw_zero + 1;
+                        let w_fp32 = f32::from(w_int4 - zero) * scale;
+                        let a_val = bf16_to_f32_cpu(input_bf16[row * K + kg + kk + w as usize]);
+                        acc += w_fp32 * a_val;
+                    }
+                }
+            }
+            expected[row * N + col] = acc;
+        }
+    }
+
+    // Compare: output is BF16, reference is f32 → convert expected to bf16 and compare bits
+    for i in 0..output_size {
+        let actual = bf16_to_f32_cpu(out_host[i]);
+        if (actual - expected[i]).abs() > 4.0 {
+            // Allow some tolerance due to BF16 precision
+            eprintln!("INT4 GEMM AutoRound mismatch at [{}]: got {} expected {}", i, actual, expected[i]);
+            return false;
+        }
+    }
+    true
+}
+
+/// Convert f16 bits to f32 (CPU helper matching device code)
+fn f16_to_f32_cpu(bits: u16) -> f32 {
+    let sign = (bits >> 15) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let frac = bits & 0x3FF;
+
+    if exp == 0 {
+        let mantissa = (frac as u32) << 13;
+        let e_bits = if frac != 0 { 0x7F - 14 } else { 0 };
+        f32::from_bits((sign << 31) | (e_bits << 23) | mantissa)
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | (0xFFu32 << 23))
+    } else {
+        let e_bits = exp + (127 - 15);
+        f32::from_bits((sign << 31) | (e_bits << 23) | ((frac as u32) << 13))
+    }
+}
+
+// ─── int4_gemm_gguf (non-transposed layout) ─────────────
+
+fn test_int4_gemm_gguf(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    // M=2, N=16, K=64, group_size=32, transposed=0
+    const M: usize = 2;
+    const N: usize = 16;
+    const K: usize = 64;
+    const GROUP_SIZE: usize = 32;
+    let num_groups = K / GROUP_SIZE; // 2
+
+    // --- Generate deterministic test data ---
+    let mut rng_state = 99u32;
+    fn next_u8(state: &mut u32) -> u8 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 16) as u8
+    }
+
+    // Scales: FP16 in [N, K/group_size] for non-transposed layout
+    let scales_f32: Vec<f32> = (0..N * num_groups)
+        .map(|_| {
+            let v = next_u8(&mut rng_state) as f32 / 512.0 + 0.5;
+            v
+        })
+        .collect();
+    let scales_f16: Vec<u16> = scales_f32.iter().map(|&v| {
+        let bits = v.to_bits();
+        let sign = ((bits >> 31) & 0x1) as u16;
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+        let frac = (bits & 0x7FFFFF) as u16;
+        if exp <= -16 { 0u16 }
+        else if exp >= 15 { (sign << 15) | 0x7C00 }
+        else {
+            let e10 = (exp + 15) as u16;
+            let f10 = (frac >> 13) & 0x3FF;
+            (sign << 15) | (e10 << 10) | f10
+        }
+    }).collect();
+
+    // Weights: packed INT4 in [N, K/8] for non-transposed → N=16, K/8=8
+    let weight_size = N * (K / 8); // 16 * 8 = 128
+    let weights: Vec<u32> = (0..weight_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Zeros: packed INT4, flat index = col * num_groups + group_idx, then /8 and %8
+    let max_flat = N * num_groups; // 16 * 2 = 32
+    let zeros_size = (max_flat + 7) / 8; // ceil(32/8) = 4
+    let zeros: Vec<u32> = (0..zeros_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Input: BF16 in [M, K]
+    let input_f32: Vec<f32> = (0..M * K)
+        .map(|_i| {
+            ((next_u8(&mut rng_state) as f32) - 127.5) / 512.0
+        })
+        .collect();
+    let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // Output buffer
+    let output_size = M * N;
+    let weight_dev = DeviceBuffer::from_host(&stream, &weights).unwrap();
+    let scales_dev = DeviceBuffer::from_host(&stream, &scales_f16).unwrap();
+    let zeros_dev = DeviceBuffer::from_host(&stream, &zeros).unwrap();
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, output_size).unwrap();
+
+    // Launch with 16x16 thread blocks
+    let launch = LaunchConfig {
+        grid_dim: (((N + 15) / 16) as u32, ((M + 15) / 16) as u32, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.int4_gemm_gguf(
+        &stream, launch, &mut out_dev, &weight_dev, &scales_dev, &zeros_dev, &input_dev,
+        M as u32, N as u32, K as u32, GROUP_SIZE as u32, 0u32, // transposed=0
+    ).unwrap();
+
+    let out_host = out_dev.to_host_vec(&stream).unwrap();
+
+    // --- CPU reference: GGUF formula (zero = raw_zero, no +1) ---
+    // Non-transposed layout: weight [N, K/8], scales [N, K/group_size], zeros flat
+    let mut expected: Vec<f32> = vec![0.0; M * N];
+    for row in 0..M {
+        for col in 0..N {
+            let mut acc: f32 = 0.0;
+            for kg in (0..K).step_by(GROUP_SIZE) {
+                let group_idx = kg / GROUP_SIZE;
+
+                // Scale: scales[col * num_groups + group_idx]
+                let scale_bits = scales_f16[col * num_groups + group_idx];
+                let scale = f16_to_f32_cpu(scale_bits);
+
+                // Zero point: flat_idx = col * num_groups + group_idx, then /8 and %8
+                let flat_idx = col * num_groups + group_idx;
+                let zp_packed_idx = flat_idx / 8;
+                let zp_shift = (flat_idx % 8) * 4;
+                let raw_zero = ((zeros[zp_packed_idx] >> zp_shift) & 0xF) as i8;
+
+                // Process 8 weights at a time
+                for kk in (0..GROUP_SIZE).step_by(8) {
+                    let widx = (col * K + kg + kk) / 8;
+                    let packed = weights[widx];
+                    for w in 0..8i32 {
+                        let shift = w * 4;
+                        let w_int4 = ((packed >> shift) & 0xF) as i8;
+                        // GGUF: zero = raw_zero (no offset)
+                        let w_fp32 = f32::from(w_int4 - raw_zero) * scale;
+                        let a_val = bf16_to_f32_cpu(input_bf16[row * K + kg + kk + w as usize]);
+                        acc += w_fp32 * a_val;
+                    }
+                }
+            }
+            expected[row * N + col] = acc;
+        }
+    }
+
+    // Compare: output is BF16, reference is f32 → compare with tolerance
+    for i in 0..output_size {
+        let actual = bf16_to_f32_cpu(out_host[i]);
+        if (actual - expected[i]).abs() > 4.0 {
+            eprintln!("INT4 GEMM GGUF mismatch at [{}]: got {} expected {}", i, actual, expected[i]);
+            return false;
+        }
+    }
+    true
+}
+
 // ─── main ────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -799,7 +1108,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fail_count += 1;
     }
 
-    println!("\n=== Summary: {} tests, {} failed ===", 15, fail_count);
+    // ─── Tier 3: INT4 GEMM kernels ──────────────────────
+
+    if test_int4_gemm_autoround(&ctx) {
+        println!("[PASS] int4_gemm_auto_round (transposed layout)");
+    } else {
+        eprintln!("[FAIL] int4_gemm_auto_round (transposed layout)");
+        fail_count += 1;
+    }
+
+    if test_int4_gemm_gguf(&ctx) {
+        println!("[PASS] int4_gemm_gguf (non-transposed layout)");
+    } else {
+        eprintln!("[FAIL] int4_gemm_gguf (non-transposed layout)");
+        fail_count += 1;
+    }
+
+    println!("\n=== Summary: {} tests, {} failed ===", 17, fail_count);
 
     if fail_count > 0 {
         std::process::exit(1);

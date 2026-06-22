@@ -124,6 +124,35 @@ Four additional kernels validating BF16 arithmetic, packed BF16x2 FMA, INT4 bit 
 **Key discovery — RNE vs truncate mismatch**: The `fma.rn.bf16x2` PTX instruction uses round-to-nearest-even. CPU verification must use the same rounding mode (`f32_to_bf16_rne`) rather than truncation (`f32_to_bf16`) to match GPU results.
 
 **Key discovery — f16 in device code**: `f16::from_bits()` works inside kernels. Casting `(f16_val as f32)` works for f16→f32 conversion. The `From<f16>` trait is not implemented on `f32` — use explicit cast instead.
+
+### cuda-oxide: INT4 GEMM with Trait-Based Dequantization Dispatch
+
+Flagship kernel in `infers-kernel-lib` — computes `output[M][N] = dequant(weight) @ input[M][K]` with per-group FP16 scales and packed INT4 zero points, using Rust trait dispatch for multi-format support.
+
+**Dequantize trait**: Defines `dequant(w_int4: i8, raw_zero: i8, scale: f32) -> f32` — the single point of format-specific logic. Two implementations:
+
+| Format | Zero Point | Formula |
+|--------|-----------|---------|
+| AutoRound | `zero = stored_zero + 1` | `(w - (stored_zero + 1)) * scale` |
+| GGUF | `zero = stored_zero` | `(w - stored_zero) * scale` |
+
+**Architecture**: Generic inner function `int4_gemm_inner<Q: Dequantize>` handles all kernel logic (thread indexing, transposed/non-transposed layouts, group iteration, weight unpacking). Two `#[kernel]` wrappers (`int4_gemm_auto_round`, `int4_gemm_gguf`) monomorphize the inner function for each format. The inner function is **not** a `#[kernel]` — it's `#[inline(always)]` and inlined into each wrapper at compile time.
+
+**Layout support**: Two weight layouts via `transposed` flag:
+- `transposed=0`: weight [N, K/8], scales [N, K/group_size], zeros flat-packed
+- `transposed=1`: weight [K/8, N], scales [K/group_size, N], zeros [K/group_size, ceil(N/8)]
+
+**FP16 scale conversion**: Custom `f16_to_f32` function handles subnormals, normals, and inf/NaN without depending on Rust's unstable f16 type. Bias adjustment: 15→127, mantissa shift: 10→23 bits.
+
+**Launch configuration**: Prefill (M>1): 16×16 blocks, tiled grid. Decode (M=1): 256 threads flat. Each thread computes one output element with fp32 accumulation, writing bf16 result via `f32_to_bf16`.
+
+**Kernels added**:
+
+| Kernel | Purpose | Test Result |
+|--------|---------|-------------|
+| `int4_gemm_auto_round` | AutoRound INT4 GEMM (transposed=1) | ✅ M=2, N=16, K=64 vs CPU reference |
+| `int4_gemm_gguf` | GGUF INT4 GEMM (transposed=0) | ✅ M=2, N=16, K=64 vs CPU reference |
+
 ### cuda-oxide POC: GDN Kernels and 80KB Dynamic Shared Memory (Exploration Complete)
 
 Three additional kernels validating GDN math patterns with `libm` math functions, plus a progressive dynamic shared memory sizing test.
@@ -285,3 +314,35 @@ Six additional Tier 1 CUDA kernels ported from nvcc to Rust in cuda-oxide-kernel
 **Shared memory patterns**: `infers_argmax_bf16` uses two `static mut SharedArray<f32, 256>` (one for values, one for indices stored as f32). Thread 0 writes the final argmax index. Launch config: one block per row via direct `LaunchConfig { grid_dim, block_dim }` construction (no `for_num_elems` convenience for multi-block launches).
 
 **Sigmoid implementation**: All three sigmoid kernels (`silu_bf16`, `silu_glu_bf16`, `attn_output_gate_bf16`) use the same pattern: bf16→f32 conversion, `libm::expf(-val)` for sigmoid denominator, f32→bf16 truncation via `cuda_device::tcgen05::f32_to_bf16()`. CPU verification uses matching `libm::expf()` for bit-exact comparison.
+
+### cuda-oxide Kernel Library: Tier 2 Kernels (Phase 18 — 8 Kernels Ported)
+
+Eight shared memory and advanced compute kernels ported from nvcc to Rust in cuda-oxide-kernel-lib. All pass verification via tolerance-based CPU reference.
+
+**Kernels added**:
+
+| Kernel | Source File | Description | Test Result |
+|--------|-------------|-------------|-------------|
+| `infers_rmsnorm_bf16` | New | RMSNorm with dynamic shared memory tree reduction: `x * rsqrt(mean(x²) + eps) * (1 + weight)` | ✅ 2 rows × 8 hidden, bit-exact |
+| `infers_rms_norm_gated_bf16` | New | RMSNorm + SiLU gate: `weight * x_norm * SiLU(gate)` with shared memory reduction | ✅ 2 rows × 8 dim, tolerance 0.5 |
+| `infers_l2norm_bf16` | `l2norm_bf16.cu` | L2 normalize per row: `input / sqrt(sum(input²) + eps)` via shared memory reduction | ✅ 2 rows × 8 dim, unit length verified |
+| `infers_softmax_bf16` | `softmax.cu` | 3-phase softmax (max→exp-sum→normalize) with optional causal mask | ✅ 4×4 matrix, rows sum to ~1.0 |
+| `infers_conv1d_depthwise_silu_bf16` | `conv1d_depthwise.cu` | Depthwise 1D conv + SiLU activation, padding = kernel_size - 1 | ✅ 1 batch × 2 dim × 4 seq, tolerance 1.0 |
+| `infers_paged_kv_write_bf16` | `paged_kv_write.cu` | Paged KV cache write with block-table address translation | ✅ Round-trip: write then read back matches |
+| `infers_paged_kv_read_bf16` | `paged_kv_read.cu` | Mirror of paged KV write — reads from page_pool using block_table | ✅ Same round-trip test |
+| `infers_rope_bf16` | `rope.cu` | Rotary Position Embedding with half-split pairing (rotate_half/GPT-NeoX) | ✅ 2 tokens × 2 heads × 4 head_dim, tolerance 1.0 |
+
+**Dynamic shared memory reduction pattern**: Kernels using `DynamicSharedArray::<f32>::get()` follow a consistent pattern:
+
+1. **Phase 1 — Partial reduction**: Each thread accumulates partial results over its grid-stride chunk, writes to `smem[tid]`, then `sync_threads()`.
+2. **Phase 2 — Halving reduction**: Loop from stride = 128 down to 1, adding (or maxing) adjacent pairs: `if tid < stride { smem[tid] += smem[tid + stride] }` with `sync_threads()` between steps.
+3. **Phase 3 — Scalar computation**: Thread 0 reads the reduced value from `smem[0]`, computes a scalar (e.g., inverse RMS, inverse norm), writes back to `smem[0]`, then `sync_threads()`.
+4. **Phase 4 — Apply transformation**: All threads read the scalar from `smem[0]` and apply it to their respective elements in a grid-stride loop.
+
+**Device sqrt**: `f32::sqrt()` compiles directly to PTX `sqrt.rn.f32` (validated in POC and kernel-lib build). Replaces the initial `dev_sqrtf()` bit-hack + Newton-Raphson implementation. The bit-hack was introduced because `libm::sqrtf()` uses x86 inline assembly that fails PTX generation, but `f32::sqrt()` is a compiler intrinsic that nvptx backend handles natively. Used by `rmsnorm_bf16`, `rms_norm_gated_bf16`, and `l2norm_bf16`.
+
+**Index layout for conv1d**: Output decomposition uses `[batch][seq_len][conv_dim]` layout (D innermost, matches nvcc `conv1d_depthwise.cu`): `d = i % conv_dim`, `t = (i / conv_dim) % seq_len`, `b = i / (seq_len * conv_dim)`. Input indexing: `inp_idx = b * seq_len * conv_dim + adj_t * conv_dim + d`. Bounds check avoids usize underflow: `input_t >= pad && input_t < seq_len + pad`. Original port had incorrect [B,D,T] layout (T innermost) — fixed to match nvcc.
+
+**Paged KV address translation**: Both read and write use block_table to map logical pages to physical pages. Write takes a `positions` array for scattered writes; read uses contiguous positions (0..num_cached_tokens) for sequential reads. Page stride = 2 × page_size × kv_dim (K and V stored back-to-back in each physical page).
+
+**Rope half-split pairing**: Each rotary pair pairs dimension `dim_pair` with `dim_pair + half_rotary` (rotate_half/GPT-NeoX convention). Q and K are rotated in-place using the same cos/sin values for a given token position.
