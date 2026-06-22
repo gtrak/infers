@@ -4,9 +4,11 @@
 //! against a CPU reference.
 
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
-use cuda_core::sys;
+use cuda_core::embedded::{self, ArtifactPayloadKind};
+use cuda_host::ltoir;
 
 /// Convert f32 to bf16 bits (truncate — matches `cuda_device::tcgen05::f32_to_bf16`).
 fn f32_to_bf16_cpu(val: f32) -> u16 {
@@ -1896,7 +1898,139 @@ fn test_gdn_chunked_gated_delta_prefill(ctx: &Arc<CudaContext>) -> bool {
     true
 }
 
+/// Extract the embedded cubin from the current binary and write it to disk.
+fn save_cubin(out_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let bundles = embedded::artifact_bundles_from_current_exe()?;
+    if bundles.is_empty() {
+        eprintln!("no embedded artifact bundles found in this binary");
+        std::process::exit(1);
+    }
+
+    let bundle = &bundles[0];
+    let arch = ltoir::target_arch();
+
+    // Try cubin first, then PTX, then compile NVVM IR, then link LTOIR
+    if let Some(cubin) = bundle.payload(ArtifactPayloadKind::Cubin) {
+        std::fs::write(&out_path, cubin)?;
+        println!(
+            "Saved cubin to {} ({} bytes)",
+            out_path.display(),
+            cubin.len()
+        );
+        return Ok(());
+    }
+
+    if let Some(ptx) = bundle.payload(ArtifactPayloadKind::Ptx) {
+        // PTX is not directly a cubin; compile via ptxas or write as-is
+        std::fs::write(&out_path, ptx)?;
+        println!(
+            "Saved PTX to {} ({} bytes) — use ptxas to convert to cubin",
+            out_path.display(),
+            ptx.len()
+        );
+        return Ok(());
+    }
+
+    if let Some(nvvm_ir) = bundle.payload(ArtifactPayloadKind::NvvmIr) {
+        let cubin_bytes = ltoir::build_cubin_from_nvvm_ir(nvvm_ir, &bundle.name, &arch)?;
+        println!(
+            "Saved cubin to {} ({} bytes)",
+            out_path.display(),
+            cubin_bytes.len()
+        );
+        std::fs::write(&out_path, &cubin_bytes)?;
+        return Ok(());
+    }
+
+    if let Some(ltoir_bytes) = bundle.payload(ArtifactPayloadKind::Ltoir) {
+        let cubin_bytes = ltoir::link_ltoir_to_cubin(ltoir_bytes, &bundle.name, &arch)?;
+        println!(
+            "Saved cubin to {} ({} bytes)",
+            out_path.display(),
+            cubin_bytes.len()
+        );
+        std::fs::write(&out_path, &cubin_bytes)?;
+        return Ok(());
+    }
+
+    eprintln!("bundle '{}' has no supported payload kind", bundle.name);
+    std::process::exit(1);
+}
+
+/// Load a cubin file and verify all 27 kernel function names resolve.
+fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx: Arc<CudaContext> = CudaContext::new(0)?;
+    let module = ctx.load_module_from_file(cubin_path.to_str().ok_or("invalid cubin path")?)?;
+
+    let kernel_names = [
+        "infers_add_bf16",
+        "infers_embedding_gather_bf16",
+        "infers_silu_bf16",
+        "infers_silu_glu_bf16",
+        "infers_attn_output_gate_bf16",
+        "infers_argmax_bf16",
+        "infers_kv_cache_write_bf16",
+        "infers_rmsnorm_bf16",
+        "infers_rms_norm_gated_bf16",
+        "infers_l2norm_bf16",
+        "infers_softmax_bf16",
+        "infers_conv1d_depthwise_silu_bf16",
+        "infers_paged_kv_write_bf16",
+        "infers_paged_kv_read_bf16",
+        "infers_rope_bf16",
+        "int4_gemm_auto_round",
+        "int4_gemm_gguf",
+        "infers_fp8_quantize_e4m3",
+        "infers_fp8_dequantize_e4m3",
+        "infers_fp8_quantize_e5m2",
+        "infers_fp8_dequantize_e5m2",
+        "infers_paged_attention_decode_bf16",
+        "infers_gdn_recurrent_step_bf16",
+        "infers_gdn_mamba2_update_bf16",
+        "infers_gdn_update_bf16",
+        "infers_gdn_gated_delta_update_bf16",
+        "infers_gdn_gated_delta_prefill_bf16",
+    ];
+
+    let mut failed = Vec::new();
+    for name in &kernel_names {
+        match module.load_function(name) {
+            Ok(_) => println!("[OK]   {}", name),
+            Err(e) => {
+                eprintln!("[FAIL] {} — {}", name, e);
+                failed.push(name.to_string());
+            }
+        }
+    }
+
+    if failed.is_empty() {
+        println!("\nAll {} kernel functions resolved successfully.", kernel_names.len());
+        Ok(())
+    } else {
+        eprintln!("\n{} of {} kernel functions FAILED to resolve:", failed.len(), kernel_names.len());
+        std::process::exit(1);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check for --save-cubin <path> flag
+    if let Some(pos) = args.iter().position(|a| a == "--save-cubin") {
+        let path = args.get(pos + 1)
+            .ok_or("missing argument for --save-cubin")?;
+        save_cubin(PathBuf::from(path))?;
+        return Ok(());
+    }
+
+    // Check for --verify-cubin <path> flag
+    if let Some(pos) = args.iter().position(|a| a == "--verify-cubin") {
+        let path = args.get(pos + 1)
+            .ok_or("missing argument for --verify-cubin")?;
+        verify_cubin(PathBuf::from(path))?;
+        return Ok(());
+    }
+
     println!("=== infers-cuda-oxide-kernels: all kernel tests ===\n");
 
     let ctx: Arc<CudaContext> = CudaContext::new(0)?;
