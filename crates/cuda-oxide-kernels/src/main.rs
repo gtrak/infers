@@ -1000,7 +1000,395 @@ fn test_int4_gemm_gguf(ctx: &Arc<CudaContext>) -> bool {
     true
 }
 
-// ─── main ────────────────────────────────────────────────
+// ─── FP8 quantize/dequantize E4M3 ──────────────────────
+
+/// CPU reference: E4M3 quantize (same algorithm as device)
+fn fp8_e4m3_quantize_cpu(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = (bits >> 23) & 0xFF;
+    let mantissa = bits & 0x7FFFFF;
+
+    if exp == 0xFF {
+        if mantissa != 0 { return 0x7F; }  // NaN
+        return if sign == 0 { 0x77 } else { 0xF7 };  // Inf → max finite
+    }
+    if exp == 0 && mantissa == 0 { return ((sign & 1) as u8) * 0x80; }
+
+    let fp8_exp = (exp as i32) - 127 + 7;
+    if fp8_exp >= 0xF { return if sign != 0 { 0xF7 } else { 0x77 }; }
+    if fp8_exp < 0 { return ((sign & 1) as u8) * 0x80; }
+
+    let fp8_mant = ((mantissa >> 20) & 0x7) as u8;
+    ((((sign & 1) as u8) << 7) | ((fp8_exp as u8) << 3) | fp8_mant)
+}
+
+/// CPU reference: E4M3 dequantize
+fn fp8_e4m3_dequantize_cpu(val: u8) -> f32 {
+    let sign = (val >> 7) & 1;
+    let exp = (val >> 3) & 0xF;
+    let mant = val & 0x7;
+
+    if exp == 0xF { return f32::from_bits(0x7FC00000); }
+    if exp == 0 && mant == 0 { return if sign != 0 { -0.0f32 } else { 0.0f32 }; }
+
+    let fp32_exp = if exp == 0 { 0 } else { (exp as u32) + 120 };
+    let fp32_mant = (mant as u32) << 20;
+    f32::from_bits(((sign as u32) << 31) | (fp32_exp << 23) | fp32_mant)
+}
+
+/// CPU reference: E5M2 quantize
+fn fp8_e5m2_quantize_cpu(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = (bits >> 23) & 0xFF;
+    let mantissa = bits & 0x7FFFFF;
+
+    if exp == 0xFF {
+        if mantissa != 0 { return if sign == 0 { 0x7F } else { 0xFF }; }  // NaN
+        return if sign == 0 { 0x7C } else { 0xFC };  // Inf
+    }
+    if exp == 0 && mantissa == 0 { return ((sign & 1) as u8) * 0x80; }
+
+    let fp8_exp = (exp as i32) - 127 + 15;
+    if fp8_exp >= 0x1F { return if sign != 0 { 0xFB } else { 0x7B }; }
+    if fp8_exp < 0 { return ((sign & 1) as u8) * 0x80; }
+
+    let fp8_mant = ((mantissa >> 21) & 0x3) as u8;
+    ((((sign & 1) as u8) << 7) | ((fp8_exp as u8) << 2) | fp8_mant)
+}
+
+/// CPU reference: E5M2 dequantize
+fn fp8_e5m2_dequantize_cpu(val: u8) -> f32 {
+    let sign = (val >> 7) & 1;
+    let exp = (val >> 2) & 0x1F;
+    let mant = val & 0x3;
+
+    if exp == 0x1F { return f32::from_bits(0x7FC00000); }
+    if exp == 0 && mant == 0 { return if sign != 0 { -0.0f32 } else { 0.0f32 }; }
+
+    let fp32_exp = if exp == 0 { 0 } else { (exp as u32) + 112 };
+    let fp32_mant = (mant as u32) << 21;
+    f32::from_bits(((sign as u32) << 31) | (fp32_exp << 23) | fp32_mant)
+}
+
+fn test_fp8_e4m3(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    const N: usize = 256;
+    // Generate test values spanning a range of magnitudes, plus edge cases at the end
+    let mut vals_f32: Vec<f32> = (0..N - 4).map(|i| {
+        if i < 128 { (-127isize + i as isize) as f32 / 10.0 } else { 2.0 - ((i - 128) as f32) / 50.0 }
+    }).collect();
+    // Edge cases: INFINITY, NEG_INFINITY, NaN, and a very small subnormal value
+    vals_f32.push(f32::INFINITY);
+    vals_f32.push(f32::NEG_INFINITY);
+    vals_f32.push(f32::NAN);
+    vals_f32.push(1e-40f32); // very small subnormal
+    let input_bf16: Vec<u16> = vals_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // CPU reference: quantize E4M3
+    let expected_e4m3: Vec<u8> = vals_f32.iter().map(|&v| fp8_e4m3_quantize_cpu(v)).collect();
+
+    // Quantize on GPU
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+    let mut fp8_dev = DeviceBuffer::<u8>::zeroed(&stream, N).unwrap();
+    module.infers_fp8_quantize_e4m3(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &input_dev, &mut fp8_dev, N as u32,
+    ).unwrap();
+
+    let fp8_host = fp8_dev.to_host_vec(&stream).unwrap();
+    if fp8_host != expected_e4m3 {
+        for i in 0..N {
+            if fp8_host[i] != expected_e4m3[i] {
+                eprintln!("FP8 E4M3 quantize mismatch at [{}]: got 0x{:02X} expected 0x{:02X} (input={:.4})", i, fp8_host[i], expected_e4m3[i], vals_f32[i]);
+                break;
+            }
+        }
+        return false;
+    }
+
+    // Dequantize on GPU and compare to CPU reference
+    let fp8_dev2 = DeviceBuffer::from_host(&stream, &expected_e4m3).unwrap();
+    let mut dequant_dev = DeviceBuffer::<u16>::zeroed(&stream, N).unwrap();
+    module.infers_fp8_dequantize_e4m3(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &fp8_dev2, &mut dequant_dev, N as u32,
+    ).unwrap();
+
+    let dequant_host = dequant_dev.to_host_vec(&stream).unwrap();
+    let expected_dequant: Vec<u16> = expected_e4m3.iter().map(|&v| f32_to_bf16_cpu(fp8_e4m3_dequantize_cpu(v))).collect();
+
+    // Compare dequantized values with tolerance (FP8 lossy conversion)
+    for i in 0..N {
+        let actual = bf16_to_f32_cpu(dequant_host[i]);
+        let expected_val = fp8_e4m3_dequantize_cpu(expected_e4m3[i]);
+        if (actual - expected_val).abs() > 1.0 {
+            eprintln!("FP8 E4M3 dequantize mismatch at [{}]: got {:.4} expected {:.4}", i, actual, expected_val);
+            return false;
+        }
+    }
+
+    // Round-trip: quantize → dequantize, check error is small compared to original
+    for i in 0..N {
+        let rt_val = bf16_to_f32_cpu(dequant_host[i]);
+        let orig_val = bf16_to_f32_cpu(input_bf16[i]);
+        // FP8 is lossy; allow relative or absolute tolerance
+        if orig_val.abs() > 1e-6 {
+            let rel_err = (rt_val - orig_val).abs() / orig_val.abs();
+            if rel_err > 0.25 { // E4M3 has ~25% quantization error for small values
+                eprintln!("FP8 E4M3 round-trip error too large at [{}]: {:.6} → {:.6} (rel err {:.4})", i, orig_val, rt_val, rel_err);
+                return false;
+            }
+        } else {
+            if (rt_val - orig_val).abs() > 0.1 {
+                eprintln!("FP8 E4M3 round-trip error too large at [{}]: {:.6} → {:.6}", i, orig_val, rt_val);
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn test_fp8_e5m2(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    const N: usize = 256;
+    // E5M2 has larger exponent range, test with wider magnitude range, plus edge cases at the end
+    let mut vals_f32: Vec<f32> = (0..N - 4).map(|i| {
+        if i < 128 { (-127isize + i as isize) as f32 / 5.0 } else { 40.0 - ((i - 128) as f32) / 10.0 }
+    }).collect();
+    // Edge cases: INFINITY, NEG_INFINITY, NaN, and a very small subnormal value
+    vals_f32.push(f32::INFINITY);
+    vals_f32.push(f32::NEG_INFINITY);
+    vals_f32.push(f32::NAN);
+    vals_f32.push(1e-40f32); // very small subnormal
+    let input_bf16: Vec<u16> = vals_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // CPU reference: quantize E5M2
+    let expected_e5m2: Vec<u8> = vals_f32.iter().map(|&v| fp8_e5m2_quantize_cpu(v)).collect();
+
+    // Quantize on GPU
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+    let mut fp8_dev = DeviceBuffer::<u8>::zeroed(&stream, N).unwrap();
+    module.infers_fp8_quantize_e5m2(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &input_dev, &mut fp8_dev, N as u32,
+    ).unwrap();
+
+    let fp8_host = fp8_dev.to_host_vec(&stream).unwrap();
+    if fp8_host != expected_e5m2 {
+        for i in 0..N {
+            if fp8_host[i] != expected_e5m2[i] {
+                eprintln!("FP8 E5M2 quantize mismatch at [{}]: got 0x{:02X} expected 0x{:02X} (input={:.4})", i, fp8_host[i], expected_e5m2[i], vals_f32[i]);
+                break;
+            }
+        }
+        return false;
+    }
+
+    // Dequantize on GPU and compare to CPU reference
+    let fp8_dev2 = DeviceBuffer::from_host(&stream, &expected_e5m2).unwrap();
+    let mut dequant_dev = DeviceBuffer::<u16>::zeroed(&stream, N).unwrap();
+    module.infers_fp8_dequantize_e5m2(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &fp8_dev2, &mut dequant_dev, N as u32,
+    ).unwrap();
+
+    let dequant_host = dequant_dev.to_host_vec(&stream).unwrap();
+
+    // Compare dequantized values with tolerance
+    for i in 0..N {
+        let actual = bf16_to_f32_cpu(dequant_host[i]);
+        let expected_val = fp8_e5m2_dequantize_cpu(expected_e5m2[i]);
+        if (actual - expected_val).abs() > 2.0 {
+            eprintln!("FP8 E5M2 dequantize mismatch at [{}]: got {:.4} expected {:.4}", i, actual, expected_val);
+            return false;
+        }
+    }
+
+    // Round-trip: check error is small (E5M2 has fewer mantissa bits but larger range)
+    for i in 0..N {
+        let rt_val = bf16_to_f32_cpu(dequant_host[i]);
+        let orig_val = bf16_to_f32_cpu(input_bf16[i]);
+        if orig_val.abs() > 1e-6 {
+            let rel_err = (rt_val - orig_val).abs() / orig_val.abs();
+            if rel_err > 0.5 { // E5M2 has ~37.5% quantization error due to only 2 mantissa bits
+                eprintln!("FP8 E5M2 round-trip error too large at [{}]: {:.6} → {:.6} (rel err {:.4})", i, orig_val, rt_val, rel_err);
+                return false;
+            }
+        } else {
+            if (rt_val - orig_val).abs() > 0.5 {
+                eprintln!("FP8 E5M2 round-trip error too large at [{}]: {:.6} → {:.6}", i, orig_val, rt_val);
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn test_paged_attention_decode(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    const NUM_KV_HEADS: usize = 2;
+    const NUM_QUERY_HEADS: usize = 4; // GQA=2
+    const HEAD_DIM: usize = 8;
+    const PAGE_SIZE: usize = 4;
+    const NUM_CACHED_TOKENS: usize = 8;
+
+    let q_per_kv = NUM_QUERY_HEADS / NUM_KV_HEADS;
+
+    // Block table: map logical pages to physical pages
+    // 2 cached tokens per page (NUM_CACHED_TOKENS=8, PAGE_SIZE=4 → 2 pages)
+    let block_table: Vec<i32> = vec![10, 5]; // logical page 0→physical 10, logical page 1→physical 5
+
+    // kv_dim for multi-head: total dims per token position across all KV heads
+    const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
+
+    let page_stride = 2 * PAGE_SIZE * KV_DIM; // K+V per page
+
+    // Build page pool with known K and V values (BF16)
+    // Only need physical pages 5 and 10, so allocate enough space
+    const MAX_PHYS_PAGE: usize = 11;
+    let mut page_pool: Vec<u16> = vec![0u16; MAX_PHYS_PAGE * page_stride];
+
+    // Fill K values for each KV head at each position in each physical page
+    for kv_head in 0..NUM_KV_HEADS {
+        for token_pos in 0..NUM_CACHED_TOKENS {
+            let logical_page = token_pos / PAGE_SIZE;
+            let token_in_page = token_pos % PAGE_SIZE;
+            let physical_page = block_table[logical_page] as usize;
+
+            // K values: simple pattern (kv_head * NUM_CACHED_TOKENS + token_pos + d)
+            for d in 0..HEAD_DIM {
+                let k_offset = physical_page * page_stride
+                    + token_in_page * KV_DIM
+                    + kv_head * HEAD_DIM + d;
+                let val = (kv_head as u16 * NUM_CACHED_TOKENS as u16) + (token_pos as u16) + (d as u16) + 1u16;
+                page_pool[k_offset] = f32_to_bf16_cpu(val as f32);
+            }
+
+            // V values: similar pattern but offset by 100
+            for d in 0..HEAD_DIM {
+                let v_offset = physical_page * page_stride
+                    + PAGE_SIZE * KV_DIM
+                    + token_in_page * KV_DIM
+                    + kv_head * HEAD_DIM + d;
+                let val = (kv_head as u16 * NUM_CACHED_TOKENS as u16) + (token_pos as u16) + (d as u16) + 101u16;
+                page_pool[v_offset] = f32_to_bf16_cpu(val as f32);
+            }
+        }
+    }
+
+    // Q values: simple ascending pattern for each query head
+    let q_bf16: Vec<u16> = (0..NUM_QUERY_HEADS * HEAD_DIM)
+        .map(|i| f32_to_bf16_cpu((i + 1) as f32))
+        .collect();
+
+    // CPU reference: compute attention manually
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+
+    let mut expected: Vec<f32> = vec![0.0; NUM_QUERY_HEADS * HEAD_DIM];
+    for q_head in 0..NUM_QUERY_HEADS {
+        let kv_head = q_head / q_per_kv;
+        // Online softmax over cached tokens
+        let mut max_val: f32 = f32::NEG_INFINITY;
+        let mut sum_exp: f32;
+
+        // First pass: compute scores and find max
+        let mut scores: Vec<f32> = Vec::with_capacity(NUM_CACHED_TOKENS);
+        for token_pos in 0..NUM_CACHED_TOKENS {
+            let logical_page = token_pos / PAGE_SIZE;
+            let token_in_page = token_pos % PAGE_SIZE;
+            let physical_page = block_table[logical_page] as usize;
+
+            let mut dot: f32 = 0.0;
+            for d in 0..HEAD_DIM {
+                let q_val = bf16_to_f32_cpu(q_bf16[q_head * HEAD_DIM + d]);
+                let k_offset = physical_page * page_stride
+                    + token_in_page * KV_DIM
+                    + kv_head * HEAD_DIM + d;
+                let k_val = bf16_to_f32_cpu(page_pool[k_offset]);
+                dot += q_val * k_val;
+            }
+            dot *= scale;
+            if dot > max_val { max_val = dot; }
+            scores.push(dot);
+        }
+
+        // Second pass: softmax normalization and weighted V accumulation
+        sum_exp = scores.iter().map(|&s| libm::expf(s - max_val)).sum();
+
+        for d in 0..HEAD_DIM {
+            let mut out_val: f32 = 0.0;
+            for token_pos in 0..NUM_CACHED_TOKENS {
+                let logical_page = token_pos / PAGE_SIZE;
+                let token_in_page = token_pos % PAGE_SIZE;
+                let physical_page = block_table[logical_page] as usize;
+
+                let weight = libm::expf(scores[token_pos] - max_val) / sum_exp;
+
+                let v_offset = physical_page * page_stride
+                    + PAGE_SIZE * KV_DIM
+                    + token_in_page * KV_DIM
+                    + kv_head * HEAD_DIM + d;
+                let v_val = bf16_to_f32_cpu(page_pool[v_offset]);
+                out_val += weight * v_val;
+            }
+            expected[q_head * HEAD_DIM + d] = out_val;
+        }
+    }
+
+    // Launch kernel on GPU
+    let q_dev = DeviceBuffer::from_host(&stream, &q_bf16).unwrap();
+    let pool_dev = DeviceBuffer::from_host(&stream, &page_pool).unwrap();
+    let bt_dev = DeviceBuffer::from_host(&stream, &block_table).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, NUM_QUERY_HEADS * HEAD_DIM).unwrap();
+
+    let bdim = (HEAD_DIM.min(256)) as u32;
+    let shared_mem_bytes = 3 * bdim as usize * std::mem::size_of::<f32>();
+    let launch = LaunchConfig {
+        grid_dim: (NUM_KV_HEADS as u32, 1, 1),
+        block_dim: (bdim, 1, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+
+    module.infers_paged_attention_decode_bf16(
+        &stream, launch, &q_dev, &pool_dev, &bt_dev,
+        (MAX_PHYS_PAGE) as u32,
+        NUM_CACHED_TOKENS as u32,
+        HEAD_DIM as u32,
+        NUM_KV_HEADS as u32,
+        NUM_QUERY_HEADS as u32,
+        PAGE_SIZE as u32,
+        KV_DIM as u32,
+        &mut out_dev,
+    ).unwrap();
+
+    let out_host = out_dev.to_host_vec(&stream).unwrap();
+
+    // Compare with tolerance (BF16 precision limits)
+    for i in 0..(NUM_QUERY_HEADS * HEAD_DIM) {
+        let actual = bf16_to_f32_cpu(out_host[i]);
+        if (actual - expected[i]).abs() > 2.0 {
+            eprintln!("Paged attention mismatch at [{}]: got {:.4} expected {:.4}", i, actual, expected[i]);
+            return false;
+        }
+    }
+
+    true
+}
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== infers-cuda-oxide-kernels: all kernel tests ===\n");
@@ -1124,7 +1512,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fail_count += 1;
     }
 
-    println!("\n=== Summary: {} tests, {} failed ===", 17, fail_count);
+    // ─── Tier 4: FP8 and paged attention kernels ──────────────
+    if test_fp8_e4m3(&ctx) {
+        println!("[PASS] infers_fp8_quantize_e4m3 + dequantize");
+    } else {
+        eprintln!("[FAIL] infers_fp8_quantize_e4m3 + dequantize");
+        fail_count += 1;
+    }
+
+    if test_fp8_e5m2(&ctx) {
+        println!("[PASS] infers_fp8_quantize_e5m2 + dequantize");
+    } else {
+        eprintln!("[FAIL] infers_fp8_quantize_e5m2 + dequantize");
+        fail_count += 1;
+    }
+
+    if test_paged_attention_decode(&ctx) {
+        println!("[PASS] infers_paged_attention_decode_bf16");
+    } else {
+        eprintln!("[FAIL] infers_paged_attention_decode_bf16");
+        fail_count += 1;
+    }
+
+    println!("\n=== Summary: {} tests, {} failed ===", 21, fail_count);
 
     if fail_count > 0 {
         std::process::exit(1);

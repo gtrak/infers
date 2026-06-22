@@ -346,3 +346,53 @@ Eight shared memory and advanced compute kernels ported from nvcc to Rust in cud
 **Paged KV address translation**: Both read and write use block_table to map logical pages to physical pages. Write takes a `positions` array for scattered writes; read uses contiguous positions (0..num_cached_tokens) for sequential reads. Page stride = 2 × page_size × kv_dim (K and V stored back-to-back in each physical page).
 
 **Rope half-split pairing**: Each rotary pair pairs dimension `dim_pair` with `dim_pair + half_rotary` (rotate_half/GPT-NeoX convention). Q and K are rotated in-place using the same cos/sin values for a given token position.
+
+### cuda-oxide Kernel Library: Tier 3 — INT4 GEMM (Phase 18 — Trait-Based Dispatch Validated)
+
+INT4 GEMM with trait-based dequantization dispatch validates the monomorphized wrapper pattern from Experiment 1c in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide Generic Kernel Experiments (Phase 19 Complete — Assessment Corrected)]].
+
+**Trait: Dequantize**: Defines `dequant(w_int4: i8, raw_zero: i8, scale: f32) -> f32` — the single point of format-specific logic. Two implementations:
+
+| Format | Zero Point | Formula |
+|--------|-----------|---------|
+| AutoRound | `zero = stored_zero + 1` | `(w - (stored_zero + 1)) * scale` |
+| GGUF | `zero = stored_zero` | `(w - stored_zero) * scale` |
+
+**Architecture**: Generic inner function `int4_gemm_inner<Q: Dequantize>` is `#[inline(always)]` and inlined into each wrapper at compile time. Two `#[kernel]` wrappers (`int4_gemm_auto_round`, `int4_gemm_gguf`) monomorphize the inner function per format.
+
+**FP16 scale conversion**: Custom `f16_to_f32` function handles subnormals, normals, and inf/NaN without Rust's unstable f16 type. Bias adjustment: 15→127, mantissa shift: 10→23 bits.
+
+| Kernel | Test Result |
+|--------|-------------|
+| `int4_gemm_auto_round` | ✅ M=2, N=16, K=64, transposed=1 vs CPU reference |
+| `int4_gemm_gguf` | ✅ M=2, N=16, K=64, transposed=0 vs CPU reference |
+
+### cuda-oxide Kernel Library: Tier 4 — FP8 and Paged Attention (Phase 18 — 5 Kernels Ported)
+
+Five kernels ported from nvcc to Rust: two FP8 format traits with four quantize/dequantize wrappers, plus the paged attention decode kernel with KvCacheFormat trait.
+
+**Trait: Fp8Format**: Defines `quantize(val: f32) -> u8` and `dequantize(val: u8) -> f32` — the single point of format-specific bit layout logic. Two implementations:
+
+| Format | Exponent | Bias | Mantissa | Max Finite |
+|--------|----------|------|----------|------------|
+| E4M3 | 4 bits | 7 | 3 bits | +0x77 / -0xF7 |
+| E5M2 | 5 bits | 15 | 2 bits | +0x7B / -0xFB |
+
+E4M3 provides better precision (smaller quantization error ~25%) while E5M2 supports a wider dynamic range. NaN handling: E4M3 maps NaN→0x7F, Inf→max finite; E5M2 uses sign-preserving NaN/Inf (NaN→0x7F/0xFF, Inf→0x7C/0xFC). Both handle zero, clamp-to-max-finite, and underflow-to-zero. Subnormal dequantization: when fp8 exp=0 with nonzero mantissa, the output fp32 exponent is 0 (subnormal path) rather than adding the bias offset. Generic inner functions `fp8_quantize_inner<F: Fp8Format>` and `fp8_dequantize_inner<F: Fp8Format>` compute grid-stride thread indices via `thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()` (not `thread::index_1d()` which resolves to a host-only stub outside `#[kernel]` context).
+**Trait: KvCacheFormat**: Defines `read_kv(pool: &[u16], offset: usize) -> f32` for reading KV cache values with format-specific dequantization. Current implementation: `KvBf16` reads bf16 directly via `(pool[offset] as u32) << 16`. Designed to support future FP8 cache variants (e.g., `KvFp8E4M3`).
+
+| Kernel | Source File | Description | Test Result |
+|--------|-------------|-------------|-------------|
+| `infers_fp8_quantize_e4m3` | `fp8_quantize.cu` | BF16→FP8 E4M3 quantization | ✅ 256 elements bit-exact vs CPU reference |
+| `infers_fp8_dequantize_e4m3` | `fp8_quantize.cu` | FP8 E4M3→BF16 dequantization | ✅ Round-trip rel error < 0.25 |
+| `infers_fp8_quantize_e5m2` | `fp8_quantize.cu` | BF16→FP8 E5M2 quantization | ✅ 256 elements bit-exact vs CPU reference |
+| `infers_fp8_dequantize_e5m2` | `fp8_quantize.cu` | FP8 E5M2→BF16 dequantization | ✅ Round-trip rel error < 0.5 |
+| `infers_paged_attention_decode_bf16` | `paged_attention_decode.cu` | Two-pass attention: online softmax + weighted V accumulation, one block per KV head, GQA support via q_per_kv loop | ✅ 2 KV heads, 4 query heads, 8 cached tokens vs CPU reference (tolerance 2.0) |
+
+**Paged attention decode algorithm**: Two-pass approach using dynamic shared memory (`3 * bdim * sizeof(f32)`):
+1. **Phase 1 — Online softmax**: Each thread processes strided tokens, computing Q·K dot products with per-thread online softmax (tracking local_max and local_sum via incremental update). Block reduction: global max via fmax halving, then adjusted sum reduction.
+2. **Phase 2 — Weighted V accumulation**: Threads with `tid < head_dim` loop over ALL tokens, recomputing Q·K dot products, applying softmax weights, and accumulating weighted V values.
+
+**Launch configuration**: Grid = `num_kv_heads` blocks (one per KV head), block = `min(head_dim, 256)` threads. Dynamic shared memory: `3 * bdim * sizeof(f32)`. For GQA, each block iterates over `q_per_kv = num_query_heads / num_kv_heads` query heads.
+
+**Key insight — thread::index_1d() limitation**: Inside `#[inline(always)]` helper functions that are inlined into kernels, `thread::index_1d()` resolves to a host-only stub. Must compute index manually: `(thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize`.

@@ -649,6 +649,194 @@ pub mod kernels {
         }
     }
 
+    // ─── FP8 quantize/dequantize with Fp8Format trait ─────────────
+
+    /// Trait for FP8 quantization format. Each format (E4M3, E5M2) implements
+    /// the quantize and dequantize methods with its specific bit layout.
+    pub trait Fp8Format {
+        fn quantize(val: f32) -> u8;
+        fn dequantize(val: u8) -> f32;
+    }
+
+    /// Fp8E4M3 — 1 sign, 4 exponent (bias 7), 3 mantissa bits.
+    /// Max finite: 0x77 positive / 0xF7 negative.
+    pub struct Fp8E4M3;
+    impl Fp8Format for Fp8E4M3 {
+        #[inline(always)]
+        fn quantize(val: f32) -> u8 {
+            let bits = val.to_bits();
+            let sign = (bits >> 31) & 1;
+            let exp = (bits >> 23) & 0xFF;
+            let mantissa = bits & 0x7FFFFF;
+
+            // NaN → 0x7F, Inf → max finite (0x77 / 0xF7)
+            if exp == 0xFF {
+                if mantissa != 0 { return 0x7F; }  // NaN
+                return if sign == 0 { 0x77 } else { 0xF7 };  // Inf → max finite
+            }
+            // Zero/subnormal
+            if exp == 0 && mantissa == 0 {
+                return (sign & 1) as u8 * 0x80;
+            }
+
+            let fp8_exp = (exp as i32) - 127 + 7;
+            // Clamp to max finite
+            if fp8_exp >= 0xF {
+                return if sign != 0 { 0xF7 } else { 0x77 };
+            }
+            // Underflow to zero
+            if fp8_exp < 0 {
+                return (sign & 1) as u8 * 0x80;
+            }
+
+            let fp8_mant = ((mantissa >> 20) & 0x7) as u8;
+            ((((sign & 1) as u8) << 7) | ((fp8_exp as u8) << 3) | fp8_mant)
+        }
+
+        #[inline(always)]
+        fn dequantize(val: u8) -> f32 {
+            let sign = (val >> 7) & 1;
+            let exp = (val >> 3) & 0xF;
+            let mant = val & 0x7;
+
+            // NaN
+            if exp == 0xF {
+                return f32::from_bits(0x7FC00000);
+            }
+            // Zero
+            if exp == 0 && mant == 0 {
+                return if sign != 0 { -0.0f32 } else { 0.0f32 };
+            }
+
+            let fp32_exp = if exp == 0 { 0 } else { (exp as u32) + 120 }; // 127 - 7 = 120
+            let fp32_mant = (mant as u32) << 20;
+            f32::from_bits(((sign as u32) << 31) | (fp32_exp << 23) | fp32_mant)
+        }
+    }
+
+    /// Fp8E5M2 — 1 sign, 5 exponent (bias 15), 2 mantissa bits.
+    /// Max finite: 0x7B positive / 0xFB negative.
+    pub struct Fp8E5M2;
+    impl Fp8Format for Fp8E5M2 {
+        #[inline(always)]
+        fn quantize(val: f32) -> u8 {
+            let bits = val.to_bits();
+            let sign = (bits >> 31) & 1;
+            let exp = (bits >> 23) & 0xFF;
+            let mantissa = bits & 0x7FFFFF;
+
+            // NaN/Inf — sign-preserving
+            if exp == 0xFF {
+                if mantissa != 0 { return if sign == 0 { 0x7F } else { 0xFF }; }  // NaN
+                return if sign == 0 { 0x7C } else { 0xFC };  // Inf
+            }
+            // Zero/subnormal
+            if exp == 0 && mantissa == 0 {
+                return (sign & 1) as u8 * 0x80;
+            }
+
+            let fp8_exp = (exp as i32) - 127 + 15;
+            // Clamp to max finite
+            if fp8_exp >= 0x1F {
+                return if sign != 0 { 0xFB } else { 0x7B };
+            }
+            // Underflow to zero
+            if fp8_exp < 0 {
+                return (sign & 1) as u8 * 0x80;
+            }
+
+            let fp8_mant = ((mantissa >> 21) & 0x3) as u8;
+            ((((sign & 1) as u8) << 7) | ((fp8_exp as u8) << 2) | fp8_mant)
+        }
+
+        #[inline(always)]
+        fn dequantize(val: u8) -> f32 {
+            let sign = (val >> 7) & 1;
+            let exp = (val >> 2) & 0x1F;
+            let mant = val & 0x3;
+
+            // NaN
+            if exp == 0x1F {
+                return f32::from_bits(0x7FC00000);
+            }
+            // Zero
+            if exp == 0 && mant == 0 {
+                return if sign != 0 { -0.0f32 } else { 0.0f32 };
+            }
+
+            let fp32_exp = if exp == 0 { 0 } else { (exp as u32) + 112 }; // 127 - 15 = 112
+            let fp32_mant = (mant as u32) << 21;
+            f32::from_bits(((sign as u32) << 31) | (fp32_exp << 23) | fp32_mant)
+        }
+    }
+
+    /// Generic FP8 quantize inner function. Monomorphized per Fp8Format impl.
+    #[inline(always)]
+    fn fp8_quantize_inner<F: Fp8Format>(
+        input: &[u16],
+        mut output: DisjointSlice<u8>,
+        n: u32,
+    ) {
+        let tid = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize;
+        let total = n as usize;
+
+        for i in (tid..total).step_by(stride) {
+            // bf16 → f32
+            let val = f32::from_bits((input[i] as u32) << 16);
+            let fp8 = F::quantize(val);
+            unsafe { *output.get_unchecked_mut(i) = fp8; }
+        }
+    }
+
+    /// Generic FP8 dequantize inner function. Monomorphized per Fp8Format impl.
+    #[inline(always)]
+    fn fp8_dequantize_inner<F: Fp8Format>(
+        input: &[u8],
+        mut output: DisjointSlice<u16>,
+        n: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let tid = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize;
+        let total = n as usize;
+
+        for i in (tid..total).step_by(stride) {
+            let fp8 = input[i];
+            let val = F::dequantize(fp8);
+            unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(val); }
+        }
+    }
+
+    /// FP8 quantize kernel: E4M3 format (BF16 → u8).
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_fp8_quantize_e4m3(input: &[u16], mut output: DisjointSlice<u8>, n: u32) {
+        fp8_quantize_inner::<Fp8E4M3>(input, output, n);
+    }
+
+    /// FP8 dequantize kernel: E4M3 format (u8 → BF16).
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_fp8_dequantize_e4m3(input: &[u8], mut output: DisjointSlice<u16>, n: u32) {
+        fp8_dequantize_inner::<Fp8E4M3>(input, output, n);
+    }
+
+    /// FP8 quantize kernel: E5M2 format (BF16 → u8).
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_fp8_quantize_e5m2(input: &[u16], mut output: DisjointSlice<u8>, n: u32) {
+        fp8_quantize_inner::<Fp8E5M2>(input, output, n);
+    }
+
+    /// FP8 dequantize kernel: E5M2 format (u8 → BF16).
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_fp8_dequantize_e5m2(input: &[u8], mut output: DisjointSlice<u16>, n: u32) {
+        fp8_dequantize_inner::<Fp8E5M2>(input, output, n);
+    }
+
     // ─── INT4 GEMM with trait-based dequantization dispatch ─────────────
 
     /// Trait for dequantizing INT4 weights. Each quant format implements this
@@ -821,6 +1009,182 @@ pub mod kernels {
             m as i32, n as i32, k as i32,
             group_size as i32, transposed as i32,
         );
+    }
+
+    // ─── Paged attention decode with KvCacheFormat trait ─────────────
+
+    /// Trait for reading K/V values from the KV cache. Each format (BF16, FP8)
+    /// implements the read method with its specific dequantization.
+    pub trait KvCacheFormat {
+        /// Read a value from the page pool at the given offset.
+        /// Returns the dequantized f32 value.
+        fn read_kv(pool: &[u16], offset: usize) -> f32;
+    }
+
+    /// KV cache stored as BF16 (default).
+    pub struct KvBf16;
+    impl KvCacheFormat for KvBf16 {
+        #[inline(always)]
+        fn read_kv(pool: &[u16], offset: usize) -> f32 {
+            f32::from_bits((pool[offset] as u32) << 16)
+        }
+    }
+
+
+
+    /// Paged attention decode kernel (BF16 KV cache).
+    /// One block per KV head, supports GQA via q_per_kv query heads per KV head.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_paged_attention_decode_bf16(
+        q: &[u16],
+        page_pool: &[u16],
+        block_table: &[i32],
+        num_pages: u32,
+        num_cached_tokens: u32,
+        head_dim: u32,
+        num_kv_heads: u32,
+        num_query_heads: u32,
+        page_size: u32,
+        kv_dim: u32,
+        mut output: DisjointSlice<u16>,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let kv_head_idx = thread::blockIdx_x() as usize;
+        if kv_head_idx >= num_kv_heads as usize {
+            return;
+        }
+
+        let q_per_kv = (num_query_heads / num_kv_heads) as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let bdim = thread::blockDim_x() as usize;
+        let page_stride = 2 * (page_size as usize) * (kv_dim as usize);
+        let scale = 1.0f32 / dev_sqrtf(head_dim as f32);
+
+        // Dynamic shared memory: 3 * bdim f32s
+        let smem = DynamicSharedArray::<f32>::get();
+
+        // Each block handles all query heads that share this KV head
+        for local_q in 0..q_per_kv {
+            let q_idx = kv_head_idx * q_per_kv + local_q;
+
+            // ================================================================
+            // Load Q_{q_idx} into shared memory [0..bdim)
+            // ================================================================
+            if tid < head_dim as usize {
+                unsafe {
+                    *smem.add(tid) = f32::from_bits((q[q_idx * (head_dim as usize) + tid] as u32) << 16);
+                }
+            }
+            cuda_device::sync_threads();
+
+            // ================================================================
+            // Phase 1: Compute attention scores with per-thread online softmax
+            // ================================================================
+            let mut local_max: f32 = f32::NEG_INFINITY;
+            let mut local_sum: f32 = 0.0;
+
+            for token_pos in (tid as usize..num_cached_tokens as usize).step_by(bdim) {
+                let logical_page = token_pos / page_size as usize;
+                let token_in_page = token_pos % page_size as usize;
+                let physical_page = block_table[logical_page] as usize;
+
+                let mut dot: f32 = 0.0;
+                for d in 0..head_dim as usize {
+                    let q_v = unsafe { *smem.add(d) };
+                    let k_off = physical_page * page_stride
+                        + token_in_page * (kv_dim as usize)
+                        + kv_head_idx * (head_dim as usize)
+                        + d;
+                    let k_v = KvBf16::read_kv(page_pool, k_off);
+                    dot += q_v * k_v;
+                }
+                dot *= scale;
+
+                let new_max = local_max.max(dot);
+                let correction = libm::expf(local_max - new_max);
+                local_sum = local_sum * correction + libm::expf(dot - new_max);
+                local_max = new_max;
+            }
+
+            // --- Block reduction: global max ---
+            unsafe { *smem.add(bdim + tid) = local_max; }
+            cuda_device::sync_threads();
+
+            let mut s = bdim / 2;
+            while s > 0 {
+                if tid < s {
+                    unsafe {
+                        let a = *smem.add(bdim + tid);
+                        let b = *smem.add(bdim + tid + s);
+                        *smem.add(bdim + tid) = a.max(b);
+                    }
+                }
+                cuda_device::sync_threads();
+                s >>= 1;
+            }
+            let global_max = unsafe { *smem.add(bdim) };
+
+            // --- Adjust per-thread sums to global max, then reduce ---
+            let adjusted_sum = local_sum * libm::expf(local_max - global_max);
+            unsafe { *smem.add(2 * bdim + tid) = adjusted_sum; }
+            cuda_device::sync_threads();
+
+            s = bdim / 2;
+            while s > 0 {
+                if tid < s {
+                    unsafe {
+                        let a = *smem.add(2 * bdim + tid);
+                        let b = *smem.add(2 * bdim + tid + s);
+                        *smem.add(2 * bdim + tid) = a + b;
+                    }
+                }
+                cuda_device::sync_threads();
+                s >>= 1;
+            }
+            let global_sum = unsafe { *smem.add(2 * bdim) };
+
+            // ================================================================
+            // Phase 2: Compute weighted V accumulation
+            // ================================================================
+            let inv_sum = if global_sum > 0.0f32 { 1.0 / global_sum } else { 0.0 };
+
+            if tid < head_dim as usize {
+                let mut out_val: f32 = 0.0;
+                for token_pos in 0..num_cached_tokens as usize {
+                    let logical_page = token_pos / page_size as usize;
+                    let token_in_page = token_pos % page_size as usize;
+                    let physical_page = block_table[logical_page] as usize;
+
+                    let mut dot: f32 = 0.0;
+                    for d in 0..head_dim as usize {
+                        let q_v = unsafe { *smem.add(d) };
+                        let k_off = physical_page * page_stride
+                            + token_in_page * (kv_dim as usize)
+                            + kv_head_idx * (head_dim as usize)
+                            + d;
+                        let k_v = KvBf16::read_kv(page_pool, k_off);
+                        dot += q_v * k_v;
+                    }
+                    dot *= scale;
+
+                    let weight = libm::expf(dot - global_max) * inv_sum;
+                    let v_off = physical_page * page_stride
+                        + (page_size as usize) * (kv_dim as usize)
+                        + token_in_page * (kv_dim as usize)
+                        + kv_head_idx * (head_dim as usize)
+                        + tid;
+                    let v_val = KvBf16::read_kv(page_pool, v_off);
+                    out_val += weight * v_val;
+                }
+                unsafe {
+                    *output.get_unchecked_mut(q_idx * (head_dim as usize) + tid) = f32_to_bf16(out_val);
+                }
+            }
+
+            cuda_device::sync_threads();
+        }
     }
 
     /// Rotary Position Embedding with precomputed sin/cos.
