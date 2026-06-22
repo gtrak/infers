@@ -1,204 +1,271 @@
-# Phase 24: cuda-oxide — End-to-End Inference with Trait-Based Quant Dispatch
+# Phase 24: cuda-oxide — End-to-End Inference, All Kernels in Rust
 
 ---
 **Status**: NOT STARTED
 **Last Updated**: 2026-06-22
 **Blocks**: Multi-format quantization support (GGUF, AWQ, GPTQ)
 **Blocked by**: Nothing
-**Rationale**: Replace the nvcc-compiled INT4 GEMM kernel with a Rust kernel compiled via cuda-oxide, with `Dequantize` trait-based dispatch for quant formats. This is the primary value proposition of cuda-oxide: one generic kernel monomorphized per format at zero runtime cost. Phase 023 established that all kernel features work (smem, bf16, int4, gdn, 80KB smem, generics via `cargo oxide`). This phase makes it production.
+**Rationale**: Replace all 22 nvcc-compiled CUDA kernels with Rust kernels compiled via cuda-oxide. Primary motivation: trait-based quant dispatch for INT4 GEMM. Secondary motivation: unify all GPU code in one language — no more nvcc, no more .cu/.cuh files, no more build.rs with nvcc flags, no more CUDA C context-switching. Phase 023 proved all kernel features work (smem, bf16, int4, gdn, 80KB smem, generics, math intrinsics). This phase makes it production.
 ---
 
-## What Changed Since Plan Was Written
+## Architecture: cuda-oxide Runtime + cudarc Coexistence
 
-Phase 023's exploration corrected a critical misunderstanding: **trait-based generic dispatch IS feasible** in cuda-oxide when built via `cargo oxide` (not via the `RUSTFLAGS` codegen backend shortcut). The `cross_crate_embedded` example with `scale<T>` passes. The E0282 phantom type param issue has a simple workaround (`PhantomData<D>` in kernel args). Const generics still fail at runtime (cuda-oxide bug), but trait generics work.
+**Primary path**: Use cuda-oxide's own runtime (`CudaContext`, `DeviceBuffer`, `#[cuda_module]` typed launch) for Rust kernels. cudarc stays for cuBLASLt, NCCL, and host orchestration. Both share the same CUDA primary context (proven in coexistence POC).
 
-The revised plan targets the actual blocker: **build system integration** — how to compile Rust kernels via `cargo oxide` and load the resulting PTX via cudarc at runtime, without memory copy overhead.
+**Why not extract PTX and load via cudarc?** It works but buys us almost nothing — the data copies between cudarc `CudaSlice` and cuda-oxide `DeviceBuffer` are negligible (GPU-internal memcpy at ~500 GB/s). For M=1 decode, the total copy overhead per GEMM call is ~0.04μs. The kernel reads ~13MB of weights. The copy is noise. And we might be able to avoid copies entirely by constructing cuda-oxide slice views from cudarc device pointers (same address space, same context).
 
-## Architecture: Rust→PTX→cudarc Pipeline
+The cuda-oxide runtime gives us typed launch wrappers via `#[cuda_module]`, compile-time argument checking, and the natural integration path. PTX-via-cudarc is a fallback if profiling ever shows a problem (unlikely).
 
-The key design: **compile Rust kernels to PTX via `cargo oxide`, load PTX via cudarc at runtime.** This eliminates the memory copy overhead of the cuda-oxide runtime coexistence approach, and requires no API changes to the existing host-side launch code.
+### Trait dispatch via monomorphized `#[kernel]` wrappers
 
-```
-Rust kernel source (crates/cuda-oxide-kernels/src/)
-  → cargo oxide build
-  → PTX embedded in kernel-lib binary
-  → Extract PTX at build time → save as .ptx file
-  → cudarc loads .ptx at runtime (cuModuleLoadDataEx)
-  → Launch via existing cudarc launch_builder (same as .cubin)
-```
-
-The Rust kernel must produce the same PTX entry point name and argument layout as the existing .cu kernel. cudarc can't tell the difference.
-
-### Why not cuda-oxide's own runtime?
-
-The `cuda-oxide` runtime (`CudaContext`, `DeviceBuffer`, `#[cuda_module]` launch API) works but requires copying data between cudarc `CudaSlice` and cuda-oxide `DeviceBuffer` for each kernel call. With ~384 INT4 GEMM calls per forward pass (6 per layer × 64 layers), the copy overhead would be measurable. Loading PTX via cudarc avoids all copies — the Rust kernel operates directly on cudarc-allocated memory.
-
-### Trait dispatch via monomorphized wrappers
-
-Generic `#[kernel]` functions monomorphize to separate PTX entry points. We create named wrappers for each format:
+Generic `#[kernel]` functions monomorphize correctly via `cargo oxide`. We create named wrappers for each quant format with `PhantomData<Q>` to solve E0282:
 
 ```rust
 // Generic inner kernel
-fn int4_gemm_inner<Q: Dequantize>(output: *mut bf16, weight: *const u32, ..., _marker: PhantomData<Q>) { ... }
+fn int4_gemm_inner<Q: Dequantize>(..., _marker: PhantomData<Q>) { ... }
 
-// Monomorphized wrappers with known PTX entry point names
+// Monomorphized wrappers — each becomes a separate PTX entry point
 #[kernel]
-fn int4_gemm_auto_round(output: *mut bf16, weight: *const u32, ...) {
-    int4_gemm_inner::<AutoRound>(output, weight, ..., PhantomData)
+fn int4_gemm_auto_round(...) {
+    int4_gemm_inner::<AutoRound>(..., PhantomData)
 }
 
 #[kernel]
-fn int4_gemm_gguf(output: *mut bf16, weight: *const u32, ...) {
-    int4_gemm_inner::<Gguf>(output, weight, ..., PhantomData)
+fn int4_gemm_gguf(...) {
+    int4_gemm_inner::<Gguf>(..., PhantomData)
 }
 ```
 
-cudarc loads `int4_gemm_auto_round` from the PTX, just like it loads `int4_gemm_kernel` from the .cubin today.
+## Kernel Migration: All 22 Custom Kernels
 
-## Scope: What We Rewrite, What We Keep
+We're converting everything. The POCs already validated every feature pattern needed.
 
-### Rewrite in Rust via cuda-oxide (3 kernels)
+### Tier 1: Simple elementwise (7 kernels) — trivially portable
 
-| Kernel | .cu Lines | Why | Priority |
-|--------|----------|-----|----------|
-| `int4_gemm_kernel` | 111 | Quantization-sensitive. Trait dispatch is the main motivation. | **P0** |
-| `infers_fp8_quantize_bf16` / `infers_fp8_dequantize_bf16` | ~40 | Format-sensitive (E4M3, E5M2, future NVFP4). Clean trait target. | P1 |
-| `infers_paged_attention_decode_bf16` | 166 | Reads quantized KV cache (BF16, FP8). Dequant inside attention loop. | P2 |
+| .cu Kernel | Lines | Rust Pattern | POC Precedent |
+|------------|-------|-------------|---------------|
+| `argmax.cu` | ~30 | Block reduction, BF16→F32 | reduce_benchmark in POC |
+| `elementwise.cu` | ~20 | Element-wise add | vec_add in POC |
+| `embedding.cu` | ~25 | Index gather | vec_add pattern (direct indexing) |
+| `rope.cu` | ~40 | Trig + rotation | libm math in POC (expf, sqrtf) |
+| `silu.cu` | ~30 | SiLU + SwiGLU gating | sigmoid in POC |
+| `sampling.cu` | ~25 | Argmax wrapper | argmax pattern |
+| `kv_cache.cu` | ~35 | Scattered write by position | direct indexing |
 
-### Keep on nvcc (22 kernels)
+### Tier 2: Shared memory reductions (6 kernels) — POC'd patterns
 
-GDN kernels (8): format-agnostic, 80KB smem, complex algorithms — no quant dispatch benefit.
-Simple elementwise (8): too small, no quant sensitivity.
-Shared memory reductions (5): format-agnostic, low migration value.
-cuBLASLt: stays via cudarc. NCCL: stays via cudarc.
+| .cu Kernel | Lines | Rust Pattern | POC Precedent |
+|------------|-------|-------------|---------------|
+| `rmsnorm.cu` | 66 | Block reduction + shared mem + rsqrtf | rmsnorm_static_smem + rmsnorm_dynamic_smem in POC |
+| `rms_norm_gated.cu` | ~80 | Same with gating | rmsnorm + silu pattern |
+| `l2norm_bf16.cu` | ~50 | L2 normalization | rmsnorm pattern (sum squares instead of sum) |
+| `softmax.cu` | 98 | 3-phase online softmax, causal mask | tree reduction + shared mem in POC |
+| `conv1d_depthwise.cu` | ~60 | Causal depthwise conv | direct indexing + smem |
+| `paged_kv_write.cu` / `paged_kv_read.cu` | ~50 each | Block-table gather/scatter | direct indexing |
+
+### Tier 3: Quantization-sensitive (3 kernels) — primary motivation
+
+| .cu Kernel | Lines | Why trait dispatch | POC Precedent |
+|------------|-------|-------------------|---------------|
+| `int4_gemm.cu` | 111 | `Dequantize` trait: AutoRound, GGUF, AWQ, GPTQ | int4_gemm + quant_gemm_dispatch in POC |
+| `fp8_quantize.cu` | ~40 | `Fp8Format` trait: E4M3, E5M2, NVFP4 | bf16 conversion pipeline in POC |
+| `paged_attention_decode.cu` | 166 | `KvCacheFormat` trait: BF16, FP8 | paged_kv pattern |
+
+### Tier 4: GDN (6 active kernels) — most complex, but POC'd
+
+| .cu Kernel | Lines | Rust Pattern | POC Precedent |
+|------------|-------|-------------|---------------|
+| `gdn_recurrent_step.cu` | ~100 | Single-token decode, no smem | gdn_recurrent_step in POC ✅ |
+| `gdn_mamba2_update.cu` | ~80 | SSM decode, no smem | gdn_mamba2_update in POC ✅ |
+| `gdn_update.cu` | ~60 | Single-token update | recurrent_step pattern |
+| `gdn_gated_delta_update.cu` | ~100 | Gated delta decode | recurrent_step pattern |
+| `gdn_gated_delta_prefill.cu` | ~200 | Sequential prefill | recurrent_step + token loop |
+| `gdn_chunked_gated_delta_prefill.cu` | 405 | 80KB smem, WY representation, forward substitution | dynamic_smem_80kb in POC ✅ |
+
+Note: `gdn_mamba2_prefill.cu` and `gdn_gated_delta_prefill.cu` are loaded but not in the active forward path (superseded by chunked versions). We'll port the active 6 only.
 
 ## Task Breakdown
 
-### Commit 1: Kernel crate + build pipeline
+### Commit 1: Kernel crate + build pipeline + first kernel
 
-**Files**: new `crates/cuda-oxide-kernels/`, `crates/cuda/build.rs` (updated)
+**Files**: new `crates/cuda-oxide-kernels/`, `crates/cuda/src/lib.rs`
 
 | # | Task | Detail |
 |---|------|--------|
-| 1 | Create `crates/cuda-oxide-kernels/` as standalone workspace | Same pattern as POCs — own `[workspace]`, not infers member |
+| 1 | Create `crates/cuda-oxide-kernels/` as standalone workspace | Own `[workspace]`, same pattern as POCs |
 | 2 | Configure deps: cuda-core, cuda-device, cuda-host (git), libm | Same as POC |
-| 3 | Write minimal `#[kernel]` test kernel (vector-add) | Validate build pipeline |
-| 4 | Run `cargo oxide build` from within the crate | Verify PTX generation |
-| 5 | Determine how to extract PTX from build output | Check `target/`, intermediate files, or `#[cuda_module]` embedded bytes |
-| 6 | Write build script to save PTX as `.ptx` file in `crates/cuda/kernels/compiled/` | Or embed PTX bytes via `include_bytes!` in infers-cuda |
-| 7 | Add cudarc `.ptx` loading support | cudarc `CudaModule::from_ptx()` or `cuModuleLoadDataEx` with PTX string |
-| 8 | Test: cudarc loads the Rust PTX and launches vector-add kernel | End-to-end: Rust kernel → PTX → cudarc load → GPU execution |
-
-**Complexity**: M
-**Timebox**: 3 hours
-**Acceptance**: A Rust `#[kernel]` function compiles via `cargo oxide`, the PTX is loaded by cudarc at runtime, and the kernel runs correctly on GPU. No cuda-oxide runtime deps in infers-cuda — only cudarc loads the PTX.
-
----
-
-### Commit 2: `Dequantize` trait + INT4 GEMM kernel
-
-**Files**: `crates/cuda-oxide-kernels/src/lib.rs`, `crates/cuda-oxide-kernels/src/int4_gemm.rs`
-
-| # | Task | Detail |
-|---|------|--------|
-| 1 | Define `Dequantize` trait | `fn dequant_group(packed: u32, scale_f16_bits: u16, zero_i8: i8, group_idx: u32, col: u32, n: u32, k: u32, group_size: u32, transposed: bool) -> [f32; 8]` — returns 8 dequantized f32 values from one packed u32 |
-| 2 | Implement `AutoRound` | `(w_int4 - (zero + 1)) * scale` — matches existing .cu kernel |
-| 3 | Implement `Gguf` | `(w - z) * scale` — GGUF format |
-| 4 | Write generic `int4_gemm_inner<Q: Dequantize>` | Port from `int4_gemm.cu`, preserving exact argument order and layout |
-| 5 | Write monomorphized wrappers: `int4_gemm_auto_round`, `int4_gemm_gguf` | `#[kernel]` functions with `PhantomData<Q>` workaround for E0282 |
-| 6 | Verify PTX entry point names match expectations | Check PTX output for function names |
-| 7 | Unit test: AutoRound output matches .cu kernel on representative shapes | M=1,N=5120,K=5120 and M=4,N=17408,K=5120 |
-
-**Complexity**: M
-**Timebox**: 3 hours
-**Acceptance**: Rust INT4 GEMM with `AutoRound` produces output matching the .cu kernel within BF16 precision (FP32 accumulation, BF16 output). `Gguf` variant compiles and produces correctly dequantized values. Both are separate PTX entry points.
-
----
-
-### Commit 3: Host-side integration — swap .cubin for .ptx
-
-**Files**: `crates/cuda/src/kernels.rs`, `crates/cuda/src/gemm.rs`, `crates/cuda/build.rs`
-
-| # | Task | Detail |
-|---|------|--------|
-| 1 | Add PTX file to `crates/cuda/kernels/compiled/` | From Commit 1's build output |
-| 2 | Register `int4_gemm_auto_round` in KernelRegistry | Replace or supplement `int4_gemm_kernel` entry |
-| 3 | Update `matmul_int4()` launch to use new kernel name | Or add a separate `matmul_int4_auto_round()` that targets the Rust kernel |
-| 4 | Update `gemm_dispatch.rs` to use new launch function | `CachedWeight::Int4` path calls the Rust kernel |
-| 5 | Integration test: single-layer forward pass with Rust INT4 GEMM | Compare output against nvcc version |
-| 6 | End-to-end test: server produces tokens | `cargo run --release -p infers-server -- ...` with real model |
+| 3 | Port `elementwise.cu` → `infers_add_bf16` Rust kernel | Simplest kernel — validates pipeline |
+| 4 | Add `#[cuda_module]` with kernel, write host-side launch test | Validates load + launch via cuda-oxide runtime |
+| 5 | Verify coexistence: run cuda-oxide kernel + cudarc cuBLASLt in same process | Confirms no regression vs POC |
 
 **Complexity**: M
 **Timebox**: 2 hours
-**Acceptance**: The server starts, loads the model, and produces correct tokens with the Rust INT4 GEMM kernel replacing the .cu version. Output matches the nvcc-based version (same tokens for same prompt).
+**Acceptance**: Rust `infers_add_bf16` kernel compiles via `cargo oxide`, loads via `#[cuda_module]`, runs on GPU, and produces correct output. cudarc cuBLASLt GEMM still works in same process.
 
 ---
 
-### Commit 4: FP8 quantize/dequantize with format trait
+### Commit 2: Tier 1 — all simple elementwise kernels
 
-**Files**: `crates/cuda-oxide-kernels/src/fp8_quantize.rs`
+**Files**: `crates/cuda-oxide-kernels/src/`
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Port `argmax.cu` | Block reduction, BF16→F32 |
+| 2 | Port `embedding.cu` | Index gather |
+| 3 | Port `rope.cu` | Trig + rotation (libm sinf/cosf) |
+| 4 | Port `silu.cu` | SiLU + SwiGLU gating |
+| 5 | Port `sampling.cu` | Argmax wrapper |
+| 6 | Port `kv_cache.cu` | Scattered write by position |
+| 7 | Unit test each against CPU reference | Bit-exact or within BF16 precision |
+
+**Complexity**: M
+**Timebox**: 2 hours
+**Acceptance**: All 7 simple kernels compile, load, and produce correct output.
+
+---
+
+### Commit 3: Tier 2 — shared memory kernels
+
+**Files**: `crates/cuda-oxide-kernels/src/`
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Port `rmsnorm.cu` | Block reduction + static shared mem (already POC'd) |
+| 2 | Port `rms_norm_gated.cu` | RMSNorm + SiLU gating |
+| 3 | Port `l2norm_bf16.cu` | L2 normalization |
+| 4 | Port `softmax.cu` | 3-phase online softmax, causal mask |
+| 5 | Port `conv1d_depthwise.cu` | Causal depthwise conv |
+| 6 | Port `paged_kv_write.cu` | Block-table write |
+| 7 | Port `paged_kv_read.cu` | Block-table gather |
+| 8 | Unit test each against CPU reference | Within BF16 precision |
+
+**Complexity**: M
+**Timebox**: 3 hours
+**Acceptance**: All 6 shared memory kernels compile, load, and produce correct output. Dynamic shared memory works via cuFuncSetAttribute workaround where needed.
+
+---
+
+### Commit 4: `Dequantize` trait + INT4 GEMM
+
+**Files**: `crates/cuda-oxide-kernels/src/int4_gemm.rs`
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Define `Dequantize` trait | Group-level dequant: `fn dequant_group(packed, scale, zero, ...) -> [f32; 8]` |
+| 2 | Implement `AutoRound` | `(w_int4 - (zero + 1)) * scale` — matches existing .cu kernel |
+| 3 | Implement `Gguf` | `(w - z) * scale` — GGUF format |
+| 4 | Write generic `int4_gemm_inner<Q: Dequantize>` | Port from `int4_gemm.cu`, preserving exact layout |
+| 5 | Write monomorphized wrappers: `int4_gemm_auto_round`, `int4_gemm_gguf` | `#[kernel]` with `PhantomData<Q>` |
+| 6 | Unit test: AutoRound matches .cu kernel | M=1,N=5120,K=5120 (decode) + M=4,N=17408,K=5120 (prefill) |
+
+**Complexity**: M
+**Timebox**: 2 hours
+**Acceptance**: Rust INT4 GEMM with `AutoRound` matches .cu kernel output. `Gguf` compiles and runs correctly. Both are separate PTX entry points.
+
+---
+
+### Commit 5: FP8 + paged attention with format traits
+
+**Files**: `crates/cuda-oxide-kernels/src/fp8_quantize.rs`, `crates/cuda-oxide-kernels/src/paged_attn_decode.rs`
 
 | # | Task | Detail |
 |---|------|--------|
 | 1 | Define `Fp8Format` trait | `fn quantize(val: f32) -> u8`, `fn dequantize(val: u8) -> f32` |
-| 2 | Implement `Fp8E4M3` | Current `infers_fp8_quantize_bf16` mode=0 behavior |
-| 3 | Implement `Fp8E5M2` | Current `infers_fp8_dequantize_bf16` mode=1 behavior |
-| 4 | Write generic `fp8_quantize_inner<F: Fp8Format>` + wrappers | `fp8_quantize_e4m3`, `fp8_dequantize_e4m3`, `fp8_quantize_e5m2`, `fp8_dequantize_e5m2` |
-| 5 | Register in KernelRegistry, update host launch code | Wire into KV cache quantization path |
-| 6 | Unit test: output matches .cu kernel for both formats | BF16→FP8→BF16 round-trip |
-
-**Complexity**: S
-**Timebox**: 1.5 hours
-**Acceptance**: Rust FP8 kernels produce correct output for both E4M3 and E5M2. Loaded via cudarc.
-
----
-
-### Commit 5: Paged attention decode with KV cache format trait
-
-**Files**: `crates/cuda-oxide-kernels/src/paged_attn_decode.rs`
-
-| # | Task | Detail |
-|---|------|--------|
-| 1 | Define `KvCacheFormat` trait | `fn read_kv(ptr: *const u8, offset: u32) -> f32` — dequantize on read |
-| 2 | Implement `KvBf16` | Direct BF16 read (current behavior) |
-| 3 | Implement `KvFp8E4M3` | FP8→BF16 dequantize on read |
-| 4 | Write generic `paged_attention_decode_inner<K: KvCacheFormat>` | Port from `paged_attention_decode.cu` |
-| 5 | Write monomorphized wrappers | `paged_attention_decode_bf16`, `paged_attention_decode_fp8` |
-| 6 | Register in KernelRegistry | Replace `infers_paged_attention_decode_bf16` |
-| 7 | Unit test: BF16 output matches .cu kernel | Decode with 2048-token context |
+| 2 | Implement `Fp8E4M3` and `Fp8E5M2` | Match existing .cu modes |
+| 3 | Write fp8 quantize/dequantize with format trait | Monomorphized wrappers per format |
+| 4 | Define `KvCacheFormat` trait | `fn read_kv(ptr, offset) -> f32` |
+| 5 | Implement `KvBf16` and `KvFp8E4M3` | BF16 direct read + FP8 dequant |
+| 6 | Port `paged_attention_decode.cu` with KV format trait | 166-line kernel, 2-pass online softmax |
+| 7 | Unit test all | BF16 path matches .cu kernel |
 
 **Complexity**: M
 **Timebox**: 2 hours
-**Acceptance**: Rust paged attention decode with `KvBf16` produces correct output. `KvFp8` compiles and runs. Both loaded via cudarc.
+**Acceptance**: FP8 quantize/dequantize correct for both formats. Paged attention decode with KvBf16 matches .cu kernel. KvFp8 compiles and runs.
 
 ---
 
-### Commit 6: Latency benchmark
+### Commit 6: GDN kernels
 
-**Files**: `crates/cuda/benches/oxide_vs_nvcc.rs`
+**Files**: `crates/cuda-oxide-kernels/src/gdn/`
 
 | # | Task | Detail |
-|---|------|
-| 1 | Benchmark INT4 GEMM: Rust vs .cu | M=1, N=5120, K=5120 (decode shape); M=4, N=17408, K=5120 (prefill shape) |
-| 2 | Benchmark FP8 quantize: Rust vs .cu | 1M elements BF16→FP8→BF16 |
-| 3 | Benchmark paged attention: Rust vs .cu | seq_len=1, context=2048, GQA=6 |
-| 4 | Document results | Performance parity assessment |
+|---|------|--------|
+| 1 | Port `gdn_recurrent_step.cu` | Already POC'd ✅ — copy from POC, adapt to module structure |
+| 2 | Port `gdn_mamba2_update.cu` | Already POC'd ✅ — same |
+| 3 | Port `gdn_update.cu` | Simple single-token update |
+| 4 | Port `gdn_gated_delta_update.cu` | Gated delta decode |
+| 5 | Port `gdn_gated_delta_prefill.cu` | Sequential prefill |
+| 6 | Port `gdn_chunked_gated_delta_prefill.cu` | 80KB smem + WY representation — most complex kernel, already POC'd smem pattern |
+| 7 | Unit test each against CPU reference | Within 1e-3 (GDN math precision) |
+
+**Complexity**: L
+**Timebox**: 4 hours
+**Acceptance**: All 6 active GDN kernels compile, load, and produce correct output. 80KB smem works via cuFuncSetAttribute.
+
+---
+
+### Commit 7: Host integration — wire into forward pass
+
+**Files**: `crates/cuda/src/lib.rs`, `crates/backends/native/src/engine.rs`, `crates/backends/native/src/gemm_dispatch.rs`, all forward-pass modules
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Add cuda-oxide-kernels as a dependency of infers-cuda (or infers-backend-native) | The kernel crate provides `#[cuda_module]` module + typed launch API |
+| 2 | Replace `LoadedKernelRegistry` kernel launches with cuda-oxide module launches | Where applicable — some kernels may still use cudarc for cuBLASLt interop |
+| 3 | Update `gemm_dispatch.rs` to use `int4_gemm_auto_round` from Rust kernel | `CachedWeight::Int4` path calls the Rust kernel |
+| 4 | Update engine forward pass to use Rust kernels for all non-cuBLASLt ops | Replace .cubin launches with cuda-oxide launches |
+| 5 | End-to-end test: server produces correct tokens | `cargo run --release -p infers-server` with real model |
+
+**Complexity**: M
+**Timebox**: 3 hours
+**Acceptance**: Server starts, loads model, and produces correct tokens using all-Rust kernels. Output matches the nvcc-based version (same tokens for same prompt).
+
+---
+
+### Commit 8: Remove nvcc build system
+
+**Files**: `crates/cuda/build.rs`, `crates/cuda/kernels/infers/*.cu`, `crates/cuda/kernels/infers/common.cuh`, `crates/cuda/src/kernels.rs`
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Remove `build.rs` (nvcc compilation) | No more nvcc dependency |
+| 2 | Remove `crates/cuda/kernels/infers/*.cu` and `common.cuh` | All source now in Rust |
+| 3 | Remove `crates/cuda/kernels/compiled/*.cubin` | No more compiled cubin files |
+| 4 | Remove `LoadedKernelRegistry` | No more .cubin loading at runtime |
+| 5 | Remove nvcc-related code from `crates/cuda/src/kernels.rs` | Simplify module |
+| 6 | Verify full build + test still works | `cargo build --release && cargo test --release` |
 
 **Complexity**: S
 **Timebox**: 1 hour
-**Acceptance**: Benchmark results documented. Each Rust kernel within 10% of nvcc latency. If >10% regression, keep on nvcc and file issue.
+**Acceptance**: No nvcc, no .cu files, no .cubin files, no build.rs. Build succeeds. Server runs correctly.
 
 ---
 
-### Commit 7: Documentation + lat.md update
+### Commit 9: Latency benchmark
+
+**Files**: `crates/cuda/benches/oxide_vs_nvcc.rs` or similar
+
+| # | Task | Detail |
+|---|------|--------|
+| 1 | Benchmark critical kernels: INT4 GEMM, rmsnorm, softmax, gdn_chunked | Compare vs baseline (document numbers, not automated gate) |
+| 2 | Benchmark end-to-end decode throughput | tok/s with Rust kernels vs old nvcc numbers |
+| 3 | Document results | Include in plan/research/cuda-oxide.md |
+
+**Complexity**: S
+**Timebox**: 1 hour
+**Acceptance**: Benchmark numbers documented. No requirement to match nvcc exactly — if there's a regression, we note it and decide whether to optimize or accept.
+
+---
+
+### Commit 10: Documentation + lat.md update
 
 **Files**: `lat.md/arch.md`, `plan/research/cuda-oxide.md`
 
 | # | Task | Detail |
 |---|------|--------|
-| 1 | Update lat.md/arch.md: cuda-oxide production section | Kernel crate, build pipeline, trait dispatch pattern, cudarc PTX loading |
+| 1 | Update lat.md/arch.md: cuda-oxide production section | Kernel crate, build pipeline, trait dispatch, all-kernels-migrated status |
 | 2 | Document quantization trait design | How to add a new format: one trait impl + one `#[kernel]` wrapper |
-| 3 | Update plan/research/cuda-oxide.md | Migration complete for 3 kernels, 22 remain on nvcc |
+| 3 | Update plan/research/cuda-oxide.md | Full migration complete. No nvcc dependency. |
 | 4 | Run `lat check` | All links pass |
 
 **Complexity**: XS
@@ -207,78 +274,53 @@ cuBLASLt: stays via cudarc. NCCL: stays via cudarc.
 
 ## Key Design Decisions
 
-### KD1: PTX loaded via cudarc, not cuda-oxide runtime
+### KD1: Use cuda-oxide runtime, not PTX-via-cudarc
 
-cuda-oxide's own runtime (CudaContext, DeviceBuffer) works but requires memory copies between cudarc and cuda-oxide buffers. With ~384 INT4 GEMM calls per forward pass, this overhead is measurable. Loading the PTX via cudarc's module loading API (cuModuleLoadDataEx) avoids all copies — the Rust kernel operates directly on cudarc-allocated `CudaSlice` buffers, same as .cubin kernels.
+The cuda-oxide runtime provides typed launch wrappers, `#[cuda_module]` auto-generation, and the natural integration path. Data copies between cudarc and cuda-oxide buffers are negligible (GPU-internal memcpy at ~500 GB/s). We may even be able to avoid copies by constructing cuda-oxide slice views from cudarc device pointers (same address space). PTX-via-cudarc is a fallback if profiling ever shows a problem.
 
-### KD2: Monomorphized `#[kernel]` wrappers, not bare generic `#[kernel]`
+### KD2: Convert all kernels, not just quant-sensitive ones
 
-Generic `#[kernel]` functions monomorphize correctly via `cargo oxide`, but the PTX entry point names are mangled. By creating explicit wrappers (`int4_gemm_auto_round`, `int4_gemm_gguf`), we get predictable PTX entry point names that can be registered in cudarc's KernelRegistry. The inner generic function (`int4_gemm_inner<Q: Dequantize>`) is not a `#[kernel]` — it's a regular `#[inline(always)]` function that gets monomorphized into each wrapper.
+Rust is easier to understand, modify, and debug than CUDA C. Having all GPU code in one language eliminates the cognitive overhead of context-switching and the maintenance burden of two build systems. The POCs already validated every feature pattern needed — there are no unknown unknowns.
 
-### KD3: Only rewrite quantization-sensitive kernels
+### KD3: Standalone kernel crate, not infers workspace member
 
-GDN kernels: format-agnostic, 80KB smem, complex — no quant dispatch benefit. Simple elementwise: too small. The three quant-sensitive kernels give the most value for the least effort. Other 22 kernels stay on nvcc.
+`cargo oxide build` doesn't support `-p <crate>` from a workspace root. The kernel crate must be a standalone workspace (like the POCs). Build: `cargo oxide build` from `crates/cuda-oxide-kernels/`. The compiled binary with embedded PTX is linked into the main workspace as a dependency.
 
-### KD4: E0282 workaround via PhantomData
+### KD4: Monomorphized `#[kernel]` wrappers for trait dispatch
 
-The `Dequantize` trait parameter `Q` doesn't appear in the kernel argument list — Rust can't infer it (E0282). Workaround: add `_marker: PhantomData<Q>` as the first kernel argument. On the host side, pass `PhantomData::<AutoRound>` when launching. This is zero-cost at runtime (PhantomData is ZST).
+Generic `#[kernel]` functions monomorphize correctly via `cargo oxide`, but `PhantomData<Q>` is needed to solve E0282 (phantom type param inference). Named wrappers (`int4_gemm_auto_round`, `int4_gemm_gguf`) give us clear, predictable entry points.
 
-### KD5: Benchmark gate
+### KD5: Keep cudarc for cuBLASLt + NCCL
 
-Each Rust kernel must match nvcc latency within 10%. If a kernel regresses beyond the threshold, it stays on nvcc. INT4 GEMM is the most performance-critical — it runs in every forward pass, every layer.
-
-### KD6: Standalone kernel crate, not infers workspace member
-
-`cargo oxide build` doesn't support `-p <crate>` from a workspace root. The kernel crate must be a standalone workspace (like the POCs). Build: `cargo oxide build` from `crates/cuda-oxide-kernels/`. The PTX output gets copied or included into infers-cuda.
+cuda-oxide doesn't provide cuBLASLt or NCCL bindings. cudarc stays for those operations. Both runtimes coexist on the same CUDA primary context (proven in coexistence POC).
 
 ## Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| PTX entry point names don't match expectations | Medium | Medium | Inspect PTX output before writing host code. Use `extern "C"` or named wrappers. |
-| cudarc can't load PTX (only .cubin) | Low | High | cudarc supports `CudaModule::from_ptx()`. Fallback: use `cuModuleLoadDataEx` directly via cudarc's sys bindings. |
-| PTX JIT compilation slower than .cubin load | Low | Low | PTX JIT happens once at module load time, not per kernel launch. Acceptable for startup. |
-| INT4 GEMM PTX quality worse than nvcc | Medium | Medium | Benchmark gate. If >10% slower, keep on nvcc. |
-| PhantomData argument disrupts kernel ABI | Low | High | Test in Commit 2. If PTX argument layout doesn't match cudarc expectations, use enum dispatch instead. |
-| cargo-oxide build output not extractable as .ptx file | Medium | Medium | Fallback: use `#[cuda_module]` to embed PTX in a test binary, extract bytes at build time from the compiled binary's data section. |
+| cuda-oxide runtime + cudarc stream interop issues | Low | Medium | Coexistence POC already validated. Test early in Commit 1. |
+| PTX quality worse than nvcc for complex kernels | Medium | Low | Benchmark and document. LLVM NVPTX is mature; regressions likely minor. |
+| 80KB smem in GDN chunked kernel | Low | High | POC already validated via cuFuncSetAttribute workaround. |
+| GDN math precision (expf, logf vs fast-math) | Low | Medium | cuda-oxide intercepts libm to libdevice (no fast-math). Same or better precision than our nvcc non-fast-math GDN builds. |
+| cargo-oxide build not reproducible | Low | Low | Pin git revision in Cargo.toml. |
+| Alpha API breakage in cuda-oxide | Medium | Medium | Pin git revision. The kernel code uses stable cuda-oxide APIs (#[kernel], #[cuda_module], thread indexing, smem). |
 
 ## Success Criteria
 
-- [ ] Rust `#[kernel]` compiles via `cargo oxide build` to PTX
-- [ ] PTX loads via cudarc at runtime (no cuda-oxide runtime deps in infers-cuda)
-- [ ] `int4_gemm_auto_round` produces output matching .cu kernel (BF16 precision)
-- [ ] `int4_gemm_gguf` compiles, loads, and produces correctly dequantized output
-- [ ] Server produces correct tokens using Rust INT4 GEMM (end-to-end)
-- [ ] `fp8_quantize_e4m3` and `fp8_dequantize_e5m2` produce correct output
-- [ ] `paged_attention_decode_bf16` produces correct output
-- [ ] All three Rust kernels within 10% of nvcc latency
-- [ ] lat.md updated with cuda-oxide production findings
-- [ ] `lat check` passes
+- [ ] All 22 custom kernels compile and run via cuda-oxide
+- [ ] `Dequantize` trait with `AutoRound` and `Gguf` dispatch works
+- [ ] `Fp8Format` trait with E4M3 and E5M2 works
+- [ ] `KvCacheFormat` trait with BF16 and FP8 works
+- [ ] Server produces correct tokens end-to-end with Rust kernels
+- [ ] No nvcc, no .cu files, no .cubin files, no build.rs
+- [ ] lat.md updated, `lat check` passes
 
 ## Adding a New Quant Format
 
-With the trait-based design, adding a new format (e.g., AWQ) is:
+With the trait-based design, adding a new format (e.g., AWQ) requires only:
 
-```rust
-// 1. Implement the trait (in cuda-oxide-kernels)
-struct Awq;
-impl Dequantize for Awq {
-    fn dequant_group(packed: u32, scale_f16_bits: u16, zero_i8: i8, ...) -> [f32; 8] {
-        // AWQ-specific dequantization logic
-    }
-}
+1. One `Dequantize` trait impl in the kernel crate
+2. One 3-line `#[kernel]` wrapper that calls the generic inner function
+3. One host-side launch function
 
-// 2. Add a monomorphized wrapper
-#[kernel]
-fn int4_gemm_awq(output: *mut bf16, weight: *const u32, ...) {
-    int4_gemm_inner::<Awq>(output, weight, ..., PhantomData)
-}
-
-// 3. Register in KernelRegistry (in infers-cuda)
-registry.register("int4_gemm_awq", kdir("int4_gemm_awq.ptx"));
-
-// 4. Launch from host code
-gemm_dispatch::gemm_projection_cached_awq(stream, int4_awq_kernel, ...);
-```
-
-No new CUDA kernel needed. No nvcc. No build system changes beyond registering the new PTX entry point. Just a trait impl + a 3-line wrapper.
+No new .cu file. No nvcc. No build system changes. Just Rust.
