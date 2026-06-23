@@ -12,10 +12,10 @@ use clap::Parser;
 use infers_backend_native::chat_template::{ChatTemplate, extract_template};
 use infers_backend_native::ForwardEngine;
 use infers_cuda::context::CudaRuntime;
+use infers_cuda::PinnedHostBuffer;
 use infers_cuda::stream::StreamPool;
 use infers_model::config::ModelConfig;
-use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
-use infers_model::{strip_language_model_prefix, build_main_layers, QuantTargetMap};
+use infers_model::{build_main_layers, build_metadata_registry, load_safetensors_mmap, shard_weights_tp_mmap, strip_language_model_prefix_mmap, QuantTargetMap};
 
 /// Standalone inference binary for prefill + decode.
 #[derive(Parser, Debug)]
@@ -150,17 +150,16 @@ fn main() -> Result<()> {
         eprintln!("Using max_seq_len={}", default_max);
     }
 
-    // --- 2. Load raw safetensors and strip language_model prefix ---
-    let mut raw_weights = load_safetensors(&model_dir)?;
-    strip_language_model_prefix(&mut raw_weights);
-    eprintln!("Raw tensors loaded: {}", raw_weights.num_tensors());
+    // --- 2. Load safetensors via mmap and strip language_model prefix ---
+    let mut mmap_reg = load_safetensors_mmap(&model_dir)?;
+    strip_language_model_prefix_mmap(&mut mmap_reg);
 
-    // --- 3. Shard weights for TP ---
+    // --- 3. Shard weights for TP (mmap) ---
     let num_gpus = args.tp;
-    let shards = shard_weights_tp(&raw_weights, &config, num_gpus)?;
+    let shards = shard_weights_tp_mmap(&mmap_reg, &config, num_gpus)?;
     assert_eq!(shards.len(), num_gpus, "Expected {num_gpus} shards, got {}", shards.len());
 
-      // --- 4. Build per-GPU weight registries ---
+    // --- 4. Build per-GPU mmap registries + metadata registries ---
     let quant_map = if let Some(ref quant_config) = config.quantization_config {
         QuantTargetMap::from_config(quant_config)
             .unwrap_or_else(|e| {
@@ -170,21 +169,26 @@ fn main() -> Result<()> {
     } else {
         QuantTargetMap::empty()
     };
-    let mut weight_registries: Vec<infers_model::WeightRegistry> = Vec::new();
+    let mut mmap_registries: Vec<infers_model::MmapWeightRegistry> = Vec::new();
+    let mut metadata_registries: Vec<infers_model::WeightRegistry> = Vec::new();
     for shard in shards {
+        mmap_registries.push(shard.registry.clone());
         let gpu_id = shard.gpu_id;
-        let mut registry = shard.registry;
-        build_main_layers(&mut registry, &config, &quant_map)?;
+        let mut meta_registry = build_metadata_registry(&shard.registry);
+        build_main_layers(&mut meta_registry, &config, &quant_map)?;
         eprintln!(
             "Shard {}: layers={}, embedding={}, norm={}, lm_head={}",
             gpu_id,
-            registry.layers.len(),
-            registry.embedding.is_some(),
-            registry.norm.is_some(),
-            registry.lm_head.is_some(),
+            meta_registry.layers.len(),
+            meta_registry.embedding.is_some(),
+            meta_registry.norm.is_some(),
+            meta_registry.lm_head.is_some(),
         );
-        weight_registries.push(registry);
+        metadata_registries.push(meta_registry);
     }
+
+    // Drop original mmap registry — shards have Arc references
+    drop(mmap_reg);
 
     // --- 5. Initialize CUDA runtime ---
     let runtime = CudaRuntime::new()?;
@@ -208,14 +212,18 @@ fn main() -> Result<()> {
     // --- 6. Create stream pool ---
     let stream_pool = StreamPool::new(&gpu_contexts)?;
 
-    // --- 7. Create the forward engine ---
+    // --- 7. Create the forward engine (mmap path) ---
     let config = Arc::new(config);
     let engine_start = Instant::now();
-    let mut engine = ForwardEngine::new(
+    let mut pinned = PinnedHostBuffer::new(256 * 1024 * 1024)
+        .context("Failed to allocate pinned host buffer")?;
+    let mut engine = ForwardEngine::new_from_mmap(
         config.clone(),
-        weight_registries,
+        mmap_registries,
+        metadata_registries,
         gpu_contexts,
         stream_pool,
+        &mut pinned,
         args.group_size,
     )?;
     let engine_elapsed = engine_start.elapsed();
