@@ -489,6 +489,7 @@ pub fn decode_forward(
 ) -> Result<CudaSlice<bf16>> {
     let seq_len = 1usize;
     // Decoding shares the same probe infrastructure as forward().
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.hidden_input", input, &[1, hidden_size], "decode");
     // Probe config controls whether intermediates are dumped for this path too.
 
     // Compute sharded dimensions from actual weight shapes (TP-aware)
@@ -512,6 +513,7 @@ pub fn decode_forward(
             1, conv_dim, hidden_size, group_size,
         )?;
     }
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[1, conv_dim], "decode");
 
     // =========================================================================
     // Phase 2: Conv1d with causal conv_state (matches HF causal_conv1d_update)
@@ -574,6 +576,7 @@ pub fn decode_forward(
         stream.memcpy_dtod(&src_view, &mut dst)?;
         dst
     };
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out_last, &[1, conv_dim], "decode");
 
     // =========================================================================
     // Phase 3: Split
@@ -581,6 +584,8 @@ pub fn decode_forward(
     let query_flat = clone_view_to_slice(stream, &conv_out_last, 0..key_dim)?;
     let key_flat = clone_view_to_slice(stream, &conv_out_last, key_dim..2 * key_dim)?;
     let value_flat = clone_view_to_slice(stream, &conv_out_last, 2 * key_dim..2 * key_dim + value_dim)?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &query_flat, &[1, key_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &key_flat, &[1, key_dim], "decode");
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &value_flat, &[1, value_dim], "decode");
 
     // =========================================================================
@@ -670,6 +675,7 @@ pub fn decode_forward(
             &z_weight.name, input, &mut z_gate_raw,
             1, z_dim, hidden_size, group_size,
         )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &z_gate_raw, &[1, z_dim], "decode");
 
         let n_rows = num_v_heads;
         let norm_dim = head_v_dim;
@@ -690,6 +696,7 @@ pub fn decode_forward(
         gdn_output.try_clone()
             .map_err(|e| anyhow::anyhow!("Failed to clone decode GDN output: {e}"))?
     };
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.norm_output", &norm_output, &[1, num_v_heads * head_v_dim], "decode");
 
     // =========================================================================
     // Phase 9: Output projection → hidden_size
@@ -700,6 +707,7 @@ pub fn decode_forward(
         &weights.out_proj_weight.name, &norm_output, &mut output,
         1, hidden_size, value_dim, group_size,
     )?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[1, hidden_size], "decode");
 
     Ok(output)
 }

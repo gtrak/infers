@@ -1297,6 +1297,7 @@ dependencies = [
  "cuda-host",
  "cudarc",
  "half",
+ "serde_json",
  "tracing",
 ]
 

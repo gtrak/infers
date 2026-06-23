@@ -2138,11 +2138,11 @@ pub mod kernels {
                     let q_norm_rational = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt();
                     let exp_g_row = unsafe { libm::expf(*g_cs.add(row)) };
                     // ── attn_inter[row][col_v] = (q_normed * exp(g_cs) @ S) ──
+                    // @lat: [[tests/gdn_chunked_prefill_test#GDN Chunked Prefill Kernel Test#rcp_sqrt_k Double Application Bug Fix]]
                     let mut attn_inter_val = 0.0f32;
                     for d in 0..K {
                         let q_normed_f32 = q_reg[d] * q_norm_rational;
-                    let q_val_bf16 = f32::from_bits((f32_to_bf16(q_normed_f32) as u32) << 16);
-                    let q_scl = q_val_bf16 * rcp_sqrt_k * exp_g_row;
+                        let q_scl = q_normed_f32 * exp_g_row;
                         attn_inter_val += q_scl * state[state_base + d * V + col_v];
                     }
 
@@ -2155,8 +2155,7 @@ pub mod kernels {
                         for d in 0..K {
                             unsafe {
                                 let q_normed_f32 = q_reg[d] * q_norm_rational;
-                            let q_val_bf16 = f32::from_bits((f32_to_bf16(q_normed_f32) as u32) << 16);
-                            qk_dot_j += q_val_bf16 * rcp_sqrt_k * *k_normed.add(j * K + d);
+                                qk_dot_j += q_normed_f32 * *k_normed.add(j * K + d);
                             }
                         }
                         let g_diff = unsafe { *g_cs.add(row) - *g_cs.add(j) };
