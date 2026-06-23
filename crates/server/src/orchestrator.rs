@@ -204,6 +204,7 @@ impl InferenceOrchestrator {
             let sampled = self.engine.decode_paged(
                 &self.stream, token_id, position, seq_id,
                 sampling_config, &session.tokens, session.num_prompt_tokens, rng,
+                session.num_generated_tokens,
             )?;
 
             // Check stop tokens

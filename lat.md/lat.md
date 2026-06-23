@@ -281,6 +281,12 @@ For **NVFP4 (PrismaSCOUT)**: three-step pipeline using `oxide.launch_nvfp4_dequa
 
 Per-layer probe infrastructure for dumping intermediate tensors during inference via `INFERS_DUMP_DIR`, `INFERS_DUMP_LAYERS`, and `INFERS_DUMP_STAGES` environment variables. Writes raw bf16 bytes plus JSON metadata sidecars. See [[crates/backends/native/src/probe.rs]].
 
+## Logit Dump Debug Tool
+
+Debug feature for diagnosing stuck-token issues by printing top-5 logits at each decode step.
+
+Enabled via `INFERS_DUMP_LOGITS=1` environment variable. Downloads the full logits tensor from GPU 0 to CPU after LM head projection, computes statistics (max, min, standard deviation), sorts descending to find top-5 tokens, and prints to stderr in the format `[LOGIT-DUMP] step={step} top5=[(token_id, logit_value), ...] max_logit={max} min_logit={min} logit_std={std}`. See [[crates/backends/native/src/engine.rs]].
+
 # Mmap Weight Upload
 
 Zero-copy weight upload from memory-mapped safetensors files using cuMemcpy2D DMA. Supports BF16, FP16, FP32, INT4 packed, and NVFP4 quantized weights via companion detection in `quant_companions` map. See [[crates/cuda/src/memcpy2d.rs]].

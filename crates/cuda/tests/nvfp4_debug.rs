@@ -672,3 +672,170 @@ fn test_tile_boundary_small_k() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Test 7: Compare GPU dequant + GEMM pipeline against Python reference for layer 0 in_proj_qkv.
+/// Uses actual model weights from the safetensors file (saved as raw binary by Python).
+/// This is the end-to-end validation: dequant(NVFP4) → bf16_gemm_tiled → compare output.
+// @lat: [[tests/nvfp4_ref_compare#Python Reference Compare]]
+#[test]
+fn test_python_ref_compare() -> anyhow::Result<()> {
+    use std::fs;
+
+    let n: usize = 10240;
+    let k: usize = 5120;
+    let group_size: usize = 16;
+    let m: usize = 1;
+
+    // ── Load raw binary reference data from /tmp ──────────────
+    let weight_packed_bytes = fs::read("/tmp/ref_weight_packed.bin")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_weight_packed.bin: {}", e))?;
+    let weight_scale_bytes = fs::read("/tmp/ref_weight_scale.bin")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_weight_scale.bin: {}", e))?;
+    let global_scale_bytes = fs::read("/tmp/ref_weight_global_scale.f32")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_weight_global_scale.f32: {}", e))?;
+    let input_bytes = fs::read("/tmp/ref_input.bf16")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_input.bf16: {}", e))?;
+    let ref_output_bytes = fs::read("/tmp/ref_output.bf16")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_output.bf16: {}", e))?;
+    let ref_dequant_bytes = fs::read("/tmp/ref_dequant_weight.bf16")
+        .map_err(|e| anyhow::anyhow!("Failed to read ref_dequant_weight.bf16: {}", e))?;
+
+    // Parse global scale
+    let weight_global_scale = f32::from_le_bytes(
+        global_scale_bytes[..4].try_into().unwrap()
+    );
+
+    // Assert expected sizes
+    assert_eq!(weight_packed_bytes.len(), n * k / 2, "weight_packed size mismatch");
+    assert_eq!(weight_scale_bytes.len(), n * (k / group_size), "weight_scale size mismatch");
+    assert_eq!(input_bytes.len(), m * k * 2, "input bf16 size mismatch");
+    assert_eq!(ref_output_bytes.len(), m * n * 2, "ref output bf16 size mismatch");
+    assert_eq!(ref_dequant_bytes.len(), n * k * 2, "ref dequant weight bf16 size mismatch");
+
+    // Convert input bf16 bytes to Vec<bf16>
+    let input_host: Vec<bf16> = input_bytes
+        .chunks_exact(2)
+        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+        .collect();
+    assert_eq!(input_host.len(), m * k);
+
+    // Convert ref output bf16 bytes to Vec<bf16>
+    let ref_output: Vec<bf16> = ref_output_bytes
+        .chunks_exact(2)
+        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+        .collect();
+    assert_eq!(ref_output.len(), m * n);
+
+    // Convert ref dequant weight bf16 bytes to Vec<bf16>
+    let ref_dequant: Vec<bf16> = ref_dequant_bytes
+        .chunks_exact(2)
+        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+        .collect();
+    assert_eq!(ref_dequant.len(), n * k);
+
+    println!("\n=== Test 7: Python reference compare (layer 0 in_proj_qkv) ===");
+    println!("  N={}, K={}, M={}, group_size={}", n, k, m, group_size);
+    println!("  weight_global_scale={}", weight_global_scale);
+    println!("  ref_input[0,:5]:  {:?}", input_host[..5].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+    println!("  ref_output[0,:5]: {:?}", ref_output[..5].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+    println!("  ref_dequant[0,:5]: {:?}", ref_dequant[..5].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+
+    // ── GPU pipeline ──────────────────────────────────────────
+    let (_ctx, stream, kernels) = create_context()?;
+
+    // Step 1: Dequant NVFP4 → bf16
+    let packed_gpu = stream.clone_htod(&weight_packed_bytes)?;
+    let scale_gpu = stream.clone_htod(&weight_scale_bytes)?;
+    let mut dequant_gpu = stream.alloc_zeros::<bf16>(n * k)?;
+
+    kernels.launch_nvfp4_dequant_to_bf16(
+        &stream,
+        &mut dequant_gpu,
+        &packed_gpu,
+        &scale_gpu,
+        weight_global_scale,
+        n as u32,
+        k as u32,
+        group_size as u32,
+    )?;
+    stream.synchronize()?;
+
+    // Download GPU dequant for comparison
+    let gpu_dequant: Vec<bf16> = stream.clone_dtoh(&dequant_gpu)?;
+
+    // Compare dequant weights
+    {
+        let mut max_diff = 0.0f64;
+        let mut mean_diff = 0.0f64;
+        let mut mismatches = 0usize;
+        let mut nan_count = 0usize;
+        for i in 0..(n * k) {
+            let ref_f = ref_dequant[i].to_f32();
+            let gpu_f = gpu_dequant[i].to_f32();
+            if ref_f.is_nan() || gpu_f.is_nan() { nan_count += 1; continue; }
+            let diff = (ref_f as f64 - gpu_f as f64).abs();
+            max_diff = max_diff.max(diff);
+            mean_diff += diff;
+            if diff > 1e-5 { mismatches += 1; }
+        }
+        mean_diff /= (n * k) as f64;
+        println!("\n  [Dequant] max_diff={:.8}, mean_diff={:.8}, mismatches={}/{}, nan_count={}",
+                 max_diff, mean_diff, mismatches, n * k, nan_count);
+        println!("  [Dequant] ref[0,:5]: {:?}", ref_dequant[..5].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+        println!("  [Dequant] gpu[0,:5]: {:?}", gpu_dequant[..5].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+    }
+
+    // Step 2: GEMM — output = input @ dequant_weight^T
+    let input_gpu = stream.clone_htod(&input_host)?;
+    let mut output_gpu = stream.alloc_zeros::<bf16>(m * n)?;
+
+    kernels.launch_bf16_gemm_tiled(
+        &stream,
+        &mut output_gpu,
+        &input_gpu,
+        &dequant_gpu,
+        m as u32,
+        n as u32,
+        k as u32,
+    )?;
+    stream.synchronize()?;
+
+    // Download GPU output
+    let gpu_output: Vec<bf16> = stream.clone_dtoh(&output_gpu)?;
+
+    // ── Compare pipeline output ───────────────────────────────
+    {
+        let mut max_abs_err = 0.0f64;
+        let mut mean_abs_err = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut norm_ref_sq = 0.0f64;
+        let mut norm_gpu_sq = 0.0f64;
+        let mut nan_count = 0usize;
+
+        for i in 0..(m * n) {
+            let ref_f = ref_output[i].to_f32();
+            let gpu_f = gpu_output[i].to_f32();
+            if ref_f.is_nan() || gpu_f.is_nan() { nan_count += 1; continue; }
+            let abs_err = (ref_f as f64 - gpu_f as f64).abs();
+            max_abs_err = max_abs_err.max(abs_err);
+            mean_abs_err += abs_err;
+            dot += ref_f as f64 * gpu_f as f64;
+            norm_ref_sq += (ref_f as f64) * (ref_f as f64);
+            norm_gpu_sq += (gpu_f as f64) * (gpu_f as f64);
+        }
+        mean_abs_err /= (m * n) as f64;
+        let cos_sim = if norm_ref_sq > 0.0 && norm_gpu_sq > 0.0 {
+            dot / (norm_ref_sq * norm_gpu_sq).sqrt()
+        } else { 0.0 };
+
+        println!("\n  [Pipeline Output]");
+        println!("    Cosine similarity: {:.8}", cos_sim);
+        println!("    Max absolute error: {:.8}", max_abs_err);
+        println!("    Mean absolute error: {:.8}", mean_abs_err);
+        println!("    NaN count: {}", nan_count);
+        println!("    ref[0,:10]:  {:?}", ref_output[..10].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+        println!("    gpu[0,:10]:  {:?}", gpu_output[..10].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+
+    }
+    Ok(())
+}

@@ -690,9 +690,8 @@ pub fn shard_weights_tp_mmap(
                     }
                 }
 
-                // Shard NVFP4 companion weights — replicate ALL companions to all GPUs.
-                // Fused QKV: weight_scale has a different second dim than weight_packed
-                // (groups vs elements), so segment-based sharding doesn't apply.
+                // Shard NVFP4 companion weights — weight_scale split by same fused
+                // QKV row segments as weight_packed, not replicated.
                 if name.ends_with(".weight_packed") {
                     let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
                     let weight_scale_name = format!("{}.weight_scale", base);
@@ -705,10 +704,19 @@ pub fn shard_weights_tp_mmap(
                         companion_skip.insert(weight_scale_name.clone());
                         companion_skip.insert(weight_global_scale_name.clone());
                         companion_skip.insert(input_global_scale_name.clone());
+                        // Shard weight_scale along dim0 using same fused QKV row segments
+                        // to match weight_packed's interleaved segment-based row split.
+                        let sliced_ws = mmap_shard_fused_projection_rows(
+                            weight_scale, gpu_id, num_gpus, qkv_segments,
+                        )
+                        .context(format!(
+                            "Failed to shard NVFP4 weight_scale (fused QKV): {}",
+                            weight_scale_name
+                        ))?;
                         shard.registry.quant_companions.insert(
                             name.clone(),
                             MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
-                                weight_scale: weight_scale.clone(),
+                                weight_scale: sliced_ws,
                                 weight_global_scale: weight_global_scale.clone(),
                                 input_global_scale: input_global_scale.clone(),
                             }),

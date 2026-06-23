@@ -825,6 +825,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         token_history: &[u32],
         num_prompt_tokens: usize,
         rng: &mut Xoshiro256PlusPlus,
+        step: usize,
     ) -> Result<u32> {
         let span = tracing::info_span!("decode");
         let _enter = span.enter();
@@ -1165,6 +1166,33 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         )?;
 
         probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size], "decode");
+
+        // Debug logit dump (only when INFERS_DUMP_LOGITS is set)
+        // @lat: [[lat.md/lat#Forward Engine#Logit Dump Debug Tool]]
+        if std::env::var("INFERS_DUMP_LOGITS").is_ok() {
+            let logits_bf16: Vec<bf16> = final_stream.clone_dtoh(&logits)
+                .map_err(|e| anyhow::anyhow!("Failed to download logits for dump: {:?}", e))?;
+
+            let logits_f32: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+
+            // Find top-5 by sorting descending
+            let mut indexed: Vec<(usize, f32)> = logits_f32.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let top5: Vec<_> = indexed.iter().take(5).map(|&(idx, val)| (idx as u32, val)).collect();
+            let max_logit = indexed[0].1;
+            let min_logit = indexed.last().unwrap().1;
+
+            // Standard deviation
+            let mean: f32 = logits_f32.iter().sum::<f32>() / logits_f32.len() as f32;
+            let variance: f32 = logits_f32.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / logits_f32.len() as f32;
+            let std_logit = variance.sqrt();
+
+            eprintln!(
+                "[LOGIT-DUMP] step={} top5=[{:?}] max_logit={:.4} min_logit={:.4} logit_std={:.4}",
+                step, top5, max_logit, min_logit, std_logit,
+            );
+        }
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::sample_with_config(

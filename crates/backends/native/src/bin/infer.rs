@@ -325,7 +325,7 @@ fn main() -> Result<()> {
     for step in 0..args.max_tokens {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
-        let token = engine.decode_paged(&external_stream, current_token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng)?;
+        let token = engine.decode_paged(&external_stream, current_token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng, step)?;
         if infers_backend_native::sample::should_stop(token, &sampling_config) {
             eprintln!("Stop token generated: {}, stopping at step {}", token, step);
             break;

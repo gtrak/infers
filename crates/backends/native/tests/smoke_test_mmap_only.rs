@@ -208,7 +208,7 @@ fn run_prefill_decode(
     for step in 0..30 {
         let pos = (token_ids.len() + step) as u32;
     
-        current = engine.decode_paged(&ext_stream, current, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng)?;
+        current = engine.decode_paged(&ext_stream, current, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng, step)?;
      
         all_tokens.push(current);
         assert!(current < config.vocab_size as u32, "Token {} >= vocab_size at step {}", current, step);
