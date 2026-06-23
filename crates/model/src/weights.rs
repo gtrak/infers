@@ -2,18 +2,20 @@
 //!
 //! Stores model weights as raw byte data with shape metadata,
 //! ready for GPU upload when the CUDA runtime is available.
-//! Supports both direct BF16/FP16 weights and INT4 quantized triplets
-//! (qweight, scales, qzeros) for AutoRound/GPTQ models.
+//! Supports direct BF16/FP16 weights and quantized formats:
+//! - INT4 (AutoRound/GPTQ): qweight, scales, qzeros companions
+//! - NVFP4 (PrismaSCOUT): weight_scale, weight_global_scale, input_global_scale companions
 
 use std::collections::HashMap;
 use bytes::Bytes;
 use super::config::LayerType;
 
+// @lat: [[lat#Quantized Companion Tensors#Int4Companions]]
 /// Companion tensors for an INT4 quantized weight.
 ///
 /// When a projection uses INT4 quantization, the qweight is stored as the
 /// main `WeightData` in layer structs (e.g., `MlpWeights.gate_proj`), and
-/// the scales/qzeros companions are stored in `WeightRegistry.int4_companions`
+/// the scales/qzeros companions are stored in `WeightRegistry.quant_companions`
 /// keyed by the qweight's tensor name.
 #[derive(Debug, Clone)]
 pub struct Int4Companions {
@@ -21,6 +23,35 @@ pub struct Int4Companions {
     pub qzeros: WeightData,
     /// BF16 group scales.
     pub scales: WeightData,
+}
+
+// @lat: [[lat#Quantized Companion Tensors#Nvfp4Companions]]
+/// Companion tensors for an NVFP4 quantized weight (PrismaSCOUT).
+///
+/// When a projection uses NVFP4 quantization, the packed weight is stored as the
+/// main `WeightData` in layer structs, and the scale/companion tensors are stored
+/// in `WeightRegistry.quant_companions` keyed by the packed weight's tensor name.
+#[derive(Debug, Clone)]
+pub struct Nvfp4Companions {
+    /// Per-block scale factor (FP8 E4M3).
+    pub weight_scale: WeightData,
+    /// Global scale for the tensor (BF16 scalar).
+    pub weight_global_scale: WeightData,
+    /// Input activation global scale (BF16 scalar).
+    pub input_global_scale: WeightData,
+}
+
+// @lat: [[lat#Quantized Companion Tensors#QuantCompanions]]
+/// Unified companion tensors for any quantized weight format.
+///
+/// Replaces the old `int4_companions` HashMap with a format-aware enum that
+/// supports both INT4 (AutoRound) and NVFP4 (PrismaSCOUT) companion tensors.
+#[derive(Debug, Clone)]
+pub enum QuantCompanions {
+    /// AutoRound INT4 companions: packed zero points and group scales.
+    Int4(Int4Companions),
+    /// PrismaSCOUT NVFP4 companions: weight_scale, weight_global_scale, input_global_scale.
+    Nvfp4(Nvfp4Companions),
 }
 
 /// Raw tensor data with shape metadata, stored as bytes until GPU upload.
@@ -188,10 +219,10 @@ pub struct WeightRegistry {
     pub norm: Option<WeightData>,
     /// All tensors by name, for lookup and sharding.
     pub tensors: HashMap<String, WeightData>,
-    /// Companion tensors for INT4 weights (qzeros, scales) keyed by the
-    /// qweight tensor name. Populated during `build_main_layers` when
-    /// INT4 quantized projections are detected.
-    pub int4_companions: HashMap<String, Int4Companions>,
+    /// Companion tensors for quantized weights keyed by the packed weight
+    /// tensor name. Supports both INT4 (AutoRound: qzeros/scales) and NVFP4
+    /// (PrismaSCOUT: weight_scale/weight_global_scale/input_global_scale).
+    pub quant_companions: HashMap<String, QuantCompanions>,
 }
 
 impl WeightRegistry {
@@ -204,7 +235,7 @@ impl WeightRegistry {
             lm_head: None,
             norm: None,
             tensors: HashMap::new(),
-            int4_companions: HashMap::new(),
+            quant_companions: HashMap::new(),
         }
     }
 
@@ -255,6 +286,15 @@ impl MlpWeights {
         self.gate_proj.data = Bytes::new();
         self.up_proj.data = Bytes::new();
         self.down_proj.data = Bytes::new();
+    }
+}
+
+impl Nvfp4Companions {
+    /// Drop all weight data (Bytes) from this NVFP4 companion set.
+    pub fn clear_data(&mut self) {
+        self.weight_scale.data = Bytes::new();
+        self.weight_global_scale.data = Bytes::new();
+        self.input_global_scale.data = Bytes::new();
     }
 }
 
@@ -320,10 +360,19 @@ impl WeightRegistry {
             weight.data = Bytes::new();
         }
 
-        // Clear INT4 companions
-        for (_name, companions) in self.int4_companions.iter_mut() {
-            companions.qzeros.data = Bytes::new();
-            companions.scales.data = Bytes::new();
+        // Clear quantized companions (INT4 and NVFP4)
+        for (_name, companions) in self.quant_companions.iter_mut() {
+            match companions {
+                QuantCompanions::Int4(c) => {
+                    c.qzeros.data = Bytes::new();
+                    c.scales.data = Bytes::new();
+                }
+                QuantCompanions::Nvfp4(c) => {
+                    c.weight_scale.data = Bytes::new();
+                    c.weight_global_scale.data = Bytes::new();
+                    c.input_global_scale.data = Bytes::new();
+                }
+            }
         }
     }
 }

@@ -17,4 +17,4 @@ pub use weights::*;
 pub use loader::{build_main_layers, build_mtp_weights, strip_language_model_prefix};
 pub use sharding::*;
 pub use budget::*;
-pub use mmap::{MmapTensor, MmapWeightRegistry, MmapCompanions, MmapWeightShard, load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry};
+ pub use mmap::{MmapTensor, MmapWeightRegistry, MmapCompanions, MmapNvfp4Companions, MmapQuantCompanions, MmapWeightShard, load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry};

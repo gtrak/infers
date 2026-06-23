@@ -3,8 +3,8 @@
 //! Provides `gemm_projection_cached` which dispatches GEMM using GPU-resident
 //! weight buffers from `GpuWeightCache`, avoiding per-call CPU→GPU uploads.
 //! Handles both BF16 contiguous weights and INT4 quantized triplets in a
-//! single call. For INT4 weights, the INT4 GEMM kernel performs on-the-fly
-//! per-group dequantization in registers.
+//! single call. For INT4 weights, dequantize to bf16 on GPU then dispatch
+//! through cuBLAS GEMM.
 
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 /// Dispatch a single projection GEMM using cached GPU-resident weights.
 ///
 /// Looks up the weight by name from the `GpuWeightCache`. For BF16 weights,
-/// calls `gemm.matmul_bf16` directly. For INT4 weights, dispatches through
-/// `OxideKernels::launch_int4_gemm_auto_round` using the cached qweight/scales/qzeros buffers.
+/// calls `gemm.matmul_bf16` directly. For INT4 and NVFP4 weights, dequantizes
+/// to bf16 on GPU then dispatches through cuBLAS GEMM.
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
@@ -49,26 +49,7 @@ pub fn gemm_projection_cached(
 ) -> Result<CudaSlice<bf16>> {
     match cache.get(weight_name) {
         Some(crate::gpu_cache::CachedWeight::Bf16(weight_gpu)) => {
-            // cuBLASLt uses column-major storage convention.
-            // Our input/weight are row-major [M,K] and [N,K].
-            //
-            // The naive approach would be:
-            //   gemm.matmul_bf16(config(m,n,k, transa=true,transb=false), input, weight, output)
-            // which computes: C = input^T @ weight = (input[M,K] as [K,M])^T @ (weight[N,K] as [K,N])
-            // = [M,K] @ [K,N] = [M,N]. This is correct MATHEMATICALLY.
-            //
-            // BUT cuBLASLt writes C in COLUMN-major: C(m,n) at offset m + n*M.
-            // Our code reads the flat output buffer as ROW-major: C[m][n] at offset m*N + n.
-            // These only agree at (0,0) — all other elements are WRONG.
-            //
-            // The fix: swap arguments AND swap output dimensions.
-            //   gemm.matmul_bf16(config(m=N,n=M,k=K, transa=true,transb=false), weight, input, output)
-            // This computes: C' = weight^T @ input = [N,K]^T @ [M,K]^T = (weight[N,K] as [K,N])^T @ (input[M,K] as [K,M])
-            // = [K,N]^T @ [K,M] = [N,K] @ [K,M] = [N,M]
-            // C'(n,m) = sum_k weight[n][k] * input[m][k] = sum_k input[m][k] * weight[n][k] = C[m][n]
-            //
-            // cuBLASLt writes C' in column-major [N,M] with ldc=C'(row=n at offset C'(n,m) at offset n + m*N.
-            // Reading row-major [M,N]: buffer[m*N + n] = n + m*N = C'(n,m) = C[m][n]. ✓
+            eprintln!("[GEMM-DISPATCH] Bf16 weight '{}': len={}", weight_name, weight_gpu.len());
             gemm.matmul_bf16(
                 &GemmConfig {
                     m: n,
@@ -83,28 +64,87 @@ pub fn gemm_projection_cached(
                     ldc: None,
                     activation: None,
                 },
-                weight_gpu,  // FIRST arg — transposed view: [K, N] → op(A) = [N, K]
-                input,       // SECOND arg — transposed view: [K, M] → op(B) = [K, M]
+                weight_gpu,
+                input,
                 output,
             )?;
         }
         Some(crate::gpu_cache::CachedWeight::Int4(int4_bufs)) => {
-            // Determine transposition from shape and K dimension — same logic as gemm_projection
-            let is_transposed = int4_bufs.shape.len() >= 2 && int4_bufs.shape[0] * 8 == k;
+            eprintln!("[GEMM-DISPATCH] Int4 weight '{}': n={}, k={}", weight_name, n, k);
+            // 1. Allocate bf16 buffer for dequantized weights: [N, K]
+            let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
 
-            // Scales are stored as f16 (IEEE half) but the kernel reads raw u16 bits.
-            // bf16 and f16 have identical memory layout (both are repr(transparent) over u16),
-            // so we can safely transmute the reference for the bridge call.
-            let scales_bf16: &CudaSlice<bf16> = unsafe {
-                &*(std::ptr::addr_of!(int4_bufs.scales) as *const CudaSlice<bf16>)
-            };
+            // 2. Launch dequant kernel
+           oxide.launch_int4_dequant_to_bf16(
+                stream,
+                &mut dequant_buf,
+                &int4_bufs.qweight,
+                &int4_bufs.scales,
+                &int4_bufs.qzeros,
+                n as u32,
+                k as u32,
+                group_size as u32,
+            )?;
 
-            oxide.launch_int4_gemm_auto_round(
-                stream, output, &int4_bufs.qweight, scales_bf16, &int4_bufs.qzeros, input,
-                m as u32, n as u32, k as u32, group_size as u32, is_transposed as u32,
+            // 3. cuBLAS GEMM with dequantized bf16 weights (same convention as BF16 branch)
+            gemm.matmul_bf16(
+                &GemmConfig {
+                    m: n,
+                    n: m,
+                    k,
+                    transa: true,
+                    transb: false,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    lda: None,
+                    ldb: None,
+                    ldc: None,
+                    activation: None,
+                },
+                &dequant_buf,
+                input,
+                output,
+            )?;
+        }
+        Some(crate::gpu_cache::CachedWeight::Nvfp4(nvfp4_bufs)) => {
+            // NVFP4 group_size is always 16 (fixed property of the format)
+            const NVFP4_GROUP_SIZE: u32 = 16;
+
+            // 1. Allocate bf16 buffer for dequantized weights: [N, K]
+            let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
+
+            // 2. Launch NVFP4 dequant kernel
+            oxide.launch_nvfp4_dequant_to_bf16(
+                stream,
+                &mut dequant_buf,
+                &nvfp4_bufs.weight_packed,
+                &nvfp4_bufs.weight_scale,
+                nvfp4_bufs.weight_global_scale,
+                n as u32,
+                k as u32,
+                NVFP4_GROUP_SIZE,
+            )?;
+
+            // 3. Sanitize NaN values in dequant buffer (stale GPU memory may contain NaN)
+            oxide.launch_sanitize_nan_bf16(stream, &mut dequant_buf)?;
+
+            // 4. Compute actual batch/sequence dimension from input
+            let m = input.len() / k;
+
+            // 5. bf16 tiled GEMM: output = input @ dequant_buf^T
+            //    Bypasses cuBLAS to avoid workspace corruption with NVFP4 dequant buffers.
+            oxide.launch_bf16_gemm_tiled(
+                stream,
+                output,
+                input,
+                &dequant_buf,
+                m as u32,
+                n as u32,
+                k as u32,
             )?;
         }
         None => {
+            eprintln!("[GEMM-DISPATCH] Weight '{}' NOT FOUND in cache", weight_name);
             anyhow::bail!("Weight '{}' not found in GpuWeightCache", weight_name);
         }
     }

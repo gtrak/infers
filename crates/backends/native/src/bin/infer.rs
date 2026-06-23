@@ -15,7 +15,7 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::stream::StreamPool;
 use infers_model::config::ModelConfig;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
-use infers_model::{strip_language_model_prefix, build_main_layers};
+use infers_model::{strip_language_model_prefix, build_main_layers, QuantTargetMap};
 
 /// Standalone inference binary for prefill + decode.
 #[derive(Parser, Debug)]
@@ -160,12 +160,21 @@ fn main() -> Result<()> {
     let shards = shard_weights_tp(&raw_weights, &config, num_gpus)?;
     assert_eq!(shards.len(), num_gpus, "Expected {num_gpus} shards, got {}", shards.len());
 
-    // --- 4. Build per-GPU weight registries ---
+      // --- 4. Build per-GPU weight registries ---
+    let quant_map = if let Some(ref quant_config) = config.quantization_config {
+        QuantTargetMap::from_config(quant_config)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to parse quantization config, using empty map: {}", e);
+                QuantTargetMap::empty()
+            })
+    } else {
+        QuantTargetMap::empty()
+    };
     let mut weight_registries: Vec<infers_model::WeightRegistry> = Vec::new();
     for shard in shards {
         let gpu_id = shard.gpu_id;
         let mut registry = shard.registry;
-        build_main_layers(&mut registry, &config)?;
+        build_main_layers(&mut registry, &config, &quant_map)?;
         eprintln!(
             "Shard {}: layers={}, embedding={}, norm={}, lm_head={}",
             gpu_id,

@@ -1327,6 +1327,7 @@ dependencies = [
  "bytes",
  "infers-model-loader-heap",
  "memmap2",
+ "regex",
  "safetensors",
  "serde",
  "serde_json",

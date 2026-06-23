@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use super::weights::{Int4Companions, ShardIndex, WeightData, WeightDtype, WeightRegistry};
+  use super::weights::{Int4Companions, Nvfp4Companions, QuantCompanions, ShardIndex, WeightData, WeightDtype, WeightRegistry};
 
 // @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#DataOwner]]
 /// Owns the backing data for an MmapTensor — either a memory-mapped file (zero-copy)
@@ -229,6 +229,7 @@ impl MmapTensor {
         self.owner.clone()
     }
 }
+// @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#MmapCompanions]]
 /// Companion tensors for a zero-copy INT4 quantized weight.
 #[derive(Debug, Clone)]
 pub struct MmapCompanions {
@@ -236,12 +237,33 @@ pub struct MmapCompanions {
     pub scales: MmapTensor,
 }
 
+// @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#MmapNvfp4Companions]]
+/// Companion tensors for a zero-copy NVFP4 quantized weight (PrismaSCOUT).
+#[derive(Debug, Clone)]
+pub struct MmapNvfp4Companions {
+    /// Per-block scale factor (FP8 E4M3).
+    pub weight_scale: MmapTensor,
+    /// Global scale for the tensor (BF16 scalar).
+    pub weight_global_scale: MmapTensor,
+    /// Input activation global scale (BF16 scalar).
+    pub input_global_scale: MmapTensor,
+}
+
+// @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#MmapQuantCompanions]]
+/// Unified companion tensors for any quantized weight format in the mmap path.
+#[derive(Debug, Clone)]
+pub enum MmapQuantCompanions {
+    /// AutoRound INT4 companions.
+    Int4(MmapCompanions),
+    /// PrismaSCOUT NVFP4 companions.
+    Nvfp4(MmapNvfp4Companions),
+}
 
 /// Complete model weight registry backed by memory-mapped files.
 #[derive(Clone)]
 pub struct MmapWeightRegistry {
     pub tensors: HashMap<String, MmapTensor>,
-    pub int4_companions: HashMap<String, MmapCompanions>,
+    pub quant_companions: HashMap<String, MmapQuantCompanions>,
 }
 
 impl MmapWeightRegistry {
@@ -249,7 +271,7 @@ impl MmapWeightRegistry {
     pub fn new() -> Self {
         Self {
             tensors: HashMap::new(),
-            int4_companions: HashMap::new(),
+            quant_companions: HashMap::new(),
         }
     }
 
@@ -287,16 +309,37 @@ impl MmapWeightRegistry {
                 tensor.data_len = 0;
             }
         }
-        for companions in self.int4_companions.values_mut() {
-            if let DataOwner::Owned(_) = &companions.qzeros.owner {
-                companions.qzeros.owner = DataOwner::Owned(empty.clone());
-                companions.qzeros.data_ptr = empty.as_ptr();
-                companions.qzeros.data_len = 0;
-            }
-            if let DataOwner::Owned(_) = &companions.scales.owner {
-                companions.scales.owner = DataOwner::Owned(empty.clone());
-                companions.scales.data_ptr = empty.as_ptr();
-                companions.scales.data_len = 0;
+        for companions in self.quant_companions.values_mut() {
+            match companions {
+                MmapQuantCompanions::Int4(c) => {
+                    if let DataOwner::Owned(_) = &c.qzeros.owner {
+                        c.qzeros.owner = DataOwner::Owned(empty.clone());
+                        c.qzeros.data_ptr = empty.as_ptr();
+                        c.qzeros.data_len = 0;
+                    }
+                    if let DataOwner::Owned(_) = &c.scales.owner {
+                        c.scales.owner = DataOwner::Owned(empty.clone());
+                        c.scales.data_ptr = empty.as_ptr();
+                        c.scales.data_len = 0;
+                    }
+                }
+                MmapQuantCompanions::Nvfp4(c) => {
+                    if let DataOwner::Owned(_) = &c.weight_scale.owner {
+                        c.weight_scale.owner = DataOwner::Owned(empty.clone());
+                        c.weight_scale.data_ptr = empty.as_ptr();
+                        c.weight_scale.data_len = 0;
+                    }
+                    if let DataOwner::Owned(_) = &c.weight_global_scale.owner {
+                        c.weight_global_scale.owner = DataOwner::Owned(empty.clone());
+                        c.weight_global_scale.data_ptr = empty.as_ptr();
+                        c.weight_global_scale.data_len = 0;
+                    }
+                    if let DataOwner::Owned(_) = &c.input_global_scale.owner {
+                        c.input_global_scale.owner = DataOwner::Owned(empty.clone());
+                        c.input_global_scale.data_ptr = empty.as_ptr();
+                        c.input_global_scale.data_len = 0;
+                    }
+                }
             }
         }
     }
@@ -510,9 +553,10 @@ pub fn shard_weights_tp_mmap(
         // No sharding needed for single GPU — cheap Arc clones.
         let mut shard_registry = MmapWeightRegistry {
             tensors: registry.tensors.clone(),
-            int4_companions: HashMap::new(),
+            quant_companions: HashMap::new(),
         };
         for name in shard_registry.tensors.keys() {
+            // Handle INT4 companions
             if name.ends_with(".qweight") {
                 let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
                 let scales_name = format!("{}.scales", base);
@@ -521,9 +565,31 @@ pub fn shard_weights_tp_mmap(
                 if let Some(scales) = shard_registry.tensors.get(&scales_name)
                     && let Some(qzeros) = shard_registry.tensors.get(&qzeros_name)
                 {
-                    shard_registry.int4_companions.insert(
+                    shard_registry.quant_companions.insert(
                         name.clone(),
-                        MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() },
+                        MmapQuantCompanions::Int4(MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() }),
+                    );
+                }
+            }
+
+            // Handle NVFP4 companions
+            if name.ends_with(".weight_packed") {
+                let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                let weight_scale_name = format!("{}.weight_scale", base);
+                let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                if let Some(weight_scale) = shard_registry.tensors.get(&weight_scale_name)
+                    && let Some(weight_global_scale) = shard_registry.tensors.get(&weight_global_scale_name)
+                    && let Some(input_global_scale) = shard_registry.tensors.get(&input_global_scale_name)
+                {
+                    shard_registry.quant_companions.insert(
+                        name.clone(),
+                        MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
+                            weight_scale: weight_scale.clone(),
+                            weight_global_scale: weight_global_scale.clone(),
+                            input_global_scale: input_global_scale.clone(),
+                        }),
                     );
                 }
             }
@@ -538,11 +604,15 @@ pub fn shard_weights_tp_mmap(
         })
         .collect();
 
-    // Pre-scan: companion tensors (.scales, .qzeros) are skipped during sharding
-    // since they are processed together with their qweight parent.
+     // Pre-scan: companion tensors are skipped during sharding since they are
+    // processed together with their parent quantized weight.
     let mut companion_skip: HashSet<String> = HashSet::new();
     for name in registry.tensors.keys() {
         if name.ends_with(".scales") || name.ends_with(".qzeros") {
+            companion_skip.insert(name.clone());
+        }
+        // NVFP4 companions
+        if name.ends_with(".weight_scale") || name.ends_with(".weight_global_scale") || name.ends_with(".input_global_scale") {
             companion_skip.insert(name.clone());
         }
     }
@@ -552,7 +622,9 @@ pub fn shard_weights_tp_mmap(
             continue;
         }
 
-        let is_int4 = tensor.dtype() == WeightDtype::Int4Packed;
+        let is_int4 = matches!(tensor.dtype(), WeightDtype::Int4Packed);
+        let is_nvfp4 = matches!(tensor.dtype(), WeightDtype::Nvfp4)
+            || name.ends_with(".weight_packed");
 
         // Check if this is a fused QKV projection that needs per-projection sharding.
         // Shard each sub-projection (Q/K/V) independently rather than splitting the
@@ -567,14 +639,23 @@ pub fn shard_weights_tp_mmap(
         ];
 
         if name.contains("in_proj_qkv") {
+            // The fused output dimension is the last segment endpoint.
+            let fused_dim = qkv_segments.last().map(|(_, e)| *e).unwrap_or(0);
+            // Detect which axis of the weight tensor holds the fused output dimension.
+            // INT4 qweight: shape (K/8, N=fused_dim) → split dim1 → columns fn
+            // NVFP4 weight_packed: shape (N=fused_dim, K/2) → split dim0 → rows fn
+            let use_rows = tensor.shape()[0] == fused_dim;
+
             // Scaled segments for qzeros (conv_dim/8 instead of conv_dim)
             let qzeros_segments: Vec<(usize, usize)> =
                 qkv_segments.iter().map(|&(s, e)| (s / 8, e / 8)).collect();
 
             for (gpu_id, shard) in shards.iter_mut().enumerate() {
-                let sliced = mmap_shard_fused_projection_columns(
-                    tensor, gpu_id, num_gpus, qkv_segments,
-                )
+                let sliced = if use_rows {
+                    mmap_shard_fused_projection_rows(tensor, gpu_id, num_gpus, qkv_segments)
+                } else {
+                    mmap_shard_fused_projection_columns(tensor, gpu_id, num_gpus, qkv_segments)
+                }
                 .context(format!("Failed to shard fused QKV projection: {}", name))?;
                 shard.registry.tensors.insert(name.clone(), sliced);
 
@@ -602,9 +683,35 @@ pub fn shard_weights_tp_mmap(
                             qzeros, gpu_id, num_gpus, &qzeros_segments,
                         )
                         .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                        shard.registry.int4_companions.insert(
+                        shard.registry.quant_companions.insert(
                             name.clone(),
-                            MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros },
+                            MmapQuantCompanions::Int4(MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros }),
+                        );
+                    }
+                }
+
+                // Shard NVFP4 companion weights — replicate ALL companions to all GPUs.
+                // Fused QKV: weight_scale has a different second dim than weight_packed
+                // (groups vs elements), so segment-based sharding doesn't apply.
+                if name.ends_with(".weight_packed") {
+                    let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                    let weight_scale_name = format!("{}.weight_scale", base);
+                    let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                    let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                    if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                        && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                        && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                        companion_skip.insert(weight_scale_name.clone());
+                        companion_skip.insert(weight_global_scale_name.clone());
+                        companion_skip.insert(input_global_scale_name.clone());
+                        shard.registry.quant_companions.insert(
+                            name.clone(),
+                            MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
+                                weight_scale: weight_scale.clone(),
+                                weight_global_scale: weight_global_scale.clone(),
+                                input_global_scale: input_global_scale.clone(),
+                            }),
                         );
                     }
                 }
@@ -614,10 +721,19 @@ pub fn shard_weights_tp_mmap(
 
         // conv1d.weight: fused QKV weight needing per-segment row splitting (same as heap path)
         if name.contains("conv1d.weight") {
+            // The fused output dimension is the last segment endpoint.
+            let fused_dim = qkv_segments.last().map(|(_, e)| *e).unwrap_or(0);
+            // Detect which axis of the weight tensor holds the fused output dimension.
+            // BF16: shape (N=fused_dim, K...) → split dim0 → rows fn
+            // NVFP4 might differ — detect generically from shape vs segments.
+            let use_rows = tensor.shape()[0] == fused_dim;
+
             for (gpu_id, shard) in shards.iter_mut().enumerate() {
-                let sliced = mmap_shard_fused_projection_rows(
-                    tensor, gpu_id, num_gpus, qkv_segments,
-                )
+                let sliced = if use_rows {
+                    mmap_shard_fused_projection_rows(tensor, gpu_id, num_gpus, qkv_segments)
+                } else {
+                    mmap_shard_fused_projection_columns(tensor, gpu_id, num_gpus, qkv_segments)
+                }
                     .context(format!("Failed to shard conv1d weight: {}", name))?;
                 shard.registry.tensors.insert(name.clone(), sliced);
             }
@@ -647,9 +763,40 @@ pub fn shard_weights_tp_mmap(
                                     .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                                 let sliced_qzeros = mmap_slice_last_dim(qzeros, gpu_id, num_gpus)
                                     .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                                shard.registry.int4_companions.insert(
+                                shard.registry.quant_companions.insert(
                                     name.clone(),
-                                    MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros },
+                                    MmapQuantCompanions::Int4(MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros }),
+                                );
+                            }
+                        }
+                    }
+                } else if is_nvfp4 {
+                    // NVFP4 column-parallel: split dim 0 — N is on dim 0.
+                    for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                        let sliced = mmap_slice_dim0(tensor, gpu_id, num_gpus)
+                            .context(format!("Failed to shard column-parallel weight: {}", name))?;
+                        shard.registry.tensors.insert(name.clone(), sliced);
+
+                        // Shard NVFP4 companion weights — weight_scale split on dim0 (N) to match weight_packed.
+                        if name.ends_with(".weight_packed") {
+                            let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                            let weight_scale_name = format!("{}.weight_scale", base);
+                            let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                            let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                            if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                                && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                                && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                                let sliced_ws = mmap_slice_dim0(weight_scale, gpu_id, num_gpus)
+                                    .context(format!("Failed to shard NVFP4 weight_scale: {}", weight_scale_name))?;
+                                // weight_global_scale and input_global_scale are 1D scalars — replicate to all GPUs
+                                shard.registry.quant_companions.insert(
+                                    name.clone(),
+                                    MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
+                                        weight_scale: sliced_ws,
+                                        weight_global_scale: weight_global_scale.clone(),
+                                        input_global_scale: input_global_scale.clone(),
+                                    }),
                                 );
                             }
                         }
@@ -684,9 +831,40 @@ pub fn shard_weights_tp_mmap(
                                     .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                                 let sliced_qzeros = mmap_slice_dim0(qzeros, gpu_id, num_gpus)
                                     .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                                shard.registry.int4_companions.insert(
+                                shard.registry.quant_companions.insert(
                                     name.clone(),
-                                    MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros },
+                                    MmapQuantCompanions::Int4(MmapCompanions { scales: sliced_scales, qzeros: sliced_qzeros }),
+                                );
+                            }
+                        }
+                    }
+                } else if is_nvfp4 {
+                    // NVFP4 row-parallel: split last dim (K/2 on dim1) — non-contiguous, copies data.
+                    for (gpu_id, shard) in shards.iter_mut().enumerate() {
+                        let sliced = mmap_slice_last_dim(tensor, gpu_id, num_gpus)
+                            .context(format!("Failed to shard NVFP4 row-parallel weight: {}", name))?;
+                        shard.registry.tensors.insert(name.clone(), sliced);
+
+                        // Shard NVFP4 companion weights — weight_scale split on last dim (K/group_size on dim1).
+                        if name.ends_with(".weight_packed") {
+                            let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                            let weight_scale_name = format!("{}.weight_scale", base);
+                            let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                            let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                            if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                                && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                                && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                                let sliced_ws = mmap_slice_last_dim(weight_scale, gpu_id, num_gpus)
+                                    .context(format!("Failed to shard NVFP4 weight_scale: {}", weight_scale_name))?;
+                                // weight_global_scale and input_global_scale are 1D scalars — replicate to all GPUs
+                                shard.registry.quant_companions.insert(
+                                    name.clone(),
+                                    MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
+                                        weight_scale: sliced_ws,
+                                        weight_global_scale: weight_global_scale.clone(),
+                                        input_global_scale: input_global_scale.clone(),
+                                    }),
                                 );
                             }
                         }
@@ -714,9 +892,30 @@ pub fn shard_weights_tp_mmap(
                         if let Some(scales) = registry.tensors.get(&scales_name)
                             && let Some(qzeros) = registry.tensors.get(&qzeros_name)
                         {
-                            shard.registry.int4_companions.insert(
+                            shard.registry.quant_companions.insert(
                                 name.clone(),
-                                MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() },
+                                MmapQuantCompanions::Int4(MmapCompanions { scales: scales.clone(), qzeros: qzeros.clone() }),
+                            );
+                        }
+                    }
+
+                    // Replicate NVFP4 companion weights.
+                    if name.ends_with(".weight_packed") {
+                        let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                        let weight_scale_name = format!("{}.weight_scale", base);
+                        let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                        let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                        if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                            && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                            && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                            shard.registry.quant_companions.insert(
+                                name.clone(),
+                                MmapQuantCompanions::Nvfp4(MmapNvfp4Companions {
+                                    weight_scale: weight_scale.clone(),
+                                    weight_global_scale: weight_global_scale.clone(),
+                                    input_global_scale: input_global_scale.clone(),
+                                }),
                             );
                         }
                     }
@@ -886,6 +1085,7 @@ pub fn strip_language_model_prefix_mmap(registry: &mut MmapWeightRegistry) {
     }
 }
 
+// @lat: [[lat#Weight Registry and Tensors#MmapTensor and MmapWeightRegistry#build_metadata_registry]]
 /// Build a WeightRegistry with metadata (names/shapes only) from a MmapWeightRegistry.
 /// The WeightData entries have empty Bytes — they are used only for name lookups
 /// during inference, not for data access.
@@ -901,22 +1101,48 @@ pub fn build_metadata_registry(mmap_reg: &MmapWeightRegistry) -> WeightRegistry 
             name: name.clone(),
         });
     }
-    // Copy int4_companions metadata (names only)
-    for (name, companions) in &mmap_reg.int4_companions {
-        registry.int4_companions.insert(name.clone(), Int4Companions {
-            qzeros: WeightData {
-                data: Bytes::new(),
-                shape: companions.qzeros.shape().to_vec(),
-                dtype: companions.qzeros.dtype(),
-                name: companions.qzeros.name().to_string(),
-            },
-            scales: WeightData {
-                data: Bytes::new(),
-                shape: companions.scales.shape().to_vec(),
-                dtype: companions.scales.dtype(),
-                name: companions.scales.name().to_string(),
-            },
-        });
+    // Copy quantized companion metadata (names only) — INT4 and NVFP4
+    for (name, companions) in &mmap_reg.quant_companions {
+        match companions {
+            MmapQuantCompanions::Int4(c) => {
+                registry.quant_companions.insert(name.clone(), QuantCompanions::Int4(Int4Companions {
+                    qzeros: WeightData {
+                        data: Bytes::new(),
+                        shape: c.qzeros.shape().to_vec(),
+                        dtype: c.qzeros.dtype(),
+                        name: c.qzeros.name().to_string(),
+                    },
+                    scales: WeightData {
+                        data: Bytes::new(),
+                        shape: c.scales.shape().to_vec(),
+                        dtype: c.scales.dtype(),
+                        name: c.scales.name().to_string(),
+                    },
+                }));
+            }
+            MmapQuantCompanions::Nvfp4(c) => {
+                registry.quant_companions.insert(name.clone(), QuantCompanions::Nvfp4(Nvfp4Companions {
+                    weight_scale: WeightData {
+                        data: Bytes::new(),
+                        shape: c.weight_scale.shape().to_vec(),
+                        dtype: c.weight_scale.dtype(),
+                        name: c.weight_scale.name().to_string(),
+                    },
+                    weight_global_scale: WeightData {
+                        data: Bytes::new(),
+                        shape: c.weight_global_scale.shape().to_vec(),
+                        dtype: c.weight_global_scale.dtype(),
+                        name: c.weight_global_scale.name().to_string(),
+                    },
+                    input_global_scale: WeightData {
+                        data: Bytes::new(),
+                        shape: c.input_global_scale.shape().to_vec(),
+                        dtype: c.input_global_scale.dtype(),
+                        name: c.input_global_scale.name().to_string(),
+                    },
+                }));
+            }
+        }
     }
     registry
 }
@@ -1483,9 +1709,12 @@ mod tests {
                 assert_eq!(row0_data, &expected[..], "GPU 1 row data mismatch");
             }
 
-            // Verify companion tensors were also correctly sharded
-            let companions = shards[gpu_id].registry.int4_companions.get("layers.0.linear_attn.in_proj_qkv.qweight")
-                .expect("companion should exist for qweight");
+          // Verify companion tensors were also correctly sharded
+            let companions = match shards[gpu_id].registry.quant_companions.get("layers.0.linear_attn.in_proj_qkv.qweight")
+                .expect("companion should exist for qweight") {
+                    MmapQuantCompanions::Int4(c) => c,
+                    _ => panic!("Expected MmapQuantCompanions::Int4"),
+                };
             assert_eq!(companions.scales.shape(), &[4, 64], "GPU {} scales shape", gpu_id);
             // Qzeros segments scaled by 1/8: Q=[0,4), K=[4,8), V=[8,16) → shard 2+2+4=8 cols per GPU
             assert_eq!(companions.qzeros.shape(), &[4, 8], "GPU {} qzeros shape", gpu_id);

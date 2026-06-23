@@ -3,11 +3,12 @@
 //! Loads model weights from safetensors files (single or sharded),
 //! detects quantization format, and constructs a WeightRegistry.
 
+use super::formats::QuantTargetMap;
 use anyhow::{Context, Result};
 use super::config::ModelConfig;
 use super::weights::{
     AttentionWeights, GdnWeights, Int4Companions, LayerWeights, MlpWeights, MtpWeights,
-    WeightData, WeightRegistry,
+    Nvfp4Companions, QuantCompanions, WeightData, WeightRegistry,
 };
 
 /// Strip `model.language_model.` prefix from tensor names and remove vision tensors.
@@ -51,7 +52,7 @@ pub fn strip_language_model_prefix(registry: &mut WeightRegistry) {
 /// Populates `registry.layers`, `registry.embedding`, `registry.norm`, and
 /// `registry.lm_head` from tensors in `registry.tensors`. Tensors are removed
 /// from the flat map during extraction to halve memory usage.
-pub fn build_main_layers(registry: &mut WeightRegistry, config: &ModelConfig) -> Result<()> {
+pub fn build_main_layers(registry: &mut WeightRegistry, config: &ModelConfig, quant_map: &QuantTargetMap) -> Result<()> {
     // Extract scalar weights: embedding, norm, lm_head
     registry.embedding = get_weight(registry, "embed_tokens.weight").ok();
     registry.norm = get_weight(registry, "norm.weight").ok();
@@ -60,7 +61,7 @@ pub fn build_main_layers(registry: &mut WeightRegistry, config: &ModelConfig) ->
     let num_layers = config.num_hidden_layers;
     let mut layers = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
-        let layer = build_main_layer(registry, config, i)?;
+        let layer = build_main_layer(registry, config, i, quant_map)?;
         layers.push(layer);
     }
     registry.layers = layers;
@@ -72,6 +73,7 @@ fn build_main_layer(
     registry: &mut WeightRegistry,
     config: &ModelConfig,
     layer_idx: usize,
+    quant_map: &QuantTargetMap,
 ) -> Result<LayerWeights> {
     let prefix = format!("layers.{}", layer_idx);
     let norm1 = get_weight(registry, &format!("{}.input_layernorm.weight", prefix))?;
@@ -87,20 +89,20 @@ fn build_main_layer(
         super::config::LayerType::GatedDeltaNet => {
             let p = &prefix;
             let sub = gdn_sub;
-            let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
-            let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
+            let in_proj_a = get_weight_with_quant(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"), quant_map)?;
+            let in_proj_b = get_weight_with_quant(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"), quant_map)?;
             let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d.weight"))?;
             // x_proj_weight and dt_proj_weight are optional — not present in Qwen3.6
-            let x_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
-            let dt_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            let x_proj_weight = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"), quant_map)?;
+            let dt_proj_weight = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"), quant_map)?;
             // out_proj (not out_proj_weight) — matches real Qwen3.6 tensor names
-            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"))?;
+            let out_proj_weight = get_weight_with_quant(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"), quant_map)?;
             // Optional Mamba2-style weights
             let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
             let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
             let norm = registry.tensors.remove(&format!("{p}.{sub}.norm.weight"));
-            let in_proj_qkv = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"))?;
-            let in_proj_z = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"))?;
+            let in_proj_qkv = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"), quant_map)?;
+            let in_proj_z = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"), quant_map)?;
             let gdn = GdnWeights {
                 in_proj_a,
                 in_proj_b,
@@ -118,10 +120,10 @@ fn build_main_layer(
         }
         super::config::LayerType::FullAttention => {
             let p = &prefix;
-            let q_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"))?;
-            let k_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"))?;
-            let v_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"))?;
-            let o_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"))?;
+            let q_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"), quant_map)?;
+            let k_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"), quant_map)?;
+            let v_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"), quant_map)?;
+            let o_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"), quant_map)?;
             // Optional Q/K norm weights
             let q_norm = registry.tensors.remove(&format!("{p}.self_attn.q_norm.weight"));
             let k_norm = registry.tensors.remove(&format!("{p}.self_attn.k_norm.weight"));
@@ -137,9 +139,9 @@ fn build_main_layer(
         }
     };
     let mlp = MlpWeights {
-        gate_proj: get_weight_or_int4(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix))?,
-        up_proj: get_weight_or_int4(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix))?,
-        down_proj: get_weight_or_int4(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix))?,
+        gate_proj: get_weight_with_quant(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix), quant_map)?,
+        up_proj: get_weight_with_quant(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix), quant_map)?,
+        down_proj: get_weight_with_quant(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix), quant_map)?,
     };
     Ok(LayerWeights {
         layer_type,
@@ -160,7 +162,7 @@ fn build_main_layer(
 /// `mtp.layers.{i}.<submodule>.<proj>.weight`
 ///
 /// This function is called during model loading when `config.has_mtp()` is true.
-pub fn build_mtp_weights(registry: &mut WeightRegistry, config: &ModelConfig) -> Result<()> {
+pub fn build_mtp_weights(registry: &mut WeightRegistry, config: &ModelConfig, quant_map: &QuantTargetMap) -> Result<()> {
     if !config.has_mtp() {
         return Ok(());
     }
@@ -176,7 +178,7 @@ pub fn build_mtp_weights(registry: &mut WeightRegistry, config: &ModelConfig) ->
     // Build MTP layers
     let mut layers = Vec::with_capacity(num_mtp_layers);
     for i in 0..num_mtp_layers {
-        let layer = build_mtp_layer(registry, config, i)?;
+        let layer = build_mtp_layer(registry, config, i, quant_map)?;
         layers.push(layer);
     }
 
@@ -202,8 +204,9 @@ pub fn build_mtp_weights(registry: &mut WeightRegistry, config: &ModelConfig) ->
 /// Build a single MTP layer from the flat tensor map.
 fn build_mtp_layer(
     registry: &mut WeightRegistry,
-    config: &ModelConfig,
+    _config: &ModelConfig,
     layer_idx: usize,
+    quant_map: &QuantTargetMap,
 ) -> Result<LayerWeights> {
     let prefix = format!("mtp.layers.{}", layer_idx);
 
@@ -221,20 +224,20 @@ fn build_mtp_layer(
         super::config::LayerType::GatedDeltaNet => {
             let p = &prefix;
             let sub = "linear_attn";  // MTP GDN layers always use linear_attn prefix
-            let in_proj_a = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"))?;
-            let in_proj_b = get_weight_or_int4(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"))?;
+            let in_proj_a = get_weight_with_quant(registry, &format!("{p}.{sub}.in_proj_a.weight"), &format!("{p}.{sub}.in_proj_a"), quant_map)?;
+            let in_proj_b = get_weight_with_quant(registry, &format!("{p}.{sub}.in_proj_b.weight"), &format!("{p}.{sub}.in_proj_b"), quant_map)?;
             let conv1d_weight = get_weight(registry, &format!("{p}.{sub}.conv1d.weight"))?;
             // x_proj_weight and dt_proj_weight are optional — not present in Qwen3.6
-            let x_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"))?;
-            let dt_proj_weight = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"))?;
+            let x_proj_weight = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.x_proj_weight.weight"), &format!("{p}.{sub}.x_proj_weight"), quant_map)?;
+            let dt_proj_weight = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.dt_proj_weight.weight"), &format!("{p}.{sub}.dt_proj_weight"), quant_map)?;
             // out_proj (not out_proj_weight) — matches real Qwen3.6 tensor names
-            let out_proj_weight = get_weight_or_int4(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"))?;
+            let out_proj_weight = get_weight_with_quant(registry, &format!("{p}.{sub}.out_proj.weight"), &format!("{p}.{sub}.out_proj"), quant_map)?;
             // Optional Mamba2-style weights
             let a_log = registry.tensors.remove(&format!("{p}.{sub}.A_log"));
             let dt_bias = registry.tensors.remove(&format!("{p}.{sub}.dt_bias"));
             let norm = registry.tensors.remove(&format!("{p}.{sub}.norm.weight"));
-            let in_proj_qkv = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"))?;
-            let in_proj_z = get_weight_or_int4_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"))?;
+            let in_proj_qkv = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.in_proj_qkv.weight"), &format!("{p}.{sub}.in_proj_qkv"), quant_map)?;
+            let in_proj_z = get_weight_with_quant_optional(registry, &format!("{p}.{sub}.in_proj_z.weight"), &format!("{p}.{sub}.in_proj_z"), quant_map)?;
             let gdn = GdnWeights {
                 in_proj_a,
                 in_proj_b,
@@ -252,10 +255,10 @@ fn build_mtp_layer(
         }
         super::config::LayerType::FullAttention => {
             let p = &prefix;
-            let q_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"))?;
-            let k_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"))?;
-            let v_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"))?;
-            let o_proj = get_weight_or_int4(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"))?;
+            let q_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.q_proj.weight"), &format!("{p}.self_attn.q_proj"), quant_map)?;
+            let k_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.k_proj.weight"), &format!("{p}.self_attn.k_proj"), quant_map)?;
+            let v_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.v_proj.weight"), &format!("{p}.self_attn.v_proj"), quant_map)?;
+            let o_proj = get_weight_with_quant(registry, &format!("{p}.self_attn.o_proj.weight"), &format!("{p}.self_attn.o_proj"), quant_map)?;
             // Optional Q/K norm weights
             let q_norm = registry.tensors.remove(&format!("{p}.self_attn.q_norm.weight"));
             let k_norm = registry.tensors.remove(&format!("{p}.self_attn.k_norm.weight"));
@@ -272,9 +275,9 @@ fn build_mtp_layer(
     };
 
     let mlp = MlpWeights {
-        gate_proj: get_weight_or_int4(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix))?,
-        up_proj: get_weight_or_int4(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix))?,
-        down_proj: get_weight_or_int4(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix))?,
+        gate_proj: get_weight_with_quant(registry, &format!("{}.mlp.gate_proj.weight", prefix), &format!("{}.mlp.gate_proj", prefix), quant_map)?,
+        up_proj: get_weight_with_quant(registry, &format!("{}.mlp.up_proj.weight", prefix), &format!("{}.mlp.up_proj", prefix), quant_map)?,
+        down_proj: get_weight_with_quant(registry, &format!("{}.mlp.down_proj.weight", prefix), &format!("{}.mlp.down_proj", prefix), quant_map)?,
     };
 
     Ok(LayerWeights {
@@ -297,104 +300,167 @@ fn get_weight(registry: &mut WeightRegistry, name: &str) -> Result<WeightData> {
         .with_context(|| format!("tensor not found: {}", name))
 }
 
-/// Get a weight tensor, falling back to INT4 quantized triplet.
+/// Get a weight tensor, using metadata to determine quantization format.
 ///
-/// First tries `{name}` (BF16/FP16/FP32 weight). If not found, tries
-/// `{name_base}.qweight` (INT4 packed). When INT4 is found, also extracts
-/// `qzeros` and `scales` companions and stores them in `registry.int4_companions`.
+/// Consults `QuantTargetMap` to decide the tensor's format, then extracts
+/// the appropriate weight and companion tensors from the registry.
 ///
 /// # Arguments
 /// * `registry` — Weight registry (mutated: tensors removed, companions added)
 /// * `bf16_name` — Full tensor name for BF16 weight (e.g., `layers.0.mlp.gate_proj.weight`)
-/// * `int4_base` — Base name for INT4 triplet (e.g., `layers.0.mlp.gate_proj`)
-fn get_weight_or_int4(
+/// * `quant_base` — Base name for quantized tensors (e.g., `layers.0.mlp.gate_proj`)
+/// * `quant_map` — Per-tensor quantization assignment from config metadata
+fn get_weight_with_quant(
     registry: &mut WeightRegistry,
     bf16_name: &str,
-    int4_base: &str,
+    quant_base: &str,
+    quant_map: &QuantTargetMap,
 ) -> Result<WeightData> {
-    // Try BF16 weight first
-    if let Some(w) = registry.tensors.remove(bf16_name) {
-        return Ok(w);
+    match quant_map.resolve(quant_base) {
+        Some(super::formats::QuantizationFormat::PrismaScout) => {
+            // NVFP4: extract weight_packed + companions
+            let packed_name = format!("{}.weight_packed", quant_base);
+            let mut packed = registry
+                .tensors
+                .remove(&packed_name)
+                .with_context(|| format!("NVFP4 weight_packed '{}' not found", packed_name))?;
+
+            // Override dtype: safetensors stores NVFP4 as U8, but the semantic
+            // type is Nvfp4. map_safetensor_dtype can't know this — it only
+            // sees the raw safetensors dtype.
+            packed.dtype = super::weights::WeightDtype::Nvfp4;
+
+            // Check if companions already populated by sharding
+            if registry.quant_companions.contains_key(&packed_name) {
+                return Ok(packed);
+            }
+
+            // Extract companion tensors
+            let weight_scale_name = format!("{}.weight_scale", quant_base);
+            let weight_global_scale_name = format!("{}.weight_global_scale", quant_base);
+            let input_global_scale_name = format!("{}.input_global_scale", quant_base);
+
+            let weight_scale = registry.tensors.remove(&weight_scale_name)
+                .with_context(|| format!("NVFP4 weight_scale '{}' not found", weight_scale_name))?;
+            let weight_global_scale = registry.tensors.remove(&weight_global_scale_name)
+                .with_context(|| format!("NVFP4 weight_global_scale '{}' not found", weight_global_scale_name))?;
+            let input_global_scale = registry.tensors.remove(&input_global_scale_name)
+                .with_context(|| format!("NVFP4 input_global_scale '{}' not found", input_global_scale_name))?;
+
+            registry.quant_companions.insert(packed_name, QuantCompanions::Nvfp4(Nvfp4Companions {
+                weight_scale,
+                weight_global_scale,
+                input_global_scale,
+            }));
+
+            Ok(packed)
+        }
+        Some(super::formats::QuantizationFormat::AutoRound) => {
+            // INT4: extract qweight + qzeros + scales
+            let qweight_name = format!("{}.qweight", quant_base);
+            let qweight = registry
+                .tensors
+                .remove(&qweight_name)
+                .with_context(|| format!("neither '{}' nor '{}' found", bf16_name, qweight_name))?;
+
+            // Check if companions already populated by sharding
+            if registry.quant_companions.contains_key(&qweight_name) {
+                return Ok(qweight);
+            }
+
+            // Extract companion tensors
+            let qzeros_name = format!("{}.qzeros", quant_base);
+            let scales_name = format!("{}.scales", quant_base);
+
+            let qzeros = registry.tensors.remove(&qzeros_name)
+                .with_context(|| format!("INT4 qzeros '{}' not found", qzeros_name))?;
+            let scales = registry.tensors.remove(&scales_name)
+                .with_context(|| format!("INT4 scales '{}' not found", scales_name))?;
+
+            registry.quant_companions.insert(qweight_name, QuantCompanions::Int4(Int4Companions { qzeros, scales }));
+
+            Ok(qweight)
+        }
+        Some(super::formats::QuantizationFormat::Bf16) | Some(super::formats::QuantizationFormat::Gguf) | None => {
+            // BF16 passthrough or no quantization
+            get_weight(registry, bf16_name)
+        }
     }
-
-    // Fall back to INT4 qweight
-    let qweight_name = format!("{}.qweight", int4_base);
-    let qweight = registry
-        .tensors
-        .remove(&qweight_name)
-        .with_context(|| format!("neither '{}' nor '{}' found", bf16_name, qweight_name))?;
-
-   // Extract companion tensors — check int4_companions first (populated by sharding),
-    // then fall back to registry.tensors (non-sharded path).
-    let qweight_name_ref = &qweight_name;
-    if registry.int4_companions.contains_key(qweight_name_ref) {
-        // Sharded path: companions already populated by sharding
-        return Ok(qweight);
-    }
-
-    // Non-sharded path: extract from tensors and store in int4_companions
-    let qzeros_name = format!("{}.qzeros", int4_base);
-    let scales_name = format!("{}.scales", int4_base);
-
-    let qzeros = registry
-        .tensors
-        .remove(&qzeros_name)
-        .with_context(|| format!("INT4 qzeros '{}' not found (qweight '{}')", qzeros_name, qweight_name))?;
-    let scales = registry
-        .tensors
-        .remove(&scales_name)
-        .with_context(|| format!("INT4 scales '{}' not found (qweight '{}')", scales_name, qweight_name))?;
-
-    // Store companions keyed by qweight name
-    registry.int4_companions.insert(qweight_name.clone(), Int4Companions { qzeros, scales });
-
-    Ok(qweight)
 }
 
-/// Optional version of `get_weight_or_int4` that returns `Ok(None)` when
-/// neither BF16 nor INT4 weights are found, instead of erroring.
-/// INT4 companions are stored in `registry.int4_companions` when INT4 is used.
-fn get_weight_or_int4_optional(
+/// Optional version of `get_weight_with_quant` that returns `Ok(None)` when
+/// no matching weight is found, instead of erroring.
+fn get_weight_with_quant_optional(
     registry: &mut WeightRegistry,
     bf16_name: &str,
-    int4_base: &str,
+    quant_base: &str,
+    quant_map: &QuantTargetMap,
 ) -> Result<Option<WeightData>> {
-    // Try BF16 weight first
-    if let Some(w) = registry.tensors.remove(bf16_name) {
-        return Ok(Some(w));
+    match quant_map.resolve(quant_base) {
+        Some(super::formats::QuantizationFormat::PrismaScout) => {
+            let packed_name = format!("{}.weight_packed", quant_base);
+            let mut packed = match registry.tensors.remove(&packed_name) {
+                Some(w) => w,
+                None => return Ok(None),
+            };
+
+            // Override dtype — same as get_weight_with_quant
+            packed.dtype = super::weights::WeightDtype::Nvfp4;
+
+            if registry.quant_companions.contains_key(&packed_name) {
+                return Ok(Some(packed));
+            }
+
+            let weight_scale_name = format!("{}.weight_scale", quant_base);
+            let weight_global_scale_name = format!("{}.weight_global_scale", quant_base);
+            let input_global_scale_name = format!("{}.input_global_scale", quant_base);
+
+            let weight_scale = registry.tensors.remove(&weight_scale_name)
+                .with_context(|| format!("NVFP4 weight_scale '{}' not found", weight_scale_name))?;
+            let weight_global_scale = registry.tensors.remove(&weight_global_scale_name)
+                .with_context(|| format!("NVFP4 weight_global_scale '{}' not found", weight_global_scale_name))?;
+            let input_global_scale = registry.tensors.remove(&input_global_scale_name)
+                .with_context(|| format!("NVFP4 input_global_scale '{}' not found", input_global_scale_name))?;
+
+            registry.quant_companions.insert(packed_name, QuantCompanions::Nvfp4(Nvfp4Companions {
+                weight_scale,
+                weight_global_scale,
+                input_global_scale,
+            }));
+
+            Ok(Some(packed))
+        }
+        Some(super::formats::QuantizationFormat::AutoRound) => {
+            let qweight_name = format!("{}.qweight", quant_base);
+            let qweight = match registry.tensors.remove(&qweight_name) {
+                Some(w) => w,
+                None => return Ok(None),
+            };
+
+            if registry.quant_companions.contains_key(&qweight_name) {
+                return Ok(Some(qweight));
+            }
+
+            let qzeros_name = format!("{}.qzeros", quant_base);
+            let scales_name = format!("{}.scales", quant_base);
+            let qzeros = registry.tensors.remove(&qzeros_name)
+                .with_context(|| format!("INT4 qzeros '{}' not found", qzeros_name))?;
+            let scales = registry.tensors.remove(&scales_name)
+                .with_context(|| format!("INT4 scales '{}' not found", scales_name))?;
+
+            registry.quant_companions.insert(qweight_name, QuantCompanions::Int4(Int4Companions { qzeros, scales }));
+
+            Ok(Some(qweight))
+        }
+        Some(super::formats::QuantizationFormat::Bf16) | Some(super::formats::QuantizationFormat::Gguf) | None => {
+            Ok(registry.tensors.remove(bf16_name))
+        }
     }
-
-  // Fall back to INT4 qweight (optional — return None if missing)
-    let qweight_name = format!("{}.qweight", int4_base);
-    let qweight = match registry.tensors.remove(&qweight_name) {
-        Some(w) => w,
-        None => return Ok(None),
-    };
-
-    // Extract companion tensors — check int4_companions first (populated by sharding),
-    // then fall back to registry.tensors (non-sharded path).
-    if registry.int4_companions.contains_key(&qweight_name) {
-        // Sharded path: companions already populated by sharding
-        return Ok(Some(qweight));
-    }
-
-    // Non-sharded path: extract from tensors and store in int4_companions
-    let qzeros_name = format!("{}.qzeros", int4_base);
-    let scales_name = format!("{}.scales", int4_base);
-    let qzeros = registry.tensors.remove(&qzeros_name)
-        .with_context(|| format!("INT4 qzeros '{}' not found (qweight '{}')", qzeros_name, qweight_name))?;
-    let scales = registry.tensors.remove(&scales_name)
-        .with_context(|| format!("INT4 scales '{}' not found (qweight '{}')", scales_name, qweight_name))?;
-
-    // Store companions keyed by qweight name
-    registry.int4_companions.insert(qweight_name.clone(), Int4Companions { qzeros, scales });
-
-    Ok(Some(qweight))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::QuantTargetMap;
     use crate::config::LayerType;
     use crate::weights::{WeightData, WeightRegistry, WeightDtype, MtpWeights};
     use bytes::Bytes;
@@ -411,7 +477,7 @@ mod tests {
         assert!(!config.has_mtp());
 
         let mut registry = WeightRegistry::new();
-        assert!(build_mtp_weights(&mut registry, &config).is_ok());
+        assert!(build_mtp_weights(&mut registry, &config, &QuantTargetMap::empty()).is_ok());
         assert!(registry.mtp.is_none());
     }
 
@@ -452,7 +518,7 @@ mod tests {
         registry.tensors.insert("mtp.layers.0.mlp.up_proj.weight".to_string(), dummy("mtp.layers.0.mlp.up_proj.weight"));
         registry.tensors.insert("mtp.layers.0.mlp.down_proj.weight".to_string(), dummy("mtp.layers.0.mlp.down_proj.weight"));
 
-        let result = build_mtp_weights(&mut registry, &config);
+        let result = build_mtp_weights(&mut registry, &config, &QuantTargetMap::empty());
         assert!(result.is_ok());
 
         let mtp = registry.mtp.as_ref().expect("MTP weights should be populated");
@@ -555,7 +621,7 @@ mod tests {
                 registry.tensors.insert(format!("{}.{}", prefix, sub), dummy_weight(&format!("{}.{}", prefix, sub)));
             }
         }
-        let result = build_main_layers(&mut registry, &config);
+        let result = build_main_layers(&mut registry, &config, &QuantTargetMap::empty());
         assert!(result.is_ok());
         assert_eq!(registry.layers.len(), 4);
         for i in 0..3 {
@@ -590,7 +656,7 @@ mod tests {
         for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
             registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
         }
-        let result = build_main_layers(&mut registry, &config);
+        let result = build_main_layers(&mut registry, &config, &QuantTargetMap::empty());
         assert!(result.is_ok());
         assert!(registry.layers[0].gdn.is_some());
         let gdn = registry.layers[0].gdn.as_ref().unwrap();
@@ -614,7 +680,7 @@ mod tests {
         for sub in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"] {
             registry.tensors.insert(format!("layers.0.{}", sub), dummy_weight(&format!("layers.0.{}", sub)));
         }
-        let result = build_main_layers(&mut registry, &config);
+        let result = build_main_layers(&mut registry, &config, &QuantTargetMap::empty());
         assert!(result.is_ok());
         assert!(registry.embedding.is_some());
         assert!(registry.norm.is_some());
@@ -661,7 +727,7 @@ mod tests {
         registry.tensors.insert("model.visual.patch_embed.proj.weight".to_string(), dummy_weight("model.visual.patch_embed.proj.weight"));
         // Simulate strip_language_model_prefix then build_main_layers
         strip_language_model_prefix(&mut registry);
-        let result = build_main_layers(&mut registry, &config);
+        let result = build_main_layers(&mut registry, &config, &QuantTargetMap::empty());
         assert!(result.is_ok(), "build_main_layers should succeed");
         assert_eq!(registry.layers.len(), 2);
         assert!(registry.embedding.is_some());

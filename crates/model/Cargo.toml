@@ -13,6 +13,7 @@ tracing = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
 bytes = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -262,7 +262,7 @@ Phase 2 (CUDA Backend) establishes the GPU runtime, kernel compilation pipeline,
 - CUDA crate (`infers-cuda`) with cudarc always present — no feature gating
 - CudaRuntime for multi-GPU device context management (cudarc CudaContext)
 - StreamPool for async CUDA stream management per device
-- OxideKernels loading `oxide_kernels.cubin` with typed launch wrappers via the oxide bridge module (27 kernels: rmsnorm, silu, silu_glu, attn_output_gate, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_gated_delta_update, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, conv1d_depthwise_silu, rms_norm_gated, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm)
+- OxideKernels loading `oxide_kernels.cubin` with typed launch wrappers via the oxide bridge module (29 kernels: rmsnorm, silu, silu_glu, attn_output_gate, rope, embedding_gather, add, argmax_bf16, softmax, kv_cache, paged_kv_write, paged_kv_read, gdn_recurrent_step, gdn_gated_delta_prefill, gdn_gated_delta_update, gdn_chunked_gated_delta_prefill, gdn_mamba2_prefill, gdn_mamba2_update, conv1d_depthwise_silu, rms_norm_gated, paged_attention_decode, fp8_quantize, fp8_dequantize, int4_gemm, int4_dequant_to_bf16, nvfp4_dequant_to_bf16)
 - GemmEngine wrapping cuBLASLt with BF16 support; `new(stream)` creates CudaBlasLT eagerly, `matmul_bf16()` accepts `GemmConfig` and `CudaSlice` buffers; `matmul_int4()` accepts `Int4GemmConfig` for INT4-packed weight GEMM with per-group dequantization (group_size=128, FP32 accumulation, BF16 output)
 - NcclCommunicator wrapping cudarc NCCL Comm with `all_reduce()`, `all_reduce_in_place()`, `broadcast()`, `reduce()`, `all_gather()`, `send()`, `recv()` methods for TP/PP collectives and P2P hidden state transfer across multiple GPUs
 - Kernel fixes: softmax max preservation (register variable), power-of-2 block rounding, attention GEMM transb correction, accumulation parity fix
@@ -285,6 +285,14 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 - `build_mtp_weights()` populates `WeightRegistry.mtp` from MTP tensor map
 - `get_weight()` helper uses `remove()` to transfer ownership from flat map to structured fields, avoiding expensive clones of large tensors
 
+
+# Phase 6 Deliverables
+
+Phase 6 (QuantTargetMap Wiring) connects the quantization target map through the server's main.rs, enabling PrismaSCOUT NVFP4 support.
+
+- Server `main.rs` builds `QuantTargetMap` from `config.quantization_config` before the shard loop — single instance shared across all GPU shards
+- Both mmap and heap (infer binary) paths construct `QuantTargetMap::from_config()` with graceful fallback to `QuantTargetMap::empty()` on parse errors, logged as warnings
+- MmapWeightRegistry field `int4_companions` renamed to `quant_companions: HashMap<String, MmapQuantCompanions>` — unified enum supporting both INT4 and NVFP4 companions. Server GPU cache (`gpu_cache.rs`) updated accordingly with matching on `MmapQuantCompanions::Int4(c)` for strided and contiguous upload paths. See [[crates/server/src/main.rs]], [[crates/backends/native/src/gpu_cache.rs]].
 # Phase 9 Deliverables
 
 Phase 9 (Tool Calls + Final Polish) adds Qwen3.6 chat template formatting, tool call parsing, tool call streaming in SSE format, and the `enable_auto_tool_choice` API parameter.

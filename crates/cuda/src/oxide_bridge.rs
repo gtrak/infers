@@ -939,6 +939,197 @@ impl OxideKernels {
         self.raw_launch("int4_gemm_auto_round", stream, config, &mut args)
     }
 
+    /// Launch INT4 AutoRound dequantize-to-BF16 kernel.
+    ///
+    /// Reads packed INT4 weights + FP16 scales + packed zeros,
+    /// writes bf16 output to `output` buffer.
+    pub fn launch_int4_dequant_to_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        output: &CudaSlice<half::bf16>,     // [N, K] bf16 output
+        weight: &CudaSlice<u32>,            // [N, K/8] packed INT4
+        scales: &CudaSlice<half::f16>,      // [N, K/group_size] fp16 scales
+        zeros: &CudaSlice<u32>,             // packed zeros
+        n: u32,
+        k: u32,
+        group_size: u32,
+    ) -> anyhow::Result<()> {
+        let o_len_val = output.len() as u64;
+        let w_len_val = weight.len() as u64;
+        let s_len_val = scales.len() as u64;
+        let z_len_val = zeros.len() as u64;
+
+        let (o_ptr, o_guard) = output.device_ptr(stream);
+        let (w_ptr, w_guard) = weight.device_ptr(stream);
+        let (s_ptr, s_guard) = scales.device_ptr(stream);
+        let (z_ptr, z_guard) = zeros.device_ptr(stream);
+
+        let _guards = (o_guard, w_guard, s_guard, z_guard);
+
+        let mut o_ptr = o_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut z_ptr = z_ptr as cuda_core::sys::CUdeviceptr;
+        let mut o_len = o_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut z_len = z_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut o_ptr, &mut o_len);  // output: DisjointSlice<u16>
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight: &[u32]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);  // scales: &[u16]
+        Self::push_slice_arg(&mut args, &mut z_ptr, &mut z_len);  // zeros: &[u32]
+        Self::push_scalar_arg(&mut args, &mut n_v);               // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
+        Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 255) / 256, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("int4_dequant_to_bf16", stream, config, &mut args)
+    }
+
+    /// Launch NVFP4 dequantize-to-BF16 kernel.
+    /// Reads packed NVFP4 weights + FP8 scales + weight global scale scalar,
+    /// writes bf16 output to `output` buffer.
+    pub fn launch_nvfp4_dequant_to_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        output: &CudaSlice<half::bf16>,     // [N, K] bf16 output
+        weight_packed: &CudaSlice<u8>,       // [N, K/2] packed FP4
+        weight_scale: &CudaSlice<u8>,        // [N, K/group_size] fp8_e4m3
+        weight_global_scale: f32,            // scalar global scale
+        n: u32,
+        k: u32,
+        group_size: u32,
+    ) -> anyhow::Result<()> {
+        let o_len_val = output.len() as u64;
+        let w_len_val = weight_packed.len() as u64;
+        let s_len_val = weight_scale.len() as u64;
+
+        let (o_ptr, o_guard) = output.device_ptr(stream);
+        let (w_ptr, w_guard) = weight_packed.device_ptr(stream);
+        let (s_ptr, s_guard) = weight_scale.device_ptr(stream);
+
+        let _guards = (o_guard, w_guard, s_guard);
+
+        let mut o_ptr = o_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut o_len = o_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+        let mut gscale = weight_global_scale;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut o_ptr, &mut o_len);  // output: DisjointSlice<u16>
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight_packed: &[u8]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);  // weight_scale: &[u8]
+        Self::push_scalar_arg(&mut args, &mut gscale);            // weight_global_scale: f32
+        Self::push_scalar_arg(&mut args, &mut n_v);               // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
+        Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 255) / 256, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("nvfp4_dequant_to_bf16", stream, config, &mut args)
+    }
+
+    /// Launch the `sanitize_nan_bf16` kernel: replace NaN values in a bf16 buffer with 0.0.
+    pub fn launch_sanitize_nan_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        buf: &mut CudaSlice<half::bf16>,
+    ) -> anyhow::Result<()> {
+        let len_val = buf.len() as u64;
+        let mut len_scalar = buf.len() as u32;
+        let block_size = 256u32;
+        let grid_size = ((buf.len() as u32 + block_size - 1) / block_size, 1, 1);
+        let (ptr, guard) = buf.device_ptr_mut(stream);
+        let _guard = guard;
+        let mut d_ptr = ptr as cuda_core::sys::CUdeviceptr;
+        let mut len_v = len_val;
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut d_ptr, &mut len_v);
+        Self::push_scalar_arg(&mut args, &mut len_scalar);
+        let config = LaunchConfig {
+            grid_dim: grid_size,
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("sanitize_nan_bf16", stream, config, &mut args)
+    }
+
+    /// Launch the `bf16_gemm_tiled` kernel: tiled bf16 GEMM with shared memory.
+    ///
+    /// Computes C[M,N] = A[M,K] @ B[N,K]^T where all buffers are row-major bf16.
+    /// Used as a replacement for cuBLAS in the NVFP4 path to avoid workspace corruption.
+    ///
+    /// The kernel signature is:
+    /// ```ignore
+    /// bf16_gemm_tiled(mut output: DisjointSlice<u16>, input: &[u16], weight: &[u16], m: u32, n: u32, k: u32)
+    /// ```
+   pub fn launch_bf16_gemm_tiled(
+        &self,
+        stream: &Arc<CudaStream>,
+        output: &mut CudaSlice<half::bf16>,
+        input: &CudaSlice<half::bf16>,
+        weight: &CudaSlice<half::bf16>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> anyhow::Result<()> {
+        let o_len_val = output.len() as u64;
+        let i_len_val = input.len() as u64;
+        let w_len_val = weight.len() as u64;
+
+        let (o_ptr, o_guard) = output.device_ptr_mut(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+        let (w_ptr, w_guard) = weight.device_ptr(stream);
+
+        let _guards = (o_guard, i_guard, w_guard);
+
+        let mut o_ptr = o_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut o_len = o_len_val;
+        let mut i_len = i_len_val;
+        let mut w_len = w_len_val;
+        let mut m_v = m;
+        let mut n_v = n;
+        let mut k_v = k;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut o_ptr, &mut o_len);  // output: DisjointSlice<u16>
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);  // input: &[u16]
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight: &[u16]
+        Self::push_scalar_arg(&mut args, &mut m_v);               // m: u32
+        Self::push_scalar_arg(&mut args, &mut n_v);               // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
+
+        // Grid: (N/64, M/64, 1), Block: (256, 1, 1)
+        let grid_x = (n + 63) / 64;
+        let grid_y = (m + 63) / 64;
+        let config = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,  // no shared memory used in current version
+        };
+        self.raw_launch("bf16_gemm_tiled", stream, config, &mut args)
+    }
+
     /// Launch the `int4_gemm_gguf` kernel: INT4 GEMM with GGUF dequant.
     ///
     /// The kernel signature is:
@@ -1721,8 +1912,8 @@ impl OxideKernels {
     }
 }
 
-/// All 28 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 28] = [
+/// All 32 kernel names compiled into the oxide_kernels.cubin file.
+const KERNEL_NAMES: [&str; 32] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -1739,6 +1930,9 @@ const KERNEL_NAMES: [&str; 28] = [
     "infers_paged_kv_read_bf16",
     "infers_rope_bf16",
     "int4_gemm_auto_round",
+    "int4_dequant_to_bf16",
+    "nvfp4_dequant_to_bf16",
+    "sanitize_nan_bf16",
     "int4_gemm_gguf",
     "infers_fp8_quantize_e4m3",
     "infers_fp8_dequantize_e4m3",
@@ -1751,6 +1945,7 @@ const KERNEL_NAMES: [&str; 28] = [
     "infers_gdn_gated_delta_update_bf16",
     "infers_gdn_gated_delta_prefill_bf16",
     "infers_gdn_chunked_gated_delta_prefill_bf16",
+    "bf16_gemm_tiled",
 ];
 
 #[cfg(test)]

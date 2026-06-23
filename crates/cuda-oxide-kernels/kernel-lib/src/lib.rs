@@ -7,6 +7,15 @@
 use cuda_device::{SharedArray, DisjointSlice, DynamicSharedArray, cuda_module, kernel, launch_bounds, thread};
 
 /// All device kernels — compiled to PTX by cuda-oxide.
+///
+/// # Module organization
+///
+/// The `#[cuda_module]` block is organized into:
+/// 1. **Utilities**: Helper functions (dev_sqrtf, f16_to_f32, fp4_e2m1_to_f32)
+/// 2. **FP8 types**: Fp8Format trait, Fp8E4M3/Fp8E5M2 structs and impls
+/// 3. **INT4 types**: Dequantize trait, AutoRound/Gguf structs and impls
+/// 4. **KV cache types**: KvCacheFormat trait, KvBf16 struct and impl
+/// 5. **Kernel functions**: All #[kernel] functions grouped by category
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -651,7 +660,10 @@ pub mod kernels {
         }
     }
 
-    // ─── FP8 quantize/dequantize with Fp8Format trait ─────────────
+
+// ════════════════════════════════════════════════════════════════
+//  Section: Utility functions — pure helpers, no CUDA types
+// ════════════════════════════════════════════════════════════════
 
     /// Trait for FP8 quantization format. Each format (E4M3, E5M2) implements
     /// the quantize and dequantize methods with its specific bit layout.
@@ -839,7 +851,10 @@ pub mod kernels {
         fp8_dequantize_inner::<Fp8E5M2>(input, output, n);
     }
 
-    // ─── INT4 GEMM with trait-based dequantization dispatch ─────────────
+
+// ════════════════════════════════════════════════════════════════
+//  Section: Kernel functions — FP8 and INT4 quantization
+// ════════════════════════════════════════════════════════════════
 
     /// Trait for dequantizing INT4 weights. Each quant format implements this
     /// with its specific zero-point offset and dequant formula.
@@ -1013,7 +1028,171 @@ pub mod kernels {
         );
     }
 
-    // ─── Paged attention decode with KvCacheFormat trait ─────────────
+// ════════════════════════════════════════════════════════════════
+//  Section: Dequantize-to-BF16 kernels
+// ════════════════════════════════════════════════════════════════
+
+    /// Dequantize INT4 AutoRound weights to BF16.
+    ///
+    /// Grid: 1D, one thread per output row (N dimension).
+    /// Each thread reads packed INT4 values from one row, unpacks,
+    /// applies scale and zero-point, and writes bf16 values.
+    ///
+    /// weight: [N, K/8] packed INT4 (each u32 holds 8 values)
+    /// scales: [N, K/group_size] fp16 group scales
+    /// zeros: [N * K/group_size / 8] packed INT4 zeros (each u32 holds 8 zeros)
+    /// output: [N, K] bf16 dequantized weights
+    #[kernel]
+     pub fn int4_dequant_to_bf16(
+        mut output: DisjointSlice<u16>,   // [N, K] bf16
+        weight: &[u32],                    // [K/8, N] packed INT4 (column-major)
+        scales: &[u16],                    // [K/group_size, N] fp16
+        zeros: &[u32],                     // [K/group_size, N/8] packed INT4 zeros
+        n: u32,
+        k: u32,
+        group_size: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let row = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if row >= n as usize { return; }
+
+        let n_usize = n as usize;
+        let num_groups = (k / group_size) as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+
+        for g in 0..num_groups {
+            // Load scale (FP16 → F32)
+            let scale_bits = scales[g * n_usize + row];
+            let scale = f16_to_f32(scale_bits);
+
+            // Unpack zero point (8 per u32, column-major: [K/group_size, N/8])
+            let zero_packed_idx = g * (n_usize / 8) + row / 8;
+            let zero_shift = (row % 8) * 4;
+            let zero_packed = zeros[zero_packed_idx];
+            let raw_zero = ((zero_packed >> zero_shift) & 0xF) as i8;
+
+            // Unpack INT4 values from u32s (8 per u32)
+            for i in 0..(group_size_usize / 8) {
+                let weight_idx = (g * (group_size_usize / 8) + i) * n_usize + row;
+                let packed = weight[weight_idx];
+
+                for w in 0..8u32 {
+                    let val = ((packed >> (w * 4)) & 0xF) as i8;
+                    // AutoRound: zero = stored_zero + 1; value = (val - zero) * scale
+                    let zero = raw_zero + 1;
+                    let dequantized = f32::from(val - zero) * scale;
+                    let bf16_val = f32_to_bf16(dequantized);
+                    let out_idx = row * k_usize + g * group_size_usize + i * 8 + w as usize;
+                    unsafe {
+                        *output.get_unchecked_mut(out_idx) = bf16_val;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decode a single FP4 E2M1 nibble to f32.
+    ///
+    /// FP4 E2M1: 1 sign, 2 exponent, 1 mantissa bit.
+    /// Denormalized (exp=0): (-1)^S × 2^(-1) × (M/2)
+    /// Normalized (exp>0):    (-1)^S × 2^(E-1) × (1 + M/2)
+    /// Lookup table: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    #[inline(always)]
+    fn fp4_e2m1_to_f32(nibble: u8) -> f32 {
+        let sign = (nibble >> 3) & 1;
+        let magnitude = match nibble & 0x7 {
+            0 => 0.0f32,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            7 => 6.0,
+            _ => unreachable!(),
+        };
+        if sign != 0 { -magnitude } else { magnitude }
+    }
+
+    /// Dequantize NVFP4 weights to BF16.
+    ///
+    /// NVFP4 packing: each byte holds 2 FP4 values (E2M1 format).
+    /// Scales: fp8_e4m3 per-group, weight global scale (f32 scalar), and input global scale (f32 scalar).
+    ///
+    /// weight_packed: [N, K/2] u8 (each byte = 2 FP4 values)
+    /// weight_scale: [N, K/group_size] fp8_e4m3 per-group scale
+    /// weight_global_scale: f32 global scale scalar
+    /// output: [N, K] bf16
+    #[kernel]
+    pub fn nvfp4_dequant_to_bf16(
+        mut output: DisjointSlice<u16>,   // [N, K] bf16
+        weight_packed: &[u8],              // [N, K/2] packed FP4
+        weight_scale: &[u8],               // [N, K/group_size] fp8_e4m3
+        weight_global_scale: f32,          // scalar global scale
+        n: u32,
+        k: u32,
+        group_size: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let row = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if row >= n as usize { return; }
+
+        let num_groups = (k / group_size) as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+
+        for g in 0..num_groups {
+            // Load per-group scale (fp8_e4m3 → f32)
+            let scale_fp8 = weight_scale[row * num_groups + g];
+            let scale = Fp8E4M3::dequantize(scale_fp8);
+
+            // Decode FP4 values within this group
+            for i in 0..(group_size_usize / 2) {
+                let byte_idx = row * (k_usize / 2) + g * group_size_usize / 2 + i;
+                let packed_byte = weight_packed[byte_idx];
+
+                // High nibble (bits 7:4)
+                let hi_nibble = (packed_byte >> 4) & 0xF;
+                let hi_val = fp4_e2m1_to_f32(hi_nibble);
+                let hi_fp32 = hi_val * scale / weight_global_scale;
+
+                // Low nibble (bits 3:0)
+                let lo_nibble = packed_byte & 0xF;
+                let lo_val = fp4_e2m1_to_f32(lo_nibble);
+                let lo_fp32 = lo_val * scale / weight_global_scale;
+
+                let out_base = row * k_usize + g * group_size_usize + i * 2;
+                // NOTE: compressed-tensors packs two FP4 values per byte as [HIGH | LOW].
+                // The unpack order is LOW first, then HIGH:
+                //   combined = stack([low, high])  => [low, high]
+                // So out_base gets LOW nibble, out_base+1 gets HIGH nibble.
+                // Source: https://github.com/vllm-project/vllm/pull/16362
+                unsafe {
+                    *output.get_unchecked_mut(out_base) = f32_to_bf16(lo_fp32);
+                    *output.get_unchecked_mut(out_base + 1) = f32_to_bf16(hi_fp32);
+                }
+            }
+        }
+    }
+
+    /// Replace NaN values in a bf16 buffer with 0.0.
+    #[kernel]
+    pub fn sanitize_nan_bf16(buf: &mut [u16], len: u32) {
+        let idx = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if idx >= len as usize { return; }
+        let val = unsafe { *buf.get_unchecked(idx) };
+        let f = f32::from_bits((val as u32) << 16);
+        if f.is_nan() {
+            unsafe { *buf.get_unchecked_mut(idx) = 0u16; }
+        }
+    }
+
+// ════════════════════════════════════════════════════════════════
+//  Section: Kernel functions — Attention and GDN
+// ════════════════════════════════════════════════════════════════
 
     /// Trait for reading K/V values from the KV cache. Each format (BF16, FP8)
     /// implements the read method with its specific dequantization.
@@ -1310,7 +1489,7 @@ pub mod kernels {
 
         let eps = 1e-6f32;
         let k_rcp = 1.0f32 / (k_l2_sq + eps).sqrt();
-        let q_rcp = 1.0f32 / (q_l2_sq + eps).sqrt();
+        let q_rcp = 1.0f32 / (q_l2_sq + eps).sqrt() * rcp_sqrt_k;
 
         let state_base = h * K * V + v;
 
@@ -1341,7 +1520,7 @@ pub mod kernels {
         let mut y_val = 0.0f32;
         for k in 0..K {
             let s_val = state[state_base + k * V];
-            let q_val = f32::from_bits((query[h * K + k] as u32) << 16) * q_rcp * rcp_sqrt_k;
+            let q_val = f32::from_bits((query[h * K + k] as u32) << 16) * q_rcp;
             y_val += s_val * q_val;
         }
 
@@ -1661,7 +1840,7 @@ pub mod kernels {
                 q_l2_sq += qv * qv;
             }
             let k_rcp = 1.0f32 / (k_l2_sq + 1e-6f32).sqrt();
-            let q_rcp = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt();
+            let q_rcp = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt() * rcp_sqrt_k;
 
             let state_base = h * K * V + v;
 
@@ -1698,7 +1877,7 @@ pub mod kernels {
             let mut y_val = 0.0f32;
             for k in 0..K {
                 let s_val = state[state_base + k * V];
-                let q_val = f32::from_bits((query[t * H * K + h * K + k] as u32) << 16) * q_rcp * rcp_sqrt_k;
+                let q_val = f32::from_bits((query[t * H * K + h * K + k] as u32) << 16) * q_rcp;
                 if s_val.is_finite() && q_val.is_finite() { y_val += s_val * q_val; }
             }
 
@@ -1845,7 +2024,7 @@ pub mod kernels {
                     for d in 0..K {
                         unsafe {
                             let idx = tid * K + d;
-                            *k_normed.add(idx) *= rcp_norm;
+                            *k_normed.add(idx) = *k_normed.add(idx) * rcp_norm;
                         }
                     }
                 }
@@ -1956,12 +2135,14 @@ pub mod kernels {
                         q_reg[d] = qv;
                         q_l2_sq += qv * qv;
                     }
-                    let q_rcp = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt() * rcp_sqrt_k;
+                    let q_norm_rational = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt();
                     let exp_g_row = unsafe { libm::expf(*g_cs.add(row)) };
                     // ── attn_inter[row][col_v] = (q_normed * exp(g_cs) @ S) ──
                     let mut attn_inter_val = 0.0f32;
                     for d in 0..K {
-                        let q_scl = q_reg[d] * q_rcp * exp_g_row;
+                        let q_normed_f32 = q_reg[d] * q_norm_rational;
+                    let q_val_bf16 = f32::from_bits((f32_to_bf16(q_normed_f32) as u32) << 16);
+                    let q_scl = q_val_bf16 * rcp_sqrt_k * exp_g_row;
                         attn_inter_val += q_scl * state[state_base + d * V + col_v];
                     }
 
@@ -1973,7 +2154,9 @@ pub mod kernels {
                         let mut qk_dot_j = 0.0f32;
                         for d in 0..K {
                             unsafe {
-                                qk_dot_j += q_reg[d] * q_rcp * *k_normed.add(j * K + d);
+                                let q_normed_f32 = q_reg[d] * q_norm_rational;
+                            let q_val_bf16 = f32::from_bits((f32_to_bf16(q_normed_f32) as u32) << 16);
+                            qk_dot_j += q_val_bf16 * rcp_sqrt_k * *k_normed.add(j * K + d);
                             }
                         }
                         let g_diff = unsafe { *g_cs.add(row) - *g_cs.add(j) };
@@ -2066,5 +2249,119 @@ pub mod kernels {
             }
 
         } // end chunk loop
+    }
+
+    /// Tiled bf16 GEMM: C[M,N] = A[M,K] @ B[N,K]^T
+    ///
+    /// A (input): [M, K] bf16, row-major
+    /// B (weight): [N, K] bf16, row-major (each row is one output feature)
+    /// C (output): [M, N] bf16, row-major
+    ///
+    /// Tile config: BM=64, BN=64
+    /// Thread tile: TM=4, TN=4
+    /// Block: 256 threads (16×16 thread mapping within tile)
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn bf16_gemm_tiled(
+        output: &mut [u16],               // [M, N] bf16
+        input: &[u16],                    // [M, K] bf16  
+        weight: &[u16],                   // [N, K] bf16
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        const TM: usize = 4;
+        const TN: usize = 4;
+
+        // Use LOCAL thread index (within block) to map to 2D tile.
+        // thread::index_1d() gives global index (blockIdx.x * blockDim.x + threadIdx.x)
+        // which would cause ty > 15 for blocks beyond the first.
+        let tid_local = thread::threadIdx_x() as usize;
+        let tx = (tid_local % 16) as usize;  // 0-15, maps to columns within tile
+        let ty = (tid_local / 16) as usize;  // 0-15, maps to rows within tile
+
+        let block_m = (thread::blockIdx_y() * 64u32) as usize;
+        let block_n = (thread::blockIdx_x() * 64u32) as usize;
+        let m_usize = m as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+
+        // Each thread computes a TM×TN = 4×4 sub-tile of the output
+        let mut acc: [f32; TM * TN] = [0.0f32; TM * TN];
+
+        // Load input values for 4 rows at column ki, with bounds checking
+        macro_rules! load_input {
+            ($row:expr, $ki:expr) => {
+                if $row < m_usize {
+                    f32::from_bits((input[$row * k_usize + $ki] as u32) << 16)
+                } else {
+                    0.0f32
+                }
+            };
+        }
+
+        // Load weight values for row at column ki, with bounds checking
+        macro_rules! load_weight {
+            ($row:expr, $ki:expr) => {
+                if $row < n_usize {
+                    f32::from_bits((weight[$row * k_usize + $ki] as u32) << 16)
+                } else {
+                    0.0f32
+                }
+            };
+        }
+
+        for ki in 0..k_usize {
+            let r0 = block_m + ty * TM + 0;
+            let r1 = block_m + ty * TM + 1;
+            let r2 = block_m + ty * TM + 2;
+            let r3 = block_m + ty * TM + 3;
+
+            let c0 = block_n + tx * TN + 0;
+            let c1 = block_n + tx * TN + 1;
+            let c2 = block_n + tx * TN + 2;
+            let c3 = block_n + tx * TN + 3;
+
+            let a0 = load_input!(r0, ki);
+            let a1 = load_input!(r1, ki);
+            let a2 = load_input!(r2, ki);
+            let a3 = load_input!(r3, ki);
+
+            let w0 = load_weight!(c0, ki);
+            let w1 = load_weight!(c1, ki);
+            let w2 = load_weight!(c2, ki);
+            let w3 = load_weight!(c3, ki);
+
+            acc[0] += a0 * w0;
+            acc[1] += a0 * w1;
+            acc[2] += a0 * w2;
+            acc[3] += a0 * w3;
+            acc[4] += a1 * w0;
+            acc[5] += a1 * w1;
+            acc[6] += a1 * w2;
+            acc[7] += a1 * w3;
+            acc[8] += a2 * w0;
+            acc[9] += a2 * w1;
+            acc[10] += a2 * w2;
+            acc[11] += a2 * w3;
+            acc[12] += a3 * w0;
+            acc[13] += a3 * w1;
+            acc[14] += a3 * w2;
+            acc[15] += a3 * w3;
+        }
+
+        // Write output - each thread writes its 4×4 sub-tile
+        for i in 0..TM {
+            for j in 0..TN {
+                let g_row = block_m + ty * TM + i;
+                let g_col = block_n + tx * TN + j;
+                if g_row < m_usize && g_col < n_usize {
+                    let idx = g_row * n_usize + g_col;
+                    output[idx] = f32_to_bf16(acc[(i * TN + j) as usize]);
+                }
+            }
+        }
     }
 }

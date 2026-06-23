@@ -19,7 +19,7 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::stream::StreamPool;
 use infers_kv::PagedKvManager;
 use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap};
-use infers_model::{build_main_layers, build_metadata_registry, ModelConfig, WeightRegistry};
+use infers_model::{build_main_layers, build_metadata_registry, ModelConfig, QuantTargetMap, WeightRegistry};
 use infers_scheduler::RoundRobinScheduler;
 use infers_tokenizer::Tokenizer;
 
@@ -213,12 +213,21 @@ async fn run() -> Result<()> {
         strip_language_model_prefix_mmap(&mut mmap_reg);
         let shards = shard_weights_tp_mmap(&mmap_reg, &config, num_gpus)
             .with_context(|| format!("Failed to shard weights (mmap) for TP={num_gpus}"))?;
+        let quant_map = if let Some(ref quant_config) = config.quantization_config {
+            QuantTargetMap::from_config(quant_config)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to parse quantization config, using empty map: {}", e);
+                    QuantTargetMap::empty()
+                })
+        } else {
+            QuantTargetMap::empty()
+        };
         let mut mmap_registries = Vec::new();
         let mut metadata_registries = Vec::new();
         for shard in shards {
             mmap_registries.push(shard.registry.clone());
             let mut meta_registry = build_metadata_registry(&shard.registry);
-            build_main_layers(&mut meta_registry, &config)
+            build_main_layers(&mut meta_registry, &config, &quant_map)
                 .with_context(|| format!("Failed to build metadata layers for GPU {}", shard.gpu_id))?;
             metadata_registries.push(meta_registry);
         }

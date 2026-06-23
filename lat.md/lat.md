@@ -8,6 +8,7 @@ Other documentation files:
 - [[misc]] — tokenizer, MTP, FP8 quantization, tech debt fixes, phase deliverables
 - [[parallel]] — tensor parallelism and pipeline parallelism implementations
 - [[testing]] — reference tests, smoke tests, debugging analysis
+- [[tests]] — CUDA kernel regression tests (gemm_compare)
 # Model Config and Format Detection
 
 Config parser and quantization format auto-detection for the infers-model crate. Parses HuggingFace `config.json` to extract Qwen3.6-27B architecture parameters and auto-detects weight quantization format from model directory contents.
@@ -40,8 +41,13 @@ Multimodal model configs wrap architecture parameters inside a `text_config` obj
 
 Parsed from quantization config JSON with arbitrary format-specific fields. See [[crates/model/src/formats.rs#QuantizationConfig]].
 
-# Weight Registry and Tensors
+## QuantTargetMap
 
+Resolved per-tensor quantization assignment from `QuantizationConfig`. Parses `config_groups` target regexes and `ignore` lists to determine which tensors are NVFP4, INT4, or BF16 passthrough.
+
+Resolves stripped tensor names (after `strip_language_model_prefix`) by reconstructing the unstripped form for matching against original config targets. See [[crates/model/src/formats.rs#QuantTargetMap]].
+
+# Weight Registry and Tensors
 Weight storage structures for model weights as raw byte data with shape metadata, ready for GPU upload.
 
 ## WeightData
@@ -66,9 +72,25 @@ Typed weight structures for GDN layers (`GdnWeights`), attention layers (`Attent
 
 MTP head weights with pre-FC norms, FC projection, full transformer layers, final norm, and optional dedicated embeddings. See [[crates/model/src/weights.rs#MtpWeights]].
 
+## Quantized Companion Tensors
+
+Companion tensors for quantized weights, stored in `HashMap<String, QuantCompanions>` on WeightRegistry. The `[[crates/model/src/weights.rs#QuantCompanions]]` enum unifies INT4 (AutoRound) and NVFP4 (PrismaSCOUT) formats.
+
+### Int4Companions
+
+INT4 quantization companions: packed zero points (`qzeros`) and BF16 group scales. See [[crates/model/src/weights.rs#Int4Companions]].
+
+### Nvfp4Companions
+
+NVFP4 (PrismaSCOUT) quantization companions: per-block weight scale (FP8 E4M3), global tensor scale (BF16), and input activation global scale (BF16). See [[crates/model/src/weights.rs#Nvfp4Companions]].
+
+### QuantCompanions
+
+Unified companion enum supporting both INT4 (AutoRound) and NVFP4 (PrismaSCOUT) quantization formats. See [[crates/model/src/weights.rs#QuantCompanions]].
+
 ## WeightRegistry
 
-Complete model weight registry with embedding, layers, optional MTP head, LM head, norm, and a `HashMap<String, WeightData>` for name-based lookup and sharding. See [[crates/model/src/weights.rs#WeightRegistry]].
+Complete model weight registry with embedding, layers, optional MTP head, LM head, norm, a flat tensor map, and `quant_companions` for INT4/NVFP4 companion tensors keyed by packed weight name. See [[crates/model/src/weights.rs#WeightRegistry]].
 
 ## MmapTensor and MmapWeightRegistry
 
@@ -82,9 +104,17 @@ Simple wrapper around `Arc<Mmap>` keeping mmap mappings alive across tensor refe
 
 Zero-copy companion tensors (qzeros, scales) for INT4 quantized weights. See [[crates/model/src/mmap.rs#MmapCompanions]].
 
+### MmapNvfp4Companions
+
+Zero-copy companion tensors (weight_scale, weight_global_scale, input_global_scale) for NVFP4 quantized weights in the PrismaSCOUT format. See [[crates/model/src/mmap.rs#MmapNvfp4Companions]].
+
+### MmapQuantCompanions
+
+Unified enum wrapping either `MmapCompanions` (INT4/AutoRound) or `MmapNvfp4Companions` (NVFP4/PrismaSCOUT). Stored in `quant_companions` HashMap of `MmapWeightRegistry`. See [[crates/model/src/mmap.rs#MmapQuantCompanions]].
+
 ### MmapWeightRegistry
 
-Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap and INT4 companions. Each MmapTensor's DataOwner keeps mmaps alive — no separate `_mmaps` tracking needed. Tracks tensor count and byte sum. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
+ Memory-mapped equivalent of `WeightRegistry`: stores tensors by name in a HashMap and quantized companions via `quant_companions: HashMap<String, MmapQuantCompanions>` — unified enum for INT4 or NVFP4. DataOwner keeps mmaps alive. See [[crates/model/src/mmap.rs#MmapWeightRegistry]].
 
 #### clear_owned_data
 
@@ -101,8 +131,7 @@ Follows the same sharding rules as `shard_weights_tp()` but operates on MmapTens
 - **RowParallel + INT4**: Split dim 0 (rows) — contiguous, zero-copy via pointer offset
 - **Replicated**: Clone MmapTensor (cheap Arc clone)
 
-INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their qweight parent (strided when needed), and stored in `int4_companions`. Fused QKV projections (`in_proj_qkv`) use per-segment column splitting — each segment (Q, K, V) is independently divided by num_gpus via [[crates/model/src/mmap.rs#mmap_shard_fused_projection_columns]]. The `conv1d.weight` tensor uses per-segment row splitting via [[crates/model/src/mmap.rs#mmap_shard_fused_projection_rows]], extracting Q/K/V row segments independently rather than naively dividing dim 0. Both match the heap path's [[lat.md/lat#Weight Sharding#Tensor Parallelism Sharding]] behavior.
-
+INT4 companion tensors (.scales, .qzeros) are extracted from `registry.tensors`, sharded alongside their parent weight (strided when needed), and stored in `quant_companions`. For NVFP4 companions, only `weight_scale` (2D matrix) is sharded with the same strategy; `weight_global_scale` and `input_global_scale` (1D scalars, shape `[1]`) are replicated to all GPUs. Fused QKV projections (`in_proj_qkv`) use per-segment splitting with **generic layout detection** — see [[lat.md/lat#Weight Sharding#Tensor Parallelism Sharding#Fused QKV Layout Detection]]. The `conv1d.weight` tensor uses the same generic detection. Both match the heap path's [[lat.md/lat#Weight Sharding#Tensor Parallelism Sharding]] behavior.
 MmapWeightShard holds gpu_id and the shard's MmapWeightRegistry. See [[crates/model/src/mmap.rs#MmapWeightShard]].
 
 ### build_metadata_registry
@@ -114,6 +143,14 @@ Multi-format model loader with safetensors file reading and auto-detection of si
 ## Loading Pipeline
 
 `load_model()` reads config, detects format, loads safetensors, then calls `build_mtp_weights()` if MTP is enabled. See [[crates/model-loader-heap/src/lib.rs#load_model]].
+
+## Metadata-Driven Weight Loading
+
+`get_weight_with_quant()` consults `QuantTargetMap` to determine each tensor's quantization format (NVFP4, INT4, or BF16) and extracts the appropriate weight and companion tensors from the registry.
+
+For NVFP4 it extracts `weight_packed` + scale companions; for INT4 it extracts `qweight` + qzeros/scales; for BF16/GGUF it falls through to passthrough. `build_main_layers()` and `build_mtp_weights()` accept a `QuantTargetMap` reference and pass it through the layer-building chain.
+
+See [[crates/model/src/loader.rs#get_weight_with_quant]], [[crates/model/src/loader.rs#build_main_layers]], [[crates/model/src/loader.rs#build_mtp_weights]].
 
 ## Single vs Sharded
 
@@ -232,13 +269,27 @@ Decode using paged KV cache: reads K/V from pages during attention computation v
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].
 
+## Quantized GEMM Dispatch via Dequantize-then-cuBLAS
+
+GEMM dispatch for quantized weights uses a two-step approach: dequantize on GPU to bf16, then compute via cuBLASLt. This replaces the custom INT4 GEMM kernel with a simpler pipeline.
+
+For **INT4 (AutoRound)**: `gemm_projection_cached` allocates a temporary bf16 buffer of size N×K, calls `oxide.launch_int4_dequant_to_bf16` to dequantize from packed INT4 + f16 scales + u32 qzeros into bf16, then calls `gemm.matmul_bf16` with the same GemmConfig convention as the BF16 branch (swapped m/n, transa=true). See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
+For **NVFP4 (PrismaSCOUT)**: three-step pipeline using `oxide.launch_nvfp4_dequant_to_bf16` with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, weight_global_scale as f32 scalar, and input_global_scale as f32 scalar — all three scales are multiplied into the dequantized weights (`dequant_weight = fp4_val * group_scale / weight_global_scale * input_global_scale`). After dequantization, `oxide.launch_sanitize_nan_bf16` replaces any NaN values in the dequant buffer with 0.0 (fixes non-deterministic NaN from stale GPU memory). Then dispatches to `oxide.launch_bf16_gemm_tiled`. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
 ## General Instrumentation Probe
 
 Per-layer probe infrastructure for dumping intermediate tensors during inference via `INFERS_DUMP_DIR`, `INFERS_DUMP_LAYERS`, and `INFERS_DUMP_STAGES` environment variables. Writes raw bf16 bytes plus JSON metadata sidecars. See [[crates/backends/native/src/probe.rs]].
 
 # Mmap Weight Upload
 
-Zero-copy weight upload from memory-mapped safetensors files using cuMemcpy2D DMA transfers. Handles contiguous tensors and strided non-contiguous shards, eliminating CPU buffer allocations. See [[crates/cuda/src/memcpy2d.rs]].
+Zero-copy weight upload from memory-mapped safetensors files using cuMemcpy2D DMA. Supports BF16, FP16, FP32, INT4 packed, and NVFP4 quantized weights via companion detection in `quant_companions` map. See [[crates/cuda/src/memcpy2d.rs]].
+
+## NVFP4 Mmap Upload
+
+NVFP4 weights are detected when their key has `MmapQuantCompanions::Nvfp4(_)` companions, since mmap dtype mapping classifies U8 as `WeightDtype::Other`.
+
+Both contiguous and strided paths handle: weight_packed (u8 bytes), weight_scale (FP8 E4M3 as u8 bytes), weight_global_scale (f32 scalar read from companion tensor), and input_global_scale (f32 scalar read from companion tensor). Strided path copies data to contiguous buffers before GPU upload, same pattern as INT4. See [[crates/backends/native/src/gpu_cache.rs#upload_strided_mmap_tensor]], [[crates/backends/native/src/gpu_cache.rs#upload_contiguous_mmap_tensor]].
 
 # GpuWeightCache
 
@@ -334,6 +385,14 @@ Weight tensor sharding strategies for tensor parallelism and pipeline parallelis
 ## Tensor Parallelism Sharding
 
 Splits weight tensors across GPUs for tensor parallelism using column-parallel (dim 0) and row-parallel (dim 1) strategies. INT4 quantized weights produce non-contiguous strided tensors requiring cuMemcpy2D DMA uploads. See [[crates/model/src/mmap.rs#shard_weights_tp_mmap]].
+
+### NVFP4 Companion Sharding
+Companion tensors go into companion_skip. Only `weight_scale` (2D) is sharded with its parent strategy. Scalar companions (`weight_global_scale`, `input_global_scale`) are **replicated** — cloned to all GPUs, never sliced.
+### Fused QKV Layout Detection
+
+Generic detection of which axis holds the fused output dimension by comparing weight shape against segment endpoints. INT4 qweight `(K/8, N=fused_dim)` splits dim 1; NVFP4 weight_packed `(N=fused_dim, K/2)` splits dim 0.
+
+This eliminates hardcoded layout branching on tensor names and prevents out-of-bounds panics when new quantization formats appear.
 ## Shard Type Detection
 
 Automatic detection of how to shard each weight tensor based on layer type, tensor name pattern, and quantization format. Maps column-parallel projections (dim 0 split), row-parallel projections (dim 1 split), and replicated weights. See [[crates/model/src/sharding.rs#ShardType]].

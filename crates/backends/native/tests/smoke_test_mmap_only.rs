@@ -22,6 +22,7 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
+use infers_model::QuantTargetMap;
 use infers_model::{strip_language_model_prefix, build_main_layers};
 
 /// Default path for the Qwen3.6-27B AutoRound INT4 model.
@@ -227,6 +228,14 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("[heap-only] Config loaded: {} layers", config.num_hidden_layers);
+    let quant_map = if let Some(ref quant_config) = config.quantization_config {
+        QuantTargetMap::from_config(quant_config).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to parse quantization config: {}", e);
+            QuantTargetMap::empty()
+        })
+    } else {
+        QuantTargetMap::empty()
+    };
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[heap-only] RSS after config: {}", format_bytes(rss));
     // 2. Load safetensors via heap path
@@ -243,7 +252,7 @@ fn smoke_test_heap_only() -> Result<(), Box<dyn std::error::Error>> {
     let mut weight_registries: Vec<infers_model::WeightRegistry> = Vec::new();
     for shard in shards {
         let mut registry = shard.registry;
-        build_main_layers(&mut registry, &config)?;
+        build_main_layers(&mut registry, &config, &quant_map)?;
         weight_registries.push(registry);
     }
 
@@ -324,6 +333,14 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("[mmap-only] Config loaded: {} layers", config.num_hidden_layers);
+    let quant_map = if let Some(ref quant_config) = config.quantization_config {
+        QuantTargetMap::from_config(quant_config).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to parse quantization config: {}", e);
+            QuantTargetMap::empty()
+        })
+    } else {
+        QuantTargetMap::empty()
+    };
     let rss = current_rss_bytes().unwrap_or(0);
     eprintln!("[mmap-only] RSS after config: {}", format_bytes(rss));
 
@@ -346,7 +363,7 @@ fn smoke_test_mmap_only() -> Result<(), Box<dyn std::error::Error>> {
     for shard in shards {
         mmap_registries.push(shard.registry.clone());
         let mut meta = build_metadata_registry(&shard.registry);
-        build_main_layers(&mut meta, &config)?;
+        build_main_layers(&mut meta, &config, &quant_map)?;
         metadata_registries.push(meta);
     }
 
@@ -440,6 +457,14 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
     // 1. Load config
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("[mmap-vs-heap] Config loaded: {} layers", config.num_hidden_layers);
+    let quant_map = if let Some(ref quant_config) = config.quantization_config {
+        QuantTargetMap::from_config(quant_config).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to parse quantization config: {}", e);
+            QuantTargetMap::empty()
+        })
+    } else {
+        QuantTargetMap::empty()
+    };
 
     // ---- Heap path: load, create engine, download GPU data, drop engine ----
     eprintln!("[mmap-vs-heap] Loading via heap path...");
@@ -454,7 +479,7 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
     let mut weight_registries: Vec<infers_model::WeightRegistry> = Vec::new();
     for shard in shards {
         let mut registry = shard.registry;
-        build_main_layers(&mut registry, &config)?;
+        build_main_layers(&mut registry, &config, &quant_map)?;
         weight_registries.push(registry);
     }
 
@@ -520,6 +545,7 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
         let wtype = match engine_heap.weight_caches()[0].get(key) {
             Some(infers_backend_native::CachedWeight::Bf16(_)) => "Bf16",
             Some(infers_backend_native::CachedWeight::Int4(_)) => "Int4",
+            Some(infers_backend_native::CachedWeight::Nvfp4(_)) => "Nvfp4",
             None => "???",
         };
         heap_key_types.push((key.to_string(), wtype));
@@ -565,7 +591,7 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
     for shard in shards_mmap {
         mmap_registries.push(shard.registry.clone());
         let mut meta = build_metadata_registry(&shard.registry);
-        build_main_layers(&mut meta, &config)?;
+        build_main_layers(&mut meta, &config, &quant_map)?;
         metadata_registries.push(meta);
     }
 
@@ -673,6 +699,7 @@ fn smoke_test_mmap_vs_heap_gpu_data() -> Result<(), Box<dyn std::error::Error>> 
                 let mmap_type = match engine_mmap.weight_caches()[0].get(key) {
                     Some(infers_backend_native::CachedWeight::Bf16(_)) => Some("Bf16"),
                     Some(infers_backend_native::CachedWeight::Int4(_)) => Some("Int4"),
+                    Some(infers_backend_native::CachedWeight::Nvfp4(_)) => Some("Nvfp4"),
                     None => None,
                 };
 

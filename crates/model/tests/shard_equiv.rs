@@ -266,21 +266,27 @@ fn compare_shards(
                 label, gpu_id, key, heap_w.data.len(), mmap_data.len());
         }
 
-        // Check INT4 companion keys match
+        // Check quantized companion keys match
         let heap_comp_keys: std::collections::HashSet<String> =
-            heap.int4_companions.keys().cloned().collect();
+            heap.quant_companions.keys().cloned().collect();
         let mmap_comp_keys: std::collections::HashSet<String> =
-            mmap.int4_companions.keys().cloned().collect();
+            mmap.quant_companions.keys().cloned().collect();
         assert_eq!(
             heap_comp_keys, mmap_comp_keys,
             "{} GPU {}: companion key mismatch\n  heap: {:?}\n  mmap: {:?}",
             label, gpu_id, heap_comp_keys, mmap_comp_keys
         );
 
-        // Compare INT4 companions
+        // Compare quantized companions
         for key in &heap_comp_keys {
-            let heap_c = heap.int4_companions.get(key).unwrap();
-            let mmap_c = mmap.int4_companions.get(key).unwrap();
+            let heap_c = match heap.quant_companions.get(key).unwrap() {
+                infers_model::QuantCompanions::Int4(c) => c,
+                _ => panic!("Expected Int4 companion for key {}", key),
+            };
+            let mmap_c = match mmap.quant_companions.get(key).unwrap() {
+                infers_model::MmapQuantCompanions::Int4(c) => c,
+                _ => panic!("Expected MmapQuantCompanions::Int4 for key {}", key),
+            };
 
             // Scales — materialize strided tensors for byte comparison
             assert_eq!(
@@ -523,16 +529,22 @@ fn shard_equiv_tp2_gdn_fused_qkv_in_proj() {
         );
 
         // Verify companions too
-        let heap_comp = heap_shards[gpu_id]
+        let heap_comp = match heap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get("layers.0.linear_attn.in_proj_qkv.qweight")
-            .unwrap();
-        let mmap_comp = mmap_shards[gpu_id]
+            .unwrap() {
+                infers_model::QuantCompanions::Int4(c) => c,
+                _ => panic!("Expected Int4 companion"),
+            };
+        let mmap_comp = match mmap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get("layers.0.linear_attn.in_proj_qkv.qweight")
-            .unwrap();
+            .unwrap() {
+                infers_model::MmapQuantCompanions::Int4(c) => c,
+                _ => panic!("Expected MmapQuantCompanions::Int4"),
+            };
 
         assert_eq!(heap_comp.scales.shape, mmap_comp.scales.shape());
         assert!(!mmap_comp.scales.is_strided(), "in_proj_qkv scales should be contiguous");
@@ -618,11 +630,14 @@ fn shard_equiv_tp2_strided_metadata_correct() {
 
     for gpu_id in 0..num_gpus {
         let key = "layers.1.self_attn.q_proj.qweight";
-        let mmap_c = mmap_shards[gpu_id]
+        let mmap_c = match mmap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get(key)
-            .unwrap();
+            .unwrap() {
+                infers_model::MmapQuantCompanions::Int4(c) => c,
+                _ => panic!("Expected MmapQuantCompanions::Int4"),
+            };
 
         assert!(mmap_c.scales.is_strided(), "q_proj scales must be strided in mmap path");
 
@@ -635,11 +650,14 @@ fn shard_equiv_tp2_strided_metadata_correct() {
             "GPU {}: scales col_start_bytes should be {}", gpu_id, expected_col_start);
 
         // Materialize and compare
-        let heap_c = heap_shards[gpu_id]
+        let heap_c = match heap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get(key)
-            .unwrap();
+            .unwrap() {
+                infers_model::QuantCompanions::Int4(c) => c,
+                _ => panic!("Expected Int4 companion"),
+            };
         let materialized_scales = materialize_mmap_tensor_data(&mmap_c.scales);
         assert_eq!(heap_c.scales.data.as_ref(), materialized_scales.as_slice(),
             "GPU {}: materialized scales data mismatch", gpu_id);
@@ -652,11 +670,14 @@ fn shard_equiv_tp2_strided_metadata_correct() {
 
     for gpu_id in 0..num_gpus {
         let key = "layers.1.self_attn.q_proj.qweight";
-        let mmap_c = mmap_shards[gpu_id]
+        let mmap_c = match mmap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get(key)
-            .unwrap();
+            .unwrap() {
+                infers_model::MmapQuantCompanions::Int4(c) => c,
+                _ => panic!("Expected MmapQuantCompanions::Int4"),
+            };
 
         assert!(mmap_c.qzeros.is_strided(), "q_proj qzeros must be strided in mmap path");
 
@@ -669,11 +690,14 @@ fn shard_equiv_tp2_strided_metadata_correct() {
             "GPU {}: qzeros col_start_bytes should be {}", gpu_id, expected_col_start_qz);
 
         // Materialize and compare
-        let heap_c = heap_shards[gpu_id]
+        let heap_c = match heap_shards[gpu_id]
             .registry
-            .int4_companions
+            .quant_companions
             .get(key)
-            .unwrap();
+            .unwrap() {
+                infers_model::QuantCompanions::Int4(c) => c,
+                _ => panic!("Expected Int4 companion"),
+            };
         let materialized_qzeros = materialize_mmap_tensor_data(&mmap_c.qzeros);
         assert_eq!(heap_c.qzeros.data.as_ref(), materialized_qzeros.as_slice(),
             "GPU {}: materialized qzeros data mismatch", gpu_id);
@@ -726,16 +750,22 @@ fn shard_equiv_tp2_strided_data_materializes_correctly() {
                 key, gpu_id, heap_w.data.len(), materialized.len());
 
             // Also verify companion tensors (scales and qzeros)
-            let heap_c = heap_shards[gpu_id]
+            let heap_c = match heap_shards[gpu_id]
                 .registry
-                .int4_companions
+                .quant_companions
                 .get(*key)
-                .unwrap();
-            let mmap_c = mmap_shards[gpu_id]
+                .unwrap() {
+                    infers_model::QuantCompanions::Int4(c) => c,
+                    _ => panic!("Expected Int4 companion"),
+                };
+            let mmap_c = match mmap_shards[gpu_id]
                 .registry
-                .int4_companions
+                .quant_companions
                 .get(*key)
-                .unwrap();
+                .unwrap() {
+                    infers_model::MmapQuantCompanions::Int4(c) => c,
+                    _ => panic!("Expected MmapQuantCompanions::Int4"),
+                };
 
             assert!(mmap_c.scales.is_strided(), "{} GPU {} scales must be strided", key, gpu_id);
             let mat_scales = materialize_mmap_tensor_data(&mmap_c.scales);

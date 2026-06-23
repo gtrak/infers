@@ -63,9 +63,9 @@ One `OxideKernels` instance per GPU loads the cubin on the correct device's prim
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
-### Oxide Bridge: Launch Wrapper Methods (27 Kernels)
+### Oxide Bridge: Launch Wrapper Methods (29 Kernels)
 
-Twenty-seven launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
+Twenty-nine launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
 
 **Element-wise kernels** (use `LaunchConfig::for_num_elems(n)`):
 
@@ -95,6 +95,18 @@ Twenty-seven launch wrapper methods on the `OxideKernels` impl block. Each follo
 | `launch_softmax_bf16` | `infers_softmax_bf16` | grid=(num_rows), block=(min(seq_len,1024)), smem=block*4 bytes |
 | `launch_gdn_update_bf16` | `infers_gdn_update_bf16` | grid=(hidden_size), block=(256), smem=1024 bytes (two-phase reduction) |
 
+**Dequant-to-BF16 kernels** (one thread per row, 256 threads per block):
+
+| Method | Kernel | Config |
+|--------|--------|--------|
+| `launch_int4_dequant_to_bf16` | `int4_dequant_to_bf16` | grid=(ceil(n/256)), block=(256), smem=0 — reads packed INT4 + fp16 scales + packed zeros, writes bf16 |
+| `launch_nvfp4_dequant_to_bf16` | `nvfp4_dequant_to_bf16` | grid=(ceil(n/256)), block=(256), smem=0 — reads packed FP4 + fp8_e4m3 scales + global scale + input_global_scale scalars, writes bf16 |
+
+**Sanitization kernels** (one thread per element):
+
+| Method | Kernel | Config |
+|--------|--------|--------|
+| `launch_sanitize_nan_bf16` | `sanitize_nan_bf16` | grid=(ceil(len/256)), block=(256), smem=0 — reads bf16 buffer, replaces NaN values with 0.0 |
 **Tile-based kernels** (2D grid, INT4 GEMM with 64x4 blocks):
 
 | Method | Kernel | Config |
@@ -358,6 +370,21 @@ INT4 GEMM with trait-based dequantization dispatch validates the monomorphized w
 | `int4_gemm_auto_round` | ✅ M=2, N=16, K=64, transposed=1 vs CPU reference |
 | `int4_gemm_gguf` | ✅ M=2, N=16, K=64, transposed=0 vs CPU reference |
 
+### cuda-oxide Kernel Library: Tier 3b — Dequantize to BF16 (Standalone Conversion Kernels)
+
+Two standalone dequantization kernels that convert quantized weights to bf16 on GPU before passing to cuBLAS GEMM. Replaces per-format GEMM kernels with a simpler dequant-then-cuBLAS pipeline.
+
+**Kernel: int4_dequant_to_bf16**: Reads INT4 AutoRound packed weights (u32, 8 values each), unpacks with FP16 group scales and packed zero points (+1 offset), writes bf16 output. Grid layout: 1D grid with 256 threads per block, one thread per output row (N dimension). Each thread iterates over K-groups within its row. Zero-point indexing matches the existing `int4_gemm_inner` kernel: `flat_idx = row * num_groups + group`, packed into `zeros[flat_idx / 8]` with nibble shift `(flat_idx % 8) * 4`.
+
+**Kernel: nvfp4_dequant_to_bf16**: Reads NVFP4 packed weights (u8, 2 FP4 values per byte), decodes each E2M1 nibble via `fp4_e2m1_to_f32()`, applies FP8 E4M3 per-group scale, f32 global weight scale, and f32 input activation global scale (`dequant_weight = fp4_val * group_scale / weight_global_scale * input_global_scale`), writes bf16 output. Same grid layout as INT4 dequant kernel. FP4 decode helper handles denormalized (exp=0), normalized (exp>0, bias=1), ±inf (exp=3, mant=0 → clamp to ±65504), and NaN (exp=3, mant=1).
+
+**FP4 E2M1 format**: 4-bit float with 1 sign bit, 2 exponent bits, 1 mantissa bit. Normalized: (-1)^S × 2^(E-1) × (1 + M/2). Denormalized: (-1)^S × 2^(-1) × (M/2).
+
+| Kernel | Quant Format | Grid Layout | Test Result |
+|--------|-------------|-------------|-------------|
+| `int4_dequant_to_bf16` | INT4 AutoRound | 1D, 256 threads/block, one row per thread | ✅ compiles clean |
+| `nvfp4_dequant_to_bf16` | NVFP4 (E2M1) | 1D, 256 threads/block, one row per thread | ✅ compiles clean |
+
 ### cuda-oxide Kernel Library: Tier 4 — FP8 and Paged Attention (Phase 18 — 5 Kernels Ported)
 
 Five kernels ported from nvcc to Rust: two FP8 format traits with four quantize/dequantize wrappers, plus the paged attention decode kernel with KvCacheFormat trait.
@@ -393,6 +420,8 @@ E4M3 provides better precision (smaller quantization error ~25%) while E5M2 supp
 Four GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-lib, covering the core SSM recurrence patterns used by Qwen3.6-27B inference. All compute in f32 with bf16 I/O for precision.
 
 **Shared math patterns**: Each kernel implements softplus (`log(1 + exp(x))` with clamping at ±20), sigmoid (`1/(1+exp(-x))`), and bf16↔f32 conversion via `(bits as u32) << 16`. These are computed inline in each kernel rather than as shared helpers — cuda-oxide's `#[cuda_module]` does not support cross-scope device functions outside the module.
+
+**Module organization**: The single `lib.rs` file inside `kernel-lib/` contains all types, utilities, and kernels within one `#[cuda_module]` block. Splitting into separate files was attempted but blocked by two Rust limitations: (1) `use super::types::*` cannot resolve imports from outside the PTX compilation scope, and (2) file-based submodules (`mod types; mod util;`) inside proc macro input require the unstable `proc_macro_hygiene` feature. The fallback is enhanced section organization with `══` separator comments marking Utilities, FP8/INT4/KV cache types, and kernel function groups. The cuda_module doc comment lists all five sections.
 
 | Kernel | Source File | Description | Test Result |
 |--------|-------------|-------------|-------------|

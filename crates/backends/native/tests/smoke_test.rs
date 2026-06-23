@@ -16,6 +16,7 @@ use infers_cuda::context::CudaRuntime;
 use infers_cuda::stream::StreamPool;
 use infers_kv::SequenceId;
 use infers_model_loader_heap::{load_safetensors, shard_weights_tp};
+use infers_model::QuantTargetMap;
 use infers_model::{strip_language_model_prefix, build_main_layers};
 use infers_model::mmap::{load_safetensors_mmap, strip_language_model_prefix_mmap, shard_weights_tp_mmap, build_metadata_registry};
 
@@ -51,6 +52,15 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     let config = infers_model::config::ModelConfig::load(&model_dir)?;
     eprintln!("Config loaded: {} layers", config.num_hidden_layers);
 
+    let quant_map = if let Some(ref quant_config) = config.quantization_config {
+        QuantTargetMap::from_config(quant_config).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to parse quantization config: {}", e);
+            QuantTargetMap::empty()
+        })
+    } else {
+        QuantTargetMap::empty()
+    };
+
     // 2. Load raw safetensors and strip language_model prefix (BEFORE sharding)
     let mut raw_weights = load_safetensors(&model_dir)?;
     strip_language_model_prefix(&mut raw_weights);
@@ -66,7 +76,7 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     for shard in shards {
         let gpu_id = shard.gpu_id;
         let mut registry = shard.registry;
-        build_main_layers(&mut registry, &config)?;
+        build_main_layers(&mut registry, &config, &quant_map)?;
         eprintln!(
             "Shard {}: layers={}, embedding={}, norm={}, lm_head={}",
             gpu_id,

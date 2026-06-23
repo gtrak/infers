@@ -76,6 +76,7 @@ half = "2.6.0"
 
 # Testing
 tempfile = "3.27.0"
+regex = "1"
 
 [profile.release]
 opt-level = 3

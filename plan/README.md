@@ -69,6 +69,8 @@ CUDA Kernels
 | [Phase 16](phase-16-zero-copy-weights.md) | DONE | 1 week | Zero-copy weight streaming from mmap to GPU | Eliminate DRAM residency — stream directly from disk via mmap + pinned staging buffer |
 | [Phase 17](phase-17-paged-prefill-wiring.md) | NOT STARTED | 2–3 days | Wire paged prefill into server orchestrator | Unified KV state, prefix caching enabled |
 | [Phase 24](024-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: end-to-end inference with trait-based quant dispatch | Rust→PTX→cudarc pipeline. INT4 GEMM + Dequantize trait. FP8 + PagedAttn with format traits. |
+| [Phase 26](026-nvfp4-support.md) | DONE | 1 week | PrismaSCOUT NVFP4 model support — metadata-driven weight loading, NVFP4 companions, quant target parsing | NVFP4 PrismaSCOUT model loads with metadata-driven per-tensor quant resolution |
+| [Phase 27](027-dequant-to-bf16.md) | PARTIAL | 3 days | Dequant-to-BF16 unified quantization path — dequant kernels + cuBLAS GEMM | INT4/NVFP4 dequant kernels, launch wrappers, gemm_dispatch wired. Old GEMM cleanup + mmap upload pending. |
 
 **Critical Path**: Phase 4.7 (GPU Weight Cache) → Phase 4 (hit 20 tok/s) → Phase 6 (continuous batching) → Phase 7 (MTP) → Phase 10 (wire server)
 

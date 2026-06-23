@@ -11,8 +11,7 @@ use bytes::Bytes;
 use safetensors::SafeTensors;
 
 use infers_model::config::ModelConfig;
-use infers_model::weights::{ShardIndex, WeightData, WeightDtype, WeightRegistry, WeightShard};
-
+use infers_model::weights::{Int4Companions, Nvfp4Companions, QuantCompanions, ShardIndex, WeightData, WeightDtype, WeightRegistry, WeightShard};
 // ---------------------------------------------------------------------------
 // Safetensors loading (heap copy)
 // ---------------------------------------------------------------------------
@@ -152,13 +151,50 @@ pub fn shard_weights_tp(
     anyhow::ensure!(num_gpus >= 1, "num_gpus must be >= 1");
 
     if num_gpus == 1 {
-        // No sharding needed for single GPU
-        return Ok(vec![WeightShard {
-            gpu_id: 0,
-            registry: registry.clone(),
-        }]);
-    }
+        // No sharding needed for single GPU — clone and populate companions.
+        let mut shard_registry = registry.clone();
+        for name in shard_registry.tensors.keys() {
+            // Handle INT4 companions
+            if name.ends_with(".qweight") {
+                let base = name.strip_suffix(".qweight").unwrap_or(name.as_str());
+                let scales_name = format!("{}.scales", base);
+                let qzeros_name = format!("{}.qzeros", base);
 
+                if let Some(scales) = shard_registry.tensors.get(&scales_name)
+                    && let Some(qzeros) = shard_registry.tensors.get(&qzeros_name) {
+                    shard_registry.quant_companions.insert(
+                        name.clone(),
+                        QuantCompanions::Int4(Int4Companions {
+                            scales: scales.clone(),
+                            qzeros: qzeros.clone(),
+                        }),
+                    );
+                }
+            }
+
+            // Handle NVFP4 companions
+            if name.ends_with(".weight_packed") {
+                let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                let weight_scale_name = format!("{}.weight_scale", base);
+                let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                if let Some(weight_scale) = shard_registry.tensors.get(&weight_scale_name)
+                    && let Some(weight_global_scale) = shard_registry.tensors.get(&weight_global_scale_name)
+                    && let Some(input_global_scale) = shard_registry.tensors.get(&input_global_scale_name) {
+                    shard_registry.quant_companions.insert(
+                        name.clone(),
+                        QuantCompanions::Nvfp4(Nvfp4Companions {
+                            weight_scale: weight_scale.clone(),
+                            weight_global_scale: weight_global_scale.clone(),
+                            input_global_scale: input_global_scale.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+        return Ok(vec![WeightShard { gpu_id: 0, registry: shard_registry }]);
+    }
     // For TP=2+, shard each layer's weights
     let mut shards: Vec<WeightShard> = (0..num_gpus)
         .map(|gpu_id| WeightShard {
@@ -174,8 +210,11 @@ pub fn shard_weights_tp(
         if name.ends_with(".scales") || name.ends_with(".qzeros") {
             companion_skip.insert(name.clone());
         }
+        // NVFP4 companions
+        if name.ends_with(".weight_scale") || name.ends_with(".weight_global_scale") || name.ends_with(".input_global_scale") {
+            companion_skip.insert(name.clone());
+        }
     }
-
     for (name, weight) in &registry.tensors {
         // Skip companion tensors that were already processed with their qweight.
         if companion_skip.contains(name) {
@@ -194,8 +233,16 @@ pub fn shard_weights_tp(
         ];
 
         if name.contains("in_proj_qkv") {
-            // Shard each sub-projection independently (INT4 column-major layout)
-            let layout = FusedProjectionLayout::ColumnMajor;
+            // The fused output dimension is the last segment endpoint.
+            let fused_dim = qkv_segments.last().map(|(_, e)| *e).unwrap_or(0);
+            // Detect which axis of the weight tensor holds the fused output dimension.
+            // INT4 qweight: shape (K/8, N=fused_dim) → split dim1 → ColumnMajor
+            // NVFP4 weight_packed: shape (N=fused_dim, K/2) → split dim0 → RowMajor
+            let layout = if weight.shape[0] == fused_dim {
+                FusedProjectionLayout::RowMajor
+            } else {
+                FusedProjectionLayout::ColumnMajor
+            };
 
             // Scaled segments for qzeros (conv_dim/8 instead of conv_dim)
             let qzeros_segments: Vec<(usize, usize)> =
@@ -233,12 +280,38 @@ pub fn shard_weights_tp(
                             layout,
                         )
                         .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                        shard.registry.int4_companions.insert(
+                        shard.registry.quant_companions.insert(
                             name.clone(),
-                            infers_model::weights::Int4Companions {
+                            QuantCompanions::Int4(Int4Companions {
                                 scales: sliced_scales,
                                 qzeros: sliced_qzeros,
-                            },
+                            }),
+                        );
+                    }
+                }
+
+                // Shard NVFP4 companion weights — replicate ALL companions to all GPUs.
+                // Fused QKV: weight_scale has a different second dim than weight_packed
+                // (groups vs elements), so segment-based sharding doesn't apply.
+                if name.ends_with(".weight_packed") {
+                    let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                    let weight_scale_name = format!("{}.weight_scale", base);
+                    let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                    let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                    if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                        && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                        && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                        companion_skip.insert(weight_scale_name.clone());
+                        companion_skip.insert(weight_global_scale_name.clone());
+                        companion_skip.insert(input_global_scale_name.clone());
+                        shard.registry.quant_companions.insert(
+                            name.clone(),
+                            QuantCompanions::Nvfp4(Nvfp4Companions {
+                                weight_scale: weight_scale.clone(),
+                                weight_global_scale: weight_global_scale.clone(),
+                                input_global_scale: input_global_scale.clone(),
+                            }),
                         );
                     }
                 }
@@ -247,8 +320,15 @@ pub fn shard_weights_tp(
         }
 
         if name.contains("conv1d.weight") {
-            // Shard conv1d weight with row-major layout (BF16)
-            let layout = FusedProjectionLayout::RowMajor;
+            let fused_dim = qkv_segments.last().map(|(_, e)| *e).unwrap_or(0);
+            // Detect which axis of the weight tensor holds the fused output dimension.
+            // BF16: shape (N=fused_dim, K...) → split dim0 → RowMajor
+            // NVFP4 might differ — detect generically from shape vs segments.
+            let layout = if weight.shape[0] == fused_dim {
+                FusedProjectionLayout::RowMajor
+            } else {
+                FusedProjectionLayout::ColumnMajor
+            };
             for (gpu_id, shard) in shards.iter_mut().enumerate() {
                 let sliced = shard_fused_projection_columns(weight, gpu_id, num_gpus, qkv_segments, layout)
                     .context(format!("Failed to shard conv1d weight: {}", name))?;
@@ -288,12 +368,40 @@ pub fn shard_weights_tp(
                                 .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                             let sliced_qzeros = slice_weight_last_dim(qzeros, gpu_id, num_gpus)
                                 .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                            shard.registry.int4_companions.insert(
+                            shard.registry.quant_companions.insert(
                                 name.clone(),
-                                infers_model::weights::Int4Companions {
+                                QuantCompanions::Int4(Int4Companions {
                                     scales: sliced_scales,
                                     qzeros: sliced_qzeros,
-                                },
+                                }),
+                            );
+                        }
+                    }
+
+                    // Shard NVFP4 companion weights
+                    if name.ends_with(".weight_packed") {
+                        let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                        let weight_scale_name = format!("{}.weight_scale", base);
+                        let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                        let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                        if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                            && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                            && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                            companion_skip.insert(weight_scale_name.clone());
+                            companion_skip.insert(weight_global_scale_name.clone());
+                            companion_skip.insert(input_global_scale_name.clone());
+                            // Column-parallel: weight_packed [N, K/2] split on dim0 → weight_scale [N, K/gs] split on dim0
+                            let sliced_ws = slice_weight_dim0(weight_scale, gpu_id, num_gpus)
+                                .context(format!("Failed to shard NVFP4 weight_scale: {}", weight_scale_name))?;
+                            // weight_global_scale and input_global_scale are 1D scalars — replicate to all GPUs
+                            shard.registry.quant_companions.insert(
+                                name.clone(),
+                                QuantCompanions::Nvfp4(Nvfp4Companions {
+                                    weight_scale: sliced_ws,
+                                    weight_global_scale: weight_global_scale.clone(),
+                                    input_global_scale: input_global_scale.clone(),
+                                }),
                             );
                         }
                     }
@@ -327,12 +435,39 @@ pub fn shard_weights_tp(
                                 .context(format!("Failed to shard INT4 scales: {}", scales_name))?;
                             let sliced_qzeros = slice_weight_dim0(qzeros, gpu_id, num_gpus)
                                 .context(format!("Failed to shard INT4 qzeros: {}", qzeros_name))?;
-                            shard.registry.int4_companions.insert(
+                            shard.registry.quant_companions.insert(
                                 name.clone(),
-                                infers_model::weights::Int4Companions {
+                                QuantCompanions::Int4(Int4Companions {
                                     scales: sliced_scales,
                                     qzeros: sliced_qzeros,
-                                },
+                                }),
+                            );
+                        }
+                    }
+
+                    // Shard NVFP4 companion weights
+                    if name.ends_with(".weight_packed") {
+                        let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                        let weight_scale_name = format!("{}.weight_scale", base);
+                        let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                        let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                        if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                            && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                            && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                            companion_skip.insert(weight_scale_name.clone());
+                            companion_skip.insert(weight_global_scale_name.clone());
+                            companion_skip.insert(input_global_scale_name.clone());
+                            let sliced_ws = slice_weight_last_dim(weight_scale, gpu_id, num_gpus)
+                                .context(format!("Failed to shard NVFP4 weight_scale: {}", weight_scale_name))?;
+                            // weight_global_scale and input_global_scale are 1D scalars — replicate to all GPUs
+                            shard.registry.quant_companions.insert(
+                                name.clone(),
+                                QuantCompanions::Nvfp4(Nvfp4Companions {
+                                    weight_scale: sliced_ws,
+                                    weight_global_scale: weight_global_scale.clone(),
+                                    input_global_scale: input_global_scale.clone(),
+                                }),
                             );
                         }
                     }
@@ -353,12 +488,36 @@ pub fn shard_weights_tp(
                             && let Some(qzeros) = registry.tensors.get(&qzeros_name) {
                             companion_skip.insert(scales_name.clone());
                             companion_skip.insert(qzeros_name.clone());
-                            shard.registry.int4_companions.insert(
+                            shard.registry.quant_companions.insert(
                                 name.clone(),
-                                infers_model::weights::Int4Companions {
+                                QuantCompanions::Int4(Int4Companions {
                                     scales: scales.clone(),
                                     qzeros: qzeros.clone(),
-                                },
+                                }),
+                            );
+                        }
+                    }
+
+                    // Replicate NVFP4 companion weights
+                    if name.ends_with(".weight_packed") {
+                        let base = name.strip_suffix(".weight_packed").unwrap_or(name.as_str());
+                        let weight_scale_name = format!("{}.weight_scale", base);
+                        let weight_global_scale_name = format!("{}.weight_global_scale", base);
+                        let input_global_scale_name = format!("{}.input_global_scale", base);
+
+                        if let Some(weight_scale) = registry.tensors.get(&weight_scale_name)
+                            && let Some(weight_global_scale) = registry.tensors.get(&weight_global_scale_name)
+                            && let Some(input_global_scale) = registry.tensors.get(&input_global_scale_name) {
+                            companion_skip.insert(weight_scale_name.clone());
+                            companion_skip.insert(weight_global_scale_name.clone());
+                            companion_skip.insert(input_global_scale_name.clone());
+                            shard.registry.quant_companions.insert(
+                                name.clone(),
+                                QuantCompanions::Nvfp4(Nvfp4Companions {
+                                    weight_scale: weight_scale.clone(),
+                                    weight_global_scale: weight_global_scale.clone(),
+                                    input_global_scale: input_global_scale.clone(),
+                                }),
                             );
                         }
                     }
