@@ -277,18 +277,25 @@ For **INT4 (AutoRound)**: `gemm_projection_cached` calls `oxide.launch_int4_gemm
 
 ### K-Split GEMM for M=1 Decode
 
-K-splitting divides the K dimension across multiple thread blocks, multiplying GPU occupancy by K_SPLIT (currently 4). Two-phase approach: `int4_gemm_auto_round_ksplit` computes partial sums in f32, then `reduce_partial_sums_bf16` combines them.
+K-splitting divides the K dimension across thread blocks, multiplying occupancy by K_SPLIT (28). Two-phase: v1 computes f32 partial sums, then `reduce_partial_sums_bf16` combines them. Production uses **v3 kernels** with four bandwidth optimizations.
 
-When `m==1` (single-token decode), the naive INT4 kernel has only `ceil(N/64)` thread blocks — e.g., N=5120 gives 80 blocks = 1.6 blocks/SM = 3.2 warps/SM on RTX 5090. This is insufficient to hide VRAM latency (~400ns).
+#### INT4 V3 Optimizations
 
-K-split boundaries align to group_size so quantization groups are never split across blocks. Overlapping groups at split boundaries are handled by skipping weights outside each split's K range (`k_start ≤ k_full < k_end`). The f32 partial_sums buffer (~80KB for N=5120, K_SPLIT=4) is allocated inline per GEMM call — the latency-hiding benefit outweighs the allocation overhead.
+Four optimizations in `int4_gemm_v3_ksplit`:
 
-**Warp-cooperative kernels** provide an alternative reduction strategy. `int4_gemm_warp` uses block (32, 8, 1) with warp shuffle XOR reduction — each warp computes one output column and reduces 32 lanes' partial sums in-register via `warp::shuffle_xor_f32`. No partial_sums buffer or reduction kernel needed when K_SPLIT=1. For larger K, `int4_gemm_warp_split` adds K-splitting: grid (ceil(N/8), K_SPLIT, 1) with each warp handling a slice of groups (`group_start + lane, group_start + lane + 32, ...`). Each split's warp reduces via shuffle and lane 0 writes to `partial_sums[split_idx * N + col]`, then `reduce_partial_sums_bf16` combines.
+(1) 4 independent f32 accumulators (acc0..acc3) exposing FMA pipeline depth. (2) Group-aligned ceil-grouped K-split — full quantization groups distributed across splits for branchless inner loop, handling non-divisible K_SPLIT. (3) Two-u32 outer-loop stride per group hiding DRAM latency. (4) Per-group `scaled_zero = (raw_zero+1)*scale` hoist saving one FMA per dequantized weight. INT4 decode: 61ms -> 48ms/step (16.4 to 20.8 tok/s).
 
-Each lane in the warp-cooperative design handles K/8/32 = K/256 groups (e.g., 20 groups for K=5120), giving ~20 u32 loads and ~160 FMA per lane — substantially better pipeline fill than the naive ksplit kernel's 2.5 u32 loads per thread.
+#### NVFP4 V3 Kernel
 
-The same K-splitting technique applies to **NVFP4 (PrismaSCOUT)**: `nvfp4_gemm_fused_ksplit` computes partial sums in f32, then `reduce_partial_sums_bf16` combines them — reusing the same format-agnostic reduction kernel. The NVFP4 K-split kernel dequantizes FP4 in registers with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, and weight_global_scale as f32 scalar. For **M>1**, the fused `nvfp4_gemm_fused` kernel is used directly — dequantizes FP4 in registers and multiplies with BF16 activations without any intermediate bf16 buffer (reads 4 bytes as u32 for 8 nibbles per load, precomputes effective_scale once per group). See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+`nvfp4_gemm_v3_ksplit` applies identical optimizations to NVFP4 dequant logic (group_size=16). Result: 117ms -> 105ms/step (8.5 to 9.4 tok/s). For **M>1**, fused `nvfp4_gemm_fused` is used directly — no intermediate bf16 buffer. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
+#### Partial Sums Buffer
+
+Pre-allocated in `DecodeWorkspace` as `partial_sums: CudaSlice<f32>` (K_SPLIT × sharded_intermediate, ~1.4MB). Threaded via `partial_sums_buf`. Decode passes `Some(&mut ws.partial_sums)`, prefill/LM head `None`. Eliminates ~800 alloc_zeros per token.
+#### Warp-Cooperative Kernels (Benchmark Result)
+`int4_gemm_warp` and `int4_gemm_warp_split` were measured slower than naive ksplit: 158ms and 161ms vs 61ms — with group_size=128 and K=5120 there are only 40 groups, too few for 32-lane shuffle reduction. Kept compiled but not wired into dispatch.
+
+When `m==1` (single-token decode), the naive INT4 kernel has only `ceil(N/64)` thread blocks — e.g., N=5120 gives 80 blocks = 1.6 blocks/SM = 3.2 warps/SM on RTX 5090. Insufficient to hide VRAM latency (~400ns).
 ### eprintln Gating in GEMM Dispatch
 
 GEMM debug output is gated behind `INFERS_DEBUG` env var via `OnceLock<bool>`, eliminating ~400 stderr writes per decode step. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
@@ -324,6 +331,7 @@ New `attn_out` field provides a shared output buffer for both GDN and attention 
 
 The `attn` field holds a nested `AttnWorkspace` with 11 pre-allocated buffers covering all attention decode intermediate allocations (k_single, v_single, k_norm_out, q_dummy, q_full, q_buf, gate_buf, q_norm_out, k_rope_dummy, attn_output, gated). See [[crates/backends/native/src/workspace.rs#AttnWorkspace]].
 
+The `partial_sums: CudaSlice<f32>` field (sized K_SPLIT x sharded_intermediate, ~1.4MB) is pre-allocated once at engine init and threaded through GEMM dispatch, eliminating ~800 alloc_zeros calls per token. See [[lat.md/lat#Forward Engine#Quantized GEMM Dispatch (Fused INT4, Dequant NVFP4)#K-Split GEMM for M=1 Decode]].
 `gdn::decode_forward` is now fully wired to use workspace buffers: takes `ws: &mut GdnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros`, zero `.clone()` calls). The `_into` helper variants (`copy_view_into`, `repeat_interleave_heads_into`) replace their allocating counterparts. NCCL all-reduce and residual add operate directly on `workspace.attn_out`. See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 `attention::decode_forward_paged` is now fully wired to use workspace buffers: takes `ws: &mut AttnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros` calls). The Q/gate extraction uses device-to-device memcpy into workspace buffers instead of allocating new ones. K-norm and Q-norm use `rms_norm_into` writing into `ws.k_norm_out`/`ws.q_norm_out`. Paged attention decode uses `paged_attention_decode_into` writing directly into `ws.attn_output`. The final O-projection writes directly into `output` (i.e., `workspace.attn_out`), eliminating the post-attention `memcpy_dtod` copy in engine.rs. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].

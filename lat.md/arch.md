@@ -63,12 +63,11 @@ One `OxideKernels` instance per GPU loads the cubin on the correct device's prim
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
-### Oxide Bridge: Launch Wrapper Methods (32 Kernels)
+### Oxide Bridge: Launch Wrapper Methods (34 Kernels)
 
-Thirty-two launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
+Thirty-four launch wrapper methods on `OxideKernels`. Each follows the same pattern as `launch_add_bf16`: cudarc device pointers, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
 
 **Element-wise kernels** (use `LaunchConfig::for_num_elems(n)`):
-
 | Method | Kernel | Parameters |
 |--------|--------|------------|
 | `launch_embedding_gather_bf16` | `infers_embedding_gather_bf16` | weight: bf16, token_ids: i32, output: bf16, seq_len, hidden_size |
@@ -116,11 +115,12 @@ Thirty-two launch wrapper methods on the `OxideKernels` impl block. Each follows
 | `launch_int4_gemm_auto_round_ksplit` | `int4_gemm_auto_round_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — K-split: each thread block computes partial sums over a portion of K (K/k_split), writes to f32 buffer |
 | `launch_int4_gemm_warp` | `int4_gemm_warp` | grid=(ceil(n/8), 1, 1), block=(32,8,1), smem=0 — warp-cooperative: each warp computes one column via shuffle reduction, lane 0 writes output directly (no partial_sums) |
 | `launch_int4_gemm_warp_split` | `int4_gemm_warp_split` | grid=(ceil(n/8), k_split, 1), block=(32,8,1), smem=0 — warp + K-split: each warp computes one column over a K-slice, shuffle reduces within warp, lane 0 writes to partial_sums |
+| `launch_int4_gemm_v3_ksplit` | `int4_gemm_v3_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — v3 bandwidth-optimized K-split: 4 f32 accumulators (ILP), branchless ceil-grouped K-split, two-u32 outer stride, scaled_zero hoist. Production kernel for INT4 decode |
 | `launch_reduce_partial_sums_bf16` | `reduce_partial_sums_bf16` | grid=(ceil(n/64), 1, 1), block=(64,1), smem=0 — reduces K-split partial sums (f32) into final bf16 output |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer. Optimized: reads 4 bytes as u32 (8 nibbles per load vs 2 per byte), precomputes effective_scale = scale / global_scale once per group |
 | `launch_nvfp4_gemm_fused_ksplit` | `nvfp4_gemm_fused_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — K-split for M=1 decode: each thread block computes partial sums over a portion of K, writes to f32 buffer. Same dequant logic as nvfp4_gemm_fused |
-
+| `launch_nvfp4_gemm_v3_ksplit` | `nvfp4_gemm_v3_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — v3 bandwidth-optimized NVFP4 K-split: same 4 optimizations as INT4 v3 applied to NVFP4 dequant (group_size=16). Production kernel for NVFP4 decode |
 **In-place write kernels** (q and k are writable `DisjointSlice<u16>`):
 
 | Method | Kernel | Notes |
