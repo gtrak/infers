@@ -71,8 +71,15 @@ CUDA Kernels
 | [Phase 24](024-cuda-oxide-quant.md) | NOT STARTED | 2–3 days | cuda-oxide: end-to-end inference with trait-based quant dispatch | Rust→PTX→cudarc pipeline. INT4 GEMM + Dequantize trait. FP8 + PagedAttn with format traits. |
 | [Phase 26](026-nvfp4-support.md) | DONE | 1 week | PrismaSCOUT NVFP4 model support — metadata-driven weight loading, NVFP4 companions, quant target parsing | NVFP4 PrismaSCOUT model loads with metadata-driven per-tensor quant resolution |
 | [Phase 27](027-dequant-to-bf16.md) | PARTIAL | 3 days | Dequant-to-BF16 unified quantization path — dequant kernels + cuBLAS GEMM | INT4/NVFP4 dequant kernels, launch wrappers, gemm_dispatch wired. Old GEMM cleanup + mmap upload pending. |
+| [Phase 28](028-fused-quant-gemm.md) | NOT STARTED | 1 week | Fused quantized GEMM with shared memory tiling | Single-kernel dequant+GEMM for INT4/NVFP4, no intermediate BF16 buffer. ~900 kernels eliminated per token. |
+| [Phase 29](029-gpu-resident-engine.md) | NOT STARTED | 1 week | GPU-resident engine — zero alloc, zero sync steady state | Pre-allocated workspace, GPU-resident metadata (RoPE, a_log, dt_bias), eliminate all CPU-GPU sync in decode loop. |
+| [Phase 30](030-async-pipeline.md) | NOT STARTED | 2 weeks | cuda-oxide async pipeline with multi-stream scheduling | DeviceOperation graph per layer, NCCL all-reduce overlapped with next layer compute. Fills GPU1 idle bubbles. |
+| [Phase 31](031-continuous-batching.md) | NOT STARTED | 2 weeks | Continuous batching — multi-sequence decode | Process up to 4 sequences per decode step. Batched GEMM amortizes weight reads. Batched paged attention + sampling. |
+| [Phase 32](032-cuda-graphs.md) | NOT STARTED | 1 week | CUDA graph capture/replay for zero-overhead decode | Single graph launch replaces ~9000 kernel launches. Mapped pinned memory for zero-copy input updates. Target: ~20-30ms/token. |
 
-**Critical Path**: Phase 4.7 (GPU Weight Cache) → Phase 4 (hit 20 tok/s) → Phase 6 (continuous batching) → Phase 7 (MTP) → Phase 10 (wire server)
+**Critical Path**: Phase 28 (fused GEMM) → Phase 29 (zero-sync engine) → Phase 30 (async pipeline) → Phase 31 (continuous batching) → Phase 32 (CUDA graphs)
+
+**Expected Performance**: Current ~2600ms/token → target ~20-30ms/token (~100x improvement across phases 28-32).
 
 **Total Time to Production**: ~33 weeks original estimate. With current state, **~4-6 weeks remaining** if focused on critical path (4.7 → 4 perf → 6 → 7 → 10).
 
