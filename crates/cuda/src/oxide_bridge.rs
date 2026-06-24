@@ -880,7 +880,7 @@ impl OxideKernels {
         stream: &Arc<CudaStream>,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
-        scales: &CudaSlice<half::bf16>,
+        scales: &CudaSlice<half::f16>,
         zeros: &CudaSlice<u32>,
         input: &CudaSlice<half::bf16>,
         m: u32,

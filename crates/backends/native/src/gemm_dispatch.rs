@@ -3,8 +3,9 @@
 //! Provides `gemm_projection_cached` which dispatches GEMM using GPU-resident
 //! weight buffers from `GpuWeightCache`, avoiding per-call CPU→GPU uploads.
 //! Handles both BF16 contiguous weights and INT4 quantized triplets in a
-//! single call. For INT4 and NVFP4, dequantize to bf16 on GPU then dispatch
-//! via `bf16_gemm_tiled` (bypassing cuBLAS).
+//! single call. For INT4, uses the fused `int4_gemm_auto_round` kernel
+//! (no dequantize buffer needed). NVFP4 still dequantizes to bf16 on GPU then
+//! dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
 
 use std::sync::Arc;
 
@@ -15,8 +16,9 @@ use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 
 /// Dispatch a single projection GEMM using cached GPU-resident weights.
 /// Looks up the weight by name from the `GpuWeightCache`. For BF16 weights,
-/// calls `gemm.matmul_bf16` directly. For INT4 and NVFP4, dequantizes
-/// to bf16 on GPU then dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
+/// calls `gemm.matmul_bf16` directly. For INT4, uses the fused
+/// `int4_gemm_auto_round` kernel. NVFP4 dequantizes to bf16 on GPU then
+/// dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
@@ -74,37 +76,28 @@ pub fn gemm_projection_cached(
         }
         Some(crate::gpu_cache::CachedWeight::Int4(int4_bufs)) => {
             if debug { eprintln!("[GEMM-DISPATCH] Int4 weight '{}': n={}, k={}", weight_name, n, k); }
-            // 1. Allocate bf16 buffer for dequantized weights: [N, K]
-            let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
 
-            // 2. Launch dequant kernel
-            oxide.launch_int4_dequant_to_bf16(
+            // Compute actual batch/sequence dimension from input
+            let m = input.len() / k;
+
+            // Determine transposition from weight shape: [K/8, N] is transposed layout.
+            let transposed: u32 = if int4_bufs.shape.len() >= 2 {
+                // If dim0 != n (N), the weight is in transposed [K/8, N] layout
+                if int4_bufs.shape[1] == n { 1 } else { 0 }
+            } else { 1 }; // default to transposed (AutoRound convention)
+
+            oxide.launch_int4_gemm_auto_round(
                 stream,
-                &mut dequant_buf,
+                output,
                 &int4_bufs.qweight,
                 &int4_bufs.scales,
                 &int4_bufs.qzeros,
-                n as u32,
-                k as u32,
-                group_size as u32,
-            )?;
-
-            // 3. Sanitize NaN values in dequant buffer (stale GPU memory may contain NaN)
-            oxide.launch_sanitize_nan_bf16(stream, &mut dequant_buf)?;
-
-            // 4. Compute actual batch/sequence dimension from input
-            let m = input.len() / k;
-
-            // 5. bf16 tiled GEMM: output = input @ dequant_buf^T
-            //    Bypasses cuBLAS to avoid workspace corruption with dequant buffers.
-            oxide.launch_bf16_gemm_tiled(
-                stream,
-                output,
                 input,
-                &dequant_buf,
                 m as u32,
                 n as u32,
                 k as u32,
+                group_size as u32,
+                transposed,
             )?;
         }
         Some(crate::gpu_cache::CachedWeight::Nvfp4(nvfp4_bufs)) => {
