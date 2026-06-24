@@ -240,7 +240,7 @@ Five deferred-feature fields and three monitoring methods in `InferenceOrchestra
 
 Fixed all compiler warnings in `infers-backend-native` crate (TD-5).
 
-Unused `stream` parameters in `prefill_paged` and `decode_paged` prefixed with `_`. The `paged_kv_read` field in `PerGpuKernels` annotated with `#[allow(dead_code)]` — kernel loaded but unused, retained for potential future use. `a_log_zeros`/`dt_bias_zeros` double-assignment warnings suppressed via `#[allow(unused_assignments)]` on both `forward` and `decode_forward` functions; the Option<None> initialization is required because zero-allocated buffers must live at function scope to satisfy borrow checker constraints across if/else branches. See [[crates/backends/native/src/engine.rs#PerGpuKernels]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
+Unused `stream` parameters in `prefill_paged` and `decode_paged` prefixed with `_`. The `paged_kv_read` field in `PerGpuKernels` annotated with `#[allow(dead_code)]` — kernel loaded but unused, retained for potential future use. In `gdn::decode_forward`, a_log/dt_bias fallback zeros are provided by workspace buffers (`ws.a_log_zeros`, `ws.dt_bias_zeros`) instead of local allocations; the `#[allow(unused_assignments)]` attribute was removed since those double-assignment patterns no longer exist in decode_forward. The prefill function still uses the older allocation-based approach. See [[crates/backends/native/src/engine.rs#PerGpuKernels]], [[crates/backends/native/src/gdn.rs#forward]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 # Phase 1 Deliverables
 

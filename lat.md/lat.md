@@ -308,6 +308,10 @@ Original functions (`rms_norm`, `add`) allocate new GPU buffers each call. The `
 
 Pre-allocated GPU workspace buffers for the decode hot path. `DecodeWorkspace` holds all intermediate buffers allocated once per GPU at engine init, eliminating hundreds of `alloc_zeros` calls per token. Fully wired into `decode_paged`. See [[crates/backends/native/src/workspace.rs#DecodeWorkspace]].
 
+New `attn_out` field provides a shared output buffer for both GDN and attention decode outputs, eliminating the `attn_outputs: Vec<CudaSlice>` and its per-layer allocation. The `gdn` field holds a nested `GdnWorkspace` with 16 pre-allocated buffers covering all GDN intermediate allocations (mixed_qkv, conv_input, conv_out, query/key/value, expanded heads, projection outputs, recurrent step output, z-gate, norm output, and fallback zero buffers for a_log/dt_bias). See [[crates/backends/native/src/workspace.rs#GdnWorkspace]].
+
+`gdn::decode_forward` is now fully wired to use workspace buffers: takes `ws: &mut GdnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros`, zero `.clone()` calls). The `_into` helper variants (`copy_view_into`, `repeat_interleave_heads_into`) replace their allocating counterparts. NCCL all-reduce and residual add operate directly on `workspace.attn_out`. See [[crates/backends/native/src/gdn.rs#decode_forward]].
+
 # Mmap Weight Upload
 
 Zero-copy weight upload from memory-mapped safetensors files using cuMemcpy2D DMA. Supports BF16, FP16, FP32, INT4 packed, and NVFP4 quantized weights via companion detection in `quant_companions` map. See [[crates/cuda/src/memcpy2d.rs]].

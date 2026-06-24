@@ -244,9 +244,11 @@ impl ForwardEngine {
             let gpu_stream = streams.get(gpu_idx).unwrap().clone();
             workspaces.push(DecodeWorkspace::new(
                 &gpu_stream,
+                config.as_ref(),
                 config.hidden_size,
                 sharded_intermediate,
                 config.vocab_size,
+                num_gpus,
             )?);
         }
 
@@ -360,9 +362,11 @@ impl ForwardEngine {
             let gpu_stream = streams.get(gpu_idx).unwrap().clone();
             workspaces.push(DecodeWorkspace::new(
                 &gpu_stream,
+                config.as_ref(),
                 config.hidden_size,
                 sharded_intermediate,
                 config.vocab_size,
+                num_gpus,
             )?);
         }
 
@@ -1017,9 +1021,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
-            // Phase A: Attention/GDN on each GPU
-            let mut attn_outputs: Vec<CudaSlice<bf16>> = Vec::new();
-
+           // Phase A: Attention/GDN on each GPU
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
@@ -1039,26 +1041,30 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &self.workspaces[gpu_idx].norm1_out, &[1, config.hidden_size], "decode");
 
                 // Attention or GDN (decode versions)
-                let attn_out = match config.get_layer_type(layer_idx) {
+                match config.get_layer_type(layer_idx) {
                     LayerType::GatedDeltaNet => {
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
-              crate::gdn::decode_forward(
-                               gemm, &gpu_stream,
-                               &self.per_gpu_kernels[gpu_idx].oxide,
-                              gdn_weights, &self.workspaces[gpu_idx].norm1_out,
-                            &mut self.gdn_states[gpu_idx][layer_idx],
-                            config.hidden_size, config.as_ref(), self.group_size,
-                            &self.weight_caches[gpu_idx],
-                            layer_idx,
-                            gpu_idx,
-                            &probe,
-                        )?
+                        {
+                            let ws = &mut self.workspaces[gpu_idx];
+                            crate::gdn::decode_forward(
+                                gemm, &gpu_stream,
+                                &self.per_gpu_kernels[gpu_idx].oxide,
+                                gdn_weights, &ws.norm1_out,
+                                &mut self.gdn_states[gpu_idx][layer_idx],
+                                config.hidden_size, config.as_ref(), self.group_size,
+                                &self.weight_caches[gpu_idx],
+                                layer_idx,
+                                gpu_idx,
+                                &probe,
+                                &mut ws.gdn, &mut ws.attn_out,
+                            )?;
+                        }
                     }
                     LayerType::FullAttention => {
                         let attn_weights = layer.attn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-            crate::attention::decode_forward_paged(
+                        let attn_out = crate::attention::decode_forward_paged(
                               gemm, &gpu_stream,
                               &self.per_gpu_kernels[gpu_idx].oxide,
                              attn_weights, &self.workspaces[gpu_idx].norm1_out,
@@ -1075,13 +1081,14 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             &probe,
                             self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
                             self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
-                        )?
+                        )?;
+                        // Copy attention output into workspace.attn_out (temporary until attention is also workspace-wired)
+                        gpu_stream.memcpy_dtod(&attn_out, &mut self.workspaces[gpu_idx].attn_out)
+                            .map_err(|e| anyhow::anyhow!("Failed to copy attn output to workspace: {e}"))?;
                     }
                 };
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &attn_out, &[1, config.hidden_size], "decode");
-
-                attn_outputs.push(attn_out);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
             // All-reduce attention outputs across GPUs (grouped)
@@ -1089,25 +1096,26 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 sync::all_reduce_attention(
-                    &self.nccl, &gpu_stream, &mut attn_outputs[gpu_idx],
+                    &self.nccl, &gpu_stream, &mut self.workspaces[gpu_idx].attn_out,
                 )?;
             }
             group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
             // Phase B: Residual add on each GPU (zero-alloc via workspace + swap)
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                let ws = &mut self.workspaces[gpu_idx];
                 crate::add::add_into(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
-                    &mut self.workspaces[gpu_idx].residual_buf,
-                    &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
+                    &mut ws.residual_buf,
+                    &hidden_states[gpu_idx], &ws.attn_out,
                 )?;
-                std::mem::swap(&mut hidden_states[gpu_idx], &mut self.workspaces[gpu_idx].residual_buf);
+                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
             }
 
             for gpu_idx in 0..num_gpus {

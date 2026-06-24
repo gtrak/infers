@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaSlice, CudaStream};
+use infers_model::ModelConfig;
 
 /// Pre-allocated GPU buffers for the decode path (per-GPU).
 ///
@@ -44,6 +45,12 @@ pub struct DecodeWorkspace {
     pub mlp_out: CudaSlice<bf16>,
     /// Final logits buffer. Size: vocab_size.
     pub logits: CudaSlice<bf16>,
+    /// Shared output buffer for GDN and attention decode outputs. Size: hidden_size.
+    /// Both GDN and attention write their final output here, eliminating the
+    /// `attn_outputs: Vec` and its per-layer allocation.
+    pub attn_out: CudaSlice<bf16>,
+    /// GDN-specific workspace buffers (allocated once, reused every GDN layer).
+    pub gdn: GdnWorkspace,
 }
 
 impl DecodeWorkspace {
@@ -51,14 +58,18 @@ impl DecodeWorkspace {
     ///
     /// # Arguments
     /// * `stream` — CUDA stream to allocate on
+    /// * `config` — Model configuration
     /// * `hidden_size` — Model hidden dimension (e.g., 5120)
     /// * `sharded_intermediate` — Intermediate size / num_gpus (e.g., ~14336/2)
     /// * `vocab_size` — Vocabulary size for logits (e.g., 151936)
+    /// * `num_gpus` — Number of GPUs for tensor-parallel sharding
     pub fn new(
         stream: &Arc<CudaStream>,
+        config: &ModelConfig,
         hidden_size: usize,
         sharded_intermediate: usize,
         vocab_size: usize,
+        num_gpus: usize,
     ) -> Result<Self> {
         Ok(Self {
             norm1_out: stream.alloc_zeros::<bf16>(hidden_size)?,
@@ -69,6 +80,89 @@ impl DecodeWorkspace {
             mlp_silu: stream.alloc_zeros::<bf16>(sharded_intermediate)?,
             mlp_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             logits: stream.alloc_zeros::<bf16>(vocab_size)?,
+            attn_out: stream.alloc_zeros::<bf16>(hidden_size)?,
+            gdn: GdnWorkspace::new(stream, config, num_gpus)?,
+        })
+    }
+}
+
+/// Pre-allocated GPU buffers for GDN decode intermediates (per-GPU).
+///
+/// These buffers replace the ~15 `alloc_zeros` calls per GDN layer per token
+/// in `gdn::decode_forward`. Allocated once at engine init.
+pub struct GdnWorkspace {
+    /// Mixed QKV projection output. Size: conv_dim.
+    pub mixed_qkv: CudaSlice<bf16>,
+    /// Conv1d input buffer [conv_state | mixed_qkv]. Size: kernel_size * conv_dim.
+    pub conv_input: CudaSlice<bf16>,
+    /// Conv1d output buffer. Size: kernel_size * conv_dim.
+    pub conv_out: CudaSlice<bf16>,
+    /// Last row of conv_out (the result for the current token). Size: conv_dim.
+    pub conv_out_last: CudaSlice<bf16>,
+    /// Query sub-slice from conv_out_last. Size: key_dim.
+    pub query: CudaSlice<bf16>,
+    /// Key sub-slice from conv_out_last. Size: key_dim.
+    pub key: CudaSlice<bf16>,
+    /// Value sub-slice from conv_out_last. Size: value_dim.
+    pub value: CudaSlice<bf16>,
+    /// Repeat-interleaved query (num_v_heads * head_k_dim). Only used when kv_ratio > 1.
+    pub query_expanded: CudaSlice<bf16>,
+    /// Repeat-interleaved key (num_v_heads * head_k_dim). Only used when kv_ratio > 1.
+    pub key_expanded: CudaSlice<bf16>,
+    /// in_proj_a GEMM output. Size: num_v_heads.
+    pub a_proj: CudaSlice<bf16>,
+    /// in_proj_b GEMM output. Size: num_v_heads (= b_dim).
+    pub b_proj: CudaSlice<bf16>,
+    /// GDN recurrent step output. Size: num_v_heads * head_v_dim.
+    pub gdn_output: CudaSlice<bf16>,
+    /// Z-gate GEMM output. Size: num_v_heads * head_v_dim (= z_dim).
+    pub z_gate: CudaSlice<bf16>,
+    /// RMSNormGated output. Size: num_v_heads * head_v_dim.
+    pub norm_out: CudaSlice<bf16>,
+    /// Pre-allocated zeros for a_log fallback (when weight is None). Size: num_v_heads (f32).
+    pub a_log_zeros: CudaSlice<f32>,
+    /// Pre-allocated zeros for dt_bias fallback (when weight is None). Size: num_v_heads (f32).
+    pub dt_bias_zeros: CudaSlice<f32>,
+}
+
+impl GdnWorkspace {
+    /// Allocate all GDN workspace buffers on the given stream.
+    ///
+    /// Sizes are computed from model config and GPU count for tensor-parallel sharding.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        config: &ModelConfig,
+        num_gpus: usize,
+    ) -> Result<Self> {
+        let num_v_heads = config.linear_num_value_heads / num_gpus;
+        let kv_ratio = config.linear_num_value_heads / config.linear_num_key_heads;
+        let num_k_heads = num_v_heads / kv_ratio;
+        let head_k_dim = config.linear_key_head_dim;
+        let head_v_dim = config.linear_value_head_dim;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let kernel_size = config.linear_conv_kernel_dim as usize;
+        let v_heads_times_k_dim = num_v_heads * head_k_dim;
+        let v_heads_times_v_dim = num_v_heads * head_v_dim;
+
+        Ok(Self {
+            mixed_qkv: stream.alloc_zeros::<bf16>(conv_dim)?,
+            conv_input: stream.alloc_zeros::<bf16>(kernel_size * conv_dim)?,
+            conv_out: stream.alloc_zeros::<bf16>(kernel_size * conv_dim)?,
+            conv_out_last: stream.alloc_zeros::<bf16>(conv_dim)?,
+            query: stream.alloc_zeros::<bf16>(key_dim)?,
+            key: stream.alloc_zeros::<bf16>(key_dim)?,
+            value: stream.alloc_zeros::<bf16>(value_dim)?,
+            query_expanded: stream.alloc_zeros::<bf16>(v_heads_times_k_dim)?,
+            key_expanded: stream.alloc_zeros::<bf16>(v_heads_times_k_dim)?,
+            a_proj: stream.alloc_zeros::<bf16>(num_v_heads)?,
+            b_proj: stream.alloc_zeros::<bf16>(num_v_heads)?,
+            gdn_output: stream.alloc_zeros::<bf16>(v_heads_times_v_dim)?,
+            z_gate: stream.alloc_zeros::<bf16>(v_heads_times_v_dim)?,
+            norm_out: stream.alloc_zeros::<bf16>(v_heads_times_v_dim)?,
+            a_log_zeros: stream.alloc_zeros::<f32>(num_v_heads)?,
+            dt_bias_zeros: stream.alloc_zeros::<f32>(num_v_heads)?,
         })
     }
 }

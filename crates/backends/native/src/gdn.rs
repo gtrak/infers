@@ -197,6 +197,45 @@ fn repeat_interleave_heads(
     Ok(dst)
 }
 
+/// Copy a range from a CudaSlice into a pre-allocated destination buffer (zero-alloc variant).
+fn copy_view_into(
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<bf16>,
+    range: std::ops::Range<usize>,
+    dst: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let view = src.slice(range);
+    stream.memcpy_dtod(&view, dst)
+        .map_err(|e| anyhow::anyhow!("Failed to copy slice: {e}"))?;
+    Ok(())
+}
+
+/// Repeat-interleave heads into a pre-allocated buffer (zero-alloc variant).
+fn repeat_interleave_heads_into(
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<bf16>,
+    seq_len: usize,
+    h_src: usize,
+    h_dst: usize,
+    head_dim: usize,
+    dst: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let ratio = h_dst / h_src;
+    for t in 0..seq_len {
+        for h in 0..h_dst {
+            let src_h = h / ratio;
+            let src_offset = (t * h_src + src_h) * head_dim;
+            let dst_offset = (t * h_dst + h) * head_dim;
+            let copy_len = head_dim;
+            let src_slice = src.slice(src_offset..src_offset + copy_len);
+            let mut dst_slice = dst.slice_mut(dst_offset..dst_offset + copy_len);
+            stream.memcpy_dtod(&src_slice, &mut dst_slice)
+                .map_err(|e| anyhow::anyhow!("Failed to copy head {h}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────
 // Prefill forward pass
 // ──────────────────────────────────────────────
@@ -466,7 +505,7 @@ fn repeat_interleave_heads(
 // ──────────────────────────────────────────────
 
 /// GDN decode forward with the correct Gated Delta Rule (single token).
-#[allow(unused_assignments, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn decode_forward(
     gemm: &mut GemmEngine,
     stream: &Arc<CudaStream>,
@@ -481,8 +520,10 @@ pub fn decode_forward(
     layer_idx: usize,
     gpu_idx: usize,
     probe: &ProbeConfig,
-) -> Result<CudaSlice<bf16>> {
-    let seq_len = 1usize;
+    ws: &mut crate::workspace::GdnWorkspace,
+    output: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let _seq_len = 1usize;
     // Decoding shares the same probe infrastructure as forward().
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.hidden_input", input, &[1, hidden_size], "decode");
     // Probe config controls whether intermediates are dumped for this path too.
@@ -500,15 +541,14 @@ pub fn decode_forward(
     // =========================================================================
     // Phase 1: in_proj_qkv
     // =========================================================================
-    let mut mixed_qkv = stream.alloc_zeros::<bf16>(conv_dim)?;
     if let Some(ref qkv_weight) = weights.in_proj_qkv {
         crate::gemm_dispatch::gemm_projection_cached(
             gemm, oxide, stream, cache,
-            &qkv_weight.name, input, &mut mixed_qkv,
+            &qkv_weight.name, input, &mut ws.mixed_qkv,
             1, conv_dim, hidden_size, group_size,
         )?;
     }
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[1, conv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &ws.mixed_qkv, &[1, conv_dim], "decode");
 
     // =========================================================================
     // Phase 2: Conv1d with causal conv_state (matches HF causal_conv1d_update)
@@ -528,98 +568,93 @@ pub fn decode_forward(
 
     gdn_state.ensure_conv_state_allocated(stream, conv_dim, kernel_size_usize)?;
 
-    // Build the conv input: [conv_state | mixed_qkv] → [kernel_size * conv_dim]
-    let mut conv_input = stream.alloc_zeros::<bf16>(kernel_size_usize * conv_dim)?;
-    if let Some(ref cs) = gdn_state.conv_state {
-        // Copy conv_state (conv_state_len * conv_dim elements) to the start
-        stream.memcpy_dtod(cs, &mut conv_input)
-            .map_err(|e| anyhow::anyhow!("Failed to copy conv state to input: {e}"))?;
-    }
-    // Copy current token's mixed_qkv to the end (conv_state_len * conv_dim offset)
-    let mixed_qkv_offset = conv_state_len * conv_dim;
-    {
-        let mut dst = conv_input.slice_mut(mixed_qkv_offset..kernel_size_usize * conv_dim);
-        stream.memcpy_dtod(&mixed_qkv, &mut dst)
-            .map_err(|e| anyhow::anyhow!("Failed to copy mixed_qkv to conv input: {e}"))?;
-    }
+   // Build the conv input: [conv_state | mixed_qkv] → [kernel_size * conv_dim]
+        if let Some(ref cs) = gdn_state.conv_state {
+            // Copy conv_state (conv_state_len * conv_dim elements) to the start
+            stream.memcpy_dtod(cs, &mut ws.conv_input)
+                .map_err(|e| anyhow::anyhow!("Failed to copy conv state to input: {e}"))?;
+        }
+        // Copy current token's mixed_qkv to the end (conv_state_len * conv_dim offset)
+        let mixed_qkv_offset = conv_state_len * conv_dim;
+        {
+            let mut dst = ws.conv_input.slice_mut(mixed_qkv_offset..kernel_size_usize * conv_dim);
+            stream.memcpy_dtod(&ws.mixed_qkv, &mut dst)
+                .map_err(|e| anyhow::anyhow!("Failed to copy mixed_qkv to conv input: {e}"))?;
+        }
 
     // Update conv_state: shift left by conv_dim, append current mixed_qkv
     // conv_state = cat([conv_state[:, :, -state_len+1:], hidden_states], dim=-1)
     // = shift left by conv_dim and put mixed_qkv at the end
-    {
-        let src_offset = conv_dim;  // skip first conv_dim elements (shift left)
-        let src_view = conv_input.slice(src_offset..kernel_size_usize * conv_dim);
-        stream.memcpy_dtod(&src_view, gdn_state.conv_state.as_mut().unwrap())
-            .map_err(|e| anyhow::anyhow!("Failed to update conv state: {e}"))?;
-    }
+  {
+            let src_offset = conv_dim;  // skip first conv_dim elements (shift left)
+            let src_view = ws.conv_input.slice(src_offset..kernel_size_usize * conv_dim);
+            stream.memcpy_dtod(&src_view, gdn_state.conv_state.as_mut().unwrap())
+                .map_err(|e| anyhow::anyhow!("Failed to update conv state: {e}"))?;
+        }
 
-    // Launch conv1d with seq_len = kernel_size (instead of 1)
-    let mut conv_out = stream.alloc_zeros::<bf16>(kernel_size_usize * conv_dim)?;
+  // Launch conv1d with seq_len = kernel_size (instead of 1)
+
     let conv1d_gpu = cache.get_bf16(&weights.conv1d_weight.name)
         .ok_or_else(|| anyhow::anyhow!("conv1d weight not in cache"))?;
     oxide.launch_conv1d_depthwise_silu_bf16(
-        stream, &conv_input, conv1d_gpu, &mut conv_out,
+        stream, &ws.conv_input, conv1d_gpu, &mut ws.conv_out,
         1, conv_dim as u32, kernel_size_usize as u32, kernel_size as u32,
     ).map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
 
-    // Extract the last position's output (the conv result for the current token)
-    // conv_out is [kernel_size, conv_dim], take the last row
-    let conv_out_last = {
-        let last_row_offset = conv_state_len * conv_dim;
-        let src_view = conv_out.slice(last_row_offset..kernel_size_usize * conv_dim);
-        let mut dst = stream.alloc_zeros::<bf16>(conv_dim)?;
-        stream.memcpy_dtod(&src_view, &mut dst)?;
-        dst
-    };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out_last, &[1, conv_dim], "decode");
+ // Extract the last position's output (the conv result for the current token)
+        // conv_out is [kernel_size, conv_dim], take the last row
+        {
+            let last_row_offset = conv_state_len * conv_dim;
+            let src_view = ws.conv_out.slice(last_row_offset..kernel_size_usize * conv_dim);
+            stream.memcpy_dtod(&src_view, &mut ws.conv_out_last)?;
+        }
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &ws.conv_out_last, &[1, conv_dim], "decode");
 
     // =========================================================================
     // Phase 3: Split
     // =========================================================================
-    let query_flat = clone_view_to_slice(stream, &conv_out_last, 0..key_dim)?;
-    let key_flat = clone_view_to_slice(stream, &conv_out_last, key_dim..2 * key_dim)?;
-    let value_flat = clone_view_to_slice(stream, &conv_out_last, 2 * key_dim..2 * key_dim + value_dim)?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &query_flat, &[1, key_dim], "decode");
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &key_flat, &[1, key_dim], "decode");
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &value_flat, &[1, value_dim], "decode");
+    copy_view_into(stream, &ws.conv_out_last, 0..key_dim, &mut ws.query)?;
+    copy_view_into(stream, &ws.conv_out_last, key_dim..2 * key_dim, &mut ws.key)?;
+    copy_view_into(stream, &ws.conv_out_last, 2 * key_dim..2 * key_dim + value_dim, &mut ws.value)?;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &ws.query, &[1, key_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &ws.key, &[1, key_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &ws.value, &[1, value_dim], "decode");
 
     // =========================================================================
     // Phase 4: repeat_interleave q/k
     // =========================================================================
-    let query_expanded = if kv_ratio > 1 {
-        repeat_interleave_heads(stream, &query_flat, 1, num_k_heads, num_v_heads, head_k_dim)?
+    let query_expanded_ref: &CudaSlice<bf16> = if kv_ratio > 1 {
+        repeat_interleave_heads_into(stream, &ws.query, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.query_expanded)?;
+        &ws.query_expanded
     } else {
-        query_flat
+        &ws.query
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", &query_expanded, &[1, num_v_heads * head_k_dim], "decode");
-    let key_expanded = if kv_ratio > 1 {
-        repeat_interleave_heads(stream, &key_flat, 1, num_k_heads, num_v_heads, head_k_dim)?
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", query_expanded_ref, &[1, num_v_heads * head_k_dim], "decode");
+    let key_expanded_ref: &CudaSlice<bf16> = if kv_ratio > 1 {
+        repeat_interleave_heads_into(stream, &ws.key, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.key_expanded)?;
+        &ws.key_expanded
     } else {
-        key_flat
+        &ws.key
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key_expanded", &key_expanded, &[1, num_v_heads * head_k_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key_expanded", key_expanded_ref, &[1, num_v_heads * head_k_dim], "decode");
 
     // =========================================================================
     // Phase 5: in_proj_a, in_proj_b
     // =========================================================================
-    let mut a_proj = stream.alloc_zeros::<bf16>(num_v_heads)?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream, cache,
-        &weights.in_proj_a.name, input, &mut a_proj,
+        &weights.in_proj_a.name, input, &mut ws.a_proj,
         1, num_v_heads, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &a_proj, &[1, num_v_heads], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &ws.a_proj, &[1, num_v_heads], "decode");
 
     let b_dim = weight_output_dim(&weights.in_proj_b);
-    let mut b_proj_raw = stream.alloc_zeros::<bf16>(b_dim)?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream, cache,
-        &weights.in_proj_b.name, input, &mut b_proj_raw,
+        &weights.in_proj_b.name, input, &mut ws.b_proj,
         1, b_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &b_proj_raw, &[1, b_dim], "decode");
-    // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads for BF16 weight)
-    let b_proj = b_proj_raw;
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &ws.b_proj, &[1, b_dim], "decode");
 
     // =========================================================================
     // Phase 6: A_log, dt_bias as float32
@@ -627,24 +662,21 @@ pub fn decode_forward(
     let a_log_f32 = if let Some(ref w) = weights.a_log {
         cache.get_f32(&w.name)
             .ok_or_else(|| anyhow::anyhow!("a_log not in f32 cache: {}", w.name))?
-            .clone()
     } else {
-        stream.alloc_zeros::<f32>(num_v_heads)?
+        &ws.a_log_zeros
     };
 
     let dt_bias_f32 = if let Some(ref w) = weights.dt_bias {
         cache.get_f32(&w.name)
             .ok_or_else(|| anyhow::anyhow!("dt_bias not in f32 cache: {}", w.name))?
-            .clone()
     } else {
-        stream.alloc_zeros::<f32>(num_v_heads)?
+        &ws.dt_bias_zeros
     };
 
     // =========================================================================
     // Phase 7: Gated delta update kernel (bf16 inputs, fp32 state)
     // =========================================================================
     gdn_state.ensure_allocated(stream, num_v_heads, head_k_dim, head_v_dim)?;
-    let mut gdn_output = stream.alloc_zeros::<bf16>(num_v_heads * head_v_dim)?;
     let state_ref = gdn_state.state.as_mut()
         .ok_or_else(|| anyhow::anyhow!("GDN state not allocated"))?;
 
@@ -652,25 +684,24 @@ pub fn decode_forward(
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
   oxide.launch_gdn_recurrent_step_bf16(
-        stream, &query_expanded, &key_expanded, &value_flat,
-        &a_proj, &b_proj, &a_log_f32, &dt_bias_f32,
-        state_ref, &mut gdn_output,
+        stream, query_expanded_ref, key_expanded_ref, &ws.value,
+        &ws.a_proj, &ws.b_proj, a_log_f32, dt_bias_f32,
+        state_ref, &mut ws.gdn_output,
         num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
     ).map_err(|e| anyhow::anyhow!("GDN recurrent step kernel launch failed: {e}"))?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[1, num_v_heads * head_v_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &ws.gdn_output, &[1, num_v_heads * head_v_dim], "decode");
 
     // =========================================================================
     // Phase 8: RMSNormGated
     // =========================================================================
-    let norm_output = if let Some(ref z_weight) = weights.in_proj_z {
+    let norm_input: &CudaSlice<bf16> = if let Some(ref z_weight) = weights.in_proj_z {
         let z_dim = weight_output_dim(z_weight);
-        let mut z_gate_raw = stream.alloc_zeros::<bf16>(z_dim)?;
         crate::gemm_dispatch::gemm_projection_cached(
             gemm, oxide, stream, cache,
-            &z_weight.name, input, &mut z_gate_raw,
+            &z_weight.name, input, &mut ws.z_gate,
             1, z_dim, hidden_size, group_size,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &z_gate_raw, &[1, z_dim], "decode");
+        probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &ws.z_gate, &[1, z_dim], "decode");
 
         let n_rows = num_v_heads;
         let norm_dim = head_v_dim;
@@ -679,30 +710,27 @@ pub fn decode_forward(
             .and_then(|w| cache.get_bf16(&w.name))
             .ok_or_else(|| anyhow::anyhow!("GDN norm weight not in cache"))?;
 
-        let mut norm_out = stream.alloc_zeros::<bf16>(n_rows * norm_dim)?;
         unsafe {
             oxide.launch_rms_norm_gated_bf16(
-                stream, &gdn_output, &z_gate_raw, norm_weight, &mut norm_out,
+                stream, &ws.gdn_output, &ws.z_gate, norm_weight, &mut ws.norm_out,
                 n_rows as u32, norm_dim as u32, 1e-6f32,
             ).map_err(|e| anyhow::anyhow!("Decode RMSNormGated kernel launch failed: {e}"))?;
         }
-        norm_out
+        &ws.norm_out
     } else {
-        gdn_output.try_clone()
-            .map_err(|e| anyhow::anyhow!("Failed to clone decode GDN output: {e}"))?
+        &ws.gdn_output
     };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.norm_output", &norm_output, &[1, num_v_heads * head_v_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.norm_output", norm_input, &[1, num_v_heads * head_v_dim], "decode");
 
     // =========================================================================
     // Phase 9: Output projection → hidden_size
     // =========================================================================
-    let mut output = stream.alloc_zeros::<bf16>(hidden_size)?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream, cache,
-        &weights.out_proj_weight.name, &norm_output, &mut output,
+        &weights.out_proj_weight.name, norm_input, output,
         1, hidden_size, value_dim, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[1, hidden_size], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", output, &[1, hidden_size], "decode");
 
-    Ok(output)
+    Ok(())
 }
