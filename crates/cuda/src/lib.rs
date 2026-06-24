@@ -8,6 +8,7 @@ pub mod nccl;
 pub mod pinned;
 pub mod memcpy2d;
 pub mod oxide_bridge;
+pub mod modules;
 
 // Re-export key cudarc types so consumers don't need `cudarc` directly.
 pub use cudarc::driver::{
