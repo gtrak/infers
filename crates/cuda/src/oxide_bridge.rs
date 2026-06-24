@@ -1047,6 +1047,68 @@ impl OxideKernels {
         self.raw_launch("nvfp4_dequant_to_bf16", stream, config, &mut args)
     }
 
+    /// Launch the `nvfp4_gemm_fused` kernel: fused NVFP4 dequant + GEMM.
+    ///
+    /// Reads compressed FP4 weights directly from GPU, dequantizes in registers,
+    /// and multiplies with BF16 activations — no intermediate bf16 buffer needed.
+    pub fn launch_nvfp4_gemm_fused(
+        &self,
+        stream: &Arc<CudaStream>,
+        output: &mut CudaSlice<half::bf16>,     // [M, N] bf16
+        weight_packed: &CudaSlice<u8>,          // [N, K/2] packed FP4
+        weight_scale: &CudaSlice<u8>,           // [N, K/group_size] fp8_e4m3
+        input: &CudaSlice<half::bf16>,            // [M, K] bf16
+        weight_global_scale: f32,                // scalar global scale
+        m: u32,
+        n: u32,
+        k: u32,
+        group_size: u32,
+    ) -> anyhow::Result<()> {
+        let o_len_val = output.len() as u64;
+        let w_len_val = weight_packed.len() as u64;
+        let s_len_val = weight_scale.len() as u64;
+        let i_len_val = input.len() as u64;
+
+        let (o_ptr, o_guard) = output.device_ptr_mut(stream);
+        let (w_ptr, w_guard) = weight_packed.device_ptr(stream);
+        let (s_ptr, s_guard) = weight_scale.device_ptr(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+
+        let _guards = (o_guard, w_guard, s_guard, i_guard);
+
+        let mut o_ptr = o_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut o_len = o_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut i_len = i_len_val;
+        let mut m_v = m;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+        let mut gscale = weight_global_scale;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut o_ptr, &mut o_len);  // mut output: DisjointSlice<u16>
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight_packed: &[u8]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);  // weight_scale: &[u8]
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);  // input: &[u16]
+        Self::push_scalar_arg(&mut args, &mut gscale);            // weight_global_scale: f32
+        Self::push_scalar_arg(&mut args, &mut m_v);               // m: u32
+        Self::push_scalar_arg(&mut args, &mut n_v);               // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
+        Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 63) / 64, (m + 3) / 4, 1),
+            block_dim: (64, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("nvfp4_gemm_fused", stream, config, &mut args)
+    }
+
     /// Launch the `sanitize_nan_bf16` kernel: replace NaN values in a bf16 buffer with 0.0.
     pub fn launch_sanitize_nan_bf16(
         &self,
@@ -1912,8 +1974,8 @@ impl OxideKernels {
     }
 }
 
-/// All 32 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 32] = [
+/// All 33 kernel names compiled into the oxide_kernels.cubin file.
+const KERNEL_NAMES: [&str; 33] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -1932,6 +1994,7 @@ const KERNEL_NAMES: [&str; 32] = [
     "int4_gemm_auto_round",
     "int4_dequant_to_bf16",
     "nvfp4_dequant_to_bf16",
+    "nvfp4_gemm_fused",
     "sanitize_nan_bf16",
     "int4_gemm_gguf",
     "infers_fp8_quantize_e4m3",

@@ -63,9 +63,9 @@ One `OxideKernels` instance per GPU loads the cubin on the correct device's prim
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
-### Oxide Bridge: Launch Wrapper Methods (29 Kernels)
+### Oxide Bridge: Launch Wrapper Methods (30 Kernels)
 
-Twenty-nine launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
+Thirty launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
 
 **Element-wise kernels** (use `LaunchConfig::for_num_elems(n)`):
 
@@ -107,12 +107,13 @@ Twenty-nine launch wrapper methods on the `OxideKernels` impl block. Each follow
 | Method | Kernel | Config |
 |--------|--------|--------|
 | `launch_sanitize_nan_bf16` | `sanitize_nan_bf16` | grid=(ceil(len/256)), block=(256), smem=0 — reads bf16 buffer, replaces NaN values with 0.0 |
-**Tile-based kernels** (2D grid, INT4 GEMM with 64x4 blocks):
+**Tile-based kernels** (2D grid, INT4 and NVFP4 GEMM with 64x4 blocks):
 
 | Method | Kernel | Config |
-|--------|--------|--------|
+|--------|--------|------------|
 | `launch_int4_gemm_auto_round` | `int4_gemm_auto_round` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
+| `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer |
 
 **In-place write kernels** (q and k are writable `DisjointSlice<u16>`):
 
@@ -371,9 +372,9 @@ INT4 GEMM with trait-based dequantization dispatch validates the monomorphized w
 | `int4_gemm_auto_round` | ✅ M=2, N=16, K=64, transposed=1 vs CPU reference |
 | `int4_gemm_gguf` | ✅ M=2, N=16, K=64, transposed=0 vs CPU reference |
 
-### cuda-oxide Kernel Library: Tier 3b — Dequantize to BF16 (Standalone Conversion Kernels)
+### cuda-oxide Kernel Library: Tier 3b — Dequantize to BF16 and Fused GEMM Kernels
 
-Two standalone dequantization kernels that convert quantized weights to bf16 on GPU before passing to cuBLAS GEMM. Replaces per-format GEMM kernels with a simpler dequant-then-cuBLAS pipeline.
+Dequantize-to-BF16 kernels for GPU weight loading, plus a fused NVFP4 GEMM kernel combining dequant + multiply in registers.
 
 **Kernel: int4_dequant_to_bf16**: Reads INT4 AutoRound packed weights (u32, 8 values each), unpacks with FP16 group scales and packed zero points (+1 offset), writes bf16 output. Grid layout: 1D grid with 256 threads per block, one thread per output row (N dimension). Each thread iterates over K-groups within its row. Zero-point indexing matches the existing `int4_gemm_inner` kernel: `flat_idx = row * num_groups + group`, packed into `zeros[flat_idx / 8]` with nibble shift `(flat_idx % 8) * 4`.
 

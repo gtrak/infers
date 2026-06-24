@@ -4,8 +4,8 @@
 //! weight buffers from `GpuWeightCache`, avoiding per-call CPU→GPU uploads.
 //! Handles both BF16 contiguous weights and INT4 quantized triplets in a
 //! single call. For INT4, uses the fused `int4_gemm_auto_round` kernel
-//! (no dequantize buffer needed). NVFP4 still dequantizes to bf16 on GPU then
-//! dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
+//! (no dequantize buffer needed). NVFP4 uses the fused `nvfp4_gemm_fused`
+//! kernel — dequantizes FP4 in registers, no intermediate bf16 buffer.
 
 use std::sync::Arc;
 
@@ -17,8 +17,8 @@ use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 /// Dispatch a single projection GEMM using cached GPU-resident weights.
 /// Looks up the weight by name from the `GpuWeightCache`. For BF16 weights,
 /// calls `gemm.matmul_bf16` directly. For INT4, uses the fused
-/// `int4_gemm_auto_round` kernel. NVFP4 dequantizes to bf16 on GPU then
-/// dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
+/// `int4_gemm_auto_round` kernel. NVFP4 uses the fused `nvfp4_gemm_fused`
+/// kernel — dequantizes FP4 in registers, no intermediate bf16 buffer.
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
@@ -104,6 +104,8 @@ pub fn gemm_projection_cached(
             // NVFP4 group_size is always 16 (fixed property of the format)
             const NVFP4_GROUP_SIZE: u32 = 16;
 
+            if debug { eprintln!("[GEMM-DISPATCH] Nvfp4 weight '{}': n={}, k={}", weight_name, n, k); }
+
             // 1. Allocate bf16 buffer for dequantized weights: [N, K]
             let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
 
@@ -119,14 +121,13 @@ pub fn gemm_projection_cached(
                 NVFP4_GROUP_SIZE,
             )?;
 
-            // 3. Sanitize NaN values in dequant buffer (stale GPU memory may contain NaN)
+            // 3. Sanitize NaN values in dequant buffer
             oxide.launch_sanitize_nan_bf16(stream, &mut dequant_buf)?;
 
             // 4. Compute actual batch/sequence dimension from input
             let m = input.len() / k;
 
             // 5. bf16 tiled GEMM: output = input @ dequant_buf^T
-            //    Bypasses cuBLAS to avoid workspace corruption with NVFP4 dequant buffers.
             oxide.launch_bf16_gemm_tiled(
                 stream,
                 output,

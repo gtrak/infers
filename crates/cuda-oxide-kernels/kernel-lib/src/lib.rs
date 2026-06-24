@@ -1178,6 +1178,70 @@ pub mod kernels {
         }
     }
 
+    /// Fused NVFP4 GEMM: dequantize FP4 weights in registers and multiply
+    /// with BF16 activations, accumulating into BF16 output.
+    ///
+    /// Reads compressed NVFP4 weights directly (no intermediate bf16 buffer).
+    /// Weight layout: [N, K/2] packed FP4 + [N, K/group_size] fp8_e4m3 scales.
+    /// Thread mapping: one thread per (row, col) of the output matrix [M, N].
+    #[kernel]
+    pub fn nvfp4_gemm_fused(
+        mut output: DisjointSlice<u16>,   // [M, N] bf16
+        weight_packed: &[u8],              // [N, K/2] packed FP4
+        weight_scale: &[u8],               // [N, K/group_size] fp8_e4m3
+        input: &[u16],                      // [M, K] bf16
+        weight_global_scale: f32,           // scalar global scale
+        m: u32, n: u32, k: u32,
+        group_size: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let row = (thread::blockIdx_y() * thread::blockDim_y() + thread::threadIdx_y()) as i32;
+        let col = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+
+        if row >= m as i32 || col >= n as i32 {
+            return;
+        }
+
+        let mut acc: f32 = 0.0;
+        let k_usize = k as usize;
+        let n_usize = n as usize;
+        let gs = group_size as usize;
+        let num_groups = (k as usize) / gs;
+
+        // Iterate over groups
+        for g in 0..num_groups {
+            // Load scale for this group (fp8_e4m3 → f32)
+            let scale_fp8 = weight_scale[col as usize * num_groups + g];
+            let scale = Fp8E4M3::dequantize(scale_fp8);
+            let effective_scale = scale / weight_global_scale;
+
+            // Process group_size values (2 FP4 per byte)
+            for i in 0..(gs / 2) {
+                let byte_idx = col as usize * (k_usize / 2) + g * gs / 2 + i;
+                let packed_byte = weight_packed[byte_idx];
+
+                // Low nibble first (compressed-tensors convention: [HIGH|LOW] packed, LOW unpacks first)
+                let lo_nibble = packed_byte & 0xF;
+                let lo_val = fp4_e2m1_to_f32(lo_nibble) * effective_scale;
+                let ki_lo = g * gs + i * 2;
+                let input_lo = f32::from_bits((input[row as usize * k_usize + ki_lo] as u32) << 16);
+                acc += lo_val * input_lo;
+
+                // High nibble
+                let hi_nibble = (packed_byte >> 4) & 0xF;
+                let hi_val = fp4_e2m1_to_f32(hi_nibble) * effective_scale;
+                let ki_hi = g * gs + i * 2 + 1;
+                let input_hi = f32::from_bits((input[row as usize * k_usize + ki_hi] as u32) << 16);
+                acc += hi_val * input_hi;
+            }
+        }
+
+        unsafe {
+            *output.get_unchecked_mut(row as usize * n_usize + col as usize) = f32_to_bf16(acc);
+        }
+    }
+
     /// Replace NaN values in a bf16 buffer with 0.0.
     #[kernel]
     pub fn sanitize_nan_bf16(buf: &mut [u16], len: u32) {

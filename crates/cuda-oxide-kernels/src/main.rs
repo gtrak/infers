@@ -1980,6 +1980,7 @@ fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "infers_rope_bf16",
         "int4_gemm_auto_round",
         "int4_gemm_gguf",
+        "nvfp4_gemm_fused",
         "infers_fp8_quantize_e4m3",
         "infers_fp8_dequantize_e4m3",
         "infers_fp8_quantize_e5m2",
