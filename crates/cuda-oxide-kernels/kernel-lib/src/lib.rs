@@ -1413,6 +1413,342 @@ pub mod kernels {
         let acc = acc0 + acc1 + acc2 + acc3;
         partial_sums[split_idx * n_usize + col] = acc;
     }
+    /// INT4 GEMM v4 with K-splitting — 128-bit LDG loads, 4 columns per thread.
+    ///
+    /// Each thread (16/block) handles 4 output columns. Weight loads are 128-bit
+    /// ([u32;4]) and input loads are 128-bit ([u16;8]). Hardcodes transposed=1 layout.
+    ///
+    /// - Block: (16, 1, 1) · Grid: (ceil(N/64), k_split, 1)
+    /// - Thread tid handles columns [base_col + tid*4 .. base_col + tid*4+3]
+    /// - 8 accumulators: col_c → acc[2c]/acc[2c+1] (even/odd lanes)
+
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn int4_gemm_v4_ksplit(
+        partial_sums: &mut [f32],
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        n: u32, k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) {
+        let base_col = (thread::blockIdx_x() * 64u32) as usize;
+        let tid = thread::threadIdx_x() as usize; // 0..15
+        let split_idx = thread::blockIdx_y() as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let gs = group_size as usize;
+        let ks = k_split as usize;
+        let num_groups = k_usize / gs;
+
+        if base_col + tid * 4 >= n_usize {
+            return;
+        }
+
+        // v3-style ceil-grouping across splits
+        let groups_per_split = (num_groups + ks - 1) / ks;
+        let group_start = split_idx * groups_per_split;
+        if group_start >= num_groups {
+            for c in 0..4usize {
+                let col = base_col + tid * 4 + c;
+                if col < n_usize {
+                    partial_sums[split_idx * n_usize + col] = 0.0;
+                }
+            }
+            return;
+        }
+        let group_end = if group_start + groups_per_split > num_groups {
+            num_groups
+        } else {
+            group_start + groups_per_split
+        };
+
+        // 8 accumulators: col_c uses acc[2c] (even) / acc[2c+1] (odd)
+        let mut acc0: f32 = 0.0;
+        let mut acc1: f32 = 0.0;
+        let mut acc2: f32 = 0.0;
+        let mut acc3: f32 = 0.0;
+        let mut acc4: f32 = 0.0;
+        let mut acc5: f32 = 0.0;
+        let mut acc6: f32 = 0.0;
+        let mut acc7: f32 = 0.0;
+
+        // Pre-compute column base for weight indexing
+        let col_base = base_col + tid * 4;
+
+        for group_idx in group_start..group_end {
+            let kg = group_idx * gs;
+
+            // Load scale for each of 4 columns (transposed layout)
+            let s0 = f16_to_f32(unsafe { *scales.get_unchecked(group_idx * n_usize + col_base) });
+            let s1 = f16_to_f32(unsafe { *scales.get_unchecked(group_idx * n_usize + col_base + 1) });
+            let s2 = f16_to_f32(unsafe { *scales.get_unchecked(group_idx * n_usize + col_base + 2) });
+            let s3 = f16_to_f32(unsafe { *scales.get_unchecked(group_idx * n_usize + col_base + 3) });
+
+            // Load zero for each column (transposed layout)
+            let n_packed = (n_usize + 7) / 8;
+            let z0_packed = unsafe { *zeros.get_unchecked(group_idx * n_packed + col_base / 8) };
+            let rz0 = ((z0_packed >> ((col_base % 8) * 4)) & 0xF) as i8;
+
+            let z1_packed = unsafe { *zeros.get_unchecked(group_idx * n_packed + (col_base + 1) / 8) };
+            let rz1 = ((z1_packed >> (((col_base + 1) % 8) * 4)) & 0xF) as i8;
+
+            let z2_packed = unsafe { *zeros.get_unchecked(group_idx * n_packed + (col_base + 2) / 8) };
+            let rz2 = ((z2_packed >> (((col_base + 2) % 8) * 4)) & 0xF) as i8;
+
+            let z3_packed = unsafe { *zeros.get_unchecked(group_idx * n_packed + (col_base + 3) / 8) };
+            let rz3 = ((z3_packed >> (((col_base + 3) % 8) * 4)) & 0xF) as i8;
+
+            // scaled_zero = (raw_zero + 1) * scale, hoisted per group
+            let sz0 = (rz0 as f32 + 1.0) * s0;
+            let sz1 = (rz1 as f32 + 1.0) * s1;
+            let sz2 = (rz2 as f32 + 1.0) * s2;
+            let sz3 = (rz3 as f32 + 1.0) * s3;
+
+            // Two-u32 stride per column: second load overlaps first compute
+            for u32_idx in (0..gs / 8).step_by(2) {
+                let k0 = kg + u32_idx * 8;
+
+                // 128-bit weight load: 4 consecutive u32s = [col_base, col_base+1, col_base+2, col_base+3]
+                let w_ptr0 = unsafe { weight.as_ptr().add((k0 >> 3) * n_usize + col_base) };
+                let packed4_0: [u32; 4] = unsafe { *(w_ptr0 as *const [u32; 4]) };
+
+                // 128-bit input load: 8 bf16 values at k0..k0+7
+                let a_vals: [u16; 8] = unsafe { *(input.as_ptr().add(k0) as *const [u16; 8]) };
+
+                // Convert input to f32 once, shared across all 4 columns at this k position
+                unsafe {
+                    let a0 = f32::from_bits((a_vals[0] as u32) << 16);
+                    let a1 = f32::from_bits((a_vals[1] as u32) << 16);
+                    let a2 = f32::from_bits((a_vals[2] as u32) << 16);
+                    let a3 = f32::from_bits((a_vals[3] as u32) << 16);
+                    let a4 = f32::from_bits((a_vals[4] as u32) << 16);
+                    let a5 = f32::from_bits((a_vals[5] as u32) << 16);
+                    let a6 = f32::from_bits((a_vals[6] as u32) << 16);
+                    let a7 = f32::from_bits((a_vals[7] as u32) << 16);
+
+                    // Column 0 → acc0/acc1 with scale s0
+                    {
+                        let p = packed4_0[0];
+                        let w0 = (p & 0xF) as i8;
+                        let w1 = ((p >> 4) & 0xF) as i8;
+                        let w2 = ((p >> 8) & 0xF) as i8;
+                        let w3 = ((p >> 12) & 0xF) as i8;
+                        acc0 += (w0 as f32 * s0 - sz0) * a0;
+                        acc1 += (w1 as f32 * s0 - sz0) * a1;
+                        acc0 += (w2 as f32 * s0 - sz0) * a2;
+                        acc1 += (w3 as f32 * s0 - sz0) * a3;
+
+                        let w4 = ((p >> 16) & 0xF) as i8;
+                        let w5 = ((p >> 20) & 0xF) as i8;
+                        let w6 = ((p >> 24) & 0xF) as i8;
+                        let w7 = ((p >> 28) & 0xF) as i8;
+
+                        acc0 += (w4 as f32 * s0 - sz0) * a4;
+                        acc1 += (w5 as f32 * s0 - sz0) * a5;
+                        acc0 += (w6 as f32 * s0 - sz0) * a6;
+                        acc1 += (w7 as f32 * s0 - sz0) * a7;
+                    }
+
+                    // Column 1 → acc2/acc3 with scale s1
+                    {
+                        let p = packed4_0[1];
+                        let w0 = (p & 0xF) as i8;
+                        let w1 = ((p >> 4) & 0xF) as i8;
+                        let w2 = ((p >> 8) & 0xF) as i8;
+                        let w3 = ((p >> 12) & 0xF) as i8;
+                        acc2 += (w0 as f32 * s1 - sz1) * a0;
+                        acc3 += (w1 as f32 * s1 - sz1) * a1;
+                        acc2 += (w2 as f32 * s1 - sz1) * a2;
+                        acc3 += (w3 as f32 * s1 - sz1) * a3;
+
+                        let w4 = ((p >> 16) & 0xF) as i8;
+                        let w5 = ((p >> 20) & 0xF) as i8;
+                        let w6 = ((p >> 24) & 0xF) as i8;
+                        let w7 = ((p >> 28) & 0xF) as i8;
+
+                        acc2 += (w4 as f32 * s1 - sz1) * a4;
+                        acc3 += (w5 as f32 * s1 - sz1) * a5;
+                        acc2 += (w6 as f32 * s1 - sz1) * a6;
+                        acc3 += (w7 as f32 * s1 - sz1) * a7;
+                    }
+
+                    // Column 2 → acc4/acc5 with scale s2
+                    {
+                        let p = packed4_0[2];
+                        let w0 = (p & 0xF) as i8;
+                        let w1 = ((p >> 4) & 0xF) as i8;
+                        let w2 = ((p >> 8) & 0xF) as i8;
+                        let w3 = ((p >> 12) & 0xF) as i8;
+                        acc4 += (w0 as f32 * s2 - sz2) * a0;
+                        acc5 += (w1 as f32 * s2 - sz2) * a1;
+                        acc4 += (w2 as f32 * s2 - sz2) * a2;
+                        acc5 += (w3 as f32 * s2 - sz2) * a3;
+
+                        let w4 = ((p >> 16) & 0xF) as i8;
+                        let w5 = ((p >> 20) & 0xF) as i8;
+                        let w6 = ((p >> 24) & 0xF) as i8;
+                        let w7 = ((p >> 28) & 0xF) as i8;
+
+                        acc4 += (w4 as f32 * s2 - sz2) * a4;
+                        acc5 += (w5 as f32 * s2 - sz2) * a5;
+                        acc4 += (w6 as f32 * s2 - sz2) * a6;
+                        acc5 += (w7 as f32 * s2 - sz2) * a7;
+                    }
+
+                    // Column 3 → acc6/acc7 with scale s3
+                    {
+                        let p = packed4_0[3];
+                        let w0 = (p & 0xF) as i8;
+                        let w1 = ((p >> 4) & 0xF) as i8;
+                        let w2 = ((p >> 8) & 0xF) as i8;
+                        let w3 = ((p >> 12) & 0xF) as i8;
+                        acc6 += (w0 as f32 * s3 - sz3) * a0;
+                        acc7 += (w1 as f32 * s3 - sz3) * a1;
+                        acc6 += (w2 as f32 * s3 - sz3) * a2;
+                        acc7 += (w3 as f32 * s3 - sz3) * a3;
+
+                        let w4 = ((p >> 16) & 0xF) as i8;
+                        let w5 = ((p >> 20) & 0xF) as i8;
+                        let w6 = ((p >> 24) & 0xF) as i8;
+                        let w7 = ((p >> 28) & 0xF) as i8;
+
+                        acc6 += (w4 as f32 * s3 - sz3) * a4;
+                        acc7 += (w5 as f32 * s3 - sz3) * a5;
+                        acc6 += (w6 as f32 * s3 - sz3) * a6;
+                        acc7 += (w7 as f32 * s3 - sz3) * a7;
+                    }
+                }
+
+                // Second half of two-u32 stride
+                if u32_idx + 1 < gs / 8 {
+                    let k1 = k0 + 8;
+
+                    let w_ptr1 = unsafe { weight.as_ptr().add((k1 >> 3) * n_usize + col_base) };
+                    let packed4_1: [u32; 4] = unsafe { *(w_ptr1 as *const [u32; 4]) };
+
+                    let a_vals1: [u16; 8] = unsafe { *(input.as_ptr().add(k1) as *const [u16; 8]) };
+
+                    // Convert input to f32 once, shared across all 4 columns at this k position
+                    unsafe {
+                        let a0 = f32::from_bits((a_vals1[0] as u32) << 16);
+                        let a1 = f32::from_bits((a_vals1[1] as u32) << 16);
+                        let a2 = f32::from_bits((a_vals1[2] as u32) << 16);
+                        let a3 = f32::from_bits((a_vals1[3] as u32) << 16);
+                        let a4 = f32::from_bits((a_vals1[4] as u32) << 16);
+                        let a5 = f32::from_bits((a_vals1[5] as u32) << 16);
+                        let a6 = f32::from_bits((a_vals1[6] as u32) << 16);
+                        let a7 = f32::from_bits((a_vals1[7] as u32) << 16);
+
+                        // Column 0 → acc0/acc1
+                        {
+                            let p = packed4_1[0];
+                            let w0 = (p & 0xF) as i8;
+                            let w1 = ((p >> 4) & 0xF) as i8;
+                            let w2 = ((p >> 8) & 0xF) as i8;
+                            let w3 = ((p >> 12) & 0xF) as i8;
+
+                            acc0 += (w0 as f32 * s0 - sz0) * a0;
+                            acc1 += (w1 as f32 * s0 - sz0) * a1;
+                            acc0 += (w2 as f32 * s0 - sz0) * a2;
+                            acc1 += (w3 as f32 * s0 - sz0) * a3;
+
+                            let w4 = ((p >> 16) & 0xF) as i8;
+                            let w5 = ((p >> 20) & 0xF) as i8;
+                            let w6 = ((p >> 24) & 0xF) as i8;
+                            let w7 = ((p >> 28) & 0xF) as i8;
+
+                            acc0 += (w4 as f32 * s0 - sz0) * a4;
+                            acc1 += (w5 as f32 * s0 - sz0) * a5;
+                            acc0 += (w6 as f32 * s0 - sz0) * a6;
+                            acc1 += (w7 as f32 * s0 - sz0) * a7;
+                        }
+
+                        // Column 1 → acc2/acc3
+                        {
+                            let p = packed4_1[1];
+                            let w0 = (p & 0xF) as i8;
+                            let w1 = ((p >> 4) & 0xF) as i8;
+                            let w2 = ((p >> 8) & 0xF) as i8;
+                            let w3 = ((p >> 12) & 0xF) as i8;
+
+                            acc2 += (w0 as f32 * s1 - sz1) * a0;
+                            acc3 += (w1 as f32 * s1 - sz1) * a1;
+                            acc2 += (w2 as f32 * s1 - sz1) * a2;
+                            acc3 += (w3 as f32 * s1 - sz1) * a3;
+
+                            let w4 = ((p >> 16) & 0xF) as i8;
+                            let w5 = ((p >> 20) & 0xF) as i8;
+                            let w6 = ((p >> 24) & 0xF) as i8;
+                            let w7 = ((p >> 28) & 0xF) as i8;
+
+                            acc2 += (w4 as f32 * s1 - sz1) * a4;
+                            acc3 += (w5 as f32 * s1 - sz1) * a5;
+                            acc2 += (w6 as f32 * s1 - sz1) * a6;
+                            acc3 += (w7 as f32 * s1 - sz1) * a7;
+                        }
+
+                        // Column 2 → acc4/acc5
+                        {
+                            let p = packed4_1[2];
+                            let w0 = (p & 0xF) as i8;
+                            let w1 = ((p >> 4) & 0xF) as i8;
+                            let w2 = ((p >> 8) & 0xF) as i8;
+                            let w3 = ((p >> 12) & 0xF) as i8;
+
+                            acc4 += (w0 as f32 * s2 - sz2) * a0;
+                            acc5 += (w1 as f32 * s2 - sz2) * a1;
+                            acc4 += (w2 as f32 * s2 - sz2) * a2;
+                            acc5 += (w3 as f32 * s2 - sz2) * a3;
+
+                            let w4 = ((p >> 16) & 0xF) as i8;
+                            let w5 = ((p >> 20) & 0xF) as i8;
+                            let w6 = ((p >> 24) & 0xF) as i8;
+                            let w7 = ((p >> 28) & 0xF) as i8;
+
+                            acc4 += (w4 as f32 * s2 - sz2) * a4;
+                            acc5 += (w5 as f32 * s2 - sz2) * a5;
+                            acc4 += (w6 as f32 * s2 - sz2) * a6;
+                            acc5 += (w7 as f32 * s2 - sz2) * a7;
+                        }
+
+                        // Column 3 → acc6/acc7
+                        {
+                            let p = packed4_1[3];
+                            let w0 = (p & 0xF) as i8;
+                            let w1 = ((p >> 4) & 0xF) as i8;
+                            let w2 = ((p >> 8) & 0xF) as i8;
+                            let w3 = ((p >> 12) & 0xF) as i8;
+
+                            acc6 += (w0 as f32 * s3 - sz3) * a0;
+                            acc7 += (w1 as f32 * s3 - sz3) * a1;
+                            acc6 += (w2 as f32 * s3 - sz3) * a2;
+                            acc7 += (w3 as f32 * s3 - sz3) * a3;
+
+                            let w4 = ((p >> 16) & 0xF) as i8;
+                            let w5 = ((p >> 20) & 0xF) as i8;
+                            let w6 = ((p >> 24) & 0xF) as i8;
+                            let w7 = ((p >> 28) & 0xF) as i8;
+
+                            acc6 += (w4 as f32 * s3 - sz3) * a4;
+                            acc7 += (w5 as f32 * s3 - sz3) * a5;
+                            acc6 += (w6 as f32 * s3 - sz3) * a6;
+                            acc7 += (w7 as f32 * s3 - sz3) * a7;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write partial sums for each of 4 columns
+        let c0 = col_base;     if c0 < n_usize { partial_sums[split_idx * n_usize + c0] = acc0 + acc1; }
+        let c1 = col_base + 1; if c1 < n_usize { partial_sums[split_idx * n_usize + c1] = acc2 + acc3; }
+        let c2 = col_base + 2; if c2 < n_usize { partial_sums[split_idx * n_usize + c2] = acc4 + acc5; }
+        let c3 = col_base + 3; if c3 < n_usize { partial_sums[split_idx * n_usize + c3] = acc6 + acc7; }
+    }
 
     /// Reduce K-split partial sums into final bf16 output.
     #[kernel]

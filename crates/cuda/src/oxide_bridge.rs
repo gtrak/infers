@@ -1163,6 +1163,78 @@ impl OxideKernels {
         };
         self.raw_launch("int4_gemm_v3_ksplit", stream, config, &mut args)
     }
+    /// Launch the `int4_gemm_v4_ksplit` kernel: 128-bit load-optimized INT4 GEMM
+    /// with K-splitting (4 columns per thread, block_dim (16,1,1)).
+    /// Same interface as `launch_int4_gemm_v3_ksplit`. Precondition:
+    /// `k_split` must divide `k / group_size` evenly.
+    ///
+    /// The kernel signature is:
+    /// ```ignore
+    /// int4_gemm_v4_ksplit(partial_sums: &mut [f32], weight: &[u32], scales: &[u16], zeros: &[u32], input: &[u16], n: u32, k: u32, group_size: u32, transposed: u32, k_split: u32)
+    /// ```
+    pub fn launch_int4_gemm_v4_ksplit(
+        &self,
+        stream: &Arc<CudaStream>,
+        partial_sums: &mut CudaSlice<f32>,
+        weight: &CudaSlice<u32>,
+        scales: &CudaSlice<half::f16>,
+        zeros: &CudaSlice<u32>,
+        input: &CudaSlice<half::bf16>,
+        n: u32,
+        k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) -> anyhow::Result<()> {
+        let ps_len_val = partial_sums.len() as u64;
+        let w_len_val = weight.len() as u64;
+        let s_len_val = scales.len() as u64;
+        let z_len_val = zeros.len() as u64;
+        let i_len_val = input.len() as u64;
+
+        let (ps_ptr, ps_guard) = partial_sums.device_ptr_mut(stream);
+        let (w_ptr, w_guard) = weight.device_ptr(stream);
+        let (s_ptr, s_guard) = scales.device_ptr(stream);
+        let (z_ptr, z_guard) = zeros.device_ptr(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+
+        let _guards = (ps_guard, w_guard, s_guard, z_guard, i_guard);
+
+        let mut ps_ptr = ps_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut z_ptr = z_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut ps_len = ps_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut z_len = z_len_val;
+        let mut i_len = i_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+        let mut transposed_v = transposed;
+        let mut k_split_v = k_split;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut ps_ptr, &mut ps_len); // partial_sums: &mut [f32]
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight: &[u32]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);  // scales: &[u16]
+        Self::push_slice_arg(&mut args, &mut z_ptr, &mut z_len);  // zeros: &[u32]
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);  // input: &[u16]
+        Self::push_scalar_arg(&mut args, &mut n_v);               // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
+        Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
+        Self::push_scalar_arg(&mut args, &mut transposed_v);      // transposed: u32
+        Self::push_scalar_arg(&mut args, &mut k_split_v);         // k_split: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 63) / 64, k_split, 1),
+            block_dim: (16, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("int4_gemm_v4_ksplit", stream, config, &mut args)
+    }
 
     /// Launch the `int4_gemm_warp_split` kernel: warp-cooperative INT4 GEMV with K-splitting.
     /// Same interface as ksplit but uses block (32,8,1) with warp shuffle reduction.
@@ -2514,7 +2586,7 @@ impl OxideKernels {
 }
 
 /// All 40 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 41] = [
+const KERNEL_NAMES: [&str; 42] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -2534,6 +2606,7 @@ const KERNEL_NAMES: [&str; 41] = [
     "int4_gemm_auto_round_tiled",
       "int4_gemm_auto_round_ksplit",
     "int4_gemm_v3_ksplit",
+    "int4_gemm_v4_ksplit",
     "int4_gemm_warp",
     "int4_gemm_warp_split",
     "reduce_partial_sums_bf16",
