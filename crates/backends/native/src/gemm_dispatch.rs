@@ -106,36 +106,21 @@ pub fn gemm_projection_cached(
 
             if debug { eprintln!("[GEMM-DISPATCH] Nvfp4 weight '{}': n={}, k={}", weight_name, n, k); }
 
-            // 1. Allocate bf16 buffer for dequantized weights: [N, K]
-            let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
-
-            // 2. Launch NVFP4 dequant kernel
-            oxide.launch_nvfp4_dequant_to_bf16(
-                stream,
-                &mut dequant_buf,
-                &nvfp4_bufs.weight_packed,
-                &nvfp4_bufs.weight_scale,
-                nvfp4_bufs.weight_global_scale,
-                n as u32,
-                k as u32,
-                NVFP4_GROUP_SIZE,
-            )?;
-
-            // 3. Sanitize NaN values in dequant buffer
-            oxide.launch_sanitize_nan_bf16(stream, &mut dequant_buf)?;
-
-            // 4. Compute actual batch/sequence dimension from input
+            // Compute actual batch/sequence dimension from input
             let m = input.len() / k;
 
-            // 5. bf16 tiled GEMM: output = input @ dequant_buf^T
-            oxide.launch_bf16_gemm_tiled(
+            // Fused NVFP4 GEMM: dequant FP4 in registers and multiply — no intermediate buffer
+            oxide.launch_nvfp4_gemm_fused(
                 stream,
                 output,
+                &nvfp4_bufs.weight_packed,
+                &nvfp4_bufs.weight_scale,
                 input,
-                &dequant_buf,
+                nvfp4_bufs.weight_global_scale,
                 m as u32,
                 n as u32,
                 k as u32,
+                NVFP4_GROUP_SIZE,
             )?;
         }
         None => {

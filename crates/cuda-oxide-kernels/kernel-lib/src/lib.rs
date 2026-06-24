@@ -1336,23 +1336,28 @@ pub mod kernels {
             // Load scale for this group (fp8_e4m3 → f32)
             let scale_fp8 = weight_scale[col as usize * num_groups + g];
             let scale = Fp8E4M3::dequantize(scale_fp8);
-            let effective_scale = scale / weight_global_scale;
 
             // Process group_size values (2 FP4 per byte)
             for i in 0..(gs / 2) {
                 let byte_idx = col as usize * (k_usize / 2) + g * gs / 2 + i;
                 let packed_byte = weight_packed[byte_idx];
 
-                // Low nibble first (compressed-tensors convention: [HIGH|LOW] packed, LOW unpacks first)
+                // Low nibble — match dequant kernel: (fp4_val * scale) / global_scale, then bf16 round
                 let lo_nibble = packed_byte & 0xF;
-                let lo_val = fp4_e2m1_to_f32(lo_nibble) * effective_scale;
+                let lo_f32 = fp4_e2m1_to_f32(lo_nibble) * scale / weight_global_scale;
+                let lo_bf16 = f32_to_bf16(lo_f32);
+                let mut lo_val = f32::from_bits((lo_bf16 as u32) << 16);
+                if !lo_val.is_finite() { lo_val = 0.0; }
                 let ki_lo = g * gs + i * 2;
                 let input_lo = f32::from_bits((input[row as usize * k_usize + ki_lo] as u32) << 16);
                 acc += lo_val * input_lo;
 
-                // High nibble
+                // High nibble — match dequant kernel: (fp4_val * scale) / global_scale, then bf16 round
                 let hi_nibble = (packed_byte >> 4) & 0xF;
-                let hi_val = fp4_e2m1_to_f32(hi_nibble) * effective_scale;
+                let hi_f32 = fp4_e2m1_to_f32(hi_nibble) * scale / weight_global_scale;
+                let hi_bf16 = f32_to_bf16(hi_f32);
+                let mut hi_val = f32::from_bits((hi_bf16 as u32) << 16);
+                if !hi_val.is_finite() { hi_val = 0.0; }
                 let ki_hi = g * gs + i * 2 + 1;
                 let input_hi = f32::from_bits((input[row as usize * k_usize + ki_hi] as u32) << 16);
                 acc += hi_val * input_hi;

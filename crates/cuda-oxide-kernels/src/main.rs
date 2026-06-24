@@ -1146,6 +1146,250 @@ fn test_int4_gemm_gguf(ctx: &Arc<CudaContext>) -> bool {
     true
 }
 
+// ─── nvfp4_gemm_fused vs dequant+GEMM comparison ──────
+
+/// CPU reference: FP4 E2M1 nibble to f32
+fn fp4_e2m1_to_f32_cpu(nibble: u8) -> f32 {
+    let sign = (nibble >> 3) & 1;
+    let magnitude = match nibble & 0x7 {
+        0 => 0.0f32, 1 => 0.5, 2 => 1.0, 3 => 1.5,
+        4 => 2.0, 5 => 3.0, 6 => 4.0, 7 => 6.0,
+        _ => unreachable!(),
+    };
+    if sign != 0 { -magnitude } else { magnitude }
+}
+
+/// CPU reference: FP8 E4M3 dequantize (matches device kernel)
+fn fp8_e4m3_dequantize_cpu_test(val: u8) -> f32 {
+    let sign = (val >> 7) & 1;
+    let exp = (val >> 3) & 0xF;
+    let mant = val & 0x7;
+
+    if exp == 0xF { return f32::from_bits(0x7FC00000); }
+    if exp == 0 && mant == 0 { return if sign != 0 { -0.0f32 } else { 0.0f32 }; }
+
+    let fp32_exp = if exp == 0 { 0 } else { (exp as u32) + 120 };
+    let fp32_mant = (mant as u32) << 20;
+    f32::from_bits(((sign as u32) << 31) | (fp32_exp << 23) | fp32_mant)
+}
+// @lat: [[nvfp4_fused_compare]]
+
+fn test_nvfp4_gemm_fused_vs_dequant(ctx: &Arc<CudaContext>) -> bool {
+    // Run both small and larger dimension tests; both must pass
+    let small_pass = nvfp4_compare_inner(
+        ctx, 2usize, 16, 64, 16, 77u32, "small (M=2,N=16,K=64)",
+    );
+    let large_pass = nvfp4_compare_inner(
+        ctx, 2usize, 512, 1024, 64, 13u32, "large (M=2,N=512,K=1024)",
+    );
+    small_pass && large_pass
+}
+
+/// Shared test logic for comparing nvfp4_gemm_fused vs dequant+GEMM path.
+fn nvfp4_compare_inner(
+    ctx: &Arc<CudaContext>,
+    M: usize, N: usize, K: usize, GROUP_SIZE: usize,
+    seed: u32, label: &str,
+) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    let num_groups = K / GROUP_SIZE;
+
+    // --- Generate deterministic test data ---
+    let mut rng_state = seed;
+    fn next_u8_test(state: &mut u32) -> u8 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 16) as u8
+    }
+
+    // FP4 packed weights: [N, K/2] — random bytes (valid nibbles 0-7)
+    let weight_packed: Vec<u8> = (0..N * K / 2)
+        .map(|_| next_u8_test(&mut rng_state) & 0xF | (next_u8_test(&mut rng_state) & 0xF) << 4)
+        .collect();
+
+    // FP8 E4M3 scales: [N, K/group_size] — small positive values, avoid NaN/Inf
+    let weight_scale: Vec<u8> = (0..N * num_groups)
+        .map(|_| {
+            let v = next_u8_test(&mut rng_state) as f32 / 64.0 + 0.5;
+            let bits = v.to_bits();
+            let sign = ((bits >> 31) & 1) as u8;
+            let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+            let mantissa = bits & 0x7FFFFF;
+            if exp == 0xFF { return if sign != 0 { 0xF7 } else { 0x77 }; }
+            let fp8_exp = (exp as i32) - 127 + 7;
+            if fp8_exp >= 0xF { return if sign != 0 { 0xF7 } else { 0x77 }; }
+            if fp8_exp < 0 { return ((sign & 1) as u8) * 0x80; }
+            let fp8_mant = ((mantissa >> 20) & 0x7) as u8;
+            ((sign << 7) | ((fp8_exp as u8) << 3) | fp8_mant)
+        })
+        .collect();
+
+    // Input: BF16 in [M, K] — small values to avoid overflow
+    let input_f32: Vec<f32> = (0..M * K)
+        .map(|_| {
+            ((next_u8_test(&mut rng_state) as f32) - 127.5) / 256.0
+        })
+        .collect();
+    let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // Global scale
+    let weight_global_scale: f32 = 0.5;
+
+    // Device buffers
+    let output_size = M * N;
+    let dequant_buf_size = N * K;
+    let weight_packed_dev = DeviceBuffer::from_host(&stream, &weight_packed).unwrap();
+    let weight_scale_dev = DeviceBuffer::from_host(&stream, &weight_scale).unwrap();
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+
+    // --- Path 1: Fused kernel ---
+    let mut out_fused_dev = DeviceBuffer::<u16>::zeroed(&stream, output_size).unwrap();
+    let launch_fused = LaunchConfig {
+        grid_dim: (((N + 63) / 64) as u32, ((M + 3) / 4) as u32, 1),
+        block_dim: (64, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    module.nvfp4_gemm_fused(
+        &stream, launch_fused,
+        &mut out_fused_dev,
+        &weight_packed_dev,
+        &weight_scale_dev,
+        &input_dev,
+        weight_global_scale,
+        M as u32, N as u32, K as u32,
+        GROUP_SIZE as u32,
+    ).unwrap();
+
+    // --- Path 2: Dequant + GEMM ---
+    let mut dequant_buf_dev = DeviceBuffer::<u16>::zeroed(&stream, dequant_buf_size).unwrap();
+    let launch_dequant = LaunchConfig {
+        grid_dim: (((N + 255) / 256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    module.nvfp4_dequant_to_bf16(
+        &stream, launch_dequant,
+        &mut dequant_buf_dev,
+        &weight_packed_dev,
+        &weight_scale_dev,
+        weight_global_scale,
+        N as u32, K as u32,
+        GROUP_SIZE as u32,
+    ).unwrap();
+
+    let mut out_dequant_dev = DeviceBuffer::<u16>::zeroed(&stream, output_size).unwrap();
+    let launch_gemm = LaunchConfig {
+        grid_dim: (((N + 63) / 64) as u32, ((M + 63) / 64) as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    module.bf16_gemm_tiled(
+        &stream, launch_gemm,
+        &mut out_dequant_dev,
+        &input_dev,
+        &dequant_buf_dev,
+        M as u32, N as u32, K as u32,
+    ).unwrap();
+
+    // Fetch results
+    let out_fused = out_fused_dev.to_host_vec(&stream).unwrap();
+    let out_dequant = out_dequant_dev.to_host_vec(&stream).unwrap();
+
+    // --- CPU reference: dequant + GEMM ---
+    let mut cpu_expected: Vec<f32> = vec![0.0; M * N];
+    for row in 0..M {
+        for col in 0..N {
+            let mut acc: f32 = 0.0;
+            for kg in (0..K).step_by(GROUP_SIZE) {
+                let group_idx = kg / GROUP_SIZE;
+
+                // Scale from FP8 E4M3
+                let scale_fp8 = weight_scale[col * num_groups + group_idx];
+                let scale = fp8_e4m3_dequantize_cpu_test(scale_fp8);
+                let effective_scale = scale / weight_global_scale;
+
+                // Process group
+                for kk in (0..GROUP_SIZE).step_by(2) {
+                    let byte_idx = col * K / 2 + group_idx * GROUP_SIZE / 2 + kk / 2;
+                    let packed_byte = weight_packed[byte_idx];
+
+                    // Low nibble first (compressed-tensors convention)
+                    let lo_nibble = packed_byte & 0xF;
+                    let lo_val = fp4_e2m1_to_f32_cpu(lo_nibble) * effective_scale;
+                    let input_val = bf16_to_f32_cpu(input_bf16[row * K + kg + kk]);
+                    acc += lo_val * input_val;
+
+                    // High nibble
+                    let hi_nibble = (packed_byte >> 4) & 0xF;
+                    let hi_val = fp4_e2m1_to_f32_cpu(hi_nibble) * effective_scale;
+                    let input_val2 = bf16_to_f32_cpu(input_bf16[row * K + kg + kk + 1]);
+                    acc += hi_val * input_val2;
+                }
+            }
+            cpu_expected[row * N + col] = acc;
+        }
+    }
+
+    // --- Print first few elements for diagnostics ---
+    println!("   {} Fused (first 5): {:?}", label, out_fused.iter().take(5).map(|&v| bf16_to_f32_cpu(v)).collect::<Vec<_>>());
+    println!("   {} Dequant+GEMM (first 5): {:?}", label, out_dequant.iter().take(5).map(|&v| bf16_to_f32_cpu(v)).collect::<Vec<_>>());
+    println!("   {} CPU ref (first 5): {:?}", label, cpu_expected.iter().take(5).cloned().collect::<Vec<_>>());
+
+    // --- Compare fused vs dequant+GEMM ---
+    let mut max_diff: f32 = 0.0;
+    let mut first_diff_idx: usize = 0;
+    for i in 0..output_size {
+        let a = bf16_to_f32_cpu(out_fused[i]);
+        let b = bf16_to_f32_cpu(out_dequant[i]);
+        let diff = (a - b).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            first_diff_idx = i;
+        }
+    }
+
+    // --- Compare fused vs CPU reference ---
+    let mut max_diff_cpu: f32 = 0.0;
+    for i in 0..output_size {
+        let a = bf16_to_f32_cpu(out_fused[i]);
+        let diff = (a - cpu_expected[i]).abs();
+        if diff > max_diff_cpu {
+            max_diff_cpu = diff;
+        }
+    }
+
+    // --- Compare dequant+GEMM vs CPU reference ---
+    let mut max_diff_deq: f32 = 0.0;
+    for i in 0..output_size {
+        let a = bf16_to_f32_cpu(out_dequant[i]);
+        let diff = (a - cpu_expected[i]).abs();
+        if diff > max_diff_deq {
+            max_diff_deq = diff;
+        }
+    }
+
+    // Check for NaN in outputs
+    let fused_has_nan = out_fused.iter().any(|&v| bf16_to_f32_cpu(v).is_nan());
+    let dequant_has_nan = out_dequant.iter().any(|&v| bf16_to_f32_cpu(v).is_nan());
+
+    // Print detailed diagnostics
+    eprintln!("   {} Max diff (fused vs dequant+GEMM): {}", label, max_diff);
+    eprintln!("   {} Max diff (fused vs CPU ref): {}", label, max_diff_cpu);
+    eprintln!("   {} Max diff (dequant+GEMM vs CPU ref): {}", label, max_diff_deq);
+    eprintln!("   {} Fused has NaN: {}", label, fused_has_nan);
+    eprintln!("   {} Dequant+GEMM has NaN: {}", label, dequant_has_nan);
+
+    if max_diff > 0.5 {
+        let a = bf16_to_f32_cpu(out_fused[first_diff_idx]);
+        let b = bf16_to_f32_cpu(out_dequant[first_diff_idx]);
+        eprintln!("   {} First big diff at element {}: fused={}, dequant+GEMM={}", label, first_diff_idx, a, b);
+    }
+
+    // Threshold: 0.5 is generous for BF16 comparison but should catch gross mismatches
+    max_diff <= 0.5 && !fused_has_nan && !dequant_has_nan
+}
+
 // ─── FP8 quantize/dequantize E4M3 ──────────────────────
 
 /// CPU reference: E4M3 quantize (same algorithm as device)
@@ -2370,7 +2614,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fail_count += 1;
     }
 
-    println!("\n=== Summary: {} tests, {} failed ===", 28, fail_count);
+    // ─── NVFP4 GEMM comparison test ──────────────
+    if test_nvfp4_gemm_fused_vs_dequant(&ctx) {
+        println!("[PASS] nvfp4_gemm_fused vs dequant+GEMM");
+    } else {
+        eprintln!("[FAIL] nvfp4_gemm_fused vs dequant+GEMM");
+        fail_count += 1;
+    }
+
+    println!("\n=== Summary: {} tests, {} failed ===", 29, fail_count);
 
     if fail_count > 0 {
         std::process::exit(1);
