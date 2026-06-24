@@ -92,7 +92,7 @@ pub fn gemm_projection_cached(
                 // K_SPLIT is correct regardless of divisibility (40, 136, 9, 34 groups
                 // all handled). K_SPLIT=20 gives ~1.25 waves on 40 SMs for the main
                 // hidden=5120 layers (2 groups/split, 1600 blocks).
-                const K_SPLIT: u32 = 20;
+                const K_SPLIT: u32 = 28;
                 let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
                 oxide.launch_int4_gemm_v3_ksplit(
                     stream, &mut partial_sums,
@@ -128,10 +128,10 @@ pub fn gemm_projection_cached(
             let m = input.len() / k;
 
             if m == 1 {
-                // K-split for M=1: more blocks = better latency hiding
-                const K_SPLIT: u32 = 32;
+                // K-split for M=1: v3 with 4 accumulators + ceil-grouped K-split + 2-u32 stride
+                const K_SPLIT: u32 = 28;
                 let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
-                oxide.launch_nvfp4_gemm_fused_ksplit(
+                oxide.launch_nvfp4_gemm_v3_ksplit(
                     stream, &mut partial_sums,
                     &nvfp4_bufs.weight_packed, &nvfp4_bufs.weight_scale,
                     input, nvfp4_bufs.weight_global_scale,
