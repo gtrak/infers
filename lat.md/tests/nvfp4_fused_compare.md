@@ -15,3 +15,7 @@ Verifies that with small random data both paths produce identical results (max d
 ## Large Dimensions (M=2, N=512, K=1024)
 
 Stress-test with larger dimensions closer to real inference workloads. Both paths match exactly (max diff = 0), ruling out tile-boundary or grid-sizing bugs.
+
+## NVFP4 K-Split vs CPU Reference (M=1, N=16, K=64)
+
+Validates that `nvfp4_gemm_fused_ksplit` with K_SPLIT=4 matches a CPU reference. The kernel dequantizes FP4 in registers, computes partial sums over K-split ranges, and writes f32 results reduced by `reduce_partial_sums_bf16`.

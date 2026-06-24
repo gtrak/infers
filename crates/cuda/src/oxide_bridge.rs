@@ -1312,6 +1312,71 @@ impl OxideKernels {
         self.raw_launch("nvfp4_gemm_fused", stream, config, &mut args)
     }
 
+    /// Launch the `nvfp4_gemm_fused_ksplit` kernel: fused NVFP4 GEMM with K-splitting.
+    /// Each block computes partial sums for 64 output columns over a portion of K (M=1 only).
+    ///
+    /// The kernel signature is:
+    /// ```ignore
+    /// nvfp4_gemm_fused_ksplit(partial_sums: &mut [f32], weight_packed: &[u8], weight_scale: &[u8], input: &[u16], weight_global_scale: f32, n: u32, k: u32, group_size: u32, k_split: u32)
+    /// ```
+    pub fn launch_nvfp4_gemm_fused_ksplit(
+        &self,
+        stream: &Arc<CudaStream>,
+        partial_sums: &mut CudaSlice<f32>,         // [K_SPLIT, N] f32
+        weight_packed: &CudaSlice<u8>,              // [N, K/2] packed FP4
+        weight_scale: &CudaSlice<u8>,               // [N, K/group_size] fp8_e4m3
+        input: &CudaSlice<half::bf16>,                // [K] bf16 (M=1)
+        weight_global_scale: f32,                    // scalar global scale
+        n: u32,
+        k: u32,
+        group_size: u32,
+        k_split: u32,
+    ) -> anyhow::Result<()> {
+        let ps_len_val = partial_sums.len() as u64;
+        let w_len_val = weight_packed.len() as u64;
+        let s_len_val = weight_scale.len() as u64;
+        let i_len_val = input.len() as u64;
+
+        let (ps_ptr, ps_guard) = partial_sums.device_ptr_mut(stream);
+        let (w_ptr, w_guard) = weight_packed.device_ptr(stream);
+        let (s_ptr, s_guard) = weight_scale.device_ptr(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+
+        let _guards = (ps_guard, w_guard, s_guard, i_guard);
+
+        let mut ps_ptr = ps_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut ps_len = ps_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut i_len = i_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+        let mut gscale = weight_global_scale;
+        let mut k_split_v = k_split;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut ps_ptr, &mut ps_len);    // partial_sums: &mut [f32]
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);     // weight_packed: &[u8]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);     // weight_scale: &[u8]
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);     // input: &[u16]
+        Self::push_scalar_arg(&mut args, &mut gscale);               // weight_global_scale: f32
+        Self::push_scalar_arg(&mut args, &mut n_v);                  // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);                  // k: u32
+        Self::push_scalar_arg(&mut args, &mut group_size_v);         // group_size: u32
+        Self::push_scalar_arg(&mut args, &mut k_split_v);            // k_split: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 63) / 64, k_split, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("nvfp4_gemm_fused_ksplit", stream, config, &mut args)
+    }
+
     /// Launch the `sanitize_nan_bf16` kernel: replace NaN values in a bf16 buffer with 0.0.
     pub fn launch_sanitize_nan_bf16(
         &self,
@@ -2177,8 +2242,8 @@ impl OxideKernels {
     }
 }
 
-/// All 36 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 36] = [
+   /// All 37 kernel names compiled into the oxide_kernels.cubin file.
+const KERNEL_NAMES: [&str; 37] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -2196,8 +2261,9 @@ const KERNEL_NAMES: [&str; 36] = [
     "infers_rope_bf16",
     "int4_gemm_auto_round",
     "int4_gemm_auto_round_tiled",
-    "int4_gemm_auto_round_ksplit",
+      "int4_gemm_auto_round_ksplit",
     "reduce_partial_sums_bf16",
+    "nvfp4_gemm_fused_ksplit",
     "int4_dequant_to_bf16",
     "nvfp4_dequant_to_bf16",
     "nvfp4_gemm_fused",

@@ -1508,6 +1508,85 @@ pub mod kernels {
         }
     }
 
+    /// Fused NVFP4 GEMM with K-splitting for M=1 decode.
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn nvfp4_gemm_fused_ksplit(
+        partial_sums: &mut [f32],         // [K_SPLIT, N] f32 output
+        weight_packed: &[u8],             // [N, K/2] packed FP4
+        weight_scale: &[u8],              // [N, K/group_size] fp8_e4m3
+        input: &[u16],                    // [K] bf16 (M=1)
+        weight_global_scale: f32,         // scalar global scale
+        n: u32, k: u32,
+        group_size: u32,
+        k_split: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let split_idx = thread::blockIdx_y() as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let gs = group_size as usize;
+
+        if col >= n_usize {
+            return;
+        }
+
+        let k_per_split = (k_usize + k_split as usize - 1) / k_split as usize;
+        let k_start = split_idx * k_per_split;
+        let k_end = (k_start + k_per_split).min(k_usize);
+
+        // Align to group boundaries
+        let k_start_aligned = (k_start / gs) * gs;
+        let k_end_aligned = ((k_end + gs - 1) / gs) * gs;
+        let k_end_aligned = k_end_aligned.min(k_usize);
+
+        let num_groups = k_usize / gs;
+        let mut acc: f32 = 0.0;
+
+        for g in (k_start_aligned / gs..k_end_aligned / gs) {
+            let kg = g * gs;
+            if kg >= k_end {
+                break;
+            }
+
+            let scale_fp8 = weight_scale[col * num_groups + g];
+            let scale = Fp8E4M3::dequantize(scale_fp8);
+            let effective_scale = scale / weight_global_scale;
+
+            for i in 0..(gs / 8) {
+                let byte_offset = col * (k_usize / 2) + g * gs / 2 + i * 4;
+                if byte_offset + 3 >= weight_packed.len() {
+                    break;
+                }
+                let packed_u32: u32 = {
+                    let b0 = weight_packed[byte_offset] as u32;
+                    let b1 = weight_packed[byte_offset + 1] as u32;
+                    let b2 = weight_packed[byte_offset + 2] as u32;
+                    let b3 = weight_packed[byte_offset + 3] as u32;
+                    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                };
+
+                for w in 0..8usize {
+                    let k_full = g * gs + i * 8 + w;
+                    if k_full < k_start || k_full >= k_end {
+                        continue;
+                    }
+                    let nibble = ((packed_u32 >> (w * 4)) & 0xF) as u8;
+                    let w_f32 = fp4_e2m1_to_f32(nibble) * effective_scale;
+                    let w_bf16 = f32_to_bf16(w_f32);
+                    let mut w_val = f32::from_bits((w_bf16 as u32) << 16);
+                    if !w_val.is_finite() { w_val = 0.0; }
+                    let input_val = f32::from_bits((input[k_full] as u32) << 16);
+                    acc += w_val * input_val;
+                }
+            }
+        }
+
+        partial_sums[split_idx * n_usize + col] = acc;
+    }
+
     /// Replace NaN values in a bf16 buffer with 0.0.
     #[kernel]
     pub fn sanitize_nan_bf16(buf: &mut [u16], len: u32) {

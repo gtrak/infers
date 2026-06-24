@@ -130,19 +130,34 @@ pub fn gemm_projection_cached(
             // Compute actual batch/sequence dimension from input
             let m = input.len() / k;
 
-            // Fused NVFP4 GEMM: dequant FP4 in registers and multiply — no intermediate buffer
-            oxide.launch_nvfp4_gemm_fused(
-                stream,
-                output,
-                &nvfp4_bufs.weight_packed,
-                &nvfp4_bufs.weight_scale,
-                input,
-                nvfp4_bufs.weight_global_scale,
-                m as u32,
-                n as u32,
-                k as u32,
-                NVFP4_GROUP_SIZE,
-            )?;
+            if m == 1 {
+                // K-split for M=1: more blocks = better latency hiding
+                const K_SPLIT: u32 = 4;
+                let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
+                oxide.launch_nvfp4_gemm_fused_ksplit(
+                    stream, &mut partial_sums,
+                    &nvfp4_bufs.weight_packed, &nvfp4_bufs.weight_scale,
+                    input, nvfp4_bufs.weight_global_scale,
+                    n as u32, k as u32, NVFP4_GROUP_SIZE, K_SPLIT,
+                )?;
+                oxide.launch_reduce_partial_sums_bf16(
+                    stream, output, &partial_sums, n as u32, K_SPLIT,
+                )?;
+            } else {
+                // Fused NVFP4 GEMM: dequant FP4 in registers and multiply — no intermediate buffer
+                oxide.launch_nvfp4_gemm_fused(
+                    stream,
+                    output,
+                    &nvfp4_bufs.weight_packed,
+                    &nvfp4_bufs.weight_scale,
+                    input,
+                    nvfp4_bufs.weight_global_scale,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    NVFP4_GROUP_SIZE,
+                )?;
+            }
         }
         None => {
             if debug { eprintln!("[GEMM-DISPATCH] Weight '{}' NOT FOUND in cache", weight_name); }

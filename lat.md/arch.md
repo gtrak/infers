@@ -117,6 +117,7 @@ Thirty-two launch wrapper methods on the `OxideKernels` impl block. Each follows
 | `launch_reduce_partial_sums_bf16` | `reduce_partial_sums_bf16` | grid=(ceil(n/64), 1, 1), block=(64,1), smem=0 — reduces K-split partial sums (f32) into final bf16 output |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer. Optimized: reads 4 bytes as u32 (8 nibbles per load vs 2 per byte), precomputes effective_scale = scale / global_scale once per group |
+| `launch_nvfp4_gemm_fused_ksplit` | `nvfp4_gemm_fused_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — K-split for M=1 decode: each thread block computes partial sums over a portion of K, writes to f32 buffer. Same dequant logic as nvfp4_gemm_fused |
 
 **In-place write kernels** (q and k are writable `DisjointSlice<u16>`):
 

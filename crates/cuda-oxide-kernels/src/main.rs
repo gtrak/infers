@@ -1592,6 +1592,142 @@ fn nvfp4_compare_inner(
     max_diff <= 0.5 && !fused_has_nan && !dequant_has_nan
 }
 
+/// Test nvfp4_gemm_fused_ksplit: K-split kernel + reduction vs CPU reference.
+// @lat: [[nvfp4_fused_compare#NVFP4 K-Split vs CPU Reference (M=1, N=16, K=64)]]
+fn test_nvfp4_gemm_fused_ksplit(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    // M=1, N=16, K=64, group_size=16, k_split=4 (same as nvfp4 compare test small)
+    const N: usize = 16;
+    const K: usize = 64;
+    const GROUP_SIZE: usize = 16;
+    const K_SPLIT: u32 = 4;
+    let num_groups = K / GROUP_SIZE; // 4
+
+    // --- Generate deterministic test data (same seed as nvfp4 test) ---
+    let mut rng_state = 77u32;
+    fn next_u8_nv(state: &mut u32) -> u8 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 16) as u8
+    }
+
+    // FP4 packed weights: [N, K/2] — random bytes (valid nibbles 0-7)
+    let weight_packed: Vec<u8> = (0..N * K / 2)
+        .map(|_| next_u8_nv(&mut rng_state) & 0xF | (next_u8_nv(&mut rng_state) & 0xF) << 4)
+        .collect();
+
+    // FP8 E4M3 scales: [N, K/group_size] — small positive values
+    let weight_scale: Vec<u8> = (0..N * num_groups)
+        .map(|_| {
+            let v = next_u8_nv(&mut rng_state) as f32 / 64.0 + 0.5;
+            let bits = v.to_bits();
+            let sign = ((bits >> 31) & 1) as u8;
+            let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+            let mantissa = bits & 0x7FFFFF;
+            if exp == 0xFF { return if sign != 0 { 0xF7 } else { 0x77 }; }
+            let fp8_exp = (exp as i32) - 127 + 7;
+            if fp8_exp >= 0xF { return if sign != 0 { 0xF7 } else { 0x77 }; }
+            if fp8_exp < 0 { return ((sign & 1) as u8) * 0x80; }
+            let fp8_mant = ((mantissa >> 20) & 0x7) as u8;
+            ((sign << 7) | ((fp8_exp as u8) << 3) | fp8_mant)
+        })
+        .collect();
+
+    // Input: BF16 in [K] — small values to avoid overflow (M=1)
+    let input_f32: Vec<f32> = (0..K)
+        .map(|_| {
+            ((next_u8_nv(&mut rng_state) as f32) - 127.5) / 256.0
+        })
+        .collect();
+    let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // Global scale
+    let weight_global_scale: f32 = 0.5;
+
+    // Device buffers
+    let weight_packed_dev = DeviceBuffer::from_host(&stream, &weight_packed).unwrap();
+    let weight_scale_dev = DeviceBuffer::from_host(&stream, &weight_scale).unwrap();
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+
+    // partial_sums buffer: [K_SPLIT, N] f32
+    let partial_sums_size = K_SPLIT as usize * N;
+    let mut partial_sums_dev = DeviceBuffer::<f32>::zeroed(&stream, partial_sums_size).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, N).unwrap();
+
+    // Launch K-split kernel: grid (ceil(N/64), K_SPLIT, 1)
+    let launch_ksplit = LaunchConfig {
+        grid_dim: (((N + 63) / 64) as u32, K_SPLIT, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.nvfp4_gemm_fused_ksplit(
+        &stream, launch_ksplit.clone(), &mut partial_sums_dev,
+        &weight_packed_dev, &weight_scale_dev, &input_dev,
+        weight_global_scale,
+        N as u32, K as u32, GROUP_SIZE as u32, K_SPLIT,
+    ).unwrap();
+
+    // Launch reduction kernel
+    let launch_reduce = LaunchConfig {
+        grid_dim: (((N + 63) / 64) as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.reduce_partial_sums_bf16(
+        &stream, launch_reduce.clone(), &mut out_dev,
+        &partial_sums_dev, N as u32, K_SPLIT,
+    ).unwrap();
+
+    let out_host = out_dev.to_host_vec(&stream).unwrap();
+
+    // CPU reference: dequant + GEMM for M=1
+    let mut expected: Vec<f32> = vec![0.0; N];
+    for col in 0..N {
+        let mut acc: f32 = 0.0;
+        for kg in (0..K).step_by(GROUP_SIZE) {
+            let group_idx = kg / GROUP_SIZE;
+
+            // Scale from FP8 E4M3
+            let scale_fp8 = weight_scale[col * num_groups + group_idx];
+            let scale = fp8_e4m3_dequantize_cpu_test(scale_fp8);
+            let effective_scale = scale / weight_global_scale;
+
+            // Process group — 2 values per byte (low nibble first, then high)
+            for kk in (0..GROUP_SIZE).step_by(2) {
+                let byte_idx = col * K / 2 + group_idx * GROUP_SIZE / 2 + kk / 2;
+                let packed_byte = weight_packed[byte_idx];
+
+                // Low nibble first (compressed-tensors convention)
+                let lo_nibble = packed_byte & 0xF;
+                let lo_val = fp4_e2m1_to_f32_cpu(lo_nibble) * effective_scale;
+                let input_val = bf16_to_f32_cpu(input_bf16[kg + kk]);
+                acc += lo_val * input_val;
+
+                // High nibble
+                let hi_nibble = (packed_byte >> 4) & 0xF;
+                let hi_val = fp4_e2m1_to_f32_cpu(hi_nibble) * effective_scale;
+                let input_val2 = bf16_to_f32_cpu(input_bf16[kg + kk + 1]);
+                acc += hi_val * input_val2;
+            }
+        }
+        expected[col] = acc;
+    }
+
+    // Compare against CPU reference
+    for i in 0..N {
+        let actual = bf16_to_f32_cpu(out_host[i]);
+        if (actual - expected[i]).abs() > 4.0 {
+            eprintln!("NVFP4 GEMM ksplit mismatch at [{}]: got {} expected {}", i, actual, expected[i]);
+            return false;
+        }
+    }
+
+    true
+}
+
 // ─── FP8 quantize/dequantize E4M3 ──────────────────────
 
 /// CPU reference: E4M3 quantize (same algorithm as device)
@@ -2571,6 +2707,7 @@ fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "int4_gemm_auto_round_tiled",
         "int4_gemm_auto_round_ksplit",
         "reduce_partial_sums_bf16",
+        "nvfp4_gemm_fused_ksplit",
         "int4_gemm_gguf",
         "nvfp4_gemm_fused",
         "infers_fp8_quantize_e4m3",
@@ -2833,7 +2970,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fail_count += 1;
     }
 
-    println!("\n=== Summary: {} tests, {} failed ===", 30, fail_count);
+    // ─── NVFP4 GEMM K-split test ──────────────
+    if test_nvfp4_gemm_fused_ksplit(&ctx) {
+        println!("[PASS] nvfp4_gemm_fused_ksplit vs CPU ref");
+    } else {
+        eprintln!("[FAIL] nvfp4_gemm_fused_ksplit vs CPU ref");
+        fail_count += 1;
+    }
+
+    println!("\n=== Summary: {} tests, {} failed ===", 31, fail_count);
 
     if fail_count > 0 {
         std::process::exit(1);
