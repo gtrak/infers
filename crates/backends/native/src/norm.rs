@@ -62,3 +62,29 @@ pub fn rms_norm_per_head(
 ) -> Result<CudaSlice<bf16>> {
     rms_norm(stream, oxide, head_tensor, norm_weight, eps, head_dim)
 }
+
+/// Apply RMSNorm, writing into a pre-allocated output buffer (zero-allocation variant).
+///
+/// Same computation as `rms_norm()` but writes into the caller-provided `output` buffer
+/// instead of allocating a new one. Used in the decode hot path to avoid per-token allocations.
+///
+/// # Arguments
+/// * `output` — Pre-allocated output buffer, must be same size as `hidden`
+pub fn rms_norm_into(
+    stream: &Arc<CudaStream>,
+    oxide: &OxideKernels,
+    output: &mut CudaSlice<bf16>,
+    hidden: &CudaSlice<bf16>,
+    weight: &CudaSlice<bf16>,
+    eps: f32,
+    hidden_size: usize,
+) -> Result<()> {
+    let elem_count = hidden.len();
+    anyhow::ensure!(elem_count > 0, "RMSNorm input must not be empty");
+    anyhow::ensure!(weight.len() >= hidden_size, "Weight vector too short for hidden_size");
+    anyhow::ensure!(output.len() >= elem_count, "Output buffer too small: {} < {}", output.len(), elem_count);
+
+    oxide.launch_rmsnorm_bf16(stream, hidden, weight, output, hidden_size as u32, eps)?;
+
+    Ok(())
+}

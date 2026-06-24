@@ -263,7 +263,7 @@ Run with `cargo test -- --nocapture`. Seven checkpoints: events recorded, pages 
 
 ## Paged Decode Path
 
-Decode using paged KV cache: reads K/V from pages during attention computation via block tables, supports single-token generation with paged attention kernels. See [[crates/backends/native/src/engine.rs]].
+Paged decode: reads K/V from pages via block tables, single-token generation with paged attention kernels. Zero-allocation — intermediate buffers use pre-allocated [[lat.md/lat#Forward Engine#Decode Workspace]]. See [[crates/backends/native/src/engine.rs]].
 
 ## INT4 Triplet Upload
 
@@ -294,6 +294,19 @@ Per-layer probe infrastructure for dumping intermediate tensors during inference
 Debug feature for diagnosing stuck-token issues by printing top-5 logits at each decode step.
 
 Enabled via `INFERS_DUMP_LOGITS=1` environment variable. Downloads the full logits tensor from GPU 0 to CPU after LM head projection, computes statistics (max, min, standard deviation), sorts descending to find top-5 tokens, and prints to stderr in the format `[LOGIT-DUMP] step={step} top5=[(token_id, logit_value), ...] max_logit={max} min_logit={min} logit_std={std}`. See [[crates/backends/native/src/engine.rs]].
+
+## Zero-Allocation _into Variants
+
+Zero-allocation variants of `rms_norm` and `add` writing into caller-provided buffers instead of allocating. Eliminates per-token GPU malloc in the decode hot path.
+
+Original functions (`rms_norm`, `add`) allocate new GPU buffers each call. The `_into` variants accept a pre-allocated `output` parameter, reducing allocation pressure from hundreds of calls per token to zero.
+`[[crates/backends/native/src/norm.rs#rms_norm_into]]` — RMSNorm writing into a pre-allocated buffer. Validates output size before kernel launch. See `[[crates/backends/native/src/norm.rs#rms_norm_into]]`.
+
+`[[crates/backends/native/src/add.rs#add_into]]` — element-wise addition writing into a pre-allocated buffer. Validates both input sizes and output capacity. See `[[crates/backends/native/src/add.rs#add_into]]`.
+
+## Decode Workspace
+
+Pre-allocated GPU workspace buffers for the decode hot path. `DecodeWorkspace` holds all intermediate buffers allocated once per GPU at engine init, eliminating hundreds of `alloc_zeros` calls per token. Fully wired into `decode_paged`. See [[crates/backends/native/src/workspace.rs#DecodeWorkspace]].
 
 # Mmap Weight Upload
 

@@ -18,6 +18,7 @@ pub mod attention;
 pub mod mlp;
 
 pub mod norm;
+pub mod workspace;
 pub mod rope;
 pub mod sample;
 pub mod embedding;

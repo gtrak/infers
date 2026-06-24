@@ -37,3 +37,27 @@ pub fn add(
 
     Ok(output)
 }
+
+/// Element-wise addition, writing into a pre-allocated output buffer (zero-allocation variant).
+///
+/// Same computation as `add()` but writes into the caller-provided `output` buffer
+/// instead of allocating a new one. Used for residual connections in the decode hot path.
+///
+/// # Arguments
+/// * `output` — Pre-allocated output buffer, must be same size as `a` and `b`
+pub fn add_into(
+    stream: &Arc<CudaStream>,
+    oxide: &OxideKernels,
+    output: &mut CudaSlice<bf16>,
+    a: &CudaSlice<bf16>,
+    b: &CudaSlice<bf16>,
+) -> Result<()> {
+    let elem_count = a.len();
+    anyhow::ensure!(elem_count > 0, "Add input must not be empty");
+    anyhow::ensure!(a.len() == b.len(), "Add inputs must have same size ({} != {})", a.len(), b.len());
+    anyhow::ensure!(output.len() >= elem_count, "Output buffer too small: {} < {}", output.len(), elem_count);
+
+    oxide.launch_add_bf16(stream, a, b, output)?;
+
+    Ok(())
+}

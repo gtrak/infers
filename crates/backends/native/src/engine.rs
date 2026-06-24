@@ -19,6 +19,7 @@ use crate::attention::{KvCache, PagedKvCache};
 use crate::gpu_cache::GpuWeightCache;
 use crate::eviction::BackendEvictionStore;
 use crate::gdn::GdnState;
+use crate::workspace::DecodeWorkspace;
 
 use infers_kv::PagedKvManager;
 
@@ -99,6 +100,9 @@ pub struct ForwardEngine {
 
     /// INT4 quantization group size for on-the-fly dequantization.
     group_size: usize,
+    /// Per-GPU pre-allocated workspace buffers for the decode hot path.
+    /// Eliminates per-token alloc_zeros calls.
+    workspaces: Vec<DecodeWorkspace>,
 }
 
 impl ForwardEngine {
@@ -233,6 +237,19 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to upload RoPE sin table for GPU {}: {}", gpu_idx, e))?);
         }
 
+        // Pre-allocate decode workspace buffers for each GPU
+        let sharded_intermediate = config.intermediate_size / num_gpus;
+        let mut workspaces = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            workspaces.push(DecodeWorkspace::new(
+                &gpu_stream,
+                config.hidden_size,
+                sharded_intermediate,
+                config.vocab_size,
+            )?);
+        }
+
         tracing::info!(
             "ForwardEngine initialized: {} layers, {} GPU shards",
             config.num_hidden_layers,
@@ -254,6 +271,7 @@ impl ForwardEngine {
             rope_cos: Some(rope_cos),
             rope_sin: Some(rope_sin),
             group_size,
+            workspaces,
         })
     }
 
@@ -335,6 +353,19 @@ impl ForwardEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to upload RoPE sin table for GPU {}: {}", gpu_idx, e))?);
         }
 
+        // Pre-allocate decode workspace buffers for each GPU
+        let sharded_intermediate = config.intermediate_size / num_gpus;
+        let mut workspaces = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            workspaces.push(DecodeWorkspace::new(
+                &gpu_stream,
+                config.hidden_size,
+                sharded_intermediate,
+                config.vocab_size,
+            )?);
+        }
+
         tracing::info!(
             "ForwardEngine initialized (mmap): {} layers, {} GPU shards",
             config.num_hidden_layers,
@@ -356,6 +387,7 @@ impl ForwardEngine {
             rope_cos: Some(rope_cos),
             rope_sin: Some(rope_sin),
             group_size,
+            workspaces,
         })
     }
 
@@ -997,12 +1029,14 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 // Norm1
                 let norm1_weight = self.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm1 weight '{}' not in cache", layer.norm1.name))?;
-                let norm1_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm1_weight,
+                crate::norm::rms_norm_into(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
+                    &mut self.workspaces[gpu_idx].norm1_out,
+                    &hidden_states[gpu_idx], &norm1_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &norm1_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &self.workspaces[gpu_idx].norm1_out, &[1, config.hidden_size], "decode");
 
                 // Attention or GDN (decode versions)
                 let attn_out = match config.get_layer_type(layer_idx) {
@@ -1010,9 +1044,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                         let gdn_weights = layer.gdn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
               crate::gdn::decode_forward(
-                              gemm, &gpu_stream,
-                              &self.per_gpu_kernels[gpu_idx].oxide,
-                             gdn_weights, &norm1_out,
+                               gemm, &gpu_stream,
+                               &self.per_gpu_kernels[gpu_idx].oxide,
+                              gdn_weights, &self.workspaces[gpu_idx].norm1_out,
                             &mut self.gdn_states[gpu_idx][layer_idx],
                             config.hidden_size, config.as_ref(), self.group_size,
                             &self.weight_caches[gpu_idx],
@@ -1024,10 +1058,10 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     LayerType::FullAttention => {
                         let attn_weights = layer.attn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-             crate::attention::decode_forward_paged(
-                             gemm, &gpu_stream,
-                             &self.per_gpu_kernels[gpu_idx].oxide,
-                            attn_weights, &norm1_out,
+            crate::attention::decode_forward_paged(
+                              gemm, &gpu_stream,
+                              &self.per_gpu_kernels[gpu_idx].oxide,
+                             attn_weights, &self.workspaces[gpu_idx].norm1_out,
                             &mut self.paged_kv_caches[gpu_idx][layer_idx],
                             &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
                             position, num_cached_tokens,
@@ -1065,13 +1099,15 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &attn_outputs[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
-            // Phase B: Residual add on each GPU
+            // Phase B: Residual add on each GPU (zero-alloc via workspace + swap)
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                hidden_states[gpu_idx] = crate::add::add(
+                crate::add::add_into(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
+                    &mut self.workspaces[gpu_idx].residual_buf,
                     &hidden_states[gpu_idx], &attn_outputs[gpu_idx],
                 )?;
+                std::mem::swap(&mut hidden_states[gpu_idx], &mut self.workspaces[gpu_idx].residual_buf);
             }
 
             for gpu_idx in 0..num_gpus {
@@ -1080,96 +1116,94 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
 
             // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
-            let mut mlp_outputs: Vec<CudaSlice<bf16>> = Vec::new();
-
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
                 let w = &self.metadata[gpu_idx];
                 let mlp_weights = &w.layers[layer_idx].mlp;
+                let ws = &mut self.workspaces[gpu_idx];
 
-                // Norm2
+                // Norm2 — into workspace
                 let norm2_weight = self.weight_caches[gpu_idx].get_bf16(&w.layers[layer_idx].norm2.name)
                     .ok_or_else(|| anyhow::anyhow!("Norm2 weight '{}' not in cache", w.layers[layer_idx].norm2.name))?;
-                let norm2_out = crate::norm::rms_norm(
-                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &hidden_states[gpu_idx], &norm2_weight,
+                crate::norm::rms_norm_into(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
+                    &mut ws.norm2_out,
+                    &hidden_states[gpu_idx], &norm2_weight,
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &norm2_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &ws.norm2_out, &[1, config.hidden_size], "decode");
 
-                // Gate projection (column-parallel: sharded_intermediate output dim)
-                let mut gate = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                // Gate projection — into workspace.mlp_gate
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.gate_proj.name,
-                    &norm2_out, &mut gate,
+                    &ws.norm2_out, &mut ws.mlp_gate,
                     1, sharded_intermediate, config.hidden_size,
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &ws.mlp_gate, &[1, config.intermediate_size / num_gpus], "decode");
 
-                // Up projection (column-parallel: sharded_intermediate output dim)
-                let mut up = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                // Up projection — into workspace.mlp_up
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.up_proj.name,
-                    &norm2_out, &mut up,
+                    &ws.norm2_out, &mut ws.mlp_up,
                     1, sharded_intermediate, config.hidden_size,
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &ws.mlp_up, &[1, config.intermediate_size / num_gpus], "decode");
 
-                // up * SiLU(gate) = SwiGLU (elementwise on sharded_intermediate)
-                let mut silu_out = gpu_stream.alloc_zeros::<bf16>(sharded_intermediate)?;
+                // up * SiLU(gate) = SwiGLU — into workspace.mlp_silu
                 self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
-                    &gpu_stream, &up, &gate, &mut silu_out, sharded_intermediate as u32,
+                    &gpu_stream, &ws.mlp_up, &ws.mlp_gate, &mut ws.mlp_silu, sharded_intermediate as u32,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &ws.mlp_silu, &[1, config.intermediate_size / num_gpus], "decode");
 
-                // Down projection (row-parallel: full hidden_size output)
-                let mut mlp_out = gpu_stream.alloc_zeros::<bf16>(config.hidden_size)?;
+                // Down projection — into workspace.mlp_out
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
                     &mlp_weights.down_proj.name,
-                    &silu_out, &mut mlp_out,
+                    &ws.mlp_silu, &mut ws.mlp_out,
                     1, config.hidden_size, sharded_intermediate,
                     self.group_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[1, config.hidden_size], "decode");
-
-                mlp_outputs.push(mlp_out);
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &ws.mlp_out, &[1, config.hidden_size], "decode");
             }
 
-            // All-reduce MLP outputs across GPUs (grouped)
+            // All-reduce MLP outputs across GPUs (grouped) — directly on workspace buffers
             group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 sync::all_reduce_mlp(
-                    &self.nccl, &gpu_stream, &mut mlp_outputs[gpu_idx],
+                    &self.nccl, &gpu_stream, &mut self.workspaces[gpu_idx].mlp_out,
                 )?;
             }
             group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &mlp_outputs[gpu_idx], &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &self.workspaces[gpu_idx].mlp_out, &[1, config.hidden_size], "decode");
             }
 
-            // Phase D: Residual add on each GPU
+            // Phase D: Residual add on each GPU (zero-alloc via workspace + swap)
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                hidden_states[gpu_idx] = crate::add::add(
+                let ws = &mut self.workspaces[gpu_idx];
+                crate::add::add_into(
                     &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide,
-                    &hidden_states[gpu_idx], &mlp_outputs[gpu_idx],
+                    &mut ws.residual_buf,
+                    &hidden_states[gpu_idx], &ws.mlp_out,
                 )?;
+                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
             }
 
             for gpu_idx in 0..num_gpus {
@@ -1183,40 +1217,44 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // ================================================================
         let final_stream = self.streams.get(0).unwrap().clone();
         let final_weights = &self.metadata[0];
-        let mut final_hidden = hidden_states.into_iter().next().unwrap();
+        let final_hidden = hidden_states.into_iter().next().unwrap();
 
-        // Final norm
+        // Final norm — write into workspace.norm1_out (reusing buffer since layer loop is done)
         let final_norm_weight = final_weights.norm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
         let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
             .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
-        final_hidden = crate::norm::rms_norm(
-            &final_stream, &self.per_gpu_kernels[0].oxide, &final_hidden, &final_norm_gpu,
+        crate::norm::rms_norm_into(
+            &final_stream, &self.per_gpu_kernels[0].oxide,
+            &mut self.workspaces[0].norm1_out,
+            &final_hidden, &final_norm_gpu,
             config.rms_norm_eps, config.hidden_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &final_hidden, &[1, config.hidden_size], "decode");
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &self.workspaces[0].norm1_out, &[1, config.hidden_size], "decode");
 
-        // LM head
+        // LM head — write into workspace.logits
         let lm_head_weight = final_weights.lm_head.as_ref()
             .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-        let mut logits = final_stream.alloc_zeros::<bf16>(config.vocab_size)?;
-        crate::gemm_dispatch::gemm_projection_cached(
-            &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
-            &self.weight_caches[0],
-            &lm_head_weight.name,
-            &final_hidden, &mut logits,
-            1, config.vocab_size, config.hidden_size,
-            self.group_size,
-        )?;
+        {
+            let ws = &mut self.workspaces[0];
+            crate::gemm_dispatch::gemm_projection_cached(
+                &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
+                &self.weight_caches[0],
+                &lm_head_weight.name,
+                &ws.norm1_out, &mut ws.logits,
+                1, config.vocab_size, config.hidden_size,
+                self.group_size,
+            )?;
+        }
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[1, config.vocab_size], "decode");
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &self.workspaces[0].logits, &[1, config.vocab_size], "decode");
 
         // Debug logit dump (only when INFERS_DUMP_LOGITS is set)
         // @lat: [[lat.md/lat#Forward Engine#Logit Dump Debug Tool]]
         if std::env::var("INFERS_DUMP_LOGITS").is_ok() {
-            let logits_bf16: Vec<bf16> = final_stream.clone_dtoh(&logits)
+            let logits_bf16: Vec<bf16> = final_stream.clone_dtoh(&self.workspaces[0].logits)
                 .map_err(|e| anyhow::anyhow!("Failed to download logits for dump: {:?}", e))?;
 
             let logits_f32: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
@@ -1242,7 +1280,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         // Sample (BF16 argmax)
         let sampled = crate::sample::sample_with_config(
-            &final_stream, &logits.as_view(), &self.per_gpu_kernels[0].oxide,
+            &final_stream, &self.workspaces[0].logits.as_view(), &self.per_gpu_kernels[0].oxide,
             sampling_config, token_history, num_prompt_tokens, rng,
         )?;
 
