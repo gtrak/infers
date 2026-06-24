@@ -46,9 +46,13 @@ pub fn gemm_projection_cached(
     k: usize,
     group_size: usize,
 ) -> Result<CudaSlice<bf16>> {
+    // Gate eprintln behind INFERS_DEBUG env var — only prints once at first call.
+    static DEBUG_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let debug = *DEBUG_GEMM.get_or_init(|| std::env::var("INFERS_DEBUG").is_ok());
+
     match cache.get(weight_name) {
         Some(crate::gpu_cache::CachedWeight::Bf16(weight_gpu)) => {
-            eprintln!("[GEMM-DISPATCH] Bf16 weight '{}': len={}", weight_name, weight_gpu.len());
+            if debug { eprintln!("[GEMM-DISPATCH] Bf16 weight '{}': len={}", weight_name, weight_gpu.len()); }
             gemm.matmul_bf16(
                 &GemmConfig {
                     m: n,
@@ -69,7 +73,7 @@ pub fn gemm_projection_cached(
             )?;
         }
         Some(crate::gpu_cache::CachedWeight::Int4(int4_bufs)) => {
-            eprintln!("[GEMM-DISPATCH] Int4 weight '{}': n={}, k={}", weight_name, n, k);
+            if debug { eprintln!("[GEMM-DISPATCH] Int4 weight '{}': n={}, k={}", weight_name, n, k); }
             // 1. Allocate bf16 buffer for dequantized weights: [N, K]
             let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
 
@@ -141,7 +145,7 @@ pub fn gemm_projection_cached(
             )?;
         }
         None => {
-            eprintln!("[GEMM-DISPATCH] Weight '{}' NOT FOUND in cache", weight_name);
+            if debug { eprintln!("[GEMM-DISPATCH] Weight '{}' NOT FOUND in cache", weight_name); }
             anyhow::bail!("Weight '{}' not found in GpuWeightCache", weight_name);
         }
     }

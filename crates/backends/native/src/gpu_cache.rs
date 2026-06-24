@@ -51,6 +51,9 @@ pub struct Nvfp4GpuBuffers {
 /// All weights for one GPU shard, keyed by tensor name.
 pub struct GpuWeightCache {
     weights: HashMap<String, CachedWeight>,
+    /// F32 buffers for a_log and dt_bias — converted at load time to avoid
+    /// D2H→CPU→H2D round-trips during decode.
+    f32_buffers: HashMap<String, CudaSlice<f32>>,
 }
 
 impl GpuWeightCache {
@@ -83,6 +86,11 @@ impl GpuWeightCache {
         }
     }
 
+    /// Lookup F32 weight (a_log, dt_bias). Returns None if not in the F32 cache.
+    pub fn get_f32(&self, name: &str) -> Option<&CudaSlice<f32>> {
+        self.f32_buffers.get(name)
+    }
+
     /// Number of cached weights.
     pub fn len(&self) -> usize {
         self.weights.len()
@@ -109,8 +117,7 @@ impl GpuWeightCache {
         registry: &WeightRegistry,
     ) -> Result<Self> {
         let mut weights = HashMap::new();
-
-        // 1. Upload embedding table (if present)
+        let mut f32_buffers = HashMap::new();
         if let Some(embed) = &registry.embedding {
             upload_and_cache(stream, embed, &registry.quant_companions, &mut weights)?;
         }
@@ -167,10 +174,22 @@ impl GpuWeightCache {
                         upload_and_cache(stream, qkv, &registry.quant_companions, &mut weights)?;
                     }
                     if let Some(a_log) = &gdn.a_log {
-                        upload_and_cache(stream, a_log, &registry.quant_companions, &mut weights)?;
+                        // Convert bf16→f32 at load time — avoids D2H→CPU→H2D round-trip during decode
+                        let bf16_data: &[bf16] = unsafe {
+                            std::slice::from_raw_parts(a_log.data.as_ptr() as *const bf16, a_log.data.len() / 2)
+                        };
+                        let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
+                        let f32_gpu = stream.clone_htod(&f32_data)?;
+                        f32_buffers.insert(a_log.name.clone(), f32_gpu);
                     }
                     if let Some(dt_bias) = &gdn.dt_bias {
-                        upload_and_cache(stream, dt_bias, &registry.quant_companions, &mut weights)?;
+                        // Convert bf16→f32 at load time — avoids D2H→CPU→H2D round-trip during decode
+                        let bf16_data: &[bf16] = unsafe {
+                            std::slice::from_raw_parts(dt_bias.data.as_ptr() as *const bf16, dt_bias.data.len() / 2)
+                        };
+                        let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
+                        let f32_gpu = stream.clone_htod(&f32_data)?;
+                        f32_buffers.insert(dt_bias.name.clone(), f32_gpu);
                     }
                     if let Some(norm) = &gdn.norm {
                         upload_and_cache(stream, norm, &registry.quant_companions, &mut weights)?;
@@ -222,12 +241,22 @@ impl GpuWeightCache {
                 if let Some(qkv) = &gdn.in_proj_qkv {
                     upload_and_cache(stream, qkv, &registry.quant_companions, &mut weights)?;
                 }
-                // SSM parameters (a_log, dt_bias) — always BF16, small
+                // SSM parameters (a_log, dt_bias) — convert bf16→f32 at load time
                 if let Some(a_log) = &gdn.a_log {
-                    upload_and_cache(stream, a_log, &registry.quant_companions, &mut weights)?;
+                    let bf16_data: &[bf16] = unsafe {
+                        std::slice::from_raw_parts(a_log.data.as_ptr() as *const bf16, a_log.data.len() / 2)
+                    };
+                    let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
+                    let f32_gpu = stream.clone_htod(&f32_data)?;
+                    f32_buffers.insert(a_log.name.clone(), f32_gpu);
                 }
                 if let Some(dt_bias) = &gdn.dt_bias {
-                    upload_and_cache(stream, dt_bias, &registry.quant_companions, &mut weights)?;
+                    let bf16_data: &[bf16] = unsafe {
+                        std::slice::from_raw_parts(dt_bias.data.as_ptr() as *const bf16, dt_bias.data.len() / 2)
+                    };
+                    let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
+                    let f32_gpu = stream.clone_htod(&f32_data)?;
+                    f32_buffers.insert(dt_bias.name.clone(), f32_gpu);
                 }
                 if let Some(norm) = &gdn.norm {
                     upload_and_cache(stream, norm, &registry.quant_companions, &mut weights)?;
@@ -242,7 +271,7 @@ impl GpuWeightCache {
             upload_and_cache(stream, &layer.mlp.down_proj, &registry.quant_companions, &mut weights)?;
         }
 
-        Ok(Self { weights })
+        Ok(Self { weights, f32_buffers })
     }
 
     /// @lat: [[lat.md/lat#GpuWeightCache#GPU Buffer Download]]
@@ -340,8 +369,9 @@ impl GpuWeightCache {
         pinned: &mut PinnedHostBuffer,
     ) -> Result<Self> {
         let mut weights = HashMap::new();
+        let mut f32_buffers = HashMap::new();
 
-   // Single pass: upload all tensors from the registry
+       // Single pass: upload all tensors from the registry
         // Use the registry key (original name) for companion lookup, since sliced mmap tensors
         // store a suffixed name internally (e.g. "qweight_gpu0") but are keyed by the original name.
 
@@ -349,14 +379,26 @@ impl GpuWeightCache {
         for (key, tensor) in &registry.tensors {
             // Skip companion tensors — they are handled as part of the parent .qweight upload.
             if key.ends_with(".qzeros") || key.ends_with(".scales") { continue; }
+
+            // a_log and dt_bias: convert bf16→f32 at load time, store in f32_buffers
+            if key.ends_with(".A_log") || key.ends_with(".dt_bias") {
+                let data = tensor.data();
+                let bf16_slice: &[bf16] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2)
+                };
+                let f32_data: Vec<f32> = bf16_slice.iter().map(|b| b.to_f32()).collect();
+                let f32_gpu = stream.clone_htod(&f32_data)?;
+                f32_buffers.insert(key.clone(), f32_gpu);
+                continue;
+            }
+
             upload_mmap_tensor(stream, tensor, key, &registry.quant_companions, pinned, &mut weights)?;
         }
 
-        Ok(Self { weights })
+        Ok(Self { weights, f32_buffers })
     }
 
 }
-
 /// Synchronize a CUDA stream with a descriptive reason on error.
 fn sync_stream(stream: &CudaStream, reason: &str) -> Result<()> {
     stream.synchronize()

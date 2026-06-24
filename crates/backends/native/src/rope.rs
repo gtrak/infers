@@ -25,7 +25,7 @@ use infers_cuda::{OxideKernels, CudaSlice, CudaStream};
 ///
 /// # Returns
 /// `(cos_table, sin_table)` as Vec<f32>, each of length `(max_position + 1) * half_dim`
-fn precompute_rope_tables(
+pub(crate) fn precompute_rope_tables(
     max_position: u32,
     head_dim: usize,
     rope_theta: f64,
@@ -77,39 +77,38 @@ pub fn apply_rope(
     head_dim: usize,
     rope_theta: f64,
     partial_rotary_factor: f32,
+    cached_cos: Option<&CudaSlice<f32>>,  // pre-computed cos table (GPU-resident)
+    cached_sin: Option<&CudaSlice<f32>>,  // pre-computed sin table (GPU-resident)
 ) -> Result<()> {
     anyhow::ensure!(!positions.is_empty(), "Positions must not be empty");
     anyhow::ensure!(head_dim.is_multiple_of(2), "head_dim must be even, got {}", head_dim);
 
-    let max_position = *positions.iter().max().unwrap();
-
-    // TODO: Cache RoPE tables in ForwardEngine at init time instead of recomputing per call
-    // Precompute sin/cos tables on host — indexed by position value, not sequential index
-    let (cos_table, sin_table) = precompute_rope_tables(max_position, head_dim, rope_theta, partial_rotary_factor);
+    let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
 
     // The kernel expects i32 for positions, but we receive u32.
     // Convert to i32 before copying to device.
     let positions_i32: Vec<i32> = positions.iter().map(|&x| x as i32).collect();
 
-    // Copy data to device
-    let positions_gpu = stream.clone_htod(&positions_i32)
-        .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
-    // CRITICAL: Sync after each upload to prevent cudaMallocAsync
-    // from returning overlapping addresses on the same stream.
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after positions: {e}"))?;
+    let (cos_gpu, sin_gpu, positions_gpu) = if let (Some(cos), Some(sin)) = (cached_cos, cached_sin) {
+        // Use cached GPU tables — still need positions on GPU per-step.
+        // clone_htod is stream-ordered; subsequent kernels on the same stream will see the write.
+        let positions_gpu = stream.clone_htod(&positions_i32)
+            .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
+        (cos.clone(), sin.clone(), positions_gpu)
+    } else {
+        // Fallback: compute and upload (old path, no synchronize needed — stream-ordered).
+        let max_position = *positions.iter().max().unwrap();
+        let (cos_table, sin_table) = precompute_rope_tables(max_position, head_dim, rope_theta, partial_rotary_factor);
 
-    let cos_gpu = stream.clone_htod(&cos_table)
-        .map_err(|e| anyhow::anyhow!("Failed to copy cos table to device: {e}"))?;
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after cos table: {e}"))?;
+        let positions_gpu = stream.clone_htod(&positions_i32)
+            .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
+        let cos_gpu = stream.clone_htod(&cos_table)
+            .map_err(|e| anyhow::anyhow!("Failed to copy cos table to device: {e}"))?;
+        let sin_gpu = stream.clone_htod(&sin_table)
+            .map_err(|e| anyhow::anyhow!("Failed to copy sin table to device: {e}"))?;
 
-    let sin_gpu = stream.clone_htod(&sin_table)
-        .map_err(|e| anyhow::anyhow!("Failed to copy sin table to device: {e}"))?;
-    stream.synchronize()
-        .map_err(|e| anyhow::anyhow!("Failed to sync stream after sin table: {e}"))?;
-
-    let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
+        (cos_gpu, sin_gpu, positions_gpu)
+    };
 
     oxide.launch_rope_bf16(
         stream, q, k, &cos_gpu, &sin_gpu, &positions_gpu,

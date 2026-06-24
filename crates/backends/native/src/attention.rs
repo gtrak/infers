@@ -359,6 +359,7 @@ pub fn forward(
             head_dim,
             rope_theta,
             partial_rotary_factor,
+            None, None, // prefill path: no cached tables yet
         )?;
 
 
@@ -512,6 +513,7 @@ pub fn forward(
             head_dim,
             rope_theta,
             partial_rotary_factor,
+            None, None,
         )?;
 
         // --- Attention scores: Q_h @ K_h^T → [seq_len × seq_len] ---
@@ -704,16 +706,17 @@ pub fn forward_paged(
         .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_full, &[seq_len, kv_dim], "prefill");
     rope::apply_rope(
-        stream,
-        oxide,
-        &mut q_dummy,
-        &mut k_full,
-        positions,
-        num_kv_heads as i32,
-        head_dim,
-        rope_theta,
-        partial_rotary_factor,
-    )?;
+            stream,
+            oxide,
+            &mut q_dummy,
+            &mut k_full,
+            positions,
+            num_kv_heads as i32,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+            None, None,
+        )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &k_full, &[seq_len, kv_dim], "prefill");
 
     // =========================================================================
@@ -902,6 +905,7 @@ pub fn forward_paged(
             head_dim,
             rope_theta,
             partial_rotary_factor,
+            None, None,
         )?;
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
             probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_h0", &q_h, &[seq_len, head_dim], "prefill");
@@ -1053,6 +1057,8 @@ pub fn decode_forward_paged(
     layer_idx: usize,
     gpu_idx: usize,
     probe: &ProbeConfig,
+    cached_cos: Option<&CudaSlice<f32>>,  // pre-computed RoPE cos table
+    cached_sin: Option<&CudaSlice<f32>>,  // pre-computed RoPE sin table,
 ) -> Result<CudaSlice<bf16>> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1114,6 +1120,8 @@ pub fn decode_forward_paged(
         head_dim,
         rope_theta,
         partial_rotary_factor,
+        cached_cos,
+        cached_sin,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &k_single, &[1, kv_dim], "decode");
 
@@ -1218,6 +1226,7 @@ pub fn decode_forward_paged(
         head_dim,
         rope_theta,
         partial_rotary_factor,
+        None, None,
     )?;
 
     // =========================================================================

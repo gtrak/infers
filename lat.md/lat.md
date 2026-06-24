@@ -277,6 +277,14 @@ For **INT4 (AutoRound)**: `gemm_projection_cached` allocates a temporary bf16 bu
 
 For **NVFP4 (PrismaSCOUT)**: three-step pipeline using `oxide.launch_nvfp4_dequant_to_bf16` with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, weight_global_scale as f32 scalar, and input_global_scale as f32 scalar — all three scales are multiplied into the dequantized weights (`dequant_weight = fp4_val * group_scale / weight_global_scale * input_global_scale`). After dequantization, `oxide.launch_sanitize_nan_bf16` replaces any NaN values in the dequant buffer with 0.0 (fixes non-deterministic NaN from stale GPU memory). Then dispatches to `oxide.launch_bf16_gemm_tiled`. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
+### eprintln Gating in GEMM Dispatch
+
+GEMM debug output is gated behind `INFERS_DEBUG` env var via `OnceLock<bool>`, eliminating ~400 stderr writes per decode step. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
+## RoPE Table Caching
+
+Precomputed cos/sin tables are uploaded to GPU at engine init and passed through the decode path, removing 3 synchronize calls per RoPE invocation. See [[crates/backends/native/src/engine.rs#ForwardEngine]], [[crates/backends/native/src/rope.rs#apply_rope]].
+
 ## General Instrumentation Probe
 
 Per-layer probe infrastructure for dumping intermediate tensors during inference via `INFERS_DUMP_DIR`, `INFERS_DUMP_LAYERS`, and `INFERS_DUMP_STAGES` environment variables. Writes raw bf16 bytes plus JSON metadata sidecars. See [[crates/backends/native/src/probe.rs]].
@@ -299,7 +307,11 @@ Both contiguous and strided paths handle: weight_packed (u8 bytes), weight_scale
 
 # GpuWeightCache
 
-GPU-resident weight cache managing tensor lifetimes across CUDA streams with download support for debugging.
+GPU-resident weight cache with BF16/INT4/NVFP4 weights and pre-converted f32 GDN parameters.
+
+## F32 Buffers for GDN Parameters
+
+The `f32_buffers` map stores a_log/dt_bias as f32 (converted at load time), eliminating ~96 syncs per token. See [[crates/backends/native/src/gpu_cache.rs#GpuWeightCache]], [[crates/backends/native/src/gdn.rs#decode_forward]].
 
 ## GPU Buffer Download
 

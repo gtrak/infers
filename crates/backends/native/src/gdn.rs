@@ -148,6 +148,7 @@ fn extract_columns(
 /// Upload a small BF16 GPU buffer as a float32 GPU buffer.
 
 /// Used for A_log and dt_bias (small per-head constant arrays).
+#[allow(dead_code)]
 fn bf16_to_f32_gpu(
     stream: &Arc<CudaStream>,
     src: &CudaSlice<bf16>,
@@ -373,21 +374,20 @@ fn repeat_interleave_heads(
     // Phase 6: Upload A_log and dt_bias as float32
     // =========================================================================
     let a_log_f32 = if let Some(ref w) = weights.a_log {
-        let gpu_bf16 = cache.get_bf16(&w.name)
-            .ok_or_else(|| anyhow::anyhow!("A_log not in cache"))?;
-        bf16_to_f32_gpu(stream, gpu_bf16, num_v_heads)?
+        cache.get_f32(&w.name)
+            .ok_or_else(|| anyhow::anyhow!("a_log not in f32 cache: {}", w.name))?
+            .clone()
     } else {
         stream.alloc_zeros::<f32>(num_v_heads)?
     };
 
     let dt_bias_f32 = if let Some(ref w) = weights.dt_bias {
-        let gpu_bf16 = cache.get_bf16(&w.name)
-            .ok_or_else(|| anyhow::anyhow!("dt_bias not in cache"))?;
-        bf16_to_f32_gpu(stream, gpu_bf16, num_v_heads)?
+        cache.get_f32(&w.name)
+            .ok_or_else(|| anyhow::anyhow!("dt_bias not in f32 cache: {}", w.name))?
+            .clone()
     } else {
         stream.alloc_zeros::<f32>(num_v_heads)?
     };
-
     // =========================================================================
     // Phase 7: Chunked parallel GDN recurrence (fp32 state, bf16 I/O)
     // =========================================================================
@@ -625,17 +625,17 @@ pub fn decode_forward(
     // Phase 6: A_log, dt_bias as float32
     // =========================================================================
     let a_log_f32 = if let Some(ref w) = weights.a_log {
-        let gpu_bf16 = cache.get_bf16(&w.name)
-            .ok_or_else(|| anyhow::anyhow!("A_log not in cache"))?;
-        bf16_to_f32_gpu(stream, gpu_bf16, num_v_heads)?
+        cache.get_f32(&w.name)
+            .ok_or_else(|| anyhow::anyhow!("a_log not in f32 cache: {}", w.name))?
+            .clone()
     } else {
         stream.alloc_zeros::<f32>(num_v_heads)?
     };
 
     let dt_bias_f32 = if let Some(ref w) = weights.dt_bias {
-        let gpu_bf16 = cache.get_bf16(&w.name)
-            .ok_or_else(|| anyhow::anyhow!("dt_bias not in cache"))?;
-        bf16_to_f32_gpu(stream, gpu_bf16, num_v_heads)?
+        cache.get_f32(&w.name)
+            .ok_or_else(|| anyhow::anyhow!("dt_bias not in f32 cache: {}", w.name))?
+            .clone()
     } else {
         stream.alloc_zeros::<f32>(num_v_heads)?
     };

@@ -93,6 +93,10 @@ pub struct ForwardEngine {
     /// Per-GPU, per-layer GDN recurrent states.
     gdn_states: Vec<Vec<GdnState>>,      // [gpu_idx][layer_idx]
 
+    /// Precomputed RoPE cos/sin tables on GPU (uploaded once at init, one per GPU).
+    rope_cos: Option<Vec<CudaSlice<f32>>>,
+    rope_sin: Option<Vec<CudaSlice<f32>>>,
+
     /// INT4 quantization group size for on-the-fly dequantization.
     group_size: usize,
 }
@@ -211,6 +215,24 @@ impl ForwardEngine {
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
+        // Precompute RoPE tables and upload to each GPU at init time
+        let (rope_cos_cpu, rope_sin_cpu) = crate::rope::precompute_rope_tables(
+            config.max_position_embeddings as u32,
+            config.head_dim,
+            config.rope_theta,
+            config.partial_rotary_factor,
+        );
+
+        let mut rope_cos: Vec<CudaSlice<f32>> = Vec::with_capacity(num_gpus);
+        let mut rope_sin: Vec<CudaSlice<f32>> = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            rope_cos.push(gpu_stream.clone_htod(&rope_cos_cpu)
+                .map_err(|e| anyhow::anyhow!("Failed to upload RoPE cos table for GPU {}: {}", gpu_idx, e))?);
+            rope_sin.push(gpu_stream.clone_htod(&rope_sin_cpu)
+                .map_err(|e| anyhow::anyhow!("Failed to upload RoPE sin table for GPU {}: {}", gpu_idx, e))?);
+        }
+
         tracing::info!(
             "ForwardEngine initialized: {} layers, {} GPU shards",
             config.num_hidden_layers,
@@ -229,6 +251,8 @@ impl ForwardEngine {
             kv_caches,
             paged_kv_caches,
             gdn_states,
+            rope_cos: Some(rope_cos),
+            rope_sin: Some(rope_sin),
             group_size,
         })
     }
@@ -293,6 +317,24 @@ impl ForwardEngine {
         // Initialize per-GPU, per-layer caches and states
         let (kv_caches, gdn_states, paged_kv_caches) = Self::init_layer_states(num_gpus, config.num_hidden_layers);
 
+        // Precompute RoPE tables and upload to each GPU at init time
+        let (rope_cos_cpu, rope_sin_cpu) = crate::rope::precompute_rope_tables(
+            config.max_position_embeddings as u32,
+            config.head_dim,
+            config.rope_theta,
+            config.partial_rotary_factor,
+        );
+
+        let mut rope_cos: Vec<CudaSlice<f32>> = Vec::with_capacity(num_gpus);
+        let mut rope_sin: Vec<CudaSlice<f32>> = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = streams.get(gpu_idx).unwrap().clone();
+            rope_cos.push(gpu_stream.clone_htod(&rope_cos_cpu)
+                .map_err(|e| anyhow::anyhow!("Failed to upload RoPE cos table for GPU {}: {}", gpu_idx, e))?);
+            rope_sin.push(gpu_stream.clone_htod(&rope_sin_cpu)
+                .map_err(|e| anyhow::anyhow!("Failed to upload RoPE sin table for GPU {}: {}", gpu_idx, e))?);
+        }
+
         tracing::info!(
             "ForwardEngine initialized (mmap): {} layers, {} GPU shards",
             config.num_hidden_layers,
@@ -311,6 +353,8 @@ impl ForwardEngine {
             kv_caches,
             paged_kv_caches,
             gdn_states,
+            rope_cos: Some(rope_cos),
+            rope_sin: Some(rope_sin),
             group_size,
         })
     }
@@ -995,6 +1039,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             layer_idx,
                             gpu_idx,
                             &probe,
+                            self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
+                            self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
                         )?
                     }
                 };
