@@ -111,7 +111,8 @@ Thirty launch wrapper methods on the `OxideKernels` impl block. Each follows the
 
 | Method | Kernel | Config |
 |--------|--------|------------|
-| `launch_int4_gemm_auto_round` | `int4_gemm_auto_round` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
+| `launch_int4_gemm_auto_round` | `int4_gemm_auto_round` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — naive: each thread reads input independently from global memory |
+| `launch_int4_gemm_auto_round_tiled` | `int4_gemm_auto_round_tiled` | grid=(ceil(n/64), m), block=(64,1), smem=group_size*2 bytes — shared-memory tiled: 64 threads cooperatively load K-tile input into smem, all threads share one copy instead of redundant global reads |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer |
 

@@ -1010,6 +1010,128 @@ pub mod kernels {
         );
     }
 
+    /// INT4 GEMM kernel for AutoRound format with shared memory input tiling.
+    ///
+    /// Optimized for M=1 decode: loads input vector chunks into shared memory
+    /// so all threads in a block share one copy instead of each reading from
+    /// global memory independently.
+    ///
+    /// - Block: (64, 1) — 64 threads compute 64 output columns
+    /// - Grid: (ceil(N/64), M, 1)
+    /// - Smem: K_TILE * sizeof(u16) = 128 * 2 = 256 bytes (input staging)
+    /// - K_TILE = group_size (128): aligns smem chunks with quant groups
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn int4_gemm_auto_round_tiled(
+        mut output: DisjointSlice<u16>,
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        m: u32, n: u32, k: u32,
+        group_size: u32, transposed: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let tid = thread::threadIdx_x() as usize;
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let row = thread::blockIdx_y() as usize;
+
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+
+        // Only check row boundary before cooperative load — all threads in a block
+        // share the same row and must participate together. Column boundary is checked
+        // later to allow valid columns to compute while invalid ones still cooperate
+        // on shared memory loads.
+        if row >= m as usize {
+            return;
+        }
+
+        // Shared memory: K_TILE = group_size input values (BF16 as u16)
+        let smem = DynamicSharedArray::<u16>::get();
+
+        let mut acc: f32 = 0.0;
+
+        // Iterate K in chunks of K_TILE (= group_size)
+        for kg in (0..k_usize).step_by(group_size_usize) {
+            let k_tile_end = (kg + group_size_usize).min(k_usize);
+            let k_tile_len = k_tile_end - kg;
+
+            // Cooperative load: ALL 64 threads participate using tid (not col),
+            // so even when N < GROUP_SIZE, the full K tile is loaded into smem.
+            for i in (tid..k_tile_len).step_by(64) {
+                unsafe {
+                    *smem.add(i) = input[row * k_usize + kg + i];
+                }
+            }
+            cuda_device::sync_threads();
+
+            // Only threads with valid columns do the GEMM computation
+            if col < n_usize {
+                // Load scale for this group
+                let group_idx = kg / group_size_usize;
+                let scale_bits: u16;
+                if transposed != 0 {
+                    scale_bits = scales[group_idx * n_usize + col];
+                } else {
+                    let num_groups = k_usize / group_size_usize;
+                    scale_bits = scales[col * num_groups + group_idx];
+                }
+                let scale = f16_to_f32(scale_bits);
+
+                // Unpack zero point
+                let (zero_packed_idx, zero_shift): (usize, usize);
+                if transposed != 0 {
+                    let n_packed = (n_usize + 7) / 8;
+                    zero_packed_idx = group_idx * n_packed + col / 8;
+                    zero_shift = (col % 8) * 4;
+                } else {
+                    let num_groups = k_usize / group_size_usize;
+                    let flat_idx = col * num_groups + group_idx;
+                    zero_packed_idx = flat_idx / 8;
+                    zero_shift = (flat_idx % 8) * 4;
+                }
+                let zero_packed = zeros[zero_packed_idx];
+                let raw_zero = ((zero_packed >> zero_shift) & 0xF) as i8;
+
+                // Process 8 INT4 weights at a time (one u32)
+                for kk in (0..k_tile_len).step_by(8) {
+                    let weight_idx: usize;
+                    if transposed != 0 {
+                        weight_idx = ((kg + kk) >> 3) * n_usize + col;
+                    } else {
+                        weight_idx = (col * k_usize + kg + kk) / 8;
+                    }
+                    let packed = weight[weight_idx];
+
+                    for w in 0..8usize {
+                        let shift = w * 4;
+                        let w_int4 = ((packed >> shift) & 0xF) as i8;
+                        // AutoRound dequant: (w_int4 - (raw_zero + 1)) * scale
+                        let w_fp32 = (w_int4 as f32 - (raw_zero as f32 + 1.0)) * scale;
+
+                        // Read input from shared memory
+                        let a_val = f32::from_bits((unsafe { *smem.add(kk + w) } as u32) << 16);
+
+                        acc += w_fp32 * a_val;
+                    }
+                }
+            }
+
+            cuda_device::sync_threads();
+        }
+
+        // Write output in BF16 only for valid columns
+        if col < n_usize {
+            unsafe {
+                *output.get_unchecked_mut(row * n_usize + col) = f32_to_bf16(acc);
+            }
+        }
+    }
+
+
     /// INT4 GEMM kernel for GGUF format (no zero offset).
     #[kernel]
     pub fn int4_gemm_gguf(
