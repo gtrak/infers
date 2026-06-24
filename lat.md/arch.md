@@ -57,6 +57,12 @@ Seven modules cover context, streams, GEMM, pinned, NCCL, memcpy2d, and oxide_br
 | nccl | Multi-GPU collective operations for TP/PP |
 | oxide_bridge | Loads pre-compiled cuda-oxide kernels from `.cubin` at runtime and launches them via cudarc `CudaSlice<T>` buffers and `CudaStream`
 
+### Workspace Buffer Migration (cuda-core DeviceBuffer)
+
+workspace.rs migrated from cudarc `CudaSlice<T>` to cuda-core `DeviceBuffer<T>` for all workspace buffer ownership. Allocation via `zeroed(&stream, len)` takes a direct stream reference instead of `Arc`.
+
+bf16 fields stored as `DeviceBuffer<u16>` (bit-pattern), f32 as `DeviceBuffer<f32>`. The oxide_bridge kernel launch layer still accepts cudarc types — workspace buffers convert at the call boundary.
+
 ### Oxide Bridge: Runtime Kernel Loading
 
 One `OxideKernels` instance per GPU loads the cubin on the correct device's primary context, preventing cross-GPU context errors in tensor-parallel inference.

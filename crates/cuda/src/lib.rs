@@ -26,3 +26,4 @@ pub use cudarc::nccl::safe::{
 pub use cudarc::nccl::result::{group_end, group_start};
 pub use pinned::PinnedHostBuffer;
 pub use oxide_bridge::OxideKernels;
+pub use modules::KernelModules;

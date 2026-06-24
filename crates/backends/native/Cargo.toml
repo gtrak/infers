@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+cuda-core = { workspace = true }
 cudarc = { workspace = true }
 infers-cuda = { path = "../../cuda" }
 infers-kv = { path = "../../kv" }

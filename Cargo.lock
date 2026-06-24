@@ -1280,6 +1280,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "cuda-core",
  "cudarc",
  "half",
  "infers-cuda",
