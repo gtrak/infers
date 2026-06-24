@@ -296,7 +296,7 @@ Experimented whether trait-based dequant dispatch is possible in cuda-oxide gene
 
 Standalone workspace at `crates/cuda-oxide-kernels/` for production kernels compiled via cuda-oxide. Cross-crate kernel library pattern with `kernel-lib` subcrate and host test binary.
 
-**Workspace structure**: `Cargo.toml` defines `[workspace]` with `members = ["kernel-lib"]`. Root crate is the host test binary; `kernel-lib/` holds the `#[cuda_module]` kernel definitions. Not a member of the infers parent workspace — avoids codegen backend conflicts during stable builds.
+**Workspace structure**: `Cargo.toml` defines `[workspace]` with `members = ["kernel-lib"]`. Root crate is the host test binary; `kernel-lib/` holds 10 separate `#[cuda_module]` kernel definitions (one per file) plus a shared helper module. Each kernel file has its own `#[cuda_module] pub mod <name> { ... }` block — multiple modules compile to a single cubin. Shared device helpers in `shared.rs` use `#[device]` for transitive PTX inclusion. Not a member of the infers parent workspace — avoids codegen backend conflicts during stable builds.
 
 **Kernel: infers_add_bf16**: Ported from the nvcc elementwise kernel. Grid-stride loop, 256 threads per block (`#[launch_bounds(256)]`). bf16 stored as u16 — converts to f32 for compute, truncates back via `cuda_device::tcgen05::f32_to_bf16()`. Bit-exact verification against CPU reference passes (1024 elements).
 
@@ -423,13 +423,26 @@ E4M3 provides better precision (smaller quantization error ~25%) while E5M2 supp
 
 **Key insight — thread::index_1d() limitation**: Inside `#[inline(always)]` helper functions that are inlined into kernels, `thread::index_1d()` resolves to a host-only stub. Must compute index manually: `(thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize`.
 
-### cuda-oxide Kernel Library: Tier 5 — GDN Kernels (Phase 18 — 4 Kernels Ported)
+### cuda-oxide Kernel Library: Tier 5 — GDN Kernels (Phase 18 — 6 Kernels Ported)
 
-Four GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-lib, covering the core SSM recurrence patterns used by Qwen3.6-27B inference. All compute in f32 with bf16 I/O for precision.
+Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-lib, covering the core SSM recurrence patterns used by Qwen3.6-27B inference. All compute in f32 with bf16 I/O for precision.
 
-**Shared math patterns**: Each kernel implements softplus (`log(1 + exp(x))` with clamping at ±20), sigmoid (`1/(1+exp(-x))`), and bf16↔f32 conversion via `(bits as u32) << 16`. These are computed inline in each kernel rather than as shared helpers — cuda-oxide's `#[cuda_module]` does not support cross-scope device functions outside the module.
+**Shared math patterns**: Each kernel implements softplus (`log(1 + exp(x))` with clamping at ±20), sigmoid (`1/(1+exp(-x))`), and bf16↔f32 conversion via `(bits as u32) << 16`. Shared device helpers live in `shared.rs` annotated with `#[device] #[inline(always)]` — they compile to PTX via transitive call-graph collection from any `#[cuda_module]` block. Kernel files import them via `use super::shared::*;`.
 
-**Module organization**: The single `lib.rs` file inside `kernel-lib/` contains all types, utilities, and kernels within one `#[cuda_module]` block. Splitting into separate files was attempted but blocked by two Rust limitations: (1) `use super::types::*` cannot resolve imports from outside the PTX compilation scope, and (2) file-based submodules (`mod types; mod util;`) inside proc macro input require the unstable `proc_macro_hygiene` feature. The fallback is enhanced section organization with `══` separator comments marking Utilities, FP8/INT4/KV cache types, and kernel function groups. The cuda_module doc comment lists all five sections.
+**Module organization**: The kernel library is split into 11 files, each with its own `#[cuda_module]` block. Shared helpers (traits, type conversions, generic GEMM) live in `shared.rs` without a `#[cuda_module]` wrapper — the `#[device]` attribute compiles them to PTX via transitive call-graph collection.
+
+| File | Module Name | Kernels / Helpers |
+|------|-------------|-------------------|
+| `shared.rs` | (none) | dev_sqrtf, f16_to_f32, fp4_e2m1_to_f32, Fp8Format trait + impls, Dequantize trait + impls, KvCacheFormat trait + impl, fp8_quantize/dequantize_inner, int4_gemm_inner |
+| `common_kernels.rs` | `common` | infers_add_bf16, infers_embedding_gather_bf16, infers_argmax_bf16, infers_softmax_bf16, infers_kv_cache_write_bf16, sanitize_nan_bf16 |
+| `norm_kernels.rs` | `norm` | infers_rmsnorm_bf16, infers_rms_norm_gated_bf16, infers_l2norm_bf16 |
+| `activation_kernels.rs` | `activation` | infers_silu_bf16, infers_silu_glu_bf16, infers_attn_output_gate_bf16, infers_conv1d_depthwise_silu_bf16 |
+| `attention_kernels.rs` | `attention` | infers_paged_kv_write_bf16, infers_paged_kv_read_bf16, infers_paged_attention_decode_bf16, infers_rope_bf16 |
+| `gdn_kernels.rs` | `gdn` | infers_gdn_recurrent_step_bf16, infers_gdn_mamba2_update_bf16, infers_gdn_update_bf16, infers_gdn_gated_delta_update_bf16, infers_gdn_gated_delta_prefill_bf16, infers_gdn_chunked_gated_delta_prefill_bf16 |
+| `int4_kernels.rs` | `int4` | int4_gemm_auto_round, int4_gemm_auto_round_tiled, int4_gemm_auto_round_ksplit, int4_gemm_v3_ksplit, int4_gemm_v4_ksplit, reduce_partial_sums_bf16, int4_gemm_warp, int4_gemm_warp_split, int4_gemm_gguf, int4_dequant_to_bf16 |
+| `nvfp4_kernels.rs` | `nvfp4` | nvfp4_dequant_to_bf16, nvfp4_gemm_fused, nvfp4_gemm_fused_ksplit, nvfp4_gemm_v3_ksplit |
+| `fp8_kernels.rs` | `fp8` | infers_fp8_quantize_e4m3, infers_fp8_dequantize_e4m3, infers_fp8_quantize_e5m2, infers_fp8_dequantize_e5m2 |
+| `bf16_kernels.rs` | `bf16` | bf16_gemm_tiled |
 
 | Kernel | Source File | Description | Test Result |
 |--------|-------------|-------------|-------------|
