@@ -1331,36 +1331,35 @@ pub mod kernels {
         let gs = group_size as usize;
         let num_groups = (k as usize) / gs;
 
-        // Iterate over groups
+      // Iterate over groups
         for g in 0..num_groups {
-            // Load scale for this group (fp8_e4m3 → f32)
+            // Load scale once per group and precompute effective_scale (hoist division)
             let scale_fp8 = weight_scale[col as usize * num_groups + g];
             let scale = Fp8E4M3::dequantize(scale_fp8);
+            let effective_scale = scale / weight_global_scale;
 
-            // Process group_size values (2 FP4 per byte)
-            for i in 0..(gs / 2) {
-                let byte_idx = col as usize * (k_usize / 2) + g * gs / 2 + i;
-                let packed_byte = weight_packed[byte_idx];
+            // Read 4 bytes at a time as u32, processing 8 FP4 values per iteration
+            for i in 0..(gs / 8) {
+                let byte_offset = col as usize * (k_usize / 2) + g * gs / 2 + i * 4;
+                let packed_u32: u32 = unsafe {
+                    let b0 = *weight_packed.get_unchecked(byte_offset) as u32;
+                    let b1 = *weight_packed.get_unchecked(byte_offset + 1) as u32;
+                    let b2 = *weight_packed.get_unchecked(byte_offset + 2) as u32;
+                    let b3 = *weight_packed.get_unchecked(byte_offset + 3) as u32;
+                    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                };
 
-                // Low nibble — match dequant kernel: (fp4_val * scale) / global_scale, then bf16 round
-                let lo_nibble = packed_byte & 0xF;
-                let lo_f32 = fp4_e2m1_to_f32(lo_nibble) * scale / weight_global_scale;
-                let lo_bf16 = f32_to_bf16(lo_f32);
-                let mut lo_val = f32::from_bits((lo_bf16 as u32) << 16);
-                if !lo_val.is_finite() { lo_val = 0.0; }
-                let ki_lo = g * gs + i * 2;
-                let input_lo = f32::from_bits((input[row as usize * k_usize + ki_lo] as u32) << 16);
-                acc += lo_val * input_lo;
+                for w in 0..8usize {
+                    let nibble = ((packed_u32 >> (w * 4)) & 0xF) as u8;
+                    let w_f32 = fp4_e2m1_to_f32(nibble) * effective_scale;
+                    let w_bf16 = f32_to_bf16(w_f32);
+                    let mut w_val = f32::from_bits((w_bf16 as u32) << 16);
+                    if !w_val.is_finite() { w_val = 0.0; }
 
-                // High nibble — match dequant kernel: (fp4_val * scale) / global_scale, then bf16 round
-                let hi_nibble = (packed_byte >> 4) & 0xF;
-                let hi_f32 = fp4_e2m1_to_f32(hi_nibble) * scale / weight_global_scale;
-                let hi_bf16 = f32_to_bf16(hi_f32);
-                let mut hi_val = f32::from_bits((hi_bf16 as u32) << 16);
-                if !hi_val.is_finite() { hi_val = 0.0; }
-                let ki_hi = g * gs + i * 2 + 1;
-                let input_hi = f32::from_bits((input[row as usize * k_usize + ki_hi] as u32) << 16);
-                acc += hi_val * input_hi;
+                    let ki = g * gs + i * 8 + w;
+                    let input_val = f32::from_bits((input[row as usize * k_usize + ki] as u32) << 16);
+                    acc += w_val * input_val;
+                }
             }
         }
 
