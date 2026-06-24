@@ -3,6 +3,7 @@
 //! Allocates test data, launches each kernel, and verifies the result
 //! against a CPU reference.
 
+mod bench;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -3052,6 +3053,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = args.get(pos + 1)
             .ok_or("missing argument for --verify-cubin")?;
         verify_cubin(PathBuf::from(path))?;
+        return Ok(());
+    }
+
+    // Check for --bench <kernel_name> flag
+    if let Some(pos) = args.iter().position(|a| a == "--bench") {
+        let kernel_name = args.get(pos + 1)
+            .ok_or("missing kernel name for --bench")?;
+        
+        let mut bench_cfg = bench::BenchConfig {
+            dump_dir: PathBuf::from("/tmp/decode_dump"),
+            model_dir: PathBuf::from("/home/gary/opt/vllm/models/qwen3.6-27b-autoround-int4"),
+            layer: 0,
+            gpu: 0,
+            stage: String::new(),
+            iterations: 100,
+            warmup: 10,
+            verify: true,
+        };
+
+        // Parse bench-specific arguments
+        let mut i = pos + 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--dump-dir" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.dump_dir = PathBuf::from(v); } }
+                "--model-dir" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.model_dir = PathBuf::from(v); } }
+                "--layer" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.layer = v.parse().ok().unwrap_or(0); } }
+                "--gpu" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.gpu = v.parse().ok().unwrap_or(0); } }
+                "--stage" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.stage = v.clone(); } }
+                "--iterations" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.iterations = v.parse().ok().unwrap_or(100); } }
+                "--warmup" => { i += 1; if let Some(v) = args.get(i) { bench_cfg.warmup = v.parse().ok().unwrap_or(10); } }
+                "--no-verify" => { bench_cfg.verify = false; }
+                _ => {} // unknown flag, skip
+            }
+            i += 1;
+        }
+
+        let ctx: Arc<CudaContext> = CudaContext::new(0)?;
+        
+        match kernel_name.as_str() {
+            "infers_rmsnorm_bf16" => bench::bench_rmsnorm(&ctx, &bench_cfg),
+            "int4_gemm_v3_ksplit" => bench::bench_int4_gemm_ksplit(&ctx, &bench_cfg),
+            "reduce_partial_sums_bf16" => bench::bench_reduce_partial_sums(&ctx, &bench_cfg),
+            "infers_silu_glu_bf16" => bench::bench_silu_glu(&ctx, &bench_cfg),
+            other => return Err(format!("Unknown bench kernel: {}", other).into()),
+        }
+        .map_err(|e| e.to_string())?;
+
         return Ok(());
     }
 

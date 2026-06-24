@@ -13,6 +13,10 @@ members = ["kernel-lib"]
 
 [dependencies]
 infers-kernel-lib = { path = "kernel-lib" }
+infers-model = { path = "../model" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide" }
+half = "2.6"
+anyhow = "1.0"
+serde_json = "1.0"
 libm = "0.2"
