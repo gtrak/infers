@@ -1133,6 +1133,77 @@ impl OxideKernels {
         self.raw_launch("reduce_partial_sums_bf16", stream, config, &mut args)
     }
 
+    /// Launch the `int4_gemm_warp` kernel: warp-cooperative INT4 GEMV for M=1 decode.
+
+    /// Each warp (32 lanes) computes one output column. Lanes split the K
+    /// dimension across groups and reduce via warp shuffle — no separate
+    /// reduction kernel or partial_sums buffer in global memory.
+
+    /// The kernel signature is:
+    /// ```ignore
+    /// int4_gemm_warp(mut output: DisjointSlice<u16>, weight: &[u32], scales: &[u16], zeros: &[u32], input: &[u16], n: u32, k: u32, group_size: u32, transposed: u32)
+    /// ```
+    pub fn launch_int4_gemm_warp(
+        &self,
+        stream: &Arc<CudaStream>,
+        output: &mut CudaSlice<half::bf16>,
+        weight: &CudaSlice<u32>,
+        scales: &CudaSlice<half::f16>,
+        zeros: &CudaSlice<u32>,
+        input: &CudaSlice<half::bf16>,
+        n: u32,
+        k: u32,
+        group_size: u32,
+        transposed: u32,
+    ) -> anyhow::Result<()> {
+        let o_len_val = output.len() as u64;
+        let w_len_val = weight.len() as u64;
+        let s_len_val = scales.len() as u64;
+        let z_len_val = zeros.len() as u64;
+        let i_len_val = input.len() as u64;
+
+        let (o_ptr, o_guard) = output.device_ptr_mut(stream);
+        let (w_ptr, w_guard) = weight.device_ptr(stream);
+        let (s_ptr, s_guard) = scales.device_ptr(stream);
+        let (z_ptr, z_guard) = zeros.device_ptr(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+
+        let _guards = (o_guard, w_guard, s_guard, z_guard, i_guard);
+
+        let mut o_ptr = o_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut z_ptr = z_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut o_len = o_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut z_len = z_len_val;
+        let mut i_len = i_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut gs_v = group_size;
+        let mut trans_v = transposed;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut o_ptr, &mut o_len);  // output: DisjointSlice<u16>
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);  // weight: &[u32]
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);  // scales: &[u16]
+        Self::push_slice_arg(&mut args, &mut z_ptr, &mut z_len);  // zeros: &[u32]
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);  // input: &[u16]
+        Self::push_scalar_arg(&mut args, &mut n_v);              // n: u32
+        Self::push_scalar_arg(&mut args, &mut k_v);              // k: u32
+        Self::push_scalar_arg(&mut args, &mut gs_v);             // group_size: u32
+        Self::push_scalar_arg(&mut args, &mut trans_v);          // transposed: u32
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 7) / 8, 1, 1),   // ceil(N / 8)
+            block_dim: (32, 8, 1),           // 32 lanes × 8 warps = 256 threads
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("int4_gemm_warp", stream, config, &mut args)
+    }
+
 
     /// Launch INT4 AutoRound dequantize-to-BF16 kernel.
     ///
@@ -2242,8 +2313,8 @@ impl OxideKernels {
     }
 }
 
-   /// All 37 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 37] = [
+   /// All 38 kernel names compiled into the oxide_kernels.cubin file.
+const KERNEL_NAMES: [&str; 38] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -2262,6 +2333,7 @@ const KERNEL_NAMES: [&str; 37] = [
     "int4_gemm_auto_round",
     "int4_gemm_auto_round_tiled",
       "int4_gemm_auto_round_ksplit",
+    "int4_gemm_warp",
     "reduce_partial_sums_bf16",
     "nvfp4_gemm_fused_ksplit",
     "int4_dequant_to_bf16",

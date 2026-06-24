@@ -87,20 +87,13 @@ pub fn gemm_projection_cached(
             } else { 1 }; // default to transposed (AutoRound convention)
 
             if m == 1 {
-                // K-split for M=1: more blocks = better latency hiding
-                const K_SPLIT: u32 = 4;
+                // K-split GEMV: split K across blocks for better occupancy
+                const K_SPLIT: u32 = 32;
                 let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
                 oxide.launch_int4_gemm_auto_round_ksplit(
                     stream, &mut partial_sums,
-                    &int4_bufs.qweight,
-                    &int4_bufs.scales,
-                    &int4_bufs.qzeros,
-                    input,
-                    n as u32,
-                    k as u32,
-                    group_size as u32,
-                    transposed,
-                    K_SPLIT,
+                    &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
+                    input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,
                 )?;
                 oxide.launch_reduce_partial_sums_bf16(
                     stream, output, &partial_sums, n as u32, K_SPLIT,
@@ -132,7 +125,7 @@ pub fn gemm_projection_cached(
 
             if m == 1 {
                 // K-split for M=1: more blocks = better latency hiding
-                const K_SPLIT: u32 = 4;
+                const K_SPLIT: u32 = 32;
                 let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
                 oxide.launch_nvfp4_gemm_fused_ksplit(
                     stream, &mut partial_sums,
