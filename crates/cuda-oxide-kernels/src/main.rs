@@ -1324,6 +1324,158 @@ fn test_int4_gemm_warp(ctx: &Arc<CudaContext>) -> bool {
     true
 }
 
+// ─── int4_gemm_warp_split (warp-cooperative + K-split) ──────
+
+fn test_int4_gemm_warp_split(ctx: &Arc<CudaContext>) -> bool {
+    let stream = ctx.default_stream();
+    let module = infers_kernel_lib::kernels::load(ctx).unwrap();
+
+    // Same parameters as test_int4_gemm_warp: N=16, K=64, group_size=32
+    const N: usize = 16;
+    const K: usize = 64;
+    const GROUP_SIZE: usize = 32;
+    const K_SPLIT: u32 = 2;
+    let num_groups = K / GROUP_SIZE; // 2
+
+    let mut rng_state = 42u32;
+    fn next_u8(state: &mut u32) -> u8 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 16) as u8
+    }
+
+    // Scales: FP16 in [K/group_size, N] for transposed layout
+    let scales_f16: Vec<u16> = (0..num_groups * N)
+        .map(|_| {
+            let v = next_u8(&mut rng_state) as f32 / 512.0 + 0.5;
+            let bits = v.to_bits();
+            let sign = ((bits >> 31) & 0x1) as u16;
+            let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+            let frac = (bits & 0x7FFFFF) as u16;
+            if exp <= -16 { 0u16 }
+            else if exp >= 15 { (sign << 15) | 0x7C00 }
+            else {
+                let e10 = (exp + 15) as u16;
+                let f10 = (frac >> 13) & 0x3FF;
+                (sign << 15) | (e10 << 10) | f10
+            }
+        })
+        .collect();
+
+    // Weights: packed INT4 in [K/8, N] for transposed layout
+    let weight_size = (K / 8) * N;
+    let weights: Vec<u32> = (0..weight_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Zeros: packed INT4 in [K/group_size, ceil(N/8)]
+    let zeros_size = num_groups * ((N + 7) / 8);
+    let zeros: Vec<u32> = (0..zeros_size)
+        .map(|_| {
+            let mut packed: u32 = 0;
+            for b in 0..8 {
+                packed |= ((next_u8(&mut rng_state) & 0xF) as u32) << (b * 4);
+            }
+            packed
+        })
+        .collect();
+
+    // Input: BF16 in [K] — M=1 decode
+    let input_f32: Vec<f32> = (0..K)
+        .map(|_| {
+            ((next_u8(&mut rng_state) as f32) - 127.5) / 512.0
+        })
+        .collect();
+    let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_cpu(v)).collect();
+
+    // Partial sums buffer: [K_SPLIT, N] f32
+    let partial_sums_size = (K_SPLIT as usize) * N;
+    
+    let weight_dev = DeviceBuffer::from_host(&stream, &weights).unwrap();
+    let scales_dev = DeviceBuffer::from_host(&stream, &scales_f16).unwrap();
+    let zeros_dev = DeviceBuffer::from_host(&stream, &zeros).unwrap();
+    let input_dev = DeviceBuffer::from_host(&stream, &input_bf16).unwrap();
+    let mut partial_sums_dev = DeviceBuffer::<f32>::zeroed(&stream, partial_sums_size).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, N).unwrap();
+
+    // Launch: grid (ceil(N / 8), K_SPLIT, 1), block (32, 8, 1) = 256 threads
+    let launch = LaunchConfig {
+        grid_dim: (((N + 7) / 8) as u32, K_SPLIT, 1),
+        block_dim: (32, 8, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.int4_gemm_warp_split(
+        &stream, launch, &mut partial_sums_dev, &weight_dev, &scales_dev, &zeros_dev, &input_dev,
+        N as u32, K as u32, GROUP_SIZE as u32, 1u32, // transposed=1
+        K_SPLIT,
+    ).unwrap();
+
+    // Reduce partial sums to final bf16 output
+    let reduce_launch = LaunchConfig {
+        grid_dim: (((N + 63) / 64) as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    module.reduce_partial_sums_bf16(
+        &stream, reduce_launch, &mut out_dev, &partial_sums_dev,
+        N as u32, K_SPLIT,
+    ).unwrap();
+
+    let out_host = out_dev.to_host_vec(&stream).unwrap();
+
+    // --- CPU reference: AutoRound formula (zero = raw_zero + 1) ---
+    let mut expected: Vec<f32> = vec![0.0; N];
+    for col in 0..N {
+        let mut acc: f32 = 0.0;
+        for kg in (0..K).step_by(GROUP_SIZE) {
+            let group_idx = kg / GROUP_SIZE;
+
+            // Scale: scales[group_idx * N + col]
+            let scale_bits = scales_f16[group_idx * N + col];
+            let scale = f16_to_f32_cpu(scale_bits);
+
+            // Zero point from zeros[group_idx * n_packed + col/8], shift = (col%8)*4
+            let n_packed = (N + 7) / 8;
+            let zp_idx = group_idx * n_packed + col / 8;
+            let zp_shift = (col % 8) * 4;
+            let raw_zero = ((zeros[zp_idx] >> zp_shift) & 0xF) as i8;
+
+            // Process 8 weights at a time
+            for kk in (0..GROUP_SIZE).step_by(8) {
+                let widx = ((kg + kk) / 8) * N + col;
+                let packed = weights[widx];
+                for w in 0..8i32 {
+                    let shift = w * 4;
+                    let w_int4 = ((packed >> shift) & 0xF) as i8;
+                    // AutoRound: zero = raw_zero + 1
+                    let zero = raw_zero + 1;
+                    let w_fp32 = f32::from(w_int4 - zero) * scale;
+                    let a_val = bf16_to_f32_cpu(input_bf16[kg + kk + w as usize]);
+                    acc += w_fp32 * a_val;
+                }
+            }
+        }
+        expected[col] = acc;
+    }
+
+    // Compare
+    for i in 0..N {
+        let actual = bf16_to_f32_cpu(out_host[i]);
+        if (actual - expected[i]).abs() > 4.0 {
+            eprintln!("INT4 GEMM warp_split mismatch at [{}]: got {} expected {}", i, actual, expected[i]);
+            return false;
+        }
+    }
+    true
+}
+
 
 /// Convert f16 bits to f32 (CPU helper matching device code)
 fn f16_to_f32_cpu(bits: u16) -> f32 {
@@ -2846,6 +2998,7 @@ fn verify_cubin(cubin_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "int4_gemm_auto_round_tiled",
         "int4_gemm_auto_round_ksplit",
         "int4_gemm_warp",
+        "int4_gemm_warp_split",
         "reduce_partial_sums_bf16",
         "nvfp4_gemm_fused_ksplit",
         "int4_gemm_gguf",
@@ -3041,6 +3194,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[PASS] int4_gemm_warp (warp-cooperative GEMV)");
     } else {
         eprintln!("[FAIL] int4_gemm_warp (warp-cooperative GEMV)");
+        fail_count += 1;
+    }
+
+    if test_int4_gemm_warp_split(&ctx) {
+        println!("[PASS] int4_gemm_warp_split (warp + K-split)");
+    } else {
+        eprintln!("[FAIL] int4_gemm_warp_split (warp + K-split)");
         fail_count += 1;
     }
 

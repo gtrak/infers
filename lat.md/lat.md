@@ -283,6 +283,10 @@ When `m==1` (single-token decode), the naive INT4 kernel has only `ceil(N/64)` t
 
 K-split boundaries align to group_size so quantization groups are never split across blocks. Overlapping groups at split boundaries are handled by skipping weights outside each split's K range (`k_start ≤ k_full < k_end`). The f32 partial_sums buffer (~80KB for N=5120, K_SPLIT=4) is allocated inline per GEMM call — the latency-hiding benefit outweighs the allocation overhead.
 
+**Warp-cooperative kernels** provide an alternative reduction strategy. `int4_gemm_warp` uses block (32, 8, 1) with warp shuffle XOR reduction — each warp computes one output column and reduces 32 lanes' partial sums in-register via `warp::shuffle_xor_f32`. No partial_sums buffer or reduction kernel needed when K_SPLIT=1. For larger K, `int4_gemm_warp_split` adds K-splitting: grid (ceil(N/8), K_SPLIT, 1) with each warp handling a slice of groups (`group_start + lane, group_start + lane + 32, ...`). Each split's warp reduces via shuffle and lane 0 writes to `partial_sums[split_idx * N + col]`, then `reduce_partial_sums_bf16` combines.
+
+Each lane in the warp-cooperative design handles K/8/32 = K/256 groups (e.g., 20 groups for K=5120), giving ~20 u32 loads and ~160 FMA per lane — substantially better pipeline fill than the naive ksplit kernel's 2.5 u32 loads per thread.
+
 The same K-splitting technique applies to **NVFP4 (PrismaSCOUT)**: `nvfp4_gemm_fused_ksplit` computes partial sums in f32, then `reduce_partial_sums_bf16` combines them — reusing the same format-agnostic reduction kernel. The NVFP4 K-split kernel dequantizes FP4 in registers with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, and weight_global_scale as f32 scalar. For **M>1**, the fused `nvfp4_gemm_fused` kernel is used directly — dequantizes FP4 in registers and multiplies with BF16 activations without any intermediate bf16 buffer (reads 4 bytes as u32 for 8 nibbles per load, precomputes effective_scale once per group). See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
 ### eprintln Gating in GEMM Dispatch

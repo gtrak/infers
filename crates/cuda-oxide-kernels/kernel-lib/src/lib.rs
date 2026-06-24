@@ -1377,6 +1377,119 @@ pub mod kernels {
     }
 
 
+    /// Warp-cooperative INT4 GEMV with K-splitting for M=1 decode (AutoRound format).
+
+    /// Combines warp shuffle reduction (no block-level reduction) with K-splitting
+    /// (for SM occupancy when K is large). Each warp computes one output column,
+    /// and 32 lanes within the warp split the K dimension across groups.
+    /// Warp shuffle reduces within each warp → lane 0 writes to partial_sums.
+
+    /// - Block: (32, WARPS_PER_BLOCK, 1) = 256 threads
+    /// - Grid: (ceil(N / WARPS_PER_BLOCK), K_SPLIT, 1)
+    /// - blockIdx.x: output column tile
+    /// - blockIdx.y: K-split index (0..K_SPLIT)
+    /// - Each lane handles groups: group_start + lane, group_start + lane + 32, ...
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn int4_gemm_warp_split(
+        partial_sums: &mut [f32],          // [K_SPLIT, N] f32 output
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        n: u32, k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) {
+        use cuda_device::warp;
+
+        const WARPS_PER_BLOCK: u32 = 8;
+
+        let lane = thread::threadIdx_x() as usize;   // 0..31
+        let warp_id = thread::threadIdx_y() as usize; // 0..7
+        let col = (thread::blockIdx_x() * WARPS_PER_BLOCK + warp_id as u32) as usize;
+        let split_idx = thread::blockIdx_y() as usize;
+
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let gs = group_size as usize;
+        let num_groups_total = k_usize / gs;
+
+        if col >= n_usize {
+            return;
+        }
+
+        // K range for this split, aligned to group boundaries
+        let groups_per_split = (num_groups_total + k_split as usize - 1) / k_split as usize;
+        let group_start = split_idx * groups_per_split;
+        let group_end = ((split_idx + 1) * groups_per_split).min(num_groups_total);
+
+        let mut acc: f32 = 0.0;
+
+        // Each lane handles groups: group_start + lane, group_start + lane + 32, ...
+        let mut g = group_start + lane;
+        while g < group_end {
+            let kg = g * gs;
+
+            // Load scale for this group
+            let scale_bits: u16;
+            if transposed != 0 {
+                scale_bits = scales[g * n_usize + col];
+            } else {
+                scale_bits = scales[col * num_groups_total + g];
+            }
+            let scale = f16_to_f32(scale_bits);
+
+            // Load zero for this group
+            let (zi, zsh): (usize, usize);
+            if transposed != 0 {
+                let n_packed = (n_usize + 7) / 8;
+                zi = g * n_packed + col / 8;
+                zsh = (col % 8) * 4;
+            } else {
+                let flat_idx = col * num_groups_total + g;
+                zi = flat_idx / 8;
+                zsh = (flat_idx % 8) * 4;
+            }
+            let raw_zero = ((zeros[zi] >> zsh) & 0xF) as i8;
+
+            // Process group_size values in chunks of 8 (1 u32 load each)
+            for kk in (0..gs).step_by(8) {
+                let k_pos = kg + kk;
+                let widx: usize;
+                if transposed != 0 {
+                    widx = (k_pos >> 3) * n_usize + col;
+                } else {
+                    widx = (col * k_usize + k_pos) / 8;
+                }
+                let packed = weight[widx];
+
+                for w in 0..8usize {
+                    let shift = w * 4;
+                    let w_int4 = ((packed >> shift) & 0xF) as i8;
+                    // AutoRound: zero = raw_zero + 1
+                    let w_fp32 = (w_int4 as f32 - (raw_zero as f32 + 1.0)) * scale;
+                    let a_val = f32::from_bits((input[k_pos + w] as u32) << 16);
+                    acc += w_fp32 * a_val;
+                }
+            }
+
+            g += 32;
+        }
+
+        // Warp reduction: sum all 32 lanes' partial sums via shuffle_xor
+        acc = acc + warp::shuffle_xor_f32(acc, 16);
+        acc = acc + warp::shuffle_xor_f32(acc, 8);
+        acc = acc + warp::shuffle_xor_f32(acc, 4);
+        acc = acc + warp::shuffle_xor_f32(acc, 2);
+        acc = acc + warp::shuffle_xor_f32(acc, 1);
+
+        // Lane 0 writes the result to partial_sums[split_idx * N + col]
+        if lane == 0 {
+            partial_sums[split_idx * n_usize + col] = acc;
+        }
+    }
     /// INT4 GEMM kernel for GGUF format (no zero offset).
     #[kernel]
     pub fn int4_gemm_gguf(

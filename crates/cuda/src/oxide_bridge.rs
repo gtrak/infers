@@ -1090,6 +1090,72 @@ impl OxideKernels {
         self.raw_launch("int4_gemm_auto_round_ksplit", stream, config, &mut args)
     }
 
+    /// Launch the `int4_gemm_warp_split` kernel: warp-cooperative INT4 GEMV with K-splitting.
+    /// Same interface as ksplit but uses block (32,8,1) with warp shuffle reduction.
+    pub fn launch_int4_gemm_warp_split(
+        &self,
+        stream: &Arc<CudaStream>,
+        partial_sums: &mut CudaSlice<f32>,
+        weight: &CudaSlice<u32>,
+        scales: &CudaSlice<half::f16>,
+        zeros: &CudaSlice<u32>,
+        input: &CudaSlice<half::bf16>,
+        n: u32,
+        k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) -> anyhow::Result<()> {
+        let ps_len_val = partial_sums.len() as u64;
+        let w_len_val = weight.len() as u64;
+        let s_len_val = scales.len() as u64;
+        let z_len_val = zeros.len() as u64;
+        let i_len_val = input.len() as u64;
+
+        let (ps_ptr, ps_guard) = partial_sums.device_ptr_mut(stream);
+        let (w_ptr, w_guard) = weight.device_ptr(stream);
+        let (s_ptr, s_guard) = scales.device_ptr(stream);
+        let (z_ptr, z_guard) = zeros.device_ptr(stream);
+        let (i_ptr, i_guard) = input.device_ptr(stream);
+
+        let _guards = (ps_guard, w_guard, s_guard, z_guard, i_guard);
+
+        let mut ps_ptr = ps_ptr as cuda_core::sys::CUdeviceptr;
+        let mut w_ptr = w_ptr as cuda_core::sys::CUdeviceptr;
+        let mut s_ptr = s_ptr as cuda_core::sys::CUdeviceptr;
+        let mut z_ptr = z_ptr as cuda_core::sys::CUdeviceptr;
+        let mut i_ptr = i_ptr as cuda_core::sys::CUdeviceptr;
+        let mut ps_len = ps_len_val;
+        let mut w_len = w_len_val;
+        let mut s_len = s_len_val;
+        let mut z_len = z_len_val;
+        let mut i_len = i_len_val;
+        let mut n_v = n;
+        let mut k_v = k;
+        let mut group_size_v = group_size;
+        let mut transposed_v = transposed;
+        let mut k_split_v = k_split;
+
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        Self::push_slice_arg(&mut args, &mut ps_ptr, &mut ps_len);
+        Self::push_slice_arg(&mut args, &mut w_ptr, &mut w_len);
+        Self::push_slice_arg(&mut args, &mut s_ptr, &mut s_len);
+        Self::push_slice_arg(&mut args, &mut z_ptr, &mut z_len);
+        Self::push_slice_arg(&mut args, &mut i_ptr, &mut i_len);
+        Self::push_scalar_arg(&mut args, &mut n_v);
+        Self::push_scalar_arg(&mut args, &mut k_v);
+        Self::push_scalar_arg(&mut args, &mut group_size_v);
+        Self::push_scalar_arg(&mut args, &mut transposed_v);
+        Self::push_scalar_arg(&mut args, &mut k_split_v);
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 7) / 8, k_split, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        self.raw_launch("int4_gemm_warp_split", stream, config, &mut args)
+    }
+
     /// Launch the `reduce_partial_sums_bf16` kernel: reduce K-split partial sums to bf16.
     ///
     /// The kernel signature is:
@@ -2314,7 +2380,7 @@ impl OxideKernels {
 }
 
    /// All 38 kernel names compiled into the oxide_kernels.cubin file.
-const KERNEL_NAMES: [&str; 38] = [
+const KERNEL_NAMES: [&str; 39] = [
     "infers_add_bf16",
     "infers_embedding_gather_bf16",
     "infers_silu_bf16",
@@ -2334,6 +2400,7 @@ const KERNEL_NAMES: [&str; 38] = [
     "int4_gemm_auto_round_tiled",
       "int4_gemm_auto_round_ksplit",
     "int4_gemm_warp",
+    "int4_gemm_warp_split",
     "reduce_partial_sums_bf16",
     "nvfp4_gemm_fused_ksplit",
     "int4_dequant_to_bf16",
