@@ -32,6 +32,9 @@ use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 /// * `n` — Output feature dimension
 /// * `k` — Inner dimension
 /// * `group_size` — INT4 group size
+/// * `partial_sums_buf` — Optional pre-allocated f32 buffer for K-split partial sums (M=1 path). 
+///   If provided and large enough, it's reused instead of allocating per-GEMM. The ksplit kernels 
+///   write every position unconditionally, so no memset is needed even on fallback alloc.
 ///
 /// # Returns
 /// The output buffer (same `output` that was passed in).
@@ -47,6 +50,7 @@ pub fn gemm_projection_cached(
     n: usize,
     k: usize,
     group_size: usize,
+    partial_sums_buf: &mut Option<&mut CudaSlice<f32>>,
 ) -> Result<CudaSlice<bf16>> {
     // Gate eprintln behind INFERS_DEBUG env var — only prints once at first call.
     static DEBUG_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -93,14 +97,27 @@ pub fn gemm_projection_cached(
                 // all handled). K_SPLIT=20 gives ~1.25 waves on 40 SMs for the main
                 // hidden=5120 layers (2 groups/split, 1600 blocks).
                 const K_SPLIT: u32 = 28;
-                let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
+                let required_len = K_SPLIT as usize * n;
+                // Use the provided buffer if large enough; else fall back to unsafe alloc (no memset needed — kernel writes every position).
+                let mut local_ps_owner: Option<CudaSlice<f32>> = None;
+                let partial_sums: &mut CudaSlice<f32> = if let Some(buf) = partial_sums_buf.as_mut() {
+                    if buf.len() >= required_len {
+                        buf
+                    } else {
+                        local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                        local_ps_owner.as_mut().unwrap()
+                    }
+                } else {
+                    local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                    local_ps_owner.as_mut().unwrap()
+                };
                 oxide.launch_int4_gemm_v3_ksplit(
-                    stream, &mut partial_sums,
+                    stream, partial_sums,
                     &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
                     input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,
                 )?;
                 oxide.launch_reduce_partial_sums_bf16(
-                    stream, output, &partial_sums, n as u32, K_SPLIT,
+                    stream, output, partial_sums, n as u32, K_SPLIT,
                 )?;
             } else {
                 oxide.launch_int4_gemm_auto_round(
@@ -130,15 +147,28 @@ pub fn gemm_projection_cached(
             if m == 1 {
                 // K-split for M=1: v3 with 4 accumulators + ceil-grouped K-split + 2-u32 stride
                 const K_SPLIT: u32 = 28;
-                let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
+                let required_len = K_SPLIT as usize * n;
+                // Use the provided buffer if large enough; else fall back to unsafe alloc (no memset needed — kernel writes every position).
+                let mut local_ps_owner: Option<CudaSlice<f32>> = None;
+                let partial_sums: &mut CudaSlice<f32> = if let Some(buf) = partial_sums_buf.as_mut() {
+                    if buf.len() >= required_len {
+                        buf
+                    } else {
+                        local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                        local_ps_owner.as_mut().unwrap()
+                    }
+                } else {
+                    local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                    local_ps_owner.as_mut().unwrap()
+                };
                 oxide.launch_nvfp4_gemm_v3_ksplit(
-                    stream, &mut partial_sums,
+                    stream, partial_sums,
                     &nvfp4_bufs.weight_packed, &nvfp4_bufs.weight_scale,
                     input, nvfp4_bufs.weight_global_scale,
                     n as u32, k as u32, NVFP4_GROUP_SIZE, K_SPLIT,
                 )?;
                 oxide.launch_reduce_partial_sums_bf16(
-                    stream, output, &partial_sums, n as u32, K_SPLIT,
+                    stream, output, partial_sums, n as u32, K_SPLIT,
                 )?;
             } else {
                 // Fused NVFP4 GEMM: dequant FP4 in registers and multiply — no intermediate buffer

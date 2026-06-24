@@ -291,12 +291,14 @@ fn repeat_interleave_heads_into(
     // Phase 1: in_proj_qkv projection (if available)
     //   mixed_qkv = input @ in_proj_qkv^T  [seq_len, conv_dim]
     // =========================================================================
+    let mut _ps = None; // prefill doesn't use pre-allocated partial_sums buffer
     let mut mixed_qkv = stream.alloc_zeros::<bf16>(seq_len * conv_dim)?;
     if let Some(ref qkv_weight) = weights.in_proj_qkv {
         crate::gemm_dispatch::gemm_projection_cached(
             gemm, oxide, stream, cache,
             &qkv_weight.name, input, &mut mixed_qkv,
             seq_len, conv_dim, hidden_size, group_size,
+            &mut _ps,
         )?;
     }
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &mixed_qkv, &[seq_len, conv_dim], "prefill");
@@ -390,11 +392,13 @@ fn repeat_interleave_heads_into(
     // a_proj = input @ in_proj_a^T  [seq_len, num_v_heads]
     // b_proj = input @ in_proj_b^T  [seq_len, num_v_heads] (extract from b_dim)
     // =========================================================================
+    let mut _ps = None;
     let mut a_proj = stream.alloc_zeros::<bf16>(seq_len * num_v_heads)?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream, cache,
         &weights.in_proj_a.name, input, &mut a_proj,
         seq_len, num_v_heads, hidden_size, group_size,
+        &mut _ps,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &a_proj, &[seq_len, num_v_heads], "prefill");
 
@@ -404,6 +408,7 @@ fn repeat_interleave_heads_into(
         gemm, oxide, stream, cache,
         &weights.in_proj_b.name, input, &mut b_proj_raw,
         seq_len, b_dim, hidden_size, group_size,
+        &mut _ps,
     )?;
     // Use b_proj_raw directly (extraction not needed since b_dim == num_v_heads)
     let b_proj = b_proj_raw;
@@ -451,6 +456,7 @@ fn repeat_interleave_heads_into(
     // =========================================================================
     // Phase 8: RMSNormGated — norm(gdn_output, z_gate, weight)
     // =========================================================================
+    let mut _ps_gdn = None; // prefill doesn't use pre-allocated partial_sums buffer
     let norm_output = if let Some(ref z_weight) = weights.in_proj_z {
         let z_dim = weight_output_dim(z_weight);
         let mut z_gate_raw = stream.alloc_zeros::<bf16>(seq_len * z_dim)?;
@@ -458,6 +464,7 @@ fn repeat_interleave_heads_into(
             gemm, oxide, stream, cache,
             &z_weight.name, input, &mut z_gate_raw,
             seq_len, z_dim, hidden_size, group_size,
+            &mut _ps_gdn,
         )?;
 
         let n_rows = seq_len * num_v_heads;
@@ -494,6 +501,7 @@ fn repeat_interleave_heads_into(
         gemm, oxide, stream, cache,
         &weights.out_proj_weight.name, &norm_output, &mut output,
         seq_len, hidden_size, value_dim, group_size,
+        &mut _ps_gdn,
     )?;
    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", &output, &[seq_len, hidden_size], "prefill");
 
@@ -522,6 +530,7 @@ pub fn decode_forward(
     probe: &ProbeConfig,
     ws: &mut crate::workspace::GdnWorkspace,
     output: &mut CudaSlice<bf16>,
+    partial_sums_buf: &mut Option<&mut CudaSlice<f32>>, // pre-allocated partial sums for K-split (mutable ref to allow reuse across calls)
 ) -> Result<()> {
     let _seq_len = 1usize;
     // Decoding shares the same probe infrastructure as forward().
@@ -546,6 +555,7 @@ pub fn decode_forward(
             gemm, oxide, stream, cache,
             &qkv_weight.name, input, &mut ws.mixed_qkv,
             1, conv_dim, hidden_size, group_size,
+            &mut *partial_sums_buf,
         )?;
     }
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.mixed_qkv", &ws.mixed_qkv, &[1, conv_dim], "decode");
@@ -645,6 +655,7 @@ pub fn decode_forward(
         gemm, oxide, stream, cache,
         &weights.in_proj_a.name, input, &mut ws.a_proj,
         1, num_v_heads, hidden_size, group_size,
+        &mut *partial_sums_buf,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.a_proj", &ws.a_proj, &[1, num_v_heads], "decode");
 
@@ -653,6 +664,7 @@ pub fn decode_forward(
         gemm, oxide, stream, cache,
         &weights.in_proj_b.name, input, &mut ws.b_proj,
         1, b_dim, hidden_size, group_size,
+        &mut *partial_sums_buf,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.b_proj", &ws.b_proj, &[1, b_dim], "decode");
 
@@ -700,6 +712,7 @@ pub fn decode_forward(
             gemm, oxide, stream, cache,
             &z_weight.name, input, &mut ws.z_gate,
             1, z_dim, hidden_size, group_size,
+            &mut *partial_sums_buf,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.z_gate", &ws.z_gate, &[1, z_dim], "decode");
 
@@ -729,6 +742,7 @@ pub fn decode_forward(
         gemm, oxide, stream, cache,
         &weights.out_proj_weight.name, norm_input, output,
         1, hidden_size, value_dim, group_size,
+        &mut *partial_sums_buf,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.output", output, &[1, hidden_size], "decode");
 

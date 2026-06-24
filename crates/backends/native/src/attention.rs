@@ -340,6 +340,8 @@ pub fn forward(
     // Phase 1: Full K, V computation + RoPE + KV cache write
     // =========================================================================
 
+    let mut _ps = None; // prefill doesn't use pre-allocated partial_sums buffer
+
     // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim] (INT4-aware)
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
@@ -348,6 +350,7 @@ pub fn forward(
         gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut k_full,
         seq_len, kv_dim, hidden_size, group_size,
+        &mut _ps,
     )?;
 
     // v_full = GEMM(input, v_proj^T)  [seq_len × kv_dim] (INT4-aware)
@@ -358,6 +361,7 @@ pub fn forward(
         gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
+        &mut _ps,
     )?;
 
     // --- K-norm on full K before Phase 1 RoPE ---
@@ -419,6 +423,7 @@ pub fn forward(
         gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
         seq_len, q_out_dim, hidden_size, group_size,
+        &mut _ps,
     )?;
 
     // --- Q-norm on Q portion only (not gate) before RoPE ---
@@ -627,6 +632,7 @@ pub fn forward(
     // =========================================================================
     // O-projection using gated attention output
     // =========================================================================
+    let mut _ps = None;
     let mut output = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
@@ -634,6 +640,7 @@ pub fn forward(
         gemm, oxide, stream,
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
+        &mut _ps,
     )?;
 
     Ok(output)
@@ -693,6 +700,7 @@ pub fn forward_paged(
     // =========================================================================
 
     // k_full = GEMM(input, k_proj^T)  [seq_len × kv_dim] (INT4-aware)
+    let mut _ps_fp = None;
     let mut k_full = stream
         .alloc_zeros::<bf16>(seq_len * kv_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
@@ -700,6 +708,7 @@ pub fn forward_paged(
         gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut k_full,
         seq_len, kv_dim, hidden_size, group_size,
+        &mut _ps_fp,
     )?;
 
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_full, &[seq_len, kv_dim], "prefill");
@@ -712,6 +721,7 @@ pub fn forward_paged(
         gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut v_full,
         seq_len, kv_dim, hidden_size, group_size,
+        &mut _ps_fp,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_full, &[seq_len, kv_dim], "prefill");
 
@@ -777,6 +787,7 @@ pub fn forward_paged(
     // We compute it as a single GEMM and then extract Q/gate from interleaved positions.
     let q_out_dim = per_gpu_head_dim * if attn_output_gate { 2 } else { 1 };
 
+    let mut _ps_fused = None;
     let mut q_full = stream
         .alloc_zeros::<bf16>(seq_len * q_out_dim)
         .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
@@ -784,6 +795,7 @@ pub fn forward_paged(
         gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut q_full,
         seq_len, q_out_dim, hidden_size, group_size,
+        &mut _ps_fused,
     )?;
 
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[seq_len, q_out_dim], "prefill");
@@ -1033,6 +1045,7 @@ pub fn forward_paged(
     // =========================================================================
     // O-projection using gated attention output
     // =========================================================================
+    let mut _ps = None;
     let mut output = stream
         .alloc_zeros::<bf16>(buf_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
@@ -1040,6 +1053,7 @@ pub fn forward_paged(
         gemm, oxide, stream,
         cache, &weights.o_proj.name, &gated_attn, &mut output,
         seq_len, hidden_size, per_gpu_head_dim, group_size,
+        &mut _ps,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[seq_len, hidden_size], "prefill");
 
@@ -1086,6 +1100,7 @@ pub fn decode_forward_paged(
     cached_sin: Option<&CudaSlice<f32>>,  // pre-computed RoPE sin table,
     ws: &mut crate::workspace::AttnWorkspace,   // attention workspace buffers
     output: &mut CudaSlice<bf16>,                // writes into workspace.attn_out
+    partial_sums_buf: &mut Option<&mut CudaSlice<f32>>, // pre-allocated partial sums for K-split (mutable ref to allow reuse across calls)
 ) -> Result<()> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1099,13 +1114,14 @@ pub fn decode_forward_paged(
     // =========================================================================
     // Phase 1: Single-token K, V computation + RoPE
     // =========================================================================
-
-    // k_single = GEMM(input, k_proj^T)  [1 × kv_dim] (INT4-aware)
+  // k_single = GEMM(input, k_proj^T)  [1 × kv_dim] (INT4-aware)
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream,
         cache, &weights.k_proj.name, input, &mut ws.k_single,
         1, kv_dim, hidden_size, group_size,
+        &mut *partial_sums_buf,
     )?;
+
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &ws.k_single, &[1, kv_dim], "decode");
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
@@ -1113,6 +1129,7 @@ pub fn decode_forward_paged(
         gemm, oxide, stream,
         cache, &weights.v_proj.name, input, &mut ws.v_single,
         1, kv_dim, hidden_size, group_size,
+        &mut *partial_sums_buf,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &ws.v_single, &[1, kv_dim], "decode");
 
@@ -1201,6 +1218,7 @@ pub fn decode_forward_paged(
         gemm, oxide, stream,
         cache, &weights.q_proj.name, input, &mut ws.q_full,
         1, q_out_dim, hidden_size, group_size,
+        &mut *partial_sums_buf,
     )?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &ws.q_full, &[1, q_out_dim], "decode");
 
@@ -1306,6 +1324,7 @@ pub fn decode_forward_paged(
             gemm, oxide, stream,
             cache, &weights.o_proj.name, &ws.gated, output,
             1, hidden_size, per_gpu_head_dim, group_size,
+            &mut *partial_sums_buf,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", output, &[1, hidden_size], "decode");
 
@@ -1383,6 +1402,7 @@ pub fn decode_forward_paged(
             gemm, oxide, stream,
             cache, &weights.o_proj.name, &ws.attn_output, output,
             1, hidden_size, per_gpu_head_dim, group_size,
+            &mut *partial_sums_buf,
         )?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", output, &[1, hidden_size], "decode");
     }

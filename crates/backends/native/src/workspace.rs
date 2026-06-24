@@ -49,6 +49,9 @@ pub struct DecodeWorkspace {
     /// Both GDN and attention write their final output here, eliminating the
     /// `attn_outputs: Vec` and its per-layer allocation.
     pub attn_out: CudaSlice<bf16>,
+    /// Pre-allocated f32 buffer for K-split GEMM partial sums. Sized for K_SPLIT=28 × sharded_intermediate (max decode-loop N).
+    /// Reused by every decode GEMM. The ksplit kernels write every position unconditionally, so no per-call memset is needed — only an alloc at engine init.
+    pub partial_sums: CudaSlice<f32>,
     /// GDN-specific workspace buffers (allocated once, reused every GDN layer).
     pub gdn: GdnWorkspace,
     /// Attention-specific workspace buffers (allocated once, reused every attention layer).
@@ -73,6 +76,7 @@ impl DecodeWorkspace {
         vocab_size: usize,
         num_gpus: usize,
     ) -> Result<Self> {
+        const K_SPLIT: u32 = 28;
         Ok(Self {
             norm1_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             norm2_out: stream.alloc_zeros::<bf16>(hidden_size)?,
@@ -83,6 +87,7 @@ impl DecodeWorkspace {
             mlp_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             logits: stream.alloc_zeros::<bf16>(vocab_size)?,
             attn_out: stream.alloc_zeros::<bf16>(hidden_size)?,
+            partial_sums: stream.alloc_zeros::<f32>((K_SPLIT as usize) * sharded_intermediate)?,
             gdn: GdnWorkspace::new(stream, config, num_gpus)?,
             attn: AttnWorkspace::new(stream, config, num_gpus)?,
         })

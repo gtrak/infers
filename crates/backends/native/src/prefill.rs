@@ -188,6 +188,8 @@ pub fn prefill(
         // --- MLP (INT4-aware) ---
         let mlp_weights = &layer.mlp;
 
+        let mut _ps = None; // prefill doesn't use pre-allocated partial_sums buffer
+
         // gate = GEMM(norm2_out, gate_proj)  [seq_len × intermediate_size]
         let gate_size = seq_len * intermediate_size;
         let mut gate = stream
@@ -197,6 +199,7 @@ pub fn prefill(
             gemm, &kernels.oxide, stream,
             cache, &mlp_weights.gate_proj.name, &norm2_out, &mut gate,
             seq_len, intermediate_size, hidden_size, group_size,
+            &mut _ps,
         )?;
 
         // up = GEMM(norm2_out, up_proj)  [seq_len × intermediate_size]
@@ -207,6 +210,7 @@ pub fn prefill(
             gemm, &kernels.oxide, stream,
             cache, &mlp_weights.up_proj.name, &norm2_out, &mut up,
             seq_len, intermediate_size, hidden_size, group_size,
+            &mut _ps,
         )?;
 
         // silu_out = SiLU(gate) ⊗ up
@@ -225,6 +229,7 @@ pub fn prefill(
             gemm, &kernels.oxide, stream,
             cache, &mlp_weights.down_proj.name, &silu_out, &mut mlp_out,
             seq_len, hidden_size, intermediate_size, group_size,
+            &mut _ps,
         )?;
 
         // --- All-reduce after row-parallel MLP down projection (TP=2) ---
@@ -257,6 +262,7 @@ pub fn prefill(
 
     // LM head: logits = hidden @ lm_head^T → [seq_len × vocab_size]
     let logits_size = seq_len * config.vocab_size;
+    let mut _ps = None;
     let mut logits = stream
         .alloc_zeros::<bf16>(logits_size)
         .map_err(|e| anyhow::anyhow!("Failed to allocate logits buffer: {e}"))?;
@@ -264,6 +270,7 @@ pub fn prefill(
         gemm, &kernels.oxide, stream,
         cache, &lm_head_weight.name, &hidden, &mut logits,
         seq_len, config.vocab_size, hidden_size, group_size,
+        &mut _ps,
     )?;
 
     // =========================================================================

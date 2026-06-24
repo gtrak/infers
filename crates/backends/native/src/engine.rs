@@ -714,6 +714,7 @@ impl ForwardEngine {
             let mut mlp_outputs: Vec<CudaSlice<bf16>> = Vec::new();
 
             for gpu_idx in 0..num_gpus {
+                let mut _ps = None; // pre-fill never uses partial_sums buffer
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let gemm = &mut self.gemm_engines[gpu_idx];
                 let w = &self.metadata[gpu_idx];
@@ -738,6 +739,7 @@ impl ForwardEngine {
                     &norm2_out, &mut gate,
                     seq_len, sharded_intermediate, config.hidden_size,
                     self.group_size,
+                    &mut _ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &gate, &[seq_len, config.intermediate_size / num_gpus], "prefill");
@@ -751,6 +753,7 @@ impl ForwardEngine {
                     &norm2_out, &mut up,
                     seq_len, sharded_intermediate, config.hidden_size,
                     self.group_size,
+                    &mut _ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &up, &[seq_len, config.intermediate_size / num_gpus], "prefill");
@@ -772,6 +775,7 @@ impl ForwardEngine {
                     &silu_out, &mut mlp_out,
                     seq_len, config.hidden_size, sharded_intermediate,
                     self.group_size,
+                    &mut _ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &mlp_out, &[seq_len, config.hidden_size], "prefill");
@@ -842,6 +846,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .or_else(|| final_weights.embedding.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         let mut logits = final_stream.alloc_zeros::<bf16>(seq_len * config.vocab_size)?;
+        let mut _ps = None;
         crate::gemm_dispatch::gemm_projection_cached(
             &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
             &self.weight_caches[0],
@@ -849,6 +854,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             &final_hidden, &mut logits,
             seq_len, config.vocab_size, config.hidden_size,
             self.group_size,
+            &mut _ps,
         )?;
 
         probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &logits, &[seq_len, config.vocab_size], "prefill");
@@ -1047,6 +1053,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             .ok_or_else(|| anyhow::anyhow!("GDN weights not found for layer {}", layer_idx))?;
                         {
                             let ws = &mut self.workspaces[gpu_idx];
+                            let mut ps = Some(&mut ws.partial_sums);
                             crate::gdn::decode_forward(
                                 gemm, &gpu_stream,
                                 &self.per_gpu_kernels[gpu_idx].oxide,
@@ -1058,6 +1065,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                                 gpu_idx,
                                 &probe,
                                 &mut ws.gdn, &mut ws.attn_out,
+                                &mut ps,
                             )?;
                         }
                     }
@@ -1066,6 +1074,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
                         {
                             let ws = &mut self.workspaces[gpu_idx];
+                            let mut ps = Some(&mut ws.partial_sums);
                             crate::attention::decode_forward_paged(
                                 gemm, &gpu_stream,
                                 &self.per_gpu_kernels[gpu_idx].oxide,
@@ -1084,6 +1093,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                                 self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
                                 self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
                                 &mut ws.attn, &mut ws.attn_out,
+                                &mut ps,
                             )?;
                         }
                     }
@@ -1145,6 +1155,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &ws.norm2_out, &[1, config.hidden_size], "decode");
 
                 // Gate projection — into workspace.mlp_gate
+                let mut ps = Some(&mut ws.partial_sums);
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
@@ -1152,11 +1163,13 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &ws.norm2_out, &mut ws.mlp_gate,
                     1, sharded_intermediate, config.hidden_size,
                     self.group_size,
+                    &mut ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &ws.mlp_gate, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Up projection — into workspace.mlp_up
+                let mut ps = Some(&mut ws.partial_sums);
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
@@ -1164,6 +1177,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &ws.norm2_out, &mut ws.mlp_up,
                     1, sharded_intermediate, config.hidden_size,
                     self.group_size,
+                    &mut ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &ws.mlp_up, &[1, config.intermediate_size / num_gpus], "decode");
@@ -1176,6 +1190,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &ws.mlp_silu, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Down projection — into workspace.mlp_out
+                let mut ps = Some(&mut ws.partial_sums);
                 crate::gemm_dispatch::gemm_projection_cached(
                     gemm, &self.per_gpu_kernels[gpu_idx].oxide, &gpu_stream,
                     &self.weight_caches[gpu_idx],
@@ -1183,6 +1198,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &ws.mlp_silu, &mut ws.mlp_out,
                     1, config.hidden_size, sharded_intermediate,
                     self.group_size,
+                    &mut ps,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &ws.mlp_out, &[1, config.hidden_size], "decode");
@@ -1248,6 +1264,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         {
             let ws = &mut self.workspaces[0];
+            let mut _ps = None; // vocab too big for pre-allocated buffer
             crate::gemm_dispatch::gemm_projection_cached(
                 &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
                 &self.weight_caches[0],
@@ -1255,6 +1272,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 &ws.norm1_out, &mut ws.logits,
                 1, config.vocab_size, config.hidden_size,
                 self.group_size,
+                &mut _ps,
             )?;
         }
 
