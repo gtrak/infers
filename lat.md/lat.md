@@ -310,7 +310,11 @@ Pre-allocated GPU workspace buffers for the decode hot path. `DecodeWorkspace` h
 
 New `attn_out` field provides a shared output buffer for both GDN and attention decode outputs, eliminating the `attn_outputs: Vec<CudaSlice>` and its per-layer allocation. The `gdn` field holds a nested `GdnWorkspace` with 16 pre-allocated buffers covering all GDN intermediate allocations (mixed_qkv, conv_input, conv_out, query/key/value, expanded heads, projection outputs, recurrent step output, z-gate, norm output, and fallback zero buffers for a_log/dt_bias). See [[crates/backends/native/src/workspace.rs#GdnWorkspace]].
 
+The `attn` field holds a nested `AttnWorkspace` with 11 pre-allocated buffers covering all attention decode intermediate allocations (k_single, v_single, k_norm_out, q_dummy, q_full, q_buf, gate_buf, q_norm_out, k_rope_dummy, attn_output, gated). See [[crates/backends/native/src/workspace.rs#AttnWorkspace]].
+
 `gdn::decode_forward` is now fully wired to use workspace buffers: takes `ws: &mut GdnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros`, zero `.clone()` calls). The `_into` helper variants (`copy_view_into`, `repeat_interleave_heads_into`) replace their allocating counterparts. NCCL all-reduce and residual add operate directly on `workspace.attn_out`. See [[crates/backends/native/src/gdn.rs#decode_forward]].
+
+`attention::decode_forward_paged` is now fully wired to use workspace buffers: takes `ws: &mut AttnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros` calls). The Q/gate extraction uses device-to-device memcpy into workspace buffers instead of allocating new ones. K-norm and Q-norm use `rms_norm_into` writing into `ws.k_norm_out`/`ws.q_norm_out`. Paged attention decode uses `paged_attention_decode_into` writing directly into `ws.attn_output`. The final O-projection writes directly into `output` (i.e., `workspace.attn_out`), eliminating the post-attention `memcpy_dtod` copy in engine.rs. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].
 
 # Mmap Weight Upload
 

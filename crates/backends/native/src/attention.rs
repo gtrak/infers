@@ -246,6 +246,31 @@ pub fn paged_attention_decode(
     Ok(output)
 }
 
+/// Paged attention decode, writing into a pre-allocated output buffer (zero-alloc variant).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_decode_into(
+    stream: &Arc<CudaStream>,
+    oxide: &infers_cuda::OxideKernels,
+    q: &CudaSlice<bf16>,
+    page_pool: &CudaSlice<bf16>,
+    block_table_gpu: &CudaSlice<i32>,
+    output: &mut CudaSlice<bf16>,
+    num_pages: usize,
+    num_cached_tokens: usize,
+    head_dim: usize,
+    num_query_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    kv_dim: usize,
+) -> Result<()> {
+    oxide.launch_paged_attention_decode_bf16(
+        stream, q, page_pool, block_table_gpu, output,
+        num_pages as u32, num_cached_tokens as u32, head_dim as u32,
+        num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
+    ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel failed: {e}"))?;
+    Ok(())
+}
+
 // ============================================================================
 // Original Flat-Cache Functions (preserved for backward compatibility)
 // ============================================================================
@@ -1059,7 +1084,9 @@ pub fn decode_forward_paged(
     probe: &ProbeConfig,
     cached_cos: Option<&CudaSlice<f32>>,  // pre-computed RoPE cos table
     cached_sin: Option<&CudaSlice<f32>>,  // pre-computed RoPE sin table,
-) -> Result<CudaSlice<bf16>> {
+    ws: &mut crate::workspace::AttnWorkspace,   // attention workspace buffers
+    output: &mut CudaSlice<bf16>,                // writes into workspace.attn_out
+) -> Result<()> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
 
@@ -1074,56 +1101,68 @@ pub fn decode_forward_paged(
     // =========================================================================
 
     // k_single = GEMM(input, k_proj^T)  [1 × kv_dim] (INT4-aware)
-    let mut k_single = stream
-        .alloc_zeros::<bf16>(kv_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate K buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream,
-        cache, &weights.k_proj.name, input, &mut k_single,
+        cache, &weights.k_proj.name, input, &mut ws.k_single,
         1, kv_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &k_single, &[1, kv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_proj", &ws.k_single, &[1, kv_dim], "decode");
 
     // v_single = GEMM(input, v_proj^T)  [1 × kv_dim] (INT4-aware)
-    let mut v_single = stream
-        .alloc_zeros::<bf16>(kv_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate V buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream,
-        cache, &weights.v_proj.name, input, &mut v_single,
+        cache, &weights.v_proj.name, input, &mut ws.v_single,
         1, kv_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &v_single, &[1, kv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_proj", &ws.v_single, &[1, kv_dim], "decode");
 
     // --- K-norm on full K before RoPE ---
-    if let Some(k_norm_w) = weights.k_norm.as_ref() {
+    let k_norm_exists = if let Some(k_norm_w) = weights.k_norm.as_ref() {
         let k_norm_gpu = cache.get_bf16(&k_norm_w.name)
             .ok_or_else(|| anyhow::anyhow!("K-norm weight '{}' not in cache", k_norm_w.name))?;
-        k_single = crate::norm::rms_norm(
-            stream, oxide, &k_single, &k_norm_gpu, rms_norm_eps, head_dim,
+        crate::norm::rms_norm_into(
+            stream, oxide, &mut ws.k_norm_out, &ws.k_single, &k_norm_gpu, rms_norm_eps, head_dim,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &k_single, &[1, kv_dim], "decode");
-    }
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_norm", &ws.k_norm_out, &[1, kv_dim], "decode");
+        true
+    } else {
+        false
+    };
 
-    // Apply RoPE to K_single
-    let mut q_dummy = stream
-        .alloc_zeros::<bf16>(kv_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate dummy Q buffer for RoPE: {e}"))?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &k_single, &[1, kv_dim], "decode");
-    rope::apply_rope(
-        stream,
-        oxide,
-        &mut q_dummy,
-        &mut k_single,
-        &[position],
-        num_kv_heads as i32,
-        head_dim,
-        rope_theta,
-        partial_rotary_factor,
-        cached_cos,
-        cached_sin,
-    )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &k_single, &[1, kv_dim], "decode");
+    // Apply RoPE to K — must do inside each branch to get the right mutable reference
+    if k_norm_exists {
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &ws.k_norm_out, &[1, kv_dim], "decode");
+        rope::apply_rope(
+            stream,
+            oxide,
+            &mut ws.q_dummy,
+            &mut ws.k_norm_out,
+            &[position],
+            num_kv_heads as i32,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+            cached_cos,
+            cached_sin,
+        )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &ws.k_norm_out, &[1, kv_dim], "decode");
+    } else {
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &ws.k_single, &[1, kv_dim], "decode");
+        rope::apply_rope(
+            stream,
+            oxide,
+            &mut ws.q_dummy,
+            &mut ws.k_single,
+            &[position],
+            num_kv_heads as i32,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+            cached_cos,
+            cached_sin,
+        )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &ws.k_single, &[1, kv_dim], "decode");
+    }
 
     // =========================================================================
     // Phase 2: Paged KV write — write new token to page pool
@@ -1131,15 +1170,18 @@ pub fn decode_forward_paged(
 
    let _ = paged_cache.ensure_allocated(stream)?;
 
+    // Get K reference for probes and paged_kv_write
+    let k_ref = if k_norm_exists { &ws.k_norm_out } else { &ws.k_single };
+
     // Probe: K and V data right before writing to paged KV cache (after norm+RoPE)
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", &k_single, &[1, kv_dim], "decode");
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &v_single, &[1, kv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_cached", k_ref, &[1, kv_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.v_cached", &ws.v_single, &[1, kv_dim], "decode");
 
    paged_kv_write(
         stream,
         oxide,
-        &k_single,
-        &v_single,
+        k_ref,
+        &ws.v_single,
         paged_cache.page_pool.as_mut().unwrap(),
         block_table_gpu,
         positions_gpu,
@@ -1150,142 +1192,202 @@ pub fn decode_forward_paged(
     )?;
 
     // =========================================================================
-    // Phase 3: Compute Q for attention decode kernel
+    // Phase 3: Compute Q for attention decode kernel (zero-alloc via workspace)
     // =========================================================================
 
     // Q projection: full Q via GEMM (doubled output when attn_output_gate enabled)
     let q_out_dim = per_gpu_head_dim * if attn_output_gate { 2 } else { 1 };
-    let mut q_full = stream
-        .alloc_zeros::<bf16>(q_out_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
     crate::gemm_dispatch::gemm_projection_cached(
         gemm, oxide, stream,
-        cache, &weights.q_proj.name, input, &mut q_full,
+        cache, &weights.q_proj.name, input, &mut ws.q_full,
         1, q_out_dim, hidden_size, group_size,
     )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &q_full, &[1, q_out_dim], "decode");
+    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_proj_raw", &ws.q_full, &[1, q_out_dim], "decode");
 
     // --- Q-norm on Q portion only (not gate) ---
-    // Split first, then normalize only the Q part.
-    let (mut q_single, gate_single) = if attn_output_gate {
+    // Split first, then normalize only the Q part.  Must do Q-extraction,
+    // Q-norm, and RoPE inside each branch to satisfy mutable borrow requirements.
+    if attn_output_gate {
         // Extract Q and gate portions from q_full (per-head interleaved layout)
-        let mut q_buf = stream
-            .alloc_zeros::<bf16>(per_gpu_head_dim)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate Q buffer: {e}"))?;
         for h in 0..num_heads {
             let src_offset = h * (head_dim * 2);
             let dst_offset = h * head_dim;
-            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
-            let mut dst_slice = q_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            let src_slice = ws.q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = ws.q_buf.slice_mut(dst_offset..dst_offset + head_dim);
             stream
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
         }
 
-        let mut gate_buf = stream
-            .alloc_zeros::<bf16>(per_gpu_head_dim)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate gate buffer: {e}"))?;
         for h in 0..num_heads {
             let src_offset = h * (head_dim * 2) + head_dim;
             let dst_offset = h * head_dim;
-            let src_slice = q_full.slice(src_offset..src_offset + head_dim);
-            let mut dst_slice = gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
+            let src_slice = ws.q_full.slice(src_offset..src_offset + head_dim);
+            let mut dst_slice = ws.gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
             stream
                 .memcpy_dtod(&src_slice, &mut dst_slice)
                 .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
         }
 
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &gate_buf, &[1, per_gpu_head_dim], "decode");
-        (q_buf, Some(gate_buf))
-    } else {
-        (q_full, None)
-    };
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &ws.gate_buf, &[1, per_gpu_head_dim], "decode");
 
-    // Apply Q-norm only to the Q portion
-    if let Some(q_norm_w) = weights.q_norm.as_ref() {
-        let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
-            .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
-        q_single = crate::norm::rms_norm(
-            stream, oxide, &q_single, &q_norm_gpu, rms_norm_eps, head_dim,
+        // Apply Q-norm only to the Q portion (into ws.q_norm_out)
+        let q_norm_exists = if let Some(q_norm_w) = weights.q_norm.as_ref() {
+            let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+                .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
+            crate::norm::rms_norm_into(
+                stream, oxide, &mut ws.q_norm_out, &ws.q_buf, &q_norm_gpu, rms_norm_eps, head_dim,
+            )?;
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &ws.q_norm_out, &[1, per_gpu_head_dim], "decode");
+            true
+        } else {
+            false
+        };
+
+        // Apply RoPE to Q — inside branch for mutable access
+        if q_norm_exists {
+            rope::apply_rope(
+                stream,
+                oxide,
+                &mut ws.q_norm_out,
+                &mut ws.k_rope_dummy,
+                &[position],
+                num_heads as i32,
+                head_dim,
+                rope_theta,
+                partial_rotary_factor,
+                None, None,
+            )?;
+        } else {
+            rope::apply_rope(
+                stream,
+                oxide,
+                &mut ws.q_buf,
+                &mut ws.k_rope_dummy,
+                &[position],
+                num_heads as i32,
+                head_dim,
+                rope_theta,
+                partial_rotary_factor,
+                None, None,
+            )?;
+        }
+
+        // Phase 4: Paged attention decode — scores, softmax, V accumulation in one kernel
+        let num_pages = block_table_gpu.len();
+        {
+            let q_for_attn = if q_norm_exists { &ws.q_norm_out } else { &ws.q_buf };
+            paged_attention_decode_into(
+                stream,
+                oxide,
+                q_for_attn,
+                paged_cache.page_pool.as_ref().unwrap(),
+                block_table_gpu,
+                &mut ws.attn_output,
+                num_pages,
+                num_cached_tokens as usize,
+                head_dim,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                kv_dim,
+            )?;
+        }
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &ws.attn_output, &[1, per_gpu_head_dim], "decode");
+
+        // Gate application: attn_output = attn_output * sigmoid(gate)
+        oxide.launch_attn_output_gate_bf16(
+            stream, &ws.attn_output, &ws.gate_buf, &mut ws.gated, per_gpu_head_dim as u32,
+        ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &ws.gated, &[1, per_gpu_head_dim], "decode");
+
+        // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
+        crate::gemm_dispatch::gemm_projection_cached(
+            gemm, oxide, stream,
+            cache, &weights.o_proj.name, &ws.gated, output,
+            1, hidden_size, per_gpu_head_dim, group_size,
         )?;
-        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &q_single, &[1, per_gpu_head_dim], "decode");
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", output, &[1, hidden_size], "decode");
+
+    } else {
+        // No gate — use ws.q_full as Q (first per_gpu_head_dim elements are valid)
+        // Apply Q-norm to the Q portion (into ws.q_norm_out)
+        let q_norm_exists = if let Some(q_norm_w) = weights.q_norm.as_ref() {
+            let q_norm_gpu = cache.get_bf16(&q_norm_w.name)
+                .ok_or_else(|| anyhow::anyhow!("Q-norm weight '{}' not in cache", q_norm_w.name))?;
+            crate::norm::rms_norm_into(
+                stream, oxide, &mut ws.q_norm_out, &ws.q_full, &q_norm_gpu, rms_norm_eps, head_dim,
+            )?;
+            probe::dump(stream, probe, layer_idx, gpu_idx, "attn.q_norm", &ws.q_norm_out, &[1, per_gpu_head_dim], "decode");
+            true
+        } else {
+            false
+        };
+
+        // Apply RoPE to Q — inside branch for mutable access
+        if q_norm_exists {
+            rope::apply_rope(
+                stream,
+                oxide,
+                &mut ws.q_norm_out,
+                &mut ws.k_rope_dummy,
+                &[position],
+                num_heads as i32,
+                head_dim,
+                rope_theta,
+                partial_rotary_factor,
+                None, None,
+            )?;
+        } else {
+            rope::apply_rope(
+                stream,
+                oxide,
+                &mut ws.q_full,
+                &mut ws.k_rope_dummy,
+                &[position],
+                num_heads as i32,
+                head_dim,
+                rope_theta,
+                partial_rotary_factor,
+                None, None,
+            )?;
+        }
+
+        // Phase 4: Paged attention decode — scores, softmax, V accumulation in one kernel
+        let num_pages = block_table_gpu.len();
+        {
+            let q_for_attn = if q_norm_exists { &ws.q_norm_out } else { &ws.q_full };
+            paged_attention_decode_into(
+                stream,
+                oxide,
+                q_for_attn,
+                paged_cache.page_pool.as_ref().unwrap(),
+                block_table_gpu,
+                &mut ws.attn_output,
+                num_pages,
+                num_cached_tokens as usize,
+                head_dim,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                kv_dim,
+            )?;
+        }
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &ws.attn_output, &[1, per_gpu_head_dim], "decode");
+
+        // No gate application needed — use attn_output directly for O-proj
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &ws.attn_output, &[1, per_gpu_head_dim], "decode");
+
+        // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
+        crate::gemm_dispatch::gemm_projection_cached(
+            gemm, oxide, stream,
+            cache, &weights.o_proj.name, &ws.attn_output, output,
+            1, hidden_size, per_gpu_head_dim, group_size,
+        )?;
+        probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", output, &[1, hidden_size], "decode");
     }
 
-
-    // Apply RoPE to Q_single only (not gate)
-    let mut k_rope_dummy = stream
-        .alloc_zeros::<bf16>(per_gpu_head_dim)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate dummy K buffer for RoPE: {e}"))?;
-    rope::apply_rope(
-        stream,
-        oxide,
-        &mut q_single,
-        &mut k_rope_dummy,
-        &[position],
-        num_heads as i32,
-        head_dim,
-        rope_theta,
-        partial_rotary_factor,
-        None, None,
-    )?;
-
-    // =========================================================================
-    // Phase 4: Paged attention decode — scores, softmax, V accumulation in one kernel
-    // =========================================================================
-
-    let num_pages = block_table_gpu.len();
-
-    let attn_output = paged_attention_decode(
-        stream,
-        oxide,
-        &q_single,
-        paged_cache.page_pool.as_ref().unwrap(),
-        block_table_gpu,
-        num_pages,
-        num_cached_tokens as usize,
-        head_dim,
-        num_heads,
-        num_kv_heads,
-        page_size,
-        kv_dim,
-    )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.combined", &attn_output, &[1, per_gpu_head_dim], "decode");
-
-    // =========================================================================
-    // Gate application: attn_output = attn_output * sigmoid(gate)
-    // =========================================================================
-    let gated_attn = if let Some(ref gate) = gate_single {
-        let mut gated = stream
-            .alloc_zeros::<bf16>(per_gpu_head_dim)
-            .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
-        oxide.launch_attn_output_gate_bf16(
-            stream, &attn_output, gate, &mut gated, per_gpu_head_dim as u32,
-        ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
-        gated
-     } else {
-        attn_output
-    };
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &gated_attn, &[1, per_gpu_head_dim], "decode");
-
-    // =========================================================================
-    // Phase 5: O-projection — single GEMM over all heads (INT4-aware)
-    // =========================================================================
-
-    // attention_output is [num_heads * head_dim] = [hidden_size]
-    // o_proj is [hidden_size × hidden_size]
-    // output = attention_output @ o_proj^T → [1 × hidden_size]
-
-    let mut output = stream
-        .alloc_zeros::<bf16>(hidden_size)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate O-proj output buffer: {e}"))?;
-    crate::gemm_dispatch::gemm_projection_cached(
-        gemm, oxide, stream,
-        cache, &weights.o_proj.name, &gated_attn, &mut output,
-        1, hidden_size, per_gpu_head_dim, group_size,
-    )?;
-    probe::dump(stream, probe, layer_idx, gpu_idx, "attn.o_proj", &output, &[1, hidden_size], "decode");
-
-    Ok(output)
+    Ok(())
 }
 
 // ── GPU-native FP8 KV cache operations ──────────────────────────────

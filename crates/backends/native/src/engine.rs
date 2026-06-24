@@ -1064,27 +1064,28 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     LayerType::FullAttention => {
                         let attn_weights = layer.attn.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Attention weights not found for layer {}", layer_idx))?;
-                        let attn_out = crate::attention::decode_forward_paged(
-                              gemm, &gpu_stream,
-                              &self.per_gpu_kernels[gpu_idx].oxide,
-                             attn_weights, &self.workspaces[gpu_idx].norm1_out,
-                            &mut self.paged_kv_caches[gpu_idx][layer_idx],
-                            &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
-                            position, num_cached_tokens,
-                            head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
-                            config.rope_theta, config.partial_rotary_factor,
-                            config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx],
-                            config.hidden_size,
-                            config.attn_output_gate,
-                            layer_idx,
-                            gpu_idx,
-                            &probe,
-                            self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
-                            self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
-                        )?;
-                        // Copy attention output into workspace.attn_out (temporary until attention is also workspace-wired)
-                        gpu_stream.memcpy_dtod(&attn_out, &mut self.workspaces[gpu_idx].attn_out)
-                            .map_err(|e| anyhow::anyhow!("Failed to copy attn output to workspace: {e}"))?;
+                        {
+                            let ws = &mut self.workspaces[gpu_idx];
+                            crate::attention::decode_forward_paged(
+                                gemm, &gpu_stream,
+                                &self.per_gpu_kernels[gpu_idx].oxide,
+                                attn_weights, &ws.norm1_out,
+                                &mut self.paged_kv_caches[gpu_idx][layer_idx],
+                                &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
+                                position, num_cached_tokens,
+                                head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
+                                config.rope_theta, config.partial_rotary_factor,
+                                config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx],
+                                config.hidden_size,
+                                config.attn_output_gate,
+                                layer_idx,
+                                gpu_idx,
+                                &probe,
+                                self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
+                                self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
+                                &mut ws.attn, &mut ws.attn_out,
+                            )?;
+                        }
                     }
                 };
 
