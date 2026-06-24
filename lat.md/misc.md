@@ -291,7 +291,7 @@ Phase 3 (Model Loading) implements multi-format model loading with auto-detectio
 Phase 6 (QuantTargetMap Wiring) connects the quantization target map through the server's main.rs, enabling PrismaSCOUT NVFP4 support.
 
 - Server `main.rs` builds `QuantTargetMap` from `config.quantization_config` before the shard loop — single instance shared across all GPU shards
-- Both mmap and heap (infer binary) paths construct `QuantTargetMap::from_config()` with graceful fallback to `QuantTargetMap::empty()` on parse errors, logged as warnings
+- Both mmap (server and infer binary) and heap paths construct `QuantTargetMap::from_config()` with graceful fallback to `QuantTargetMap::empty()` on parse errors, logged as warnings
 - MmapWeightRegistry field `int4_companions` renamed to `quant_companions: HashMap<String, MmapQuantCompanions>` — unified enum supporting both INT4 and NVFP4 companions. Server GPU cache (`gpu_cache.rs`) updated accordingly with matching on `MmapQuantCompanions::Int4(c)` for strided and contiguous upload paths. See [[crates/server/src/main.rs]], [[crates/backends/native/src/gpu_cache.rs]].
 # Phase 9 Deliverables
 

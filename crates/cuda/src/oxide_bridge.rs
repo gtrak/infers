@@ -593,7 +593,7 @@ impl OxideKernels {
         use_causal: u32,
     ) -> anyhow::Result<()> {
         let num_rows = scores.len() as u32 / seq_len;
-        let block_size = (seq_len.min(256)) as u32;
+        let block_size: u32 = 256;
 
         let s_len_val = scores.len() as u64;
         let out_len_val = output.len() as u64;

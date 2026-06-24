@@ -269,11 +269,11 @@ Decode using paged KV cache: reads K/V from pages during attention computation v
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].
 
-## Quantized GEMM Dispatch via Dequantize-then-cuBLAS
+## Quantized GEMM Dispatch via Dequantize-then-Tiled-Kernel
 
-GEMM dispatch for quantized weights uses a two-step approach: dequantize on GPU to bf16, then compute via cuBLASLt. This replaces the custom INT4 GEMM kernel with a simpler pipeline.
+GEMM dispatch for quantized weights dequantizes on GPU to bf16, then computes via `bf16_gemm_tiled` (bypassing cuBLAS to avoid workspace corruption with dequant buffers). Both INT4 and NVFP4 paths now use this kernel.
 
-For **INT4 (AutoRound)**: `gemm_projection_cached` allocates a temporary bf16 buffer of size N×K, calls `oxide.launch_int4_dequant_to_bf16` to dequantize from packed INT4 + f16 scales + u32 qzeros into bf16, then calls `gemm.matmul_bf16` with the same GemmConfig convention as the BF16 branch (swapped m/n, transa=true). See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+For **INT4 (AutoRound)**: `gemm_projection_cached` allocates a temporary bf16 buffer of size N×K, calls `oxide.launch_int4_dequant_to_bf16` to dequantize from packed INT4 + f16 scales + u32 qzeros into bf16, runs `oxide.launch_sanitize_nan_bf16` to replace NaN values with 0.0 (fixes non-deterministic NaN from stale GPU memory), computes the actual batch dimension from input length (`m = input.len() / k`), then dispatches to `oxide.launch_bf16_gemm_tiled`. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
 For **NVFP4 (PrismaSCOUT)**: three-step pipeline using `oxide.launch_nvfp4_dequant_to_bf16` with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, weight_global_scale as f32 scalar, and input_global_scale as f32 scalar — all three scales are multiplied into the dequantized weights (`dequant_weight = fp4_val * group_scale / weight_global_scale * input_global_scale`). After dequantization, `oxide.launch_sanitize_nan_bf16` replaces any NaN values in the dequant buffer with 0.0 (fixes non-deterministic NaN from stale GPU memory). Then dispatches to `oxide.launch_bf16_gemm_tiled`. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 

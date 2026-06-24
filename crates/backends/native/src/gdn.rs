@@ -399,18 +399,13 @@ fn repeat_interleave_heads(
     let num_v_heads_i32 = num_v_heads as i32;
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
-    let chunk_size: i32 = 64;
-
-    // Launch chunked parallel kernel via oxide bridge
-    let chunk_size_u32 = 64u32;
-
-    oxide.launch_gdn_chunked_gated_delta_prefill_bf16(
+    // Launch sequential kernel via oxide bridge
+    oxide.launch_gdn_gated_delta_prefill_bf16(
         stream, &query_expanded, &key_expanded, &value_flat,
         &a_proj, &b_proj, &a_log_f32, &dt_bias_f32,
         state_ref, &mut gdn_output,
         seq_len as u32, num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
-        chunk_size_u32,
-    ).map_err(|e| anyhow::anyhow!("GDN chunked prefill kernel launch failed: {e}"))?;
+    ).map_err(|e| anyhow::anyhow!("GDN prefill kernel launch failed: {e}"))?;
 
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.core_attn_out", &gdn_output, &[seq_len, num_v_heads * head_v_dim], "prefill");
 

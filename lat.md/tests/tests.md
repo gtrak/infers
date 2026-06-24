@@ -7,3 +7,4 @@ Test specifications and diagnostic tools for the infers CUDA runtime.
 - [[gdn_recurrent_step_test]] — GDN recurrent step kernel vs CPU and Python references
 - [[rms_norm_gated_test]] — RMSNorm + SiLU gate kernel vs CPU and Python references
 - [[gdn_chunked_prefill_test]] — GDN chunked prefill kernel vs sequential CPU and Python references
+- [[oracle_hidden_state_compare]] — Per-layer hidden state comparison against PyTorch oracle (INT4 + NVFP4)

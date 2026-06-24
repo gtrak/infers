@@ -3,8 +3,8 @@
 //! Provides `gemm_projection_cached` which dispatches GEMM using GPU-resident
 //! weight buffers from `GpuWeightCache`, avoiding per-call CPU→GPU uploads.
 //! Handles both BF16 contiguous weights and INT4 quantized triplets in a
-//! single call. For INT4 weights, dequantize to bf16 on GPU then dispatch
-//! through cuBLAS GEMM.
+//! single call. For INT4 and NVFP4, dequantize to bf16 on GPU then dispatch
+//! via `bf16_gemm_tiled` (bypassing cuBLAS).
 
 use std::sync::Arc;
 
@@ -14,10 +14,9 @@ use infers_cuda::gemm::{GemmConfig, GemmEngine};
 use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 
 /// Dispatch a single projection GEMM using cached GPU-resident weights.
-///
 /// Looks up the weight by name from the `GpuWeightCache`. For BF16 weights,
-/// calls `gemm.matmul_bf16` directly. For INT4 and NVFP4 weights, dequantizes
-/// to bf16 on GPU then dispatches through cuBLAS GEMM.
+/// calls `gemm.matmul_bf16` directly. For INT4 and NVFP4, dequantizes
+/// to bf16 on GPU then dispatches via `bf16_gemm_tiled` (bypassing cuBLAS).
 ///
 /// # Arguments
 /// * `gemm` — cuBLASLt engine
@@ -75,7 +74,7 @@ pub fn gemm_projection_cached(
             let mut dequant_buf = stream.alloc_zeros::<bf16>(n * k)?;
 
             // 2. Launch dequant kernel
-           oxide.launch_int4_dequant_to_bf16(
+            oxide.launch_int4_dequant_to_bf16(
                 stream,
                 &mut dequant_buf,
                 &int4_bufs.qweight,
@@ -86,24 +85,22 @@ pub fn gemm_projection_cached(
                 group_size as u32,
             )?;
 
-            // 3. cuBLAS GEMM with dequantized bf16 weights (same convention as BF16 branch)
-            gemm.matmul_bf16(
-                &GemmConfig {
-                    m: n,
-                    n: m,
-                    k,
-                    transa: true,
-                    transb: false,
-                    alpha: 1.0,
-                    beta: 0.0,
-                    lda: None,
-                    ldb: None,
-                    ldc: None,
-                    activation: None,
-                },
-                &dequant_buf,
-                input,
+            // 3. Sanitize NaN values in dequant buffer (stale GPU memory may contain NaN)
+            oxide.launch_sanitize_nan_bf16(stream, &mut dequant_buf)?;
+
+            // 4. Compute actual batch/sequence dimension from input
+            let m = input.len() / k;
+
+            // 5. bf16 tiled GEMM: output = input @ dequant_buf^T
+            //    Bypasses cuBLAS to avoid workspace corruption with dequant buffers.
+            oxide.launch_bf16_gemm_tiled(
+                stream,
                 output,
+                input,
+                &dequant_buf,
+                m as u32,
+                n as u32,
+                k as u32,
             )?;
         }
         Some(crate::gpu_cache::CachedWeight::Nvfp4(nvfp4_bufs)) => {

@@ -92,7 +92,7 @@ Twenty-nine launch wrapper methods on the `OxideKernels` impl block. Each follow
 | `launch_rmsnorm_bf16` | `infers_rmsnorm_bf16` | grid=(num_rows), block=(min(hidden,256)), smem=block*4 bytes |
 | `launch_rms_norm_gated_bf16` | `infers_rms_norm_gated_bf16` | grid=(n), block=(min(d,256)), smem=block*4 bytes |
 | `launch_l2norm_bf16` | `infers_l2norm_bf16` | grid=(num_rows), block=(min(dim,256)), smem=block*4 bytes |
-| `launch_softmax_bf16` | `infers_softmax_bf16` | grid=(num_rows), block=(min(seq_len,1024)), smem=block*4 bytes |
+| `launch_softmax_bf16` | `infers_softmax_bf16` | grid=(num_rows), block=(256), smem=256*4 bytes |
 | `launch_gdn_update_bf16` | `infers_gdn_update_bf16` | grid=(hidden_size), block=(256), smem=1024 bytes (two-phase reduction) |
 
 **Dequant-to-BF16 kernels** (one thread per row, 256 threads per block):
@@ -136,6 +136,7 @@ Twenty-nine launch wrapper methods on the `OxideKernels` impl block. Each follow
 | `launch_gdn_gated_delta_prefill_bf16` | `infers_gdn_gated_delta_prefill_bf16` | LaunchConfig::for_num_elems(H*V) | f32 (read+write) |
 | `launch_gdn_chunked_gated_delta_prefill_bf16` | `infers_gdn_chunked_gated_delta_prefill_bf16` | grid=(num_heads), block=(256), smem=(2*C*K + C*C + 3*C)*4 bytes | f32 (read+write) |
 
+**Prefill path**: `launch_gdn_gated_delta_prefill_bf16` (sequential) is used for production prefill. The chunked kernel (`launch_gdn_chunked_gated_delta_prefill_bf16`) was replaced because it achieves only cosine 0.983 vs the sequential reference — across 48 GDN layers this error compounds into degenerate output. The sequential kernel matches at cosine 0.999999, identical to the recurrent step kernel.
 ### cuda-oxide: Quantization-Generic Kernels (Phase 18)
 Rust→PTX compiler for three quantization-sensitive kernels with trait-based dispatch. Enables AutoRound, GGUF, AWQ, GPTQ with one kernel. Rust source is portable to rust-gpu (SPIR-V) and amdgcn (HIP) for multi-hardware.
 
@@ -270,7 +271,7 @@ Migration assessment: **MIGRATE LATER.** All kernel features technically feasibl
 
 ### cuda-oxide Generic Kernel Experiments (Phase 19 Complete — Assessment Corrected)
 
-Experimented whether trait-based dequant dispatch is possible in cuda-oxide generic kernels, as envisioned in [[lat.md/arch#Workspace Architecture#CUDA Crate#cuda-oxide: Quantization-Generic Kernels (Phase 18)]]. **Result: FEASIBLE via `cargo oxide` build path.** Initial experiments via `RUSTFLAGS` codegen backend path failed, but `cargo oxide` (full NVVM→PTX pipeline) handles generics correctly.
+Experimented whether trait-based dequant dispatch is possible in cuda-oxide generic kernels. **Result: FEASIBLE via `cargo oxide` build path.**
 
 **Experiment 1 — RUSTFLAGS path (FAILS)**: Generic `#[kernel]` with `Dequant` trait, compiled via `RUSTFLAGS="-Z codegen-backend=..."`. Fails with E0282 (phantom type param) and NoModules (NVVM IR vs PTX payload mismatch). The RUSTFLAGS path skips NVVM linking and embeds NVVM IR directly — incompatible with generic kernels.
 
@@ -282,7 +283,7 @@ Experimented whether trait-based dequant dispatch is possible in cuda-oxide gene
 
 **Experiment 2 — Const generics**: Still fail at runtime (`"named symbol not found"`). Not needed for trait dispatch — use type parameters instead.
 
-**Revised assessment**: Trait-based generic dispatch IS the right approach. Use `cargo oxide` as the build tool, `PhantomData<D>` for E0282, and named monomorphized wrappers for cudarc PTX loading. See [[plan/024-cuda-oxide-quant.md]] for the production plan.
+**Revised assessment**: Trait-based generic dispatch IS the right approach. Use `cargo oxide` as the build tool, `PhantomData<D>` for E0282, and named monomorphized wrappers for cudarc PTX loading.
 
 ### cuda-oxide Kernel Library (Phase 18 — Build Pipeline Validated)
 

@@ -100,6 +100,33 @@ This token-specific pattern suggests the GDN recurrence at layer 13 produces cor
 
 The divergence cascades from early tokens (positions 0-5) to later tokens (positions 9-14) across layers, suggesting positional dependence in the error mechanism.
 
+## Oracle Hidden State Dumps
+
+Full-model HF oracle that dumps per-layer hidden states (residual stream at the start of each layer) and final logits as raw BF16 bytes, for regression-testing the CUDA inference engine against ground truth.
+
+Script `scripts/dump_oracle_hidden.py` loads a Qwen3.5 model via `AutoModelForCausalLM.from_pretrained()` with bf16 dtype, device_map="auto", and low_cpu_mem_usage=True. It tokenizes a prompt, registers forward hooks on all 64 decoder layers to capture `input[0]` (hidden_states before the layer), runs a single forward pass under `torch.no_grad()`, removes hooks, and writes output files.
+
+Output format matches the probe dump convention: each layer N produces `{dir}/layer_{N}/oracle/hidden_states.raw` (raw LE BF16 bytes) and `.meta` JSON with `{"name": "hidden_states", "layer": N, "shape": [seq_len, hidden_size], "dtype": "bf16", "stage": "hidden_states", "phase": "oracle"}`. Additionally: embedding output at `layer_0/oracle/embed_output.raw`, final logits at `final/oracle/logits.raw`, and a top-level `oracle_config.json` with model path, prompt, token IDs, num_layers, hidden_size, vocab_size, and layer_types (gdn vs attn).
+
+Uses an int16 memory view of the BF16 tensor to bypass numpy's missing native bfloat16 support while preserving exact bit-patterns. File sizes verified: `seq_len * hidden_size * 2` bytes per layer (51200 for seq_len=5, hidden_size=5120).
+
+Tested with Qwen3.6-27B AutoRound INT4 — next-token prediction matches HF (token ID 11751 → " Paris" for the prompt "The capital of France is").
+
+NVFP4 config patching: The script loads the model config via `AutoConfig.from_pretrained()` before passing it to `from_pretrained()`, and patches in-memory any quantization target regexes that use vLLM's namespace (`language_model.model.layers`) by replacing them with transformers' namespace (`model.layers`). This is required for NVFP4 models exported from vLLM whose `config.json` has the wrong prefix, causing compressed_tensors to fail to match modules and never decompress weights. The patch is purely in-memory — the original config.json is never modified. See [[scripts/dump_oracle_hidden.py#patch_nvfp4_config]].
+
+## Hidden State Comparison Script
+
+Per-layer comparison of PyTorch oracle hidden states against Rust inference engine probe dumps, computing cosine similarity, max/mean absolute error, and status classification.
+
+Script `scripts/compare_hidden_states.py` reads the oracle's `oracle_config.json` for layer count and type mapping (gdn vs attn), then iterates over each layer comparing:
+- **Embedding output**: oracle `layer_0/oracle/embed_output.raw` vs infer `layer_0/prefill/embed.output_gpu0.raw`
+- **Per-layer inputs**: oracle `layer_N/oracle/hidden_states.raw` vs infer `layer_N/prefill/{attn|gdn}.norm1_input_gpu0.raw` (file name depends on layer type)
+- **Final logits**: oracle `final/oracle/logits.raw` vs infer `layer_63/prefill/final.logits_gpu0.raw`
+
+All files are read as raw BF16 bytes using the uint16→uint32 shift→float32 reinterpretation trick. Per-comparison metrics: cosine similarity (PASS > 0.99, WARN 0.95–0.99, FAIL < 0.95), max absolute error, mean absolute error. Missing files are reported as "MISSING" and skipped.
+
+Output is a formatted table with layer index, type, cosine, max/mean abs error, and status, followed by a summary showing pass/warn/fail counts and the worst cosine layer. See [[scripts/compare_hidden_states.py]].
+
 ## Full-Attention Reference Tests (Layer 3)
 
 HuggingFace-based reference capturing full-attention (Qwen3_5Attention) intermediates at layer 3 as .npy ground truth, using the engine's 15 token IDs.
