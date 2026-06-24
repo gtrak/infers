@@ -87,10 +87,14 @@ pub fn gemm_projection_cached(
             } else { 1 }; // default to transposed (AutoRound convention)
 
             if m == 1 {
-                // K-split GEMV: split K across blocks for better occupancy
-                const K_SPLIT: u32 = 32;
+                // K-split GEMV: split K across blocks for better occupancy.
+                // v3 kernel ceil-groups full quantization groups across splits, so any
+                // K_SPLIT is correct regardless of divisibility (40, 136, 9, 34 groups
+                // all handled). K_SPLIT=20 gives ~1.25 waves on 40 SMs for the main
+                // hidden=5120 layers (2 groups/split, 1600 blocks).
+                const K_SPLIT: u32 = 20;
                 let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
-                oxide.launch_int4_gemm_auto_round_ksplit(
+                oxide.launch_int4_gemm_v3_ksplit(
                     stream, &mut partial_sums,
                     &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
                     input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,

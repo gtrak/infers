@@ -1244,6 +1244,176 @@ pub mod kernels {
         partial_sums[split_idx * n_usize + col] = acc;
     }
 
+    /// INT4 GEMM v3 with K-splitting for M=1 decode (AutoRound format).
+    ///
+    /// Bandwidth-focused rewrite of [`int4_gemm_auto_round_ksplit`]:
+    /// 1. Four independent f32 accumulators to expose FMA pipeline depth (ILP).
+    /// 2. Group-aligned K-split via ceil-grouping: full quantization groups are
+    ///    distributed across splits so each is covered exactly once regardless of
+    ///    divisibility — the per-element inner loop is fully branchless (no
+    ///    k_start/k_end fixups). Empty splits write a zero partial sum.
+    /// 3. Two-u32 (16 INT4) stride per outer step so the second global load
+    ///    overlaps the first chunk's compute, hiding DRAM latency.
+    /// 4. Per-group `scaled_zero = (raw_zero + 1) * scale` hoist.
+    ///
+    /// Requires `k % group_size == 0` (AutoRound pads K to group_size).
+    /// - Grid: (ceil(N/64), k_split, 1)  ·  Block: (64, 1, 1)
+    /// - blockIdx.x: output column tile  ·  blockIdx.y: K-split index
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn int4_gemm_v3_ksplit(
+        partial_sums: &mut [f32],
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        n: u32, k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) {
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let split_idx = thread::blockIdx_y() as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let gs = group_size as usize;
+        let ks = k_split as usize;
+        let num_groups = k_usize / gs;
+
+        if col >= n_usize {
+            return;
+        }
+
+        // v3: distribute full groups across splits via ceil-grouping so every
+        // group is covered exactly once regardless of divisibility. Last split(s)
+        // may be shorter or empty. Per-element inner loop stays branchless.
+        let groups_per_split = (num_groups + ks - 1) / ks;
+        let group_start = split_idx * groups_per_split;
+        if group_start >= num_groups {
+            partial_sums[split_idx * n_usize + col] = 0.0;
+            return;
+        }
+        let group_end = if group_start + groups_per_split > num_groups {
+            num_groups
+        } else {
+            group_start + groups_per_split
+        };
+
+        let mut acc0: f32 = 0.0;
+        let mut acc1: f32 = 0.0;
+        let mut acc2: f32 = 0.0;
+        let mut acc3: f32 = 0.0;
+
+        let n_packed = (n_usize + 7) / 8;
+        let u32s_per_group = gs / 8;
+
+        for group_idx in group_start..group_end {
+            let kg = group_idx * gs;
+
+            // Per-group scale (fp16 → f32).
+            let scale_bits: u16 = if transposed != 0 {
+                unsafe { *scales.get_unchecked(group_idx * n_usize + col) }
+            } else {
+                unsafe { *scales.get_unchecked(col * num_groups + group_idx) }
+            };
+            let scale = f16_to_f32(scale_bits);
+
+            // Per-group packed zero point.
+            let (zero_packed_idx, zero_shift): (usize, usize) = if transposed != 0 {
+                (group_idx * n_packed + col / 8, (col % 8) * 4)
+            } else {
+                let flat_idx = col * num_groups + group_idx;
+                (flat_idx / 8, (flat_idx % 8) * 4)
+            };
+            let raw_zero = ((unsafe { *zeros.get_unchecked(zero_packed_idx) } >> zero_shift) & 0xF) as i8;
+            let scaled_zero = (raw_zero as f32 + 1.0) * scale;
+
+            // Two-u32 (16 INT4) stride: second DRAM load overlaps first compute.
+            for u32_idx in (0..u32s_per_group).step_by(2) {
+                let k0 = kg + u32_idx * 8;
+                let w_idx0: usize = if transposed != 0 {
+                    (k0 >> 3) * n_usize + col
+                } else {
+                    (col * k_usize + k0) / 8
+                };
+                let packed0: u32 = unsafe { *weight.get_unchecked(w_idx0) };
+
+                // packed0: 8 INT4 → acc0 (even lanes) / acc1 (odd lanes).
+                unsafe {
+                    let a0 = f32::from_bits((*input.get_unchecked(k0 + 0) as u32) << 16);
+                    let a1 = f32::from_bits((*input.get_unchecked(k0 + 1) as u32) << 16);
+                    let a2 = f32::from_bits((*input.get_unchecked(k0 + 2) as u32) << 16);
+                    let a3 = f32::from_bits((*input.get_unchecked(k0 + 3) as u32) << 16);
+                    let a4 = f32::from_bits((*input.get_unchecked(k0 + 4) as u32) << 16);
+                    let a5 = f32::from_bits((*input.get_unchecked(k0 + 5) as u32) << 16);
+                    let a6 = f32::from_bits((*input.get_unchecked(k0 + 6) as u32) << 16);
+                    let a7 = f32::from_bits((*input.get_unchecked(k0 + 7) as u32) << 16);
+
+                    let w0 = (packed0 & 0xF) as i8;
+                    let w1 = ((packed0 >> 4) & 0xF) as i8;
+                    let w2 = ((packed0 >> 8) & 0xF) as i8;
+                    let w3 = ((packed0 >> 12) & 0xF) as i8;
+                    let w4 = ((packed0 >> 16) & 0xF) as i8;
+                    let w5 = ((packed0 >> 20) & 0xF) as i8;
+                    let w6 = ((packed0 >> 24) & 0xF) as i8;
+                    let w7 = ((packed0 >> 28) & 0xF) as i8;
+
+                    acc0 += (w0 as f32 * scale - scaled_zero) * a0;
+                    acc1 += (w1 as f32 * scale - scaled_zero) * a1;
+                    acc0 += (w2 as f32 * scale - scaled_zero) * a2;
+                    acc1 += (w3 as f32 * scale - scaled_zero) * a3;
+                    acc0 += (w4 as f32 * scale - scaled_zero) * a4;
+                    acc1 += (w5 as f32 * scale - scaled_zero) * a5;
+                    acc0 += (w6 as f32 * scale - scaled_zero) * a6;
+                    acc1 += (w7 as f32 * scale - scaled_zero) * a7;
+                }
+
+                // packed1: 8 INT4 → acc2 (even lanes) / acc3 (odd lanes).
+                if u32_idx + 1 < u32s_per_group {
+                    let k1 = k0 + 8;
+                    let w_idx1: usize = if transposed != 0 {
+                        (k1 >> 3) * n_usize + col
+                    } else {
+                        (col * k_usize + k1) / 8
+                    };
+                    let packed1: u32 = unsafe { *weight.get_unchecked(w_idx1) };
+
+                    unsafe {
+                        let b0 = f32::from_bits((*input.get_unchecked(k1 + 0) as u32) << 16);
+                        let b1 = f32::from_bits((*input.get_unchecked(k1 + 1) as u32) << 16);
+                        let b2 = f32::from_bits((*input.get_unchecked(k1 + 2) as u32) << 16);
+                        let b3 = f32::from_bits((*input.get_unchecked(k1 + 3) as u32) << 16);
+                        let b4 = f32::from_bits((*input.get_unchecked(k1 + 4) as u32) << 16);
+                        let b5 = f32::from_bits((*input.get_unchecked(k1 + 5) as u32) << 16);
+                        let b6 = f32::from_bits((*input.get_unchecked(k1 + 6) as u32) << 16);
+                        let b7 = f32::from_bits((*input.get_unchecked(k1 + 7) as u32) << 16);
+
+                        let v0 = (packed1 & 0xF) as i8;
+                        let v1 = ((packed1 >> 4) & 0xF) as i8;
+                        let v2 = ((packed1 >> 8) & 0xF) as i8;
+                        let v3 = ((packed1 >> 12) & 0xF) as i8;
+                        let v4 = ((packed1 >> 16) & 0xF) as i8;
+                        let v5 = ((packed1 >> 20) & 0xF) as i8;
+                        let v6 = ((packed1 >> 24) & 0xF) as i8;
+                        let v7 = ((packed1 >> 28) & 0xF) as i8;
+
+                        acc2 += (v0 as f32 * scale - scaled_zero) * b0;
+                        acc3 += (v1 as f32 * scale - scaled_zero) * b1;
+                        acc2 += (v2 as f32 * scale - scaled_zero) * b2;
+                        acc3 += (v3 as f32 * scale - scaled_zero) * b3;
+                        acc2 += (v4 as f32 * scale - scaled_zero) * b4;
+                        acc3 += (v5 as f32 * scale - scaled_zero) * b5;
+                        acc2 += (v6 as f32 * scale - scaled_zero) * b6;
+                        acc3 += (v7 as f32 * scale - scaled_zero) * b7;
+                    }
+                }
+            }
+        }
+
+        let acc = acc0 + acc1 + acc2 + acc3;
+        partial_sums[split_idx * n_usize + col] = acc;
+    }
+
     /// Reduce K-split partial sums into final bf16 output.
     #[kernel]
     #[launch_bounds(64)]
