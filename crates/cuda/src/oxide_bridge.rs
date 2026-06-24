@@ -931,10 +931,18 @@ impl OxideKernels {
         Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
         Self::push_scalar_arg(&mut args, &mut transposed_v);      // transposed: u32
 
-        let config = LaunchConfig {
-            grid_dim: ((n + 63) / 64, (m + 3) / 4, 1),
-            block_dim: (64, 4, 1),
-            shared_mem_bytes: 0,
+        let config = if m <= 1 {
+            LaunchConfig {
+                grid_dim: ((n + 63) / 64, 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            LaunchConfig {
+                grid_dim: ((n + 63) / 64, (m + 3) / 4, 1),
+                block_dim: (64, 4, 1),
+                shared_mem_bytes: 0,
+            }
         };
         self.raw_launch("int4_gemm_auto_round", stream, config, &mut args)
     }
@@ -1173,10 +1181,18 @@ impl OxideKernels {
         Self::push_scalar_arg(&mut args, &mut k_v);               // k: u32
         Self::push_scalar_arg(&mut args, &mut group_size_v);      // group_size: u32
 
-        let config = LaunchConfig {
-            grid_dim: ((n + 63) / 64, (m + 3) / 4, 1),
-            block_dim: (64, 4, 1),
-            shared_mem_bytes: 0,
+        let config = if m <= 1 {
+            LaunchConfig {
+                grid_dim: ((n + 63) / 64, 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            LaunchConfig {
+                grid_dim: ((n + 63) / 64, (m + 3) / 4, 1),
+                block_dim: (64, 4, 1),
+                shared_mem_bytes: 0,
+            }
         };
         self.raw_launch("nvfp4_gemm_fused", stream, config, &mut args)
     }
