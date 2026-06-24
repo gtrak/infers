@@ -63,9 +63,9 @@ One `OxideKernels` instance per GPU loads the cubin on the correct device's prim
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU.
 
-### Oxide Bridge: Launch Wrapper Methods (30 Kernels)
+### Oxide Bridge: Launch Wrapper Methods (32 Kernels)
 
-Thirty launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
+Thirty-two launch wrapper methods on the `OxideKernels` impl block. Each follows the same pattern as `launch_add_bf16`: device pointers from cudarc, cast to cuda-oxide CUdeviceptr, pack args, call `raw_launch`.
 
 **Element-wise kernels** (use `LaunchConfig::for_num_elems(n)`):
 
@@ -113,6 +113,8 @@ Thirty launch wrapper methods on the `OxideKernels` impl block. Each follows the
 |--------|--------|------------|
 | `launch_int4_gemm_auto_round` | `int4_gemm_auto_round` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — naive: each thread reads input independently from global memory |
 | `launch_int4_gemm_auto_round_tiled` | `int4_gemm_auto_round_tiled` | grid=(ceil(n/64), m), block=(64,1), smem=group_size*2 bytes — shared-memory tiled: 64 threads cooperatively load K-tile input into smem, all threads share one copy instead of redundant global reads |
+| `launch_int4_gemm_auto_round_ksplit` | `int4_gemm_auto_round_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — K-split: each thread block computes partial sums over a portion of K (K/k_split), writes to f32 buffer |
+| `launch_reduce_partial_sums_bf16` | `reduce_partial_sums_bf16` | grid=(ceil(n/64), 1, 1), block=(64,1), smem=0 — reduces K-split partial sums (f32) into final bf16 output |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer. Optimized: reads 4 bytes as u32 (8 nibbles per load vs 2 per byte), precomputes effective_scale = scale / global_scale once per group |
 

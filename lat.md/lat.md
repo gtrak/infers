@@ -275,6 +275,14 @@ GEMM dispatch uses two strategies. INT4 uses the fused `int4_gemm_auto_round` ke
 
 For **INT4 (AutoRound)**: `gemm_projection_cached` calls `oxide.launch_int4_gemm_auto_round` directly with packed qweight (u32), f16 scales, u32 qzeros, and bf16 input. The kernel dequantizes in registers and accumulates into the output buffer — eliminating ~896 allocations and dequant kernel launches per decode token. Transposition is determined from `int4_bufs.shape` at call time: if shape[1] == n the weight is transposed [K/8, N] layout (AutoRound convention). See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
+### K-Split GEMM for M=1 Decode
+
+K-splitting divides the K dimension across multiple thread blocks, multiplying GPU occupancy by K_SPLIT (currently 4). Two-phase approach: `int4_gemm_auto_round_ksplit` computes partial sums in f32, then `reduce_partial_sums_bf16` combines them.
+
+When `m==1` (single-token decode), the naive INT4 kernel has only `ceil(N/64)` thread blocks — e.g., N=5120 gives 80 blocks = 1.6 blocks/SM = 3.2 warps/SM on RTX 5090. This is insufficient to hide VRAM latency (~400ns).
+
+K-split boundaries align to group_size so quantization groups are never split across blocks. Overlapping groups at split boundaries are handled by skipping weights outside each split's K range (`k_start ≤ k_full < k_end`). The f32 partial_sums buffer (~80KB for N=5120, K_SPLIT=4) is allocated inline per GEMM call — the latency-hiding benefit outweighs the allocation overhead.
+
 For **NVFP4 (PrismaSCOUT)**: three-step pipeline using `oxide.launch_nvfp4_dequant_to_bf16` with group_size=16 (fixed NVFP4 property), weight_packed as u8 bytes, weight_scale as fp8 e4m3 bytes, weight_global_scale as f32 scalar, and input_global_scale as f32 scalar — all three scales are multiplied into the dequantized weights (`dequant_weight = fp4_val * group_scale / weight_global_scale * input_global_scale`). After dequantization, `oxide.launch_sanitize_nan_bf16` replaces any NaN values in the dequant buffer with 0.0 (fixes non-deterministic NaN from stale GPU memory). Then dispatches to `oxide.launch_bf16_gemm_tiled`. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
 
 ### eprintln Gating in GEMM Dispatch

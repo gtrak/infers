@@ -86,19 +86,40 @@ pub fn gemm_projection_cached(
                 if int4_bufs.shape[1] == n { 1 } else { 0 }
             } else { 1 }; // default to transposed (AutoRound convention)
 
-            oxide.launch_int4_gemm_auto_round(
-                stream,
-                output,
-                &int4_bufs.qweight,
-                &int4_bufs.scales,
-                &int4_bufs.qzeros,
-                input,
-                m as u32,
-                n as u32,
-                k as u32,
-                group_size as u32,
-                transposed,
-            )?;
+            if m == 1 {
+                // K-split for M=1: more blocks = better latency hiding
+                const K_SPLIT: u32 = 4;
+                let mut partial_sums = stream.alloc_zeros::<f32>(K_SPLIT as usize * n)?;
+                oxide.launch_int4_gemm_auto_round_ksplit(
+                    stream, &mut partial_sums,
+                    &int4_bufs.qweight,
+                    &int4_bufs.scales,
+                    &int4_bufs.qzeros,
+                    input,
+                    n as u32,
+                    k as u32,
+                    group_size as u32,
+                    transposed,
+                    K_SPLIT,
+                )?;
+                oxide.launch_reduce_partial_sums_bf16(
+                    stream, output, &partial_sums, n as u32, K_SPLIT,
+                )?;
+            } else {
+                oxide.launch_int4_gemm_auto_round(
+                    stream,
+                    output,
+                    &int4_bufs.qweight,
+                    &int4_bufs.scales,
+                    &int4_bufs.qzeros,
+                    input,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    group_size as u32,
+                    transposed,
+                )?;
+            }
         }
         Some(crate::gpu_cache::CachedWeight::Nvfp4(nvfp4_bufs)) => {
             // NVFP4 group_size is always 16 (fixed property of the format)

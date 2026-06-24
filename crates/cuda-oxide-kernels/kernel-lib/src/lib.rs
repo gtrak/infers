@@ -1131,6 +1131,146 @@ pub mod kernels {
         }
     }
 
+    /// INT4 GEMM kernel with K-splitting for M=1 decode (AutoRound format).
+    ///
+    /// Splits the K dimension across multiple thread blocks. Each block computes
+    /// partial sums for 64 output columns over a portion of K. A subsequent
+    /// reduction kernel (`reduce_partial_sums_bf16`) combines the partial sums.
+    ///
+    /// - Grid: (ceil(N/64), K_SPLIT, 1)
+    /// - Block: (64, 1, 1)
+    /// - blockIdx.x: output column tile
+    /// - blockIdx.y: K-split index (0..K_SPLIT)
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn int4_gemm_auto_round_ksplit(
+        partial_sums: &mut [f32],          // [K_SPLIT, N] f32 output
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],
+        n: u32, k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) {
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let split_idx = thread::blockIdx_y() as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let group_size_usize = group_size as usize;
+
+        if col >= n_usize {
+            return;
+        }
+
+        // K range for this split
+        let k_per_split = (k_usize + k_split as usize - 1) / k_split as usize;
+        let k_start = split_idx * k_per_split;
+        let k_end = (k_start + k_per_split).min(k_usize);
+
+        // Align k_start/k_end to group boundaries so we don't split a quantization group
+        let k_start_aligned = (k_start / group_size_usize) * group_size_usize;
+        let k_end_aligned = ((k_end + group_size_usize - 1) / group_size_usize) * group_size_usize;
+        let k_end_aligned = k_end_aligned.min(k_usize);
+
+        let mut acc: f32 = 0.0;
+
+        for kg in (k_start_aligned..k_end_aligned).step_by(group_size_usize) {
+            let group_idx = kg / group_size_usize;
+
+            // Load scale
+            let scale_bits: u16;
+            if transposed != 0 {
+                scale_bits = scales[group_idx * n_usize + col];
+            } else {
+                let num_groups = k_usize / group_size_usize;
+                scale_bits = scales[col * num_groups + group_idx];
+            }
+            let scale = f16_to_f32(scale_bits);
+
+            // Unpack zero point
+            let (zero_packed_idx, zero_shift): (usize, usize);
+            if transposed != 0 {
+                let n_packed = (n_usize + 7) / 8;
+                zero_packed_idx = group_idx * n_packed + col / 8;
+                zero_shift = (col % 8) * 4;
+            } else {
+                let num_groups = k_usize / group_size_usize;
+                let flat_idx = col * num_groups + group_idx;
+                zero_packed_idx = flat_idx / 8;
+                zero_shift = (flat_idx % 8) * 4;
+            }
+            let zero_packed = zeros[zero_packed_idx];
+            let raw_zero = ((zero_packed >> zero_shift) & 0xF) as i8;
+
+            for kk in (0..group_size_usize).step_by(8) {
+                let k_pos = kg + kk;
+                if k_pos >= k_end {
+                    break;
+                }
+                // Skip u32 that starts before this split's range
+                if k_pos + 7 < k_start {
+                    continue;
+                }
+                let weight_idx: usize;
+                if transposed != 0 {
+                    weight_idx = (k_pos >> 3) * n_usize + col;
+                } else {
+                    weight_idx = (col * k_usize + k_pos) / 8;
+                }
+                let packed = weight[weight_idx];
+
+                for w in 0..8usize {
+                    let k_full = k_pos + w;
+                    if k_full >= k_end {
+                        break;
+                    }
+                    // Skip weights before this split's range
+                    if k_full < k_start {
+                        continue;
+                    }
+                    let shift = w * 4;
+                    let w_int4 = ((packed >> shift) & 0xF) as i8;
+                    // AutoRound: zero = stored_zero + 1
+                    let w_fp32 = (w_int4 as f32 - (raw_zero as f32 + 1.0)) * scale;
+                    let a_val = f32::from_bits((input[k_full] as u32) << 16);
+                    acc += w_fp32 * a_val;
+                }
+            }
+        }
+
+        // Write partial sum to partial_sums[split_idx][col]
+        partial_sums[split_idx * n_usize + col] = acc;
+    }
+
+    /// Reduce K-split partial sums into final bf16 output.
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn reduce_partial_sums_bf16(
+        mut output: DisjointSlice<u16>,    // [N] bf16 output
+        partial_sums: &[f32],              // [K_SPLIT, N] f32
+        n: u32,
+        k_split: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        if col >= n as usize {
+            return;
+        }
+
+        let mut sum: f32 = 0.0;
+        for s in 0..k_split as usize {
+            sum += partial_sums[s * n as usize + col];
+        }
+
+        unsafe {
+            *output.get_unchecked_mut(col) = f32_to_bf16(sum);
+        }
+    }
+
+
 
     /// INT4 GEMM kernel for GGUF format (no zero offset).
     #[kernel]
