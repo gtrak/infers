@@ -107,6 +107,9 @@ pub struct ForwardEngine {
     /// CUDA graph for decode loop replay (one per GPU). None until first capture.
     pub(crate) decode_graphs: Vec<Option<CudaGraph>>,
 
+    /// Cached ProbeConfig — avoids per-step env::var lookups.
+    pub(crate) probe_config: probe::ProbeConfig,
+
     /// Step counter for graph capture scheduling.
     pub(crate) decode_step_count: usize,
 }
@@ -281,6 +284,7 @@ impl ForwardEngine {
             group_size,
             workspaces,
             decode_graphs: (0..num_gpus).map(|_| None).collect(),
+            probe_config: probe::ProbeConfig::from_env(),
             decode_step_count: 0,
         })
     }
@@ -401,6 +405,7 @@ impl ForwardEngine {
             group_size,
             workspaces,
             decode_graphs: (0..num_gpus).map(|_| None).collect(),
+            probe_config: probe::ProbeConfig::from_env(),
             decode_step_count: 0,
         })
     }

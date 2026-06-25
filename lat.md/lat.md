@@ -317,7 +317,9 @@ Precomputed cos/sin tables are uploaded to GPU at engine init and passed through
 
 ## General Instrumentation Probe
 
-Per-layer probe infrastructure for dumping intermediate tensors during inference via `INFERS_DUMP_DIR`, `INFERS_DUMP_LAYERS`, and `INFERS_DUMP_STAGES` environment variables. Writes raw bf16 bytes plus JSON metadata sidecars. See [[crates/backends/native/src/probe.rs]].
+Per-layer probe infrastructure for dumping intermediate tensors during inference via `INFERS_DUMP_DIR`, `INFERS_DUMP_LAYERS`, and `INFERS_DUMP_STAGES` environment variables. See [[crates/backends/native/src/probe.rs]].
+
+The `ProbeConfig` is cached on `ForwardEngine` at init time — avoids repeated `env::var` lookups on the decode hot path.
 
 ## Logit Dump Debug Tool
 

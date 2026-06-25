@@ -6,7 +6,6 @@ use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
 use infers_cuda::{CudaContext, CudaSlice, CudaStream};
-use infers_cuda::{group_end, group_start};
 use infers_model::LayerType;
 
 use crate::engine::{ForwardEngine, PerGpuKernels};
@@ -74,9 +73,8 @@ impl ForwardEngine {
         let config = &self.config;
         let head_dim = config.head_dim;
 
-        // Probe instrumentation
-        let probe = probe::ProbeConfig::from_env();
-        probe::dump_config(&self.config, num_gpus, self.group_size);
+        // Probe instrumentation (cached at engine init — avoids per-step env::var calls)
+        let probe = &self.probe_config;
 
         // Dynamically allocate pages as needed for the target position,
         // then read the (possibly updated) block table and cached-token count.
@@ -145,7 +143,7 @@ impl ForwardEngine {
                     1, config.hidden_size,
                 )?;
             }
-            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &self.workspaces[gpu_idx].embed_out, &[1, config.hidden_size], "decode");
+            probe::dump(&gpu_stream, probe, usize::MAX, gpu_idx, "embed.output", &self.workspaces[gpu_idx].embed_out, &[1, config.hidden_size], "decode");
             hidden_states.push(self.workspaces[gpu_idx].embed_out.clone());
         }
 
@@ -174,7 +172,7 @@ impl ForwardEngine {
             // Dump hidden input at start of layer
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, &format!("{}.norm1_input", stage_prefix), &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
            // Phase A: Attention/GDN on each GPU
@@ -194,7 +192,7 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &self.workspaces[gpu_idx].norm1_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, &format!("{}.norm1", stage_prefix), &self.workspaces[gpu_idx].norm1_out, &[1, config.hidden_size], "decode");
 
                 // Attention or GDN (decode versions)
                 match config.get_layer_type(layer_idx) {
@@ -213,7 +211,7 @@ impl ForwardEngine {
                                 &self.weight_caches[gpu_idx],
                                 layer_idx,
                                 gpu_idx,
-                                &probe,
+                                probe,
                                 &mut ws.gdn, &mut ws.attn_out,
                                 &mut ps,
                             )?;
@@ -240,7 +238,7 @@ impl ForwardEngine {
                                 config.attn_output_gate,
                                 layer_idx,
                                 gpu_idx,
-                                &probe,
+                                probe,
                                 self.rope_cos.as_ref().map(|v| &v[gpu_idx]),
                                 self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
                                 &mut ws.attn, &mut ws.attn_out,
@@ -252,22 +250,20 @@ impl ForwardEngine {
                     }
                 };
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, &format!("{}.o_proj", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
-            // All-reduce attention outputs across GPUs (grouped)
-            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            // All-reduce attention outputs across GPUs
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 sync::all_reduce_attention(
                     &self.nccl, &gpu_stream, &mut self.workspaces[gpu_idx].attn_out,
                 )?;
             }
-            group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
             // Phase B: Residual add on each GPU (zero-alloc via workspace + swap)
@@ -284,7 +280,7 @@ impl ForwardEngine {
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "residual.attn", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
 
             // Phase C: MLP on each GPU (column-parallel gate/up, row-parallel down)
@@ -305,7 +301,7 @@ impl ForwardEngine {
                     config.rms_norm_eps, config.hidden_size,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.norm2", &ws.norm2_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.norm2", &ws.norm2_out, &[1, config.hidden_size], "decode");
 
                 // Gate projection — into workspace.mlp_gate
                 let mut ps = Some(&mut ws.partial_sums);
@@ -319,7 +315,7 @@ impl ForwardEngine {
                     &mut ps,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.gate_proj", &ws.mlp_gate, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.gate_proj", &ws.mlp_gate, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Up projection — into workspace.mlp_up
                 let mut ps = Some(&mut ws.partial_sums);
@@ -333,14 +329,14 @@ impl ForwardEngine {
                     &mut ps,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.up_proj", &ws.mlp_up, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.up_proj", &ws.mlp_up, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // up * SiLU(gate) = SwiGLU — into workspace.mlp_silu
                 self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
                     &gpu_stream, &ws.mlp_up, &ws.mlp_gate, &mut ws.mlp_silu, sharded_intermediate as u32,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &ws.mlp_silu, &[1, config.intermediate_size / num_gpus], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.silu", &ws.mlp_silu, &[1, config.intermediate_size / num_gpus], "decode");
 
                 // Down projection — into workspace.mlp_out
                 let mut ps = Some(&mut ws.partial_sums);
@@ -354,22 +350,20 @@ impl ForwardEngine {
                     &mut ps,
                 )?;
 
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_raw", &ws.mlp_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.down_raw", &ws.mlp_out, &[1, config.hidden_size], "decode");
             }
 
-            // All-reduce MLP outputs across GPUs (grouped) — directly on workspace buffers
-            group_start().map_err(|e| anyhow::anyhow!("NCCL group_start failed: {:?}", e))?;
+            // All-reduce MLP outputs across GPUs
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 sync::all_reduce_mlp(
                     &self.nccl, &gpu_stream, &mut self.workspaces[gpu_idx].mlp_out,
                 )?;
             }
-            group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &self.workspaces[gpu_idx].mlp_out, &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.down_ar", &self.workspaces[gpu_idx].mlp_out, &[1, config.hidden_size], "decode");
             }
 
             // Phase D: Residual add on each GPU (zero-alloc via workspace + swap)
@@ -386,7 +380,7 @@ impl ForwardEngine {
 
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
+                probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "residual.mlp", &hidden_states[gpu_idx], &[1, config.hidden_size], "decode");
             }
         }
 
@@ -409,7 +403,7 @@ impl ForwardEngine {
             config.rms_norm_eps, config.hidden_size,
         )?;
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &self.workspaces[0].norm1_out, &[1, config.hidden_size], "decode");
+        probe::dump(&final_stream, probe, config.num_hidden_layers - 1, 0, "final.norm", &self.workspaces[0].norm1_out, &[1, config.hidden_size], "decode");
 
         // LM head — write into workspace.logits
         let lm_head_weight = final_weights.lm_head.as_ref()
@@ -429,7 +423,7 @@ impl ForwardEngine {
             )?;
         }
 
-        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &self.workspaces[0].logits, &[1, config.vocab_size], "decode");
+        probe::dump(&final_stream, probe, config.num_hidden_layers - 1, 0, "final.logits", &self.workspaces[0].logits, &[1, config.vocab_size], "decode");
 
         // Debug logit dump (only when INFERS_DUMP_LOGITS is set)
         // @lat: [[lat.md/lat#Forward Engine#Logit Dump Debug Tool]]
