@@ -56,11 +56,13 @@ Combine ksplit and reduce into one kernel. Each block computes all K-splits for 
 
 Per-layer all-reduces have data dependency (residual add between attn and MLP AR). Cannot batch within a layer. Cross-layer pipeline overlap requires engine-level stream separation — deferred.
 
-### EXP-015: GDN decode memcpy elimination — DONE
+### EXP-015: GDN decode memcpy elimination — DONE, BUG FIXED
 
 Replaces 48 per-head repeat-interleave memcpy calls with a single CUDA kernel. Eliminates conv_out_last intermediate buffer. Reduces per-token memcpy calls from 55 to 7.
 
 Kernel `infers_repeat_interleave_bf16` in `common_kernels.rs` uses grid-stride pattern over `[seq_len, num_src_heads * kv_ratio, head_dim]`. q/k/v splits copy directly from conv_out via offset-based `copy_view_into`. Affects: `gdn.rs`, `common_kernels.rs`, `oxide_bridge.rs`, `workspace.rs`.
+
+**Bug (post-merge):** The `src_t` calculation in the kernel used `num_src_heads * head_dim` as the divisor instead of `num_dst_heads * head_dim`. This caused wrong source indexing when mapping DST layout `[seq_len, num_dst_heads, head_dim]` back to SRC layout `[seq_len, num_src_heads, head_dim]`. Fix: changed `num_src_heads` to `num_dst_heads` in the `src_t` divisor (line 284 of `common_kernels.rs`). Smoke test confirmed "Paris" decoded correctly after fix.
 
 ### EXP-016: v4_ksplit as production kernel
 

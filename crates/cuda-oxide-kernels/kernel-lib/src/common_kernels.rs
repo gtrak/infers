@@ -281,7 +281,7 @@ pub mod common {
             let dst_head = (i / head_dim as usize) % num_dst_heads;
             let src_head = dst_head / (kv_ratio as usize);
             let d = i % head_dim as usize;
-            let src_t = i / (num_src_heads as usize * (head_dim as usize));
+            let src_t = i / (num_dst_heads * (head_dim as usize));
             let src_idx = src_t * (num_src_heads as usize) * (head_dim as usize) + src_head * (head_dim as usize) + d;
             unsafe {
                 *dst.get_unchecked_mut(i) = src[src_idx];
