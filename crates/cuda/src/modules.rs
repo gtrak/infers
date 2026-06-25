@@ -31,6 +31,11 @@ impl KernelModules {
         let module = ctx.load_module_from_file(cubin_path)
             .map_err(|e| anyhow::anyhow!("Failed to load cubin {}: {:?}", cubin_path, e))?;
 
+        Self::from_module(module)
+    }
+
+    /// Construct from an already-loaded CudaModule (avoids loading the cubin twice).
+    pub fn from_module(module: Arc<CudaModule>) -> anyhow::Result<Self> {
         Ok(Self {
             common: infers_kernel_lib::common_kernels::common::from_module(module.clone())?,
             norm: infers_kernel_lib::norm_kernels::norm::from_module(module.clone())?,

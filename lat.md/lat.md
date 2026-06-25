@@ -5,6 +5,7 @@ This directory defines the high-level concepts, business logic, and architecture
 Other documentation files:
 - [[api]] — API types for the inference server
 - [[arch]] — workspace architecture and kernel build system
+- [[kernel-optimization]] — INT4 GEMM experiment tracking, baseline configs, and results
 - [[misc]] — tokenizer, MTP, FP8 quantization, tech debt fixes, phase deliverables
 - [[parallel]] — tensor parallelism and pipeline parallelism implementations
 - [[testing]] — reference tests, smoke tests, debugging analysis
