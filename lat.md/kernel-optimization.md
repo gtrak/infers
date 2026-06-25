@@ -6,6 +6,64 @@ Systematic record of kernel-level optimization experiments targeting 48ms→25ms
 
 INT4 decode at 48ms/token (20.8 tok/s). Target: 25ms/token (40 tok/s).
 
+## Nsight Systems Profile (EXP round 1)
+
+GPU kernel time breakdown from nsys profile (2× RTX 5060 Ti, 30 decode steps):
+
+| Kernel | Time % | Total (ms) | Instances | Avg (µs) | Med (µs) |
+|--------|--------|-----------|-----------|----------|----------|
+| `int4_gemm_v3_ksplit_sm` | **44.5%** | 1137.5 | 24,000 | 47.4 | 48.8 |
+| `int4_gemm_auto_round` | 16.8% | 428.9 | 800 | 536.1 | 522.4 |
+| `ncclDevKernel_AllReduce` | 14.7% | 375.9 | 7,936 | 47.4 | 20.9 |
+| `gemvx (cuBLASLt bf16)` | 7.6% | 193.9 | 5,790 | 33.5 | 3.5 |
+| `infers_gdn_recurrent_step` | 5.7% | 144.7 | 2,880 | 50.2 | 50.2 |
+| `infers_paged_attention_decode` | 4.1% | 105.3 | 960 | 109.7 | 115.9 |
+| `infers_gdn_gated_delta_prefill` | 2.0% | 50.1 | 96 | 522.0 | 523.1 |
+| `infers_rmsnorm_bf16` | 1.9% | 48.1 | 9,951 | 4.8 | 5.7 |
+| `reduce_partial_sums_bf16` | 1.2% | 30.5 | 24,000 | 1.3 | 1.3 |
+| All others | ~2.5% | ~65 | — | — | — |
+
+Per-step estimate (median, 56 layers, 2 GPUs): ~30ms kernel time + ~8ms overhead = 38ms/step.
+
+**Top bottlenecks:**
+1. **INT4 GEMM (ksplit+reduce) = 45.7%** — 49µs/call, ~400 calls/step = 19.6ms
+2. **NCCL AllReduce = 14.7%** — 7936 calls, ring latency
+3. **cuBLASLt BF16 GEMMs = 7.6%** — small projections (a_proj, b_proj)
+4. **GDN recurrent step = 5.7%** — 96 calls/step × 50µs = 4.8ms
+5. **Paged attention = 4.1%** — 32 calls/step × 110µs = 3.5ms
+
+## Round 2 Experiment Queue
+
+Based on nsys profile: INT4 GEMM dominates at 45.7%. NCCL is 14.7%. These two account for 60% of GPU time.
+
+### EXP-011: INT4 GEMM occupancy — K_SPLIT sweep
+
+Sweep K_SPLIT (1..56) to find optimal occupancy. Current K_SPLIT=28 gives 1792 threads per GEMM ≈ 3.5 SMs on RTX 5060 Ti.
+
+Hypothesis: lower K_SPLIT → fewer blocks → better cache locality but less parallelism. Optimal may differ from 28.
+
+### EXP-012: INT4 GEMM batch K-split — eliminate reduce kernel
+
+Batch N K-split calls into one kernel. Eliminates `reduce_partial_sums_bf16` (1.2%) and launch overhead.
+
+Affects: `int4_kernels.rs`, `oxide_bridge.rs`, `gemm_dispatch.rs`.
+
+### EXP-013: INT4 GEMM fused ksplit+reduce — single-kernel approach
+
+Combine ksplit and reduce into one kernel. Each block computes all K-splits for one output column, accumulates in registers, and writes final bf16 output directly. Eliminates partial_sums buffer allocation + reduce kernel. Affects: `int4_kernels.rs`.
+
+### EXP-014: NCCL AllReduce grouping — batched reduce
+
+The profile shows 7936 NCCL calls per 30 steps = 264 per step. These are likely individual small all-reduces. Batch them into fewer larger all-reduces to reduce ring latency overhead. Affects: `engine.rs`.
+
+### EXP-015: cuBLASLt bf16 GEMM → INT4 ksplit migration
+
+Small projections (a_proj, b_proj, conv) currently use cuBLASLt BF16 GEMM because weights may not be quantized. Check if these can use INT4 ksplit instead (7.6% of time). Affects: `gemm_dispatch.rs`.
+
+### EXP-016: INT4 GEMM v4_ksplit as production kernel
+
+The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. It had higher throughput in microbenchmarks but was not integrated. Evaluate for production use. Affects: `int4_kernels.rs`, `oxide_bridge.rs`.
+
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.
