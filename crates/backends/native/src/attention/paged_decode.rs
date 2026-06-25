@@ -12,7 +12,7 @@ use super::*;
 /// 4. Launch `infers_paged_attention_decode_bf16` for full decode attention
 /// 5. Apply O-projection to attention output
 pub fn decode_forward_paged(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &AttentionWeights,

@@ -30,6 +30,7 @@ pub mod quant;
 pub mod gemm_dispatch;
 pub mod gpu_cache;
 pub mod probe;
+pub mod resources;
 
 pub use engine::ForwardEngine;
 pub use gpu_cache::{CachedWeight, Int4GpuBuffers};

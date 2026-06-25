@@ -250,7 +250,7 @@ fn repeat_interleave_heads_into(
 /// GDN output `[seq_len × hidden_size]`
 #[allow(unused_assignments, clippy::too_many_arguments)]
   pub fn forward(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &GdnWeights,
@@ -507,7 +507,7 @@ fn repeat_interleave_heads_into(
 /// GDN decode forward with the correct Gated Delta Rule (single token).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_forward(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &GdnWeights,

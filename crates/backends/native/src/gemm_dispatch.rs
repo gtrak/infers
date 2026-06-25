@@ -39,7 +39,7 @@ use infers_cuda::{CudaSlice, CudaStream, OxideKernels};
 /// # Returns
 /// The output buffer (same `output` that was passed in).
 pub fn gemm_projection_cached(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     oxide: &OxideKernels,
     stream: &Arc<CudaStream>,
     cache: &crate::gpu_cache::GpuWeightCache,

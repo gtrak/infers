@@ -264,7 +264,7 @@ Run with `cargo test -- --nocapture`. Seven checkpoints: events recorded, pages 
 
 ## Paged Decode Path
 
-Paged decode: reads K/V from pages via block tables, single-token generation with paged attention kernels. Zero-allocation — intermediate buffers use pre-allocated [[lat.md/lat#Forward Engine#Decode Workspace]]. Extracted to a standalone `decode` module for file size reduction. See [[crates/backends/native/src/decode.rs]].
+Paged decode: reads K/V via block tables for single-token generation. Zero-allocation through pre-allocated workspace buffers. Accesses immutable resources through `Arc<GpuResources>` and mutable state from ForwardEngine. See [[crates/backends/native/src/decode.rs]].
 
 ### CUDA Graph Capture Diagnostics
 
@@ -276,7 +276,15 @@ Decode uses CUDA graph capture (step 0 warm-up, step 1 capture, step 2+ replay).
 
 ## Paged Decode Pipeline
 
-Async-friendly variant of [[lat.md/lat#Forward Engine#Paged Decode Path]]. Wraps GPU work in a cuda-async `DeviceOperation` pipeline via `value()`. Uses `SendPtr<T>` for crossing Send boundaries. Future iterations can decompose into per-layer `and_then` chains. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_paged_async]].
+Async variant of [[lat.md/lat#Forward Engine#Paged Decode Path]]. Uses `with_context` closure capturing `Arc<GpuResources>` (immutable) and `Arc<Mutex<DecodeState>>` (mutable). ForwardEngine temporarily moves mutable state into the Arc for async execution. See [[crates/backends/native/src/resources.rs#GpuResources]], [[crates/backends/native/src/resources.rs#DecodeState]], [[crates/backends/native/src/decode.rs#ForwardEngine#decode_paged_async]].
+
+## GpuResources and DecodeState Architecture
+
+`GpuResources` is an immutable struct holding shared GPU resources behind `Arc`. All fields are Send+Sync. Stored on ForwardEngine for cheap cloning across cuda-async closures. See [[crates/backends/native/src/resources.rs#GpuResources]].
+
+`DecodeState` holds mutable per-sequence state: workspaces, paged_kv_caches, gdn_states, and paged_kv_manager. During async decode, these are temporarily moved from ForwardEngine into an `Arc<Mutex<DecodeState>>`, used inside the closure, then restored afterward. See [[crates/backends/native/src/resources.rs#DecodeState]].
+
+The `gemm_projection_cached` function was changed from `&mut GemmEngine` to `&GemmEngine` since `matmul_bf16()` only needs immutable access. All downstream functions (`prefill`, `gdn::forward`, `gdn::decode_forward`, `attention::forward_paged`, `attention::decode_forward_paged`) follow this change, enabling GemmEngine behind Arc<GpuResources>.
 
 
 ## INT4 Triplet Upload

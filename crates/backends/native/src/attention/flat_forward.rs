@@ -33,7 +33,7 @@ use super::*;
 /// # Returns
 /// Attention output `[seq_len × hidden_size]`
 pub fn forward(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &AttentionWeights,

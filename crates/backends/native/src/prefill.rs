@@ -47,7 +47,7 @@ pub struct PrefillKernels {
 /// * `nccl` — NCCL communicator for TP=2 multi-GPU all-reduce
 /// * `group_size` — INT4 quantization group size (typically 128)
 pub fn prefill(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     kernels: &PrefillKernels,
     nccl: &NcclCommunicator,

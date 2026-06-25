@@ -15,7 +15,7 @@ use super::*;
 /// - Phase 2: Writes to paged cache via `infers_paged_kv_write_bf16` instead of flat buffer
 /// - Phase 3: Same per-head attention using the already-computed K/V buffers
 pub fn forward_paged(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     oxide: &OxideKernels,
     weights: &AttentionWeights,

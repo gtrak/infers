@@ -32,7 +32,7 @@ use infers_cuda::gemm::{GemmConfig, GemmEngine};
 /// # Returns
 /// Output tensor `[seq_len × hidden_size]`
 pub fn mlp_forward(
-    gemm: &mut GemmEngine,
+    gemm: &GemmEngine,
     stream: &Arc<CudaStream>,
     silu_kernel: &CudaFunction,
     gate_proj: &CudaSlice<bf16>,
