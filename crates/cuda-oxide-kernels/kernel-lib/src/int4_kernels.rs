@@ -507,8 +507,6 @@ pub mod int4 {
             partial_sums[split_idx * n_usize + col] = acc;
         }
     }
-
-    /// INT4 GEMM v4 with K-splitting — 128-bit LDG loads, 4 columns per thread.
     ///
     /// Each thread (16/block) handles 4 output columns. Weight loads are 128-bit
     /// ([u32;4]) and input loads are 128-bit ([u16;8]). Hardcodes transposed=1 layout.
