@@ -354,7 +354,7 @@ impl OxideKernels {
         eps: f32,
     ) -> anyhow::Result<()> {
         let num_rows = x.len() / hidden as usize;
-        let block_size = (hidden.min(256)) as u32;
+        let block_size = (hidden.min(512)) as u32;
 
         // Create CudaSliceViews wrapping the cudarc slices
         let x_view = CudaSliceView::new(&x, stream, &self.ctx);
@@ -392,7 +392,7 @@ impl OxideKernels {
         d: u32,
         eps: f32,
     ) -> anyhow::Result<()> {
-        let block_size = (d.min(256)) as u32;
+        let block_size = (d.min(512)) as u32;
 
         // Create CudaSliceViews wrapping the cudarc slices
         let input_view = CudaSliceView::new(&input, stream, &self.ctx);
@@ -429,7 +429,7 @@ impl OxideKernels {
         eps: f32,
     ) -> anyhow::Result<()> {
         let num_rows = input.len() as u32 / dim;
-        let block_size = (dim.min(256)) as u32;
+        let block_size = (dim.min(512)) as u32;
 
         // Create CudaSliceViews wrapping the cudarc slices
         let input_view = CudaSliceView::new(&input, stream, &self.ctx);

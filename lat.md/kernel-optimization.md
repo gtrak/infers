@@ -38,7 +38,7 @@ Kernel: `paged_attention_decode_bf16`. Change: cache K dot products from Phase 1
 
 Kernel: `gdn_recurrent_step_bf16`. Change: tile one head's state S[h,k,v] into shared memory instead of strided global memory access. Hypothesis: major latency reduction from register-speed state access. Affects: `gdn_kernels.rs`.
 
-### EXP-008: RMSNorm block size 512
+### EXP-008: RMSNorm block size 512 — DONE
 
 Kernel: `rmsnorm_bf16`. Change: increase `launch_bounds` from 256 to 512, halving per-thread iterations for hidden=5120. Hypothesis: ~15-20% improvement from better SM utilization. Affects: `norm_kernels.rs`.
 
@@ -76,4 +76,12 @@ Replaced scalar u16 loads with `[u16;4]` 8-byte vectorized loads in both SiLU ke
 
 - **Correctness**: Smoke test PASSED — correct output ("Paris")
 - **Latency**: 0.050s/step (vs 0.050s baseline) — no measurable improvement. SiLU kernels are likely not the bottleneck (compute-bound from libm::expf, not memory-bound).
+- **Status**: Integrated.
+
+### EXP-008: RMSNorm block size 512 — DONE
+
+Increased launch block size from 256 to 512 in all three norm kernels, with dynamic step sizes via `thread::blockDim_x()`.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
+- **Latency**: 0.049s/step (vs 0.049s baseline) — no measurable change. Norm kernels are already fast relative to the INT4 GEMM bottleneck.
 - **Status**: Integrated.

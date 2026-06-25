@@ -10,7 +10,7 @@ pub mod norm {
     /// RMSNorm: output = x * rsqrt(mean(x²) + eps) * (1 + weight)
     /// One block per row, shared memory tree reduction for sum-of-squares.
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(512)]
     pub fn infers_rmsnorm_bf16(
         x: &[u16],
         weight: &[u16],
@@ -24,13 +24,14 @@ pub mod norm {
         let tid = thread::threadIdx_x() as usize;
         let hidden_usize = hidden as usize;
 
-        // Dynamic shared memory for reduction buffer (256 f32s)
+        // Dynamic shared memory for reduction buffer (512 f32s)
         let smem = DynamicSharedArray::<f32>::get();
+        let block_dim = thread::blockDim_x() as usize;
 
         // Phase 1: partial sum-of-squares per thread
         let mut local_sum_sq: f32 = 0.0;
         let row_offset = row * hidden_usize;
-        for i in (tid..hidden_usize).step_by(256) {
+        for i in (tid..hidden_usize).step_by(block_dim) {
             let val = f32::from_bits((x[row_offset + i] as u32) << 16);
             local_sum_sq += val * val;
         }
@@ -39,7 +40,7 @@ pub mod norm {
         cuda_device::sync_threads();
 
         // Phase 2: halving reduction in shared memory
-        let mut s = 128u32;
+        let mut s = (block_dim / 2) as u32;
         while s > 0 {
             if tid < s as usize {
                 unsafe {
@@ -62,7 +63,7 @@ pub mod norm {
 
         // Phase 4: apply normalization — each thread handles its chunk
         let inv_rms = unsafe { *smem.add(0) };
-        for i in (tid..hidden_usize).step_by(256) {
+        for i in (tid..hidden_usize).step_by(block_dim) {
             let x_val = f32::from_bits((x[row_offset + i] as u32) << 16);
             let w_val = f32::from_bits((weight[i] as u32) << 16);
             let result = x_val * inv_rms * (1.0 + w_val);
@@ -73,7 +74,7 @@ pub mod norm {
     /// RMSNorm with SiLU gate: output = weight * x_norm * SiLU(gate)
     /// where x_norm = x * rsqrt(mean(x²) + eps) and SiLU(g) = g / (1 + exp(-g))
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(512)]
     pub fn infers_rms_norm_gated_bf16(
         input: &[u16],
         gate: &[u16],
@@ -94,7 +95,7 @@ pub mod norm {
         // Phase 1: partial sum-of-squares per thread
         let mut local_sum_sq: f32 = 0.0;
         let row_offset = row * d_usize;
-        for i in (tid..d_usize).step_by(256) {
+        for i in (tid..d_usize).step_by(thread::blockDim_x() as usize) {
             let val = f32::from_bits((input[row_offset + i] as u32) << 16);
             local_sum_sq += val * val;
         }
@@ -124,7 +125,7 @@ pub mod norm {
 
         // Phase 4: apply normalization and SiLU gate
         let inv_rms = unsafe { *smem.add(0) };
-        for i in (tid..d_usize).step_by(256) {
+        for i in (tid..d_usize).step_by(thread::blockDim_x() as usize) {
             let x_val = f32::from_bits((input[row_offset + i] as u32) << 16);
             let g_val = f32::from_bits((gate[row_offset + i] as u32) << 16);
             let w_val = f32::from_bits((weight[i] as u32) << 16);
@@ -137,7 +138,7 @@ pub mod norm {
 
     /// L2 norm: output[i] = input[i] / sqrt(sum(input²) + eps) per row
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(512)]
     pub fn infers_l2norm_bf16(
         input: &[u16],
         mut output: DisjointSlice<u16>,
@@ -155,7 +156,7 @@ pub mod norm {
         // Phase 1: partial sum-of-squares per thread
         let mut local_sum_sq: f32 = 0.0;
         let row_offset = row * dim_usize;
-        for i in (tid..dim_usize).step_by(256) {
+        for i in (tid..dim_usize).step_by(thread::blockDim_x() as usize) {
             let val = f32::from_bits((input[row_offset + i] as u32) << 16);
             local_sum_sq += val * val;
         }
@@ -186,7 +187,7 @@ pub mod norm {
 
         // Phase 4: apply normalization
         let inv_norm = unsafe { *smem.add(0) };
-        for i in (tid..dim_usize).step_by(256) {
+        for i in (tid..dim_usize).step_by(thread::blockDim_x() as usize) {
             let val = f32::from_bits((input[row_offset + i] as u32) << 16);
             let result = val * inv_norm;
             unsafe { *output.get_unchecked_mut(row_offset + i) = f32_to_bf16(result); }
