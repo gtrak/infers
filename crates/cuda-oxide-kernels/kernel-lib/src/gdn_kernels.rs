@@ -89,35 +89,28 @@ pub mod gdn {
 
         let state_base = h * K * V + v;
 
-        // Step 1: State decay (no key/query needed)
-        for k in 0..K {
-            state[state_base + k * V] *= decay;
-        }
-
-        // Step 2: kv_mem = sum_k S[h][k][v] * key_normed[h][k] (from smem)
+        // Step 1+2: Merged decay + kv_mem accumulation (1 read + 1 write per K)
         let mut kv_mem = 0.0f32;
         for k in 0..K {
             let s_val = state[state_base + k * V];
+            let s_decayed = s_val * decay;
+            state[state_base + k * V] = s_decayed;
             let k_val = unsafe { *smem_key.add(k) } * k_rcp;
-            kv_mem += s_val * k_val;
+            kv_mem += s_decayed * k_val;
         }
 
         // Step 3: delta = beta * (value - kv_mem)
         let v_val = f32::from_bits((value[h * V + v] as u32) << 16);
         let delta = beta_val * (v_val - kv_mem);
 
-        // Step 4: State update (from smem)
-        for k in 0..K {
-            let k_val = unsafe { *smem_key.add(k) } * k_rcp;
-            state[state_base + k * V] += k_val * delta;
-        }
-
-        // Step 5: Output (from smem)
+        // Step 4+5: Merged state update + output accumulation (1 read + 1 write per K)
         let mut y_val = 0.0f32;
         for k in 0..K {
-            let s_val = state[state_base + k * V];
+            let k_val = unsafe { *smem_key.add(k) } * k_rcp;
+            let s_updated = state[state_base + k * V] + k_val * delta;
+            state[state_base + k * V] = s_updated;
             let q_val = unsafe { *smem_query.add(k) } * q_rcp;
-            y_val += s_val * q_val;
+            y_val += s_updated * q_val;
         }
 
         unsafe { *output.get_unchecked_mut(h * V + v) = f32_to_bf16(y_val); }

@@ -30,10 +30,9 @@ Replace scalar u16 loads with `[u16;4]` 8-byte vectorized loads (4 bf16 at once)
 
 Kernel: `paged_attention_decode_bf16`. Change: cache K dot products from Phase 1 so Phase 2 doesn't re-read K from global memory. Hypothesis: ~2x KV bandwidth saved. Affects: `attention_kernels.rs`.
 
-### EXP-007: GDN shared memory state tiling
+### EXP-007: GDN recurrent step loop merging — DONE
 
-Kernel: `gdn_recurrent_step_bf16`. Change: tile one head's state S[h,k,v] into shared memory instead of strided global memory access. Hypothesis: major latency reduction from register-speed state access. Affects: `gdn_kernels.rs`.
-
+Merge state decay+kv_mem and state update+output into single loops, cutting global memory reads by half. Affects: `gdn_kernels.rs`.
 ### EXP-008: RMSNorm block size 512 — DONE
 
 Kernel: `rmsnorm_bf16`. Change: increase `launch_bounds` from 256 to 512, halving per-thread iterations for hidden=5120. Hypothesis: ~15-20% improvement from better SM utilization. Affects: `norm_kernels.rs`.
@@ -124,3 +123,10 @@ One block per head (128 threads tiling v_dim). Cooperative load of key and query
 - **Correctness**: Smoke test PASSED — correct output (30 tokens decoded)
 - **Latency**: 0.038s/step (vs prior baseline to be measured). Key saved: ~512 global reads per head eliminated (K×2 across steps 2,4). Query saved: ~256 global reads per head eliminated (K across step 5).
 - **Status**: Integrated. `#[launch_bounds(128)]`, `DynamicSharedArray::<f32>` for key+query. Launch config updated in `oxide_bridge.rs` with 2D grid and shared memory allocation.
+### EXP-007: GDN recurrent step loop merging — DONE
+
+Merged Steps 1+2 (decay + kv_mem) and Steps 4+5 (update + output) into single loops, using register-held `s_decayed`/`s_updated` instead of re-reading global memory. State reads reduced from 4 to 2 per K element.
+
+- **Correctness**: Smoke test PASSED — correct output (30 tokens decoded)
+- **Latency**: 0.038s/step (vs 0.038s post-EXP-003 baseline) — no measurable change at this stage; the pipeline remains INT4 GEMM bound, but global memory traffic for state is cut by 50%.
+- **Status**: Integrated.
