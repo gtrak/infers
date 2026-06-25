@@ -1101,6 +1101,8 @@ pub fn decode_forward_paged(
     ws: &mut crate::workspace::AttnWorkspace,   // attention workspace buffers
     output: &mut CudaSlice<bf16>,                // writes into workspace.attn_out
     partial_sums_buf: &mut Option<&mut CudaSlice<f32>>, // pre-allocated partial sums for K-split (mutable ref to allow reuse across calls)
+    rope_position_staging: &mut CudaSlice<i32>, // pre-allocated staging buffer for RoPE positions (zero-alloc)
+    position_i32: &[i32],                      // host-side position as i32
 ) -> Result<()> {
     let per_gpu_head_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -1149,35 +1151,42 @@ pub fn decode_forward_paged(
     // Apply RoPE to K — must do inside each branch to get the right mutable reference
     if k_norm_exists {
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &ws.k_norm_out, &[1, kv_dim], "decode");
-        rope::apply_rope(
-            stream,
-            oxide,
-            &mut ws.q_dummy,
-            &mut ws.k_norm_out,
-            &[position],
-            num_kv_heads as i32,
-            head_dim,
-            rope_theta,
-            partial_rotary_factor,
-            cached_cos,
-            cached_sin,
-        )?;
+        // Use staging buffer for RoPE positions when cached tables available (zero-alloc)
+        match (cached_cos, cached_sin) {
+            (Some(cos), Some(sin)) => {
+                rope::apply_rope_with_staging(
+                    stream, oxide, &mut ws.q_dummy, &mut ws.k_norm_out,
+                    position_i32, rope_position_staging,
+                    num_kv_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                )?;
+            }
+            _ => {
+                rope::apply_rope(
+                    stream, oxide, &mut ws.q_dummy, &mut ws.k_norm_out,
+                    &[position], num_kv_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                    cached_cos, cached_sin,
+                )?;
+            }
+        }
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &ws.k_norm_out, &[1, kv_dim], "decode");
     } else {
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_before_rope", &ws.k_single, &[1, kv_dim], "decode");
-        rope::apply_rope(
-            stream,
-            oxide,
-            &mut ws.q_dummy,
-            &mut ws.k_single,
-            &[position],
-            num_kv_heads as i32,
-            head_dim,
-            rope_theta,
-            partial_rotary_factor,
-            cached_cos,
-            cached_sin,
-        )?;
+        match (cached_cos, cached_sin) {
+            (Some(cos), Some(sin)) => {
+                rope::apply_rope_with_staging(
+                    stream, oxide, &mut ws.q_dummy, &mut ws.k_single,
+                    position_i32, rope_position_staging,
+                    num_kv_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                )?;
+            }
+            _ => {
+                rope::apply_rope(
+                    stream, oxide, &mut ws.q_dummy, &mut ws.k_single,
+                    &[position], num_kv_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                    cached_cos, cached_sin,
+                )?;
+            }
+        }
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.k_after_rope", &ws.k_single, &[1, kv_dim], "decode");
     }
 
@@ -1247,33 +1256,38 @@ pub fn decode_forward_paged(
             false
         };
 
-        // Apply RoPE to Q — inside branch for mutable access
-        if q_norm_exists {
-            rope::apply_rope(
-                stream,
-                oxide,
-                &mut ws.q_norm_out,
-                &mut ws.k_rope_dummy,
-                &[position],
-                num_heads as i32,
-                head_dim,
-                rope_theta,
-                partial_rotary_factor,
-                cached_cos, cached_sin,
-            )?;
-        } else {
-            rope::apply_rope(
-                stream,
-                oxide,
-                &mut ws.q_buf,
-                &mut ws.k_rope_dummy,
-                &[position],
-                num_heads as i32,
-                head_dim,
-                rope_theta,
-                partial_rotary_factor,
-                cached_cos, cached_sin,
-            )?;
+        // Apply RoPE to Q — inside branch for mutable access (zero-alloc via staging)
+        match (cached_cos, cached_sin) {
+            (Some(cos), Some(sin)) => {
+                if q_norm_exists {
+                    rope::apply_rope_with_staging(
+                        stream, oxide, &mut ws.q_norm_out, &mut ws.k_rope_dummy,
+                        position_i32, rope_position_staging,
+                        num_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                    )?;
+                } else {
+                    rope::apply_rope_with_staging(
+                        stream, oxide, &mut ws.q_buf, &mut ws.k_rope_dummy,
+                        position_i32, rope_position_staging,
+                        num_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                    )?;
+                }
+            }
+            _ => {
+                if q_norm_exists {
+                    rope::apply_rope(
+                        stream, oxide, &mut ws.q_norm_out, &mut ws.k_rope_dummy,
+                        &[position], num_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                        cached_cos, cached_sin,
+                    )?;
+                } else {
+                    rope::apply_rope(
+                        stream, oxide, &mut ws.q_buf, &mut ws.k_rope_dummy,
+                        &[position], num_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                        cached_cos, cached_sin,
+                    )?;
+                }
+            }
         }
 
         // Phase 4: Paged attention decode — scores, softmax, V accumulation in one kernel
@@ -1328,33 +1342,38 @@ pub fn decode_forward_paged(
             false
         };
 
-        // Apply RoPE to Q — inside branch for mutable access
-        if q_norm_exists {
-            rope::apply_rope(
-                stream,
-                oxide,
-                &mut ws.q_norm_out,
-                &mut ws.k_rope_dummy,
-                &[position],
-                num_heads as i32,
-                head_dim,
-                rope_theta,
-                partial_rotary_factor,
-                cached_cos, cached_sin,
-            )?;
-        } else {
-            rope::apply_rope(
-                stream,
-                oxide,
-                &mut ws.q_full,
-                &mut ws.k_rope_dummy,
-                &[position],
-                num_heads as i32,
-                head_dim,
-                rope_theta,
-                partial_rotary_factor,
-                cached_cos, cached_sin,
-            )?;
+        // Apply RoPE to Q — inside branch for mutable access (zero-alloc via staging)
+        match (cached_cos, cached_sin) {
+            (Some(cos), Some(sin)) => {
+                if q_norm_exists {
+                    rope::apply_rope_with_staging(
+                        stream, oxide, &mut ws.q_norm_out, &mut ws.k_rope_dummy,
+                        position_i32, rope_position_staging,
+                        num_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                    )?;
+                } else {
+                    rope::apply_rope_with_staging(
+                        stream, oxide, &mut ws.q_full, &mut ws.k_rope_dummy,
+                        position_i32, rope_position_staging,
+                        num_heads as i32, head_dim, cos, sin, partial_rotary_factor,
+                    )?;
+                }
+            }
+            _ => {
+                if q_norm_exists {
+                    rope::apply_rope(
+                        stream, oxide, &mut ws.q_norm_out, &mut ws.k_rope_dummy,
+                        &[position], num_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                        cached_cos, cached_sin,
+                    )?;
+                } else {
+                    rope::apply_rope(
+                        stream, oxide, &mut ws.q_full, &mut ws.k_rope_dummy,
+                        &[position], num_heads as i32, head_dim, rope_theta, partial_rotary_factor,
+                        cached_cos, cached_sin,
+                    )?;
+                }
+            }
         }
 
         // Phase 4: Paged attention decode — scores, softmax, V accumulation in one kernel

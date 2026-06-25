@@ -117,3 +117,50 @@ pub fn apply_rope(
 
     Ok(())
 }
+
+/// Apply RoPE using a pre-allocated position staging buffer (zero-alloc variant).
+///
+/// Writes the position into the provided staging buffer via `memcpy_htod` instead
+/// of allocating a new device buffer each step. Requires cached cos/sin tables.
+/// Used in the decode path for CUDA-graph compatibility.
+///
+/// # Arguments
+/// * `stream` — CUDA stream
+/// * `oxide` — Loaded OxideKernels bridge handle for `infers_rope_bf16`
+/// * `q` — Query tensor, modified in-place
+/// * `k` — Key tensor, modified in-place
+/// * `position_i32` — Host-side position as i32 (single element for decode)
+/// * `positions_gpu` — Pre-allocated staging buffer on device (at least 1 element)
+/// * `num_heads` — Number of attention heads
+/// * `head_dim` — Per-head dimension
+/// * `cos_gpu` — Pre-computed cos table on GPU
+/// * `sin_gpu` — Pre-computed sin table on GPU
+/// * `partial_rotary_factor` — Fraction of head_dim to apply RoPE to
+pub fn apply_rope_with_staging(
+    stream: &Arc<CudaStream>,
+    oxide: &OxideKernels,
+    q: &mut CudaSlice<bf16>,
+    k: &mut CudaSlice<bf16>,
+    position_i32: &[i32],
+    positions_gpu: &mut CudaSlice<i32>,
+    num_heads: i32,
+    head_dim: usize,
+    cos_gpu: &CudaSlice<f32>,
+    sin_gpu: &CudaSlice<f32>,
+    partial_rotary_factor: f32,
+) -> Result<()> {
+    anyhow::ensure!(!position_i32.is_empty(), "Position must not be empty");
+
+    let rotary_dim = (head_dim as f32 * partial_rotary_factor) as usize;
+
+    // Write position into pre-allocated staging buffer (no allocation)
+    stream.memcpy_htod(position_i32, positions_gpu)
+        .map_err(|e| anyhow::anyhow!("Failed to copy position to staging buffer: {e}"))?;
+
+    oxide.launch_rope_bf16(
+        stream, q, k, cos_gpu, sin_gpu, positions_gpu,
+        position_i32.len() as u32, num_heads as u32, head_dim as u32, rotary_dim as u32,
+    )?;
+
+    Ok(())
+}

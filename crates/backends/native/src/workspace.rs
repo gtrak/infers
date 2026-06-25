@@ -52,10 +52,24 @@ pub struct DecodeWorkspace {
     /// Pre-allocated f32 buffer for K-split GEMM partial sums. Sized for K_SPLIT=28 × sharded_intermediate (max decode-loop N).
     /// Reused by every decode GEMM. The ksplit kernels write every position unconditionally, so no per-call memset is needed — only an alloc at engine init.
     pub partial_sums: CudaSlice<f32>,
+    /// Partial sums buffer for LM head GEMM. Sized for K_SPLIT × vocab_size (f32).
+    /// Allocated separately because vocab_size >> sharded_intermediate.
+    pub lm_head_partial_sums: CudaSlice<f32>,
     /// GDN-specific workspace buffers (allocated once, reused every GDN layer).
     pub gdn: GdnWorkspace,
     /// Attention-specific workspace buffers (allocated once, reused every attention layer).
     pub attn: AttnWorkspace,
+    // ── H2D staging buffers (pre-allocated, written each step via memcpy_htod) ──
+    /// Pre-allocated embedding output buffer [hidden_size] bf16. Replaces per-step alloc_zeros in embed_tokens.
+    pub embed_out: CudaSlice<bf16>,
+    /// Pre-allocated device staging buffer for token IDs [1] i32. Replaces per-step clone_htod in embed_tokens.
+    pub token_ids_staging: CudaSlice<i32>,
+    /// Pre-allocated device staging buffer for position [1] i32. Replaces per-step clone_htod for attention position uploads.
+    pub position_staging: CudaSlice<i32>,
+    /// Pre-allocated device staging buffer for RoPE positions [1] i32. Replaces per-step clone_htod in rope::apply_rope.
+    pub rope_position_staging: CudaSlice<i32>,
+    /// Pre-allocated device staging buffer for block table [max_pages] i32. Replaces per-step clone_htod for paged attention.
+    pub block_table_staging: CudaSlice<i32>,
 }
 
 impl DecodeWorkspace {
@@ -77,6 +91,10 @@ impl DecodeWorkspace {
         num_gpus: usize,
     ) -> Result<Self> {
         const K_SPLIT: u32 = 20;
+        // Upper bound for block table staging: with page_size=1, every position gets its own page.
+        // In practice page_size >= 8, so this is generously oversized but safe and avoids
+        // needing page_size at workspace init time (it's only known after init_paged).
+        let max_pages_upper_bound = config.max_position_embeddings;
         Ok(Self {
             norm1_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             norm2_out: stream.alloc_zeros::<bf16>(hidden_size)?,
@@ -88,8 +106,15 @@ impl DecodeWorkspace {
             logits: stream.alloc_zeros::<bf16>(vocab_size)?,
             attn_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             partial_sums: stream.alloc_zeros::<f32>((K_SPLIT as usize) * sharded_intermediate)?,
+            lm_head_partial_sums: stream.alloc_zeros::<f32>((K_SPLIT as usize) * vocab_size)?,
             gdn: GdnWorkspace::new(stream, config, num_gpus)?,
             attn: AttnWorkspace::new(stream, config, num_gpus)?,
+            // Staging buffers for H2D transfers (zero-alloc during decode)
+            embed_out: stream.alloc_zeros::<bf16>(hidden_size)?,
+            token_ids_staging: stream.alloc_zeros::<i32>(1)?,
+            position_staging: stream.alloc_zeros::<i32>(1)?,
+            rope_position_staging: stream.alloc_zeros::<i32>(1)?,
+            block_table_staging: stream.alloc_zeros::<i32>(max_pages_upper_bound)?,
         })
     }
 }

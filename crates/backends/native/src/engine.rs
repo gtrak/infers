@@ -965,14 +965,20 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             let bt: Vec<i32> = mgr.block_table(seq_id)?.iter().map(|p| *p as i32).collect();
             (ps, cached, bt)
         };
-        let position_i32 = vec![position as i32];
+        let position_i32 = [position as i32];
 
-        let mut block_tables_gpu: Vec<CudaSlice<i32>> = Vec::new();
-        let mut positions_gpu_vec: Vec<CudaSlice<i32>> = Vec::new();
+        // Write block table and position into pre-allocated staging buffers on each GPU (zero-alloc)
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            block_tables_gpu.push(gpu_stream.clone_htod(&block_table_i32)?);
-            positions_gpu_vec.push(gpu_stream.clone_htod(&position_i32)?);
+            let ws = &mut self.workspaces[gpu_idx];
+
+            // Write block table into staging buffer via memcpy_htod
+            gpu_stream.memcpy_htod(&block_table_i32, &mut ws.block_table_staging)
+                .map_err(|e| anyhow::anyhow!("Failed to copy block table to staging: {e}"))?;
+
+            // Write position into staging buffer via memcpy_htod
+            gpu_stream.memcpy_htod(&position_i32, &mut ws.position_staging)
+                .map_err(|e| anyhow::anyhow!("Failed to copy position to staging: {e}"))?;
         }
 
         // Ensure page pools allocated on each GPU
@@ -982,7 +988,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
         }
 
-        // Embed single token on each GPU
+        // Embed single token on each GPU — using pre-allocated staging + output buffers (zero-alloc)
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
@@ -991,12 +997,19 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
             let embed_table = self.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
                 .ok_or_else(|| anyhow::anyhow!("Embedding weight '{}' not in cache", embed_weight.name))?;
-            let h = crate::embedding::embed_tokens(
-                &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &[token_id], &embed_table,
-                config.hidden_size, config.vocab_size,
-            )?;
-            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &h, &[1, config.hidden_size], "decode");
-            hidden_states.push(h);
+
+            // Convert token_id to i32 and write into staging buffer, then embed into ws.embed_out
+            let token_ids_i32 = [token_id as i32];
+            {
+                let ws = &mut self.workspaces[gpu_idx];
+                crate::embedding::embed_tokens_into(
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide, &embed_table,
+                    &token_ids_i32, &mut ws.token_ids_staging, &mut ws.embed_out,
+                    1, config.hidden_size,
+                )?;
+            }
+            probe::dump(&gpu_stream, &probe, usize::MAX, gpu_idx, "embed.output", &self.workspaces[gpu_idx].embed_out, &[1, config.hidden_size], "decode");
+            hidden_states.push(self.workspaces[gpu_idx].embed_out.clone());
         }
 
         // Per-GPU sharded head counts
@@ -1080,7 +1093,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                                 &self.per_gpu_kernels[gpu_idx].oxide,
                                 attn_weights, &ws.norm1_out,
                                 &mut self.paged_kv_caches[gpu_idx][layer_idx],
-                                &block_tables_gpu[gpu_idx], &positions_gpu_vec[gpu_idx],
+                                &ws.block_table_staging, &ws.position_staging,
                                 position, num_cached_tokens,
                                 head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
                                 config.rope_theta, config.partial_rotary_factor,
@@ -1094,6 +1107,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                                 self.rope_sin.as_ref().map(|v| &v[gpu_idx]),
                                 &mut ws.attn, &mut ws.attn_out,
                                 &mut ps,
+                                &mut ws.rope_position_staging,
+                                &position_i32,
                             )?;
                         }
                     }
@@ -1264,7 +1279,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
         {
             let ws = &mut self.workspaces[0];
-            let mut _ps = None; // vocab too big for pre-allocated buffer
+            let mut lm_head_ps = Some(&mut ws.lm_head_partial_sums);
             crate::gemm_dispatch::gemm_projection_cached(
                 &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
                 &self.weight_caches[0],
@@ -1272,7 +1287,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 &ws.norm1_out, &mut ws.logits,
                 1, config.vocab_size, config.hidden_size,
                 self.group_size,
-                &mut _ps,
+                &mut lm_head_ps,
             )?;
         }
 

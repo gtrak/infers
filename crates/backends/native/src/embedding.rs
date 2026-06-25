@@ -54,3 +54,41 @@ pub fn embed_tokens(
 
     Ok(output)
 }
+
+/// Gather embeddings into a pre-allocated output buffer (zero-alloc variant).
+///
+/// Writes token IDs into the provided staging buffer via `memcpy_htod`, then
+/// launches the embedding gather kernel into the pre-allocated output buffer.
+/// Replaces per-step `clone_htod` and `alloc_zeros` calls in the decode path,
+/// making it CUDA-graph compatible.
+///
+/// # Arguments
+/// * `stream` — CUDA stream to enqueue the kernel on
+/// * `oxide` — Loaded OxideKernels bridge handle for `infers_embedding_gather_bf16`
+/// * `embedding_table` — GPU-resident embedding matrix `[vocab_size × hidden_size]`
+/// * `token_ids_i32` — Host-side token IDs as i32 (single element for decode)
+/// * `token_ids_gpu` — Pre-allocated staging buffer on device (must be at least token_ids_i32.len())
+/// * `output` — Pre-allocated output buffer `[seq_len × hidden_size]`
+/// * `seq_len` — Number of tokens to embed (1 for decode)
+/// * `hidden_size` — Dimension of each embedding vector
+pub fn embed_tokens_into(
+    stream: &Arc<CudaStream>,
+    oxide: &OxideKernels,
+    embedding_table: &CudaSlice<bf16>,
+    token_ids_i32: &[i32],
+    token_ids_gpu: &mut CudaSlice<i32>,
+    output: &mut CudaSlice<bf16>,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    anyhow::ensure!(seq_len > 0, "seq_len must be > 0");
+    anyhow::ensure!(!token_ids_i32.is_empty(), "Token IDs must not be empty");
+
+    // Write token IDs into pre-allocated staging buffer (no allocation)
+    stream.memcpy_htod(token_ids_i32, token_ids_gpu)
+        .map_err(|e| anyhow::anyhow!("Failed to copy token IDs to staging buffer: {e}"))?;
+
+    oxide.launch_embedding_gather_bf16(stream, embedding_table, token_ids_gpu, output, seq_len as u32, hidden_size as u32)?;
+
+    Ok(())
+}
