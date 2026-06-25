@@ -141,10 +141,16 @@ pub mod attention {
             let mut local_max: f32 = f32::NEG_INFINITY;
             let mut local_sum: f32 = 0.0;
 
+            let mut prev_logical_page: usize = usize::MAX;
+            let mut cached_physical_page: usize = 0;
             for token_pos in (tid as usize..num_cached_tokens as usize).step_by(bdim) {
                 let logical_page = token_pos / page_size as usize;
                 let token_in_page = token_pos % page_size as usize;
-                let physical_page = block_table[logical_page] as usize;
+                if logical_page != prev_logical_page {
+                    cached_physical_page = block_table[logical_page] as usize;
+                    prev_logical_page = logical_page;
+                }
+                let physical_page = cached_physical_page;
 
                 let mut dot: f32 = 0.0;
                 for d in 0..head_dim as usize {
@@ -209,10 +215,16 @@ pub mod attention {
             // applies softmax weight, and stores the result. This avoids head_dim
             // redundant K reads per token in Phase 2.
             let weights_base = 3 * bdim;
+            let mut prev_logical_page_1b: usize = usize::MAX;
+            let mut cached_physical_page_1b: usize = 0;
             for token_pos in (tid as usize..num_cached_tokens as usize).step_by(bdim) {
                 let logical_page = token_pos / page_size as usize;
                 let token_in_page = token_pos % page_size as usize;
-                let physical_page = block_table[logical_page] as usize;
+                if logical_page != prev_logical_page_1b {
+                    cached_physical_page_1b = block_table[logical_page] as usize;
+                    prev_logical_page_1b = logical_page;
+                }
+                let physical_page = cached_physical_page_1b;
 
                 let mut dot: f32 = 0.0;
                 for d in 0..head_dim as usize {
@@ -236,10 +248,16 @@ pub mod attention {
             // ================================================================
             if tid < head_dim as usize {
                 let mut out_val: f32 = 0.0;
+                let mut prev_logical_page_2: usize = usize::MAX;
+                let mut cached_physical_page_2: usize = 0;
                 for token_pos in 0..num_cached_tokens as usize {
                     let logical_page = token_pos / page_size as usize;
                     let token_in_page = token_pos % page_size as usize;
-                    let physical_page = block_table[logical_page] as usize;
+                    if logical_page != prev_logical_page_2 {
+                        cached_physical_page_2 = block_table[logical_page] as usize;
+                        prev_logical_page_2 = logical_page;
+                    }
+                    let physical_page = cached_physical_page_2;
 
                     let weight = unsafe { *smem.add(weights_base + token_pos) };
                     let v_off = physical_page * page_stride

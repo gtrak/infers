@@ -46,9 +46,9 @@ Kernel: `rmsnorm_bf16`. Change: increase `launch_bounds` from 256 to 512, halvin
 
 Replace all `libm::expf` calls with Schraudolph bit-manip trick (~0.3% error). 39 call sites across 5 kernel files.
 
-### EXP-010: Paged attention block table hoisting
+### EXP-010: Paged attention block table hoisting — DONE
 
-Kernel: `paged_attention_decode_bf16`. Change: cache physical_page across consecutive token positions sharing the same logical page in Phase 2. Hypothesis: moderate reduction in redundant block table lookups. Affects: `attention_kernels.rs`.
+Cache `physical_page` across consecutive token positions sharing the same logical page in Phase 1, Phase 1b, and Phase 2. Eliminates 15/16 redundant `block_table` reads per phase for page_size=16.
 
 ## Results
 
@@ -111,3 +111,11 @@ Added Phase 1b: after Phase 1's block reduction, each thread re-iterates its tok
 - **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded). Internal unit test PASS (CPU reference match).
 - **Latency**: 0.039s/step (vs 0.039s baseline) — no measurable change at this workload. For Qwen3.6-27B (head_dim=128, bdim=128, ~512 cached tokens), K reads drop from ~66K to ~1K (98.5% reduction). The lack of speedup suggests K bandwidth is not the bottleneck at current workload sizes.
 - **Status**: Integrated. Shared memory increased in `oxide_bridge.rs` launch wrapper.
+
+### EXP-010: Paged attention block table hoisting — DONE
+
+Cached `physical_page` across consecutive positions sharing the same logical page in Phase 1, 1b, and 2. Three separate `prev_logical_page`/`cached_physical_page` pairs.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
+- **Latency**: 25.96s total (same run) — no measurable change. Block table reads are a tiny fraction of total memory traffic.
+- **Status**: Integrated.
