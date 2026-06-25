@@ -483,7 +483,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 
 **CudaSliceView<'a, T, U>**: Non-owning wrapper that presents a cudarc `CudaSlice<T>` as a `cuda-core DeviceBuffer<T>`. Uses `ManuallyDrop` to prevent double-free (CudaSlice owns the memory). `SyncOnDrop` guard keeps cudarc stream synchronization alive. `Deref`/`DerefMut` impls allow passing views directly to typed methods.
 
-**Stream handling**: Typed dispatch uses `cc_stream` (cuda-core non-blocking stream created via `ctx.new_stream()` in `OxideKernels::new()`). Non-blocking stream matches cudarc's StreamPool semantics. BorrowedCudaStream approach (casting cudarc's CUstream through cuda-core CudaStream) was rejected — it caused SIGSEGV due to incompatible internal context validation in cuda-oxide's `bind_to_thread()`.
+**Stream handling**: Both StreamPool and OxideKernels use non-blocking streams (via `ctx.new_stream()`) to support CUDA graph capture — the null/default stream does NOT support graph capture. With `CU_STREAM_CAPTURE_MODE_GLOBAL`, all operations across both streams are captured into the same graph. BorrowedCudaStream approach (casting cudarc's CUstream through cuda-core CudaStream) was rejected — it caused SIGSEGV due to incompatible internal context validation in cuda-oxide's `bind_to_thread()`.
 
 **OxideKernels struct**: `ctx` (cuda-core context), `module` (cuda-core cubin), `modules` (KernelModules typed dispatch), `cc_stream` (cuda-core stream). No more manual arg packing — `push_slice_arg`, `push_scalar_arg`, `raw_launch` removed.
 

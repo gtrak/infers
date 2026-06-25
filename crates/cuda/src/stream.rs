@@ -15,6 +15,9 @@ impl StreamPool {
     /// (also the null stream) shares the same stream and operations are ordered
     /// FIFO. Non-blocking streams would NOT synchronize with the null stream,
     /// causing race conditions between cudarc and cuda-core kernel launches.
+    ///
+    /// CUDA graph capture uses GLOBAL capture mode which captures operations
+    /// from ALL streams, including the null stream.
     pub fn new(contexts: &[std::sync::Arc<CudaContext>]) -> anyhow::Result<Self> {
         let mut streams = Vec::with_capacity(contexts.len());
         for ctx in contexts {

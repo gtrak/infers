@@ -266,6 +266,14 @@ Run with `cargo test -- --nocapture`. Seven checkpoints: events recorded, pages 
 
 Paged decode: reads K/V from pages via block tables, single-token generation with paged attention kernels. Zero-allocation — intermediate buffers use pre-allocated [[lat.md/lat#Forward Engine#Decode Workspace]]. Extracted to a standalone `decode` module for file size reduction. See [[crates/backends/native/src/decode.rs]].
 
+### CUDA Graph Capture Diagnostics
+
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` was caused by null streams — fixed by switching to non-blocking streams via `ctx.new_stream()` and using `CU_STREAM_CAPTURE_MODE_GLOBAL`.
+
+Diagnostics print the stream capture status before and after each compute phase. Checkpoints: before `begin_capture` on each GPU, and after all kernel execution on each GPU. See [[crates/backends/native/src/decode.rs]].
+
+Decode uses CUDA graph capture (step 0 warm-up, step 1 capture, step 2+ replay). Diagnostics check whether warm-up left the stream in a capturing state incompatible with `begin_capture`.
+
 ## INT4 Triplet Upload
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].

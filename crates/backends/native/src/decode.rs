@@ -5,7 +5,7 @@ use half::bf16;
 use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
-use infers_cuda::{CudaContext, CudaSlice, CudaStream};
+use infers_cuda::{CudaContext, CudaGraph, CudaSlice, CudaStream};
 use infers_cuda::{group_end, group_start};
 use infers_model::LayerType;
 
@@ -49,27 +49,6 @@ impl ForwardEngine {
         let span = tracing::info_span!("decode");
         let _enter = span.enter();
         let num_gpus = self.metadata.len();
-
-        // GPU timing: create events on each GPU's context
-        let gpu_start_events: Vec<_> = (0..num_gpus)
-            .map(|gpu_idx| {
-                let ctx = self.streams.get(gpu_idx).unwrap().context();
-                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU start event for GPU {gpu_idx}: {:?}", e))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let gpu_end_events: Vec<_> = (0..num_gpus)
-            .map(|gpu_idx| {
-                let ctx = self.streams.get(gpu_idx).unwrap().context();
-                ctx.new_event(None).map_err(|e| anyhow::anyhow!("Failed to create GPU end event for GPU {gpu_idx}: {:?}", e))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Record start events
-        for gpu_idx in 0..num_gpus {
-            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            gpu_start_events[gpu_idx].record(&gpu_stream)
-                .map_err(|e| anyhow::anyhow!("Failed to record start event on GPU {gpu_idx}: {:?}", e))?;
-        }
 
         let config = &self.config;
         let head_dim = config.head_dim;
@@ -125,7 +104,56 @@ impl ForwardEngine {
             }
         }
 
-        // Embed single token on each GPU — using pre-allocated staging + output buffers (zero-alloc)
+        // Pre-define final_stream (GPU 0) — needed by both replay and normal paths below.
+        let final_stream = self.streams.get(0).unwrap().clone();
+
+        // Determine CUDA graph mode:
+        //   step 0 = warm-up (normal execute, no capture),
+        //   step 1 = capture (record kernel topology into graph),
+        //   step 2+ = replay (launch captured graph, skip compute loop).
+        let is_replay = self.decode_step_count >= 2 && self.decode_graphs[0].is_some();
+        let is_capture = self.decode_step_count == 1;
+
+        if is_replay {
+            // Replay mode: launch captured graph instead of executing kernels individually.
+            tracing::info!("CUDA graph replay mode (step {})", step);
+            for gpu_idx in 0..num_gpus {
+                if let Some(ref graph) = self.decode_graphs[gpu_idx] {
+                    graph.launch()
+                        .map_err(|e| anyhow::anyhow!("Graph launch failed on GPU {}: {:?}", gpu_idx, e))?;
+                }
+            }
+            // Graph replayed — skip to sampling (final norm + LM head already in graph).
+        } else {
+            // GPU timing events are NOT created during warm-up or capture steps.
+            // cudaEventSynchronize (called by elapsed_ms) creates an implicit sync on the stream
+            // that prevents CUDA graph capture on subsequent steps. Timing can be added back
+            // later using a separate async approach.
+
+            // Begin capture if this is the capture step
+            if is_capture {
+                tracing::info!("CUDA graph capture mode (step {})", step);
+
+                // Check stream capture status before starting (eprintln for test visibility)
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    match gpu_stream.capture_status() {
+                        Ok(status) => eprintln!("[DEBUG] GPU{} capture status BEFORE begin_capture: {:?}", gpu_idx, status),
+                        Err(e) => eprintln!("[ERROR] GPU{} failed to check capture status: {:?}", gpu_idx, e),
+                    }
+                }
+
+                // NOTE: Do NOT synchronize streams before begin_capture — NVIDIA explicitly
+                // prohibits this as it puts the stream in a state incompatible with capture.
+                let capture_mode = cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL;
+                for gpu_idx in 0..num_gpus {
+                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                    gpu_stream.begin_capture(capture_mode)
+                        .map_err(|e| anyhow::anyhow!("Begin capture failed on GPU {}: {:?}", gpu_idx, e))?;
+                }
+            }
+
+            // Embed single token on each GPU — using pre-allocated staging + output buffers (zero-alloc)
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
@@ -270,7 +298,8 @@ impl ForwardEngine {
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
-            // Phase B: Residual add on each GPU (zero-alloc via workspace + swap)
+            // Phase B: Residual add on each GPU (zero-alloc via workspace + copy)
+            // NOTE: memcpy_dtod instead of swap — CUDA graph requires fixed device addresses.
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let ws = &mut self.workspaces[gpu_idx];
@@ -279,7 +308,10 @@ impl ForwardEngine {
                     &mut ws.residual_buf,
                     &hidden_states[gpu_idx], &ws.attn_out,
                 )?;
-                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
+                // Copy result from residual_buf back to embed_out so that hidden_states[gpu_idx]
+                // keeps the same device address (required for CUDA graph capture).
+                gpu_stream.memcpy_dtod(&ws.residual_buf, &mut hidden_states[gpu_idx])
+                    .map_err(|e| anyhow::anyhow!("Failed to copy residual result: {e}"))?;
             }
 
             for gpu_idx in 0..num_gpus {
@@ -372,7 +404,8 @@ impl ForwardEngine {
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &self.workspaces[gpu_idx].mlp_out, &[1, config.hidden_size], "decode");
             }
 
-            // Phase D: Residual add on each GPU (zero-alloc via workspace + swap)
+            // Phase D: Residual add on each GPU (zero-alloc via workspace + copy)
+            // NOTE: memcpy_dtod instead of swap — CUDA graph requires fixed device addresses.
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let ws = &mut self.workspaces[gpu_idx];
@@ -381,7 +414,10 @@ impl ForwardEngine {
                     &mut ws.residual_buf,
                     &hidden_states[gpu_idx], &ws.mlp_out,
                 )?;
-                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
+                // Copy result from residual_buf back to embed_out so that hidden_states[gpu_idx]
+                // keeps the same device address (required for CUDA graph capture).
+                gpu_stream.memcpy_dtod(&ws.residual_buf, &mut hidden_states[gpu_idx])
+                    .map_err(|e| anyhow::anyhow!("Failed to copy residual result: {e}"))?;
             }
 
             for gpu_idx in 0..num_gpus {
@@ -393,7 +429,7 @@ impl ForwardEngine {
         // ================================================================
         // Final norm + LM head + sample on GPU 0
         // ================================================================
-        let final_stream = self.streams.get(0).unwrap().clone();
+        // (final_stream was pre-defined earlier for both replay and normal paths)
         let final_weights = &self.metadata[0];
         let final_hidden = hidden_states.into_iter().next().unwrap();
 
@@ -458,11 +494,49 @@ impl ForwardEngine {
             );
         }
 
-        // Sample (BF16 argmax)
+        // GPU timing: disabled during warm-up and capture to avoid implicit stream synchronization
+        // (cudaEventSynchronize prevents CUDA graph capture on subsequent steps).
+        tracing::info!(phase = "decode", "GPU execution complete");
+
+        // Post-compute capture status check (eprintln for test visibility) — helps diagnose
+        // whether warm-up left the stream in a capturing state incompatible with begin_capture.
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+            match gpu_stream.capture_status() {
+                Ok(status) => eprintln!("[DEBUG] GPU{} capture status AFTER compute (step={}): {:?}", gpu_idx, step, status),
+                Err(e) => eprintln!("[ERROR] GPU{} failed to check capture status after compute: {:?}", gpu_idx, e),
+            }
+        }
+
+        // End capture if this was the capture step (inside else block for end_capture API)
+        if is_capture {
+            tracing::info!("Ending CUDA graph capture");
+            for gpu_idx in 0..num_gpus {
+                let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
+                // Pass 0 as CUgraphInstantiate_flags (no flags — "auto free on launch" disabled)
+                let flags: cudarc::driver::sys::CUgraphInstantiate_flags_enum =
+                    unsafe { std::mem::transmute(0u32) };
+                let graph = gpu_stream.end_capture(flags)
+                    .map_err(|e| anyhow::anyhow!("End capture failed on GPU {}: {:?}", gpu_idx, e))?;
+                if let Some(g) = graph {
+                    g.upload().ok(); // pre-upload for faster first replay
+                    self.decode_graphs[gpu_idx] = Some(g);
+                    tracing::info!("CUDA graph captured and uploaded for GPU {}", gpu_idx);
+                }
+            }
+        }
+
+        // Close the else block — replay path skipped embedding through LM head.
+        }
+
+        // Sample (BF16 argmax) — runs in both replay and normal modes.
         let sampled = crate::sample::sample_with_config(
             &final_stream, &self.workspaces[0].logits.as_view(), &self.per_gpu_kernels[0].oxide,
             sampling_config, token_history, num_prompt_tokens, rng,
         )?;
+
+        // Increment decode step counter for graph capture scheduling
+        self.decode_step_count += 1;
 
         // Record the new token in the KV manager so the next decode step
         // sees the correct block table and cached-token count.
@@ -470,20 +544,6 @@ impl ForwardEngine {
             mgr.add_token(seq_id)
                 .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
         }
-
-        // Record end events and report GPU timing
-        let mut max_gpu_ms: f32 = 0.0;
-        for gpu_idx in 0..num_gpus {
-            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            gpu_end_events[gpu_idx].record(&gpu_stream)
-                .map_err(|e| anyhow::anyhow!("Failed to record end event on GPU {gpu_idx}: {:?}", e))?;
-            gpu_end_events[gpu_idx].synchronize()
-                .map_err(|e| anyhow::anyhow!("Failed to synchronize end event on GPU {gpu_idx}: {:?}", e))?;
-            let gpu_ms = gpu_start_events[gpu_idx].elapsed_ms(&gpu_end_events[gpu_idx])
-                .unwrap_or(0.0);
-            max_gpu_ms = max_gpu_ms.max(gpu_ms);
-        }
-        tracing::info!(gpu_time_ms = max_gpu_ms as f64, phase = "decode", "GPU execution complete");
 
         Ok(sampled)
     }

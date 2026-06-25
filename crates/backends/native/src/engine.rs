@@ -24,7 +24,7 @@ use crate::workspace::DecodeWorkspace;
 use infers_kv::PagedKvManager;
 
 use half::bf16;
-use infers_cuda::CudaSlice;
+use infers_cuda::{CudaGraph, CudaSlice};
 
 use infers_cuda::{group_end, group_start};
 use crate::sync;
@@ -103,6 +103,12 @@ pub struct ForwardEngine {
     /// Per-GPU pre-allocated workspace buffers for the decode hot path.
     /// Eliminates per-token alloc_zeros calls.
     pub(crate) workspaces: Vec<DecodeWorkspace>,
+
+    /// CUDA graph for decode loop replay (one per GPU). None until first capture.
+    pub(crate) decode_graphs: Vec<Option<CudaGraph>>,
+
+    /// Step counter for graph capture scheduling.
+    pub(crate) decode_step_count: usize,
 }
 
 impl ForwardEngine {
@@ -274,6 +280,8 @@ impl ForwardEngine {
             rope_sin: Some(rope_sin),
             group_size,
             workspaces,
+            decode_graphs: (0..num_gpus).map(|_| None).collect(),
+            decode_step_count: 0,
         })
     }
 
@@ -392,6 +400,8 @@ impl ForwardEngine {
             rope_sin: Some(rope_sin),
             group_size,
             workspaces,
+            decode_graphs: (0..num_gpus).map(|_| None).collect(),
+            decode_step_count: 0,
         })
     }
 
@@ -869,19 +879,9 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
 
         tracing::info!("Paged prefill sampled token: {}", sampled);
 
-        // Record end events and report GPU timing
-        let mut max_gpu_ms: f32 = 0.0;
-        for gpu_idx in 0..num_gpus {
-            let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-            gpu_end_events[gpu_idx].record(&gpu_stream)
-                .map_err(|e| anyhow::anyhow!("Failed to record end event on GPU {gpu_idx}: {:?}", e))?;
-            gpu_end_events[gpu_idx].synchronize()
-                .map_err(|e| anyhow::anyhow!("Failed to synchronize end event on GPU {gpu_idx}: {:?}", e))?;
-            let gpu_ms = gpu_start_events[gpu_idx].elapsed_ms(&gpu_end_events[gpu_idx])
-                .unwrap_or(0.0);
-            max_gpu_ms = max_gpu_ms.max(gpu_ms);
-        }
-        tracing::info!(gpu_time_ms = max_gpu_ms as f64, phase = "prefill", "GPU execution complete");
+        // GPU timing: disabled to avoid implicit stream synchronization via cudaEventSynchronize
+        // (prevents CUDA graph capture in subsequent decode steps).
+        tracing::info!(phase = "prefill", "GPU execution complete");
 
         Ok((num_pages_needed, sampled))
     }

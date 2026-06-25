@@ -33,3 +33,4 @@ workspace = true
 features = ["derive"]
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }

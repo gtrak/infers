@@ -61,6 +61,7 @@ pub struct OxideKernels {
     /// stream (stream 0). StreamPool must also use default streams so both
     /// systems share the null stream — non-blocking streams do NOT synchronize
     /// with the null stream.
+
     cc_stream: Arc<cuda_core::CudaStream>,
 }
 

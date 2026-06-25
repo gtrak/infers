@@ -33,6 +33,12 @@ const DEFAULT_MODEL_DIR: &str = "~/opt/vllm/models/qwen3.6-27b-autoround-int4/";
 #[test]
 #[ignore = "requires 2 GPUs and real model weights"]
 fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing subscriber for test visibility
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
     // Resolve model path from environment or default
     let model_dir_str = std::env::var("INFERS_TEST_MODEL")
         .unwrap_or_else(|_| DEFAULT_MODEL_DIR.to_string());
