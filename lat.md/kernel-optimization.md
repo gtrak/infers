@@ -52,9 +52,9 @@ Affects: `int4_kernels.rs`, `oxide_bridge.rs`, `gemm_dispatch.rs`.
 
 Combine ksplit and reduce into one kernel. Each block computes all K-splits for one output column, accumulates in registers, and writes final bf16 output directly. Eliminates partial_sums buffer allocation + reduce kernel. Affects: `int4_kernels.rs`.
 
-### EXP-014: NCCL AllReduce grouping — batched reduce
+### EXP-014: NCCL AllReduce grouping — BLOCKED
 
-The profile shows 7936 NCCL calls per 30 steps = 264 per step. These are likely individual small all-reduces. Batch them into fewer larger all-reduces to reduce ring latency overhead. Affects: `engine.rs`.
+Per-layer all-reduces have data dependency (residual add between attn and MLP AR). Cannot batch within a layer. Cross-layer pipeline overlap requires engine-level stream separation — deferred.
 
 ### EXP-015: cuBLASLt bf16 GEMM → INT4 ksplit migration
 
