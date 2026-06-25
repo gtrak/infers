@@ -333,7 +333,7 @@ impl ForwardEngine {
 
                 // up * SiLU(gate) = SwiGLU — into workspace.mlp_silu
                 self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
-                    &gpu_stream, &ws.mlp_up, &ws.mlp_gate, &mut ws.mlp_silu, sharded_intermediate as u32,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide.cc_stream(), &ws.mlp_up, &ws.mlp_gate, &mut ws.mlp_silu, sharded_intermediate as u32,
                 )?;
 
                 probe::dump(&gpu_stream, probe, layer_idx, gpu_idx, "mlp.silu", &ws.mlp_silu, &[1, config.intermediate_size / num_gpus], "decode");

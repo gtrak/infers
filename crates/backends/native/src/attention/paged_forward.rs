@@ -336,7 +336,7 @@ pub fn forward_paged(
             .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
 
         oxide.launch_softmax_bf16(
-            stream, &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
+            stream, &oxide.cc_stream(), &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
         ).map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
         if head_idx == 0 && probe.should_dump(layer_idx, "attn.heads") {
             probe::dump(stream, probe, layer_idx, gpu_idx, "attn.softmax_h0", &softmax_out_h, &[seq_len, seq_len], "prefill");
@@ -388,7 +388,7 @@ pub fn forward_paged(
             .alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
         oxide.launch_attn_output_gate_bf16(
-            stream, &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
+            stream, &oxide.cc_stream(), &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
         ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         gated
     } else {

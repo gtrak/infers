@@ -479,13 +479,15 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 
 ### Oxide Bridge: Typed Module Dispatch (Phase 041+)
 
-`oxide_bridge.rs` bridges cudarc buffer/stream types to cuda-core typed kernel modules. All 43 dispatch methods use `CudaSliceView` wrapper + typed module methods.
+`oxide_bridge.rs` bridges cudarc buffer/stream types to cuda-core typed kernel modules. All 44 dispatch methods use `CudaSliceView` wrapper + typed module methods with a dynamic `dispatch_stream` parameter.
 
 **CudaSliceView<'a, T, U>**: Non-owning wrapper that presents a cudarc `CudaSlice<T>` as a `cuda-core DeviceBuffer<T>`. Uses `ManuallyDrop` to prevent double-free (CudaSlice owns the memory). `SyncOnDrop` guard keeps cudarc stream synchronization alive. `Deref`/`DerefMut` impls allow passing views directly to typed methods.
 
 **Stream handling**: Both StreamPool and OxideKernels use non-blocking streams (via `ctx.new_stream()`) to support CUDA graph capture — the null/default stream does NOT support graph capture. With `CU_STREAM_CAPTURE_MODE_GLOBAL`, all operations across both streams are captured into the same graph. BorrowedCudaStream approach (casting cudarc's CUstream through cuda-core CudaStream) was rejected — it caused SIGSEGV due to incompatible internal context validation in cuda-oxide's `bind_to_thread()`.
 
-**OxideKernels struct**: `ctx` (cuda-core context), `module` (cuda-core cubin), `modules` (KernelModules typed dispatch), `cc_stream` (cuda-core stream). No more manual arg packing — `push_slice_arg`, `push_scalar_arg`, `raw_launch` removed.
+**OxideKernels struct**: `ctx` (cuda-core context), `module` (cuda-core cubin), `modules` (KernelModules typed dispatch), `cc_stream` (cuda-core stream, accessible via `cc_stream()` accessor). No more manual arg packing — `push_slice_arg`, `push_scalar_arg`, `raw_launch` removed.
+
+**Dynamic dispatch stream**: All 44 launch methods accept a `dispatch_stream: &cuda_core::CudaStream` parameter for kernel dispatch, replacing the previously hardcoded `&self.cc_stream`. Callers pass `&oxide.cc_stream()` to retain default-stream behavior while enabling future per-call stream selection. The cudarc `stream` parameter remains unchanged and is used exclusively for `CudaSliceView` guards.
 
 **Test binary migration**: The standalone test binary at `crates/cuda-oxide-kernels/` uses a local copy of `KernelModules` (aggregating all 9 `LoadedModule` structs) loaded from embedded cubin artifacts via `load_modules()`. All 34 call sites were migrated from `infers_kernel_lib::kernels::load(ctx)` (deleted) to `load_modules(ctx)` which returns `KernelModules`. Method calls updated from `module.kernel_name(...)` to `module.{module_field}.kernel_name(...)` (e.g., `module.int4.int4_gemm_v3_ksplit_sm(...)`).
 

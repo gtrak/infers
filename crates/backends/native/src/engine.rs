@@ -776,7 +776,7 @@ impl ForwardEngine {
                 // SiLU(gate) * up (elementwise on sharded_intermediate)
                 let mut silu_out = gpu_stream.alloc_zeros::<bf16>(seq_len * sharded_intermediate)?;
                 self.per_gpu_kernels[gpu_idx].oxide.launch_silu_glu_bf16(
-                    &gpu_stream, &up, &gate, &mut silu_out, (seq_len * sharded_intermediate) as u32,
+                    &gpu_stream, &self.per_gpu_kernels[gpu_idx].oxide.cc_stream(), &up, &gate, &mut silu_out, (seq_len * sharded_intermediate) as u32,
                 )?;
 
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.silu", &silu_out, &[seq_len, config.intermediate_size / num_gpus], "prefill");

@@ -8,6 +8,7 @@ edition = "2024"
 [dependencies]
 anyhow      = "1.0"
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
-cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide" }
+cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide", features = ["async"] }
 cuda-core   = { git = "https://github.com/NVlabs/cuda-oxide" }
+cuda-async  = { git = "https://github.com/NVlabs/cuda-oxide" }
 libm        = "0.2"

@@ -112,16 +112,16 @@ pub fn gemm_projection_cached(
                     local_ps_owner.as_mut().unwrap()
                 };
                 oxide.launch_int4_gemm_v3_ksplit_sm(
-                    stream, partial_sums,
+                    stream, &oxide.cc_stream(), partial_sums,
                     &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
                     input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,
                 )?;
                 oxide.launch_reduce_partial_sums_bf16(
-                    stream, output, partial_sums, n as u32, K_SPLIT,
+                    stream, &oxide.cc_stream(), output, partial_sums, n as u32, K_SPLIT,
                 )?;
             } else {
                 oxide.launch_int4_gemm_auto_round(
-                    stream,
+                    stream, &oxide.cc_stream(),
                     output,
                     &int4_bufs.qweight,
                     &int4_bufs.scales,
@@ -162,18 +162,18 @@ pub fn gemm_projection_cached(
                     local_ps_owner.as_mut().unwrap()
                 };
                 oxide.launch_nvfp4_gemm_v3_ksplit(
-                    stream, partial_sums,
+                    stream, &oxide.cc_stream(), partial_sums,
                     &nvfp4_bufs.weight_packed, &nvfp4_bufs.weight_scale,
                     input, nvfp4_bufs.weight_global_scale,
                     n as u32, k as u32, NVFP4_GROUP_SIZE, K_SPLIT,
                 )?;
                 oxide.launch_reduce_partial_sums_bf16(
-                    stream, output, partial_sums, n as u32, K_SPLIT,
+                    stream, &oxide.cc_stream(), output, partial_sums, n as u32, K_SPLIT,
                 )?;
             } else {
                 // Fused NVFP4 GEMM: dequant FP4 in registers and multiply — no intermediate buffer
                 oxide.launch_nvfp4_gemm_fused(
-                    stream,
+                    stream, &oxide.cc_stream(),
                     output,
                     &nvfp4_bufs.weight_packed,
                     &nvfp4_bufs.weight_scale,

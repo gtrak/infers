@@ -138,6 +138,7 @@ impl OxideKernels {
     pub fn launch_add_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         a: &CudaSlice<half::bf16>,
         b: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
@@ -152,7 +153,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(n);
         self.modules.common.infers_add_bf16(
-            &self.cc_stream, config, &a_view, &b_view, &mut output_view, n,
+            dispatch_stream, config, &a_view, &b_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_add_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -167,6 +168,7 @@ impl OxideKernels {
     pub fn launch_repeat_interleave_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         src: &CudaSlice<half::bf16>,
         dst: &mut CudaSlice<half::bf16>,
         seq_len: u32,
@@ -184,7 +186,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.common.infers_repeat_interleave_bf16(
-            &self.cc_stream, config, &src_view, &mut dst_view, seq_len, num_src_heads, head_dim, kv_ratio,
+            dispatch_stream, config, &src_view, &mut dst_view, seq_len, num_src_heads, head_dim, kv_ratio,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_repeat_interleave_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -197,6 +199,7 @@ impl OxideKernels {
     pub fn launch_split_qgate_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         q_full: &CudaSlice<half::bf16>,
         q_buf: &mut CudaSlice<half::bf16>,
         gate_buf: &mut CudaSlice<half::bf16>,
@@ -210,7 +213,7 @@ impl OxideKernels {
         let total = (num_heads as u32) * (head_dim as u32) * 2;
         let config = LaunchConfig::for_num_elems(total);
         self.modules.common.infers_split_qgate_bf16(
-            &self.cc_stream, config, &q_full_view, &mut q_buf_view, &mut gate_buf_view,
+            dispatch_stream, config, &q_full_view, &mut q_buf_view, &mut gate_buf_view,
             num_heads, head_dim,
         ).map_err(|e| anyhow::anyhow!("kernel 'infers_split_qgate_bf16' failed: {:?}", e))
     }
@@ -224,6 +227,7 @@ impl OxideKernels {
     pub fn launch_embedding_gather_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         weight: &CudaSlice<half::bf16>,
         token_ids: &CudaSlice<i32>,
         output: &mut CudaSlice<half::bf16>,
@@ -240,7 +244,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.common.infers_embedding_gather_bf16(
-            &self.cc_stream, config, &weight_view, &token_ids_view, &mut output_view, seq_len, hidden_size,
+            dispatch_stream, config, &weight_view, &token_ids_view, &mut output_view, seq_len, hidden_size,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_embedding_gather_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -254,6 +258,7 @@ impl OxideKernels {
     pub fn launch_silu_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         x: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
         total: u32,
@@ -267,7 +272,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(n);
         self.modules.activation.infers_silu_bf16(
-            &self.cc_stream, config, &x_view, &mut output_view, n,
+            dispatch_stream, config, &x_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_silu_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -282,6 +287,7 @@ impl OxideKernels {
     pub fn launch_silu_glu_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         x: &CudaSlice<half::bf16>,
         gate: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
@@ -297,7 +303,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(n);
         self.modules.activation.infers_silu_glu_bf16(
-            &self.cc_stream, config, &x_view, &gate_view, &mut output_view, n,
+            dispatch_stream, config, &x_view, &gate_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_silu_glu_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -312,6 +318,7 @@ impl OxideKernels {
     pub fn launch_attn_output_gate_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         x: &CudaSlice<half::bf16>,
         gate: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
@@ -327,7 +334,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(n);
         self.modules.activation.infers_attn_output_gate_bf16(
-            &self.cc_stream, config, &x_view, &gate_view, &mut output_view, n,
+            dispatch_stream, config, &x_view, &gate_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_attn_output_gate_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -342,6 +349,7 @@ impl OxideKernels {
     pub fn launch_argmax_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         logits: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<i32>,
         batch_size: u32,
@@ -360,7 +368,7 @@ impl OxideKernels {
 
         // Dispatch via typed module
         self.modules.common.infers_argmax_bf16(
-            &self.cc_stream, config, &logits_view, &mut output_view, batch_size, vocab_size,
+            dispatch_stream, config, &logits_view, &mut output_view, batch_size, vocab_size,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_argmax_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -375,6 +383,7 @@ impl OxideKernels {
     pub fn launch_kv_cache_write_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         k: &CudaSlice<half::bf16>,
         v: &CudaSlice<half::bf16>,
         kv_cache: &mut CudaSlice<half::bf16>,
@@ -392,7 +401,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.common.infers_kv_cache_write_bf16(
-            &self.cc_stream, config, &k_view, &v_view, &mut kv_cache_view, &positions_view, seq_len, head_dim, max_seq_len,
+            dispatch_stream, config, &k_view, &v_view, &mut kv_cache_view, &positions_view, seq_len, head_dim, max_seq_len,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_kv_cache_write_bf16' failed: {:?}", e))
     }
 
@@ -405,6 +414,7 @@ impl OxideKernels {
     pub fn launch_rmsnorm_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         x: &CudaSlice<half::bf16>,
         weight: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
@@ -427,7 +437,7 @@ impl OxideKernels {
         };
 
         self.modules.norm.infers_rmsnorm_bf16(
-            &self.cc_stream, config, &x_view, &weight_view, &mut output_view, hidden, eps,
+            dispatch_stream, config, &x_view, &weight_view, &mut output_view, hidden, eps,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_rmsnorm_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -442,6 +452,7 @@ impl OxideKernels {
     pub fn launch_rms_norm_gated_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<half::bf16>,
         gate: &CudaSlice<half::bf16>,
         weight: &CudaSlice<half::bf16>,
@@ -466,7 +477,7 @@ impl OxideKernels {
         };
 
         self.modules.norm.infers_rms_norm_gated_bf16(
-            &self.cc_stream, config, &input_view, &gate_view, &weight_view, &mut output_view, n, d, eps,
+            dispatch_stream, config, &input_view, &gate_view, &weight_view, &mut output_view, n, d, eps,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_rms_norm_gated_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -481,6 +492,7 @@ impl OxideKernels {
     pub fn launch_l2norm_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
         dim: u32,
@@ -501,7 +513,7 @@ impl OxideKernels {
         };
 
         self.modules.norm.infers_l2norm_bf16(
-            &self.cc_stream, config, &input_view, &mut output_view, dim, eps,
+            dispatch_stream, config, &input_view, &mut output_view, dim, eps,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_l2norm_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -516,6 +528,7 @@ impl OxideKernels {
     pub fn launch_softmax_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         scores: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
         seq_len: u32,
@@ -536,7 +549,7 @@ impl OxideKernels {
         };
 
         self.modules.common.infers_softmax_bf16(
-            &self.cc_stream, config, &scores_view, &mut output_view, seq_len, use_causal,
+            dispatch_stream, config, &scores_view, &mut output_view, seq_len, use_causal,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_softmax_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -551,6 +564,7 @@ impl OxideKernels {
     pub fn launch_conv1d_depthwise_silu_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<half::bf16>,
         weight: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
@@ -567,7 +581,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.activation.infers_conv1d_depthwise_silu_bf16(
-            &self.cc_stream, config, &input_view, &weight_view, &mut output_view, batch_size, conv_dim, seq_len, kernel_size,
+            dispatch_stream, config, &input_view, &weight_view, &mut output_view, batch_size, conv_dim, seq_len, kernel_size,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_conv1d_depthwise_silu_bf16' failed: {:?}", e))
     }
 
@@ -580,6 +594,7 @@ impl OxideKernels {
     pub fn launch_rope_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         q: &mut CudaSlice<half::bf16>,
         k: &mut CudaSlice<half::bf16>,
         cos: &CudaSlice<f32>,
@@ -600,7 +615,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.attention.infers_rope_bf16(
-            &self.cc_stream, config, &mut q_view, &mut k_view, &cos_view, &sin_view, &positions_view, total_tokens, num_heads, head_dim, rotary_dim,
+            dispatch_stream, config, &mut q_view, &mut k_view, &cos_view, &sin_view, &positions_view, total_tokens, num_heads, head_dim, rotary_dim,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_rope_bf16' failed: {:?}", e))
     }
 
@@ -613,6 +628,7 @@ impl OxideKernels {
     pub fn launch_paged_kv_write_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         k: &CudaSlice<half::bf16>,
         v: &CudaSlice<half::bf16>,
         page_pool: &mut CudaSlice<half::bf16>,
@@ -633,7 +649,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.attention.infers_paged_kv_write_bf16(
-            &self.cc_stream, config, &k_view, &v_view, &mut page_pool_view, &block_table_view, &positions_view, seq_len, head_dim, page_size, kv_dim,
+            dispatch_stream, config, &k_view, &v_view, &mut page_pool_view, &block_table_view, &positions_view, seq_len, head_dim, page_size, kv_dim,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_paged_kv_write_bf16' failed: {:?}", e))
     }
 
@@ -646,6 +662,7 @@ impl OxideKernels {
     pub fn launch_paged_kv_read_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         page_pool: &CudaSlice<half::bf16>,
         block_table: &CudaSlice<i32>,
         num_pages: u32,
@@ -667,7 +684,7 @@ impl OxideKernels {
         const MAX_KV_READ_TOTAL: u32 = 4096 * 16384; // up to 4096 tokens × kv_dim 16384
         let config = LaunchConfig::for_num_elems(MAX_KV_READ_TOTAL);
         self.modules.attention.infers_paged_kv_read_bf16(
-            &self.cc_stream, config, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, page_size, kv_dim, &mut k_out_view, &mut v_out_view,
+            dispatch_stream, config, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, page_size, kv_dim, &mut k_out_view, &mut v_out_view,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_paged_kv_read_bf16' failed: {:?}", e))
     }
 
@@ -680,6 +697,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_auto_round(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -711,7 +729,7 @@ impl OxideKernels {
             }
         };
         self.modules.int4.int4_gemm_auto_round(
-            &self.cc_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
             m, n, k, group_size, transposed,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_auto_round' failed: {:?}", e))
     }
@@ -726,6 +744,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_auto_round_tiled(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -749,7 +768,7 @@ impl OxideKernels {
             shared_mem_bytes: (group_size * 2),
         };
         self.modules.int4.int4_gemm_auto_round_tiled(
-            &self.cc_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
             m, n, k, group_size, transposed,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_auto_round_tiled' failed: {:?}", e))
     }
@@ -765,6 +784,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_auto_round_ksplit(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -788,7 +808,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_gemm_auto_round_ksplit(
-            &self.cc_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
             n, k, group_size, transposed, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_auto_round_ksplit' failed: {:?}", e))
     }
@@ -799,6 +819,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_v3_ksplit_sm(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -822,7 +843,7 @@ impl OxideKernels {
             shared_mem_bytes: (group_size as u32) * 2, // group_size bf16 values
         };
         self.modules.int4.int4_gemm_v3_ksplit_sm(
-            &self.cc_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
             n, k, group_size, transposed, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_v3_ksplit_sm' failed: {:?}", e))
     }
@@ -838,6 +859,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_v4_ksplit(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -861,7 +883,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_gemm_v4_ksplit(
-            &self.cc_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
             n, k, group_size, transposed, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_v4_ksplit' failed: {:?}", e))
     }
@@ -871,6 +893,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_warp_split(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -894,7 +917,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_gemm_warp_split(
-            &self.cc_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
             n, k, group_size, transposed, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_warp_split' failed: {:?}", e))
     }
@@ -908,6 +931,7 @@ impl OxideKernels {
     pub fn launch_reduce_partial_sums_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         partial_sums: &CudaSlice<f32>,
         n: u32,
@@ -922,7 +946,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.reduce_partial_sums_bf16(
-            &self.cc_stream, config, &mut output_view, &partial_sums_view, n, k_split,
+            dispatch_stream, config, &mut output_view, &partial_sums_view, n, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'reduce_partial_sums_bf16' failed: {:?}", e))
     }
 
@@ -939,6 +963,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_warp(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::f16>,
@@ -961,7 +986,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_gemm_warp(
-            &self.cc_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
             n, k, group_size, transposed,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_warp' failed: {:?}", e))
     }
@@ -974,6 +999,7 @@ impl OxideKernels {
     pub fn launch_int4_dequant_to_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,     // [N, K] bf16 output
         weight: &CudaSlice<u32>,            // [N, K/8] packed INT4
         scales: &CudaSlice<half::f16>,      // [N, K/group_size] fp16 scales
@@ -993,7 +1019,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_dequant_to_bf16(
-            &self.cc_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view,
+            dispatch_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view,
             n, k, group_size,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_dequant_to_bf16' failed: {:?}", e))
     }
@@ -1004,6 +1030,7 @@ impl OxideKernels {
     pub fn launch_nvfp4_dequant_to_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,  // [N, K] bf16 output
         weight_packed: &CudaSlice<u8>,       // [N, K/2] packed FP4
         weight_scale: &CudaSlice<u8>,        // [N, K/group_size] fp8_e4m3
@@ -1022,7 +1049,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.nvfp4.nvfp4_dequant_to_bf16(
-            &self.cc_stream, config, &mut output_view, &weight_packed_view, &weight_scale_view,
+            dispatch_stream, config, &mut output_view, &weight_packed_view, &weight_scale_view,
             weight_global_scale, n, k, group_size,
         ).map_err(|e| anyhow::anyhow!("kernel 'nvfp4_dequant_to_bf16' failed: {:?}", e))
     }
@@ -1034,6 +1061,7 @@ impl OxideKernels {
     pub fn launch_nvfp4_gemm_fused(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,     // [M, N] bf16
         weight_packed: &CudaSlice<u8>,          // [N, K/2] packed FP4
         weight_scale: &CudaSlice<u8>,           // [N, K/group_size] fp8_e4m3
@@ -1063,7 +1091,7 @@ impl OxideKernels {
             }
         };
         self.modules.nvfp4.nvfp4_gemm_fused(
-            &self.cc_stream, config, &mut output_view, &weight_packed_view, &weight_scale_view, &input_view,
+            dispatch_stream, config, &mut output_view, &weight_packed_view, &weight_scale_view, &input_view,
             weight_global_scale, m, n, k, group_size,
         ).map_err(|e| anyhow::anyhow!("kernel 'nvfp4_gemm_fused' failed: {:?}", e))
     }
@@ -1073,6 +1101,7 @@ impl OxideKernels {
     pub fn launch_nvfp4_gemm_fused_ksplit(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,         // [K_SPLIT, N] f32
         weight_packed: &CudaSlice<u8>,              // [N, K/2] packed FP4
         weight_scale: &CudaSlice<u8>,               // [N, K/group_size] fp8_e4m3
@@ -1094,7 +1123,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.nvfp4.nvfp4_gemm_fused_ksplit(
-            &self.cc_stream, config, &mut ps_view, &weight_packed_view, &weight_scale_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_packed_view, &weight_scale_view, &input_view,
             weight_global_scale, n, k, group_size, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'nvfp4_gemm_fused_ksplit' failed: {:?}", e))
     }
@@ -1104,6 +1133,7 @@ impl OxideKernels {
     pub fn launch_nvfp4_gemm_v3_ksplit(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         partial_sums: &mut CudaSlice<f32>,         // [K_SPLIT, N] f32
         weight_packed: &CudaSlice<u8>,              // [N, K/2] packed FP4
         weight_scale: &CudaSlice<u8>,               // [N, K/group_size] fp8_e4m3
@@ -1125,7 +1155,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.nvfp4.nvfp4_gemm_v3_ksplit(
-            &self.cc_stream, config, &mut ps_view, &weight_packed_view, &weight_scale_view, &input_view,
+            dispatch_stream, config, &mut ps_view, &weight_packed_view, &weight_scale_view, &input_view,
             weight_global_scale, n, k, group_size, k_split,
         ).map_err(|e| anyhow::anyhow!("kernel 'nvfp4_gemm_v3_ksplit' failed: {:?}", e))
     }
@@ -1134,6 +1164,7 @@ impl OxideKernels {
     pub fn launch_sanitize_nan_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         buf: &mut CudaSlice<half::bf16>,
     ) -> anyhow::Result<()> {
         let len_scalar = buf.len() as u32;
@@ -1151,7 +1182,7 @@ impl OxideKernels {
         };
 
         self.modules.common.sanitize_nan_bf16(
-            &self.cc_stream, config, &mut buf_view, len_scalar,
+            dispatch_stream, config, &mut buf_view, len_scalar,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'sanitize_nan_bf16' failed: {:?}", e))?;
 
         Ok(())
@@ -1164,6 +1195,7 @@ impl OxideKernels {
    pub fn launch_bf16_gemm_tiled(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         input: &CudaSlice<half::bf16>,
         weight: &CudaSlice<half::bf16>,
@@ -1184,7 +1216,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,  // no shared memory used in current version
         };
         self.modules.bf16.bf16_gemm_tiled(
-            &self.cc_stream, config, &mut output_view, &input_view, &weight_view,
+            dispatch_stream, config, &mut output_view, &input_view, &weight_view,
             m, n, k,
         ).map_err(|e| anyhow::anyhow!("kernel 'bf16_gemm_tiled' failed: {:?}", e))
     }
@@ -1198,6 +1230,7 @@ impl OxideKernels {
     pub fn launch_int4_gemm_gguf(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         output: &mut CudaSlice<half::bf16>,
         weight: &CudaSlice<u32>,
         scales: &CudaSlice<half::bf16>,
@@ -1221,7 +1254,7 @@ impl OxideKernels {
             shared_mem_bytes: 0,
         };
         self.modules.int4.int4_gemm_gguf(
-            &self.cc_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            dispatch_stream, config, &mut output_view, &weight_view, &scales_view, &zeros_view, &input_view,
             m, n, k, group_size, transposed,
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_gguf' failed: {:?}", e))
     }
@@ -1230,6 +1263,7 @@ impl OxideKernels {
     pub fn launch_fp8_quantize_e4m3(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<u8>,
         n: u32,
@@ -1239,7 +1273,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(n);
         self.modules.fp8.infers_fp8_quantize_e4m3(
-            &self.cc_stream, config, &input_view, &mut output_view, n,
+            dispatch_stream, config, &input_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel 'infers_fp8_quantize_e4m3' failed: {:?}", e))
     }
 
@@ -1247,6 +1281,7 @@ impl OxideKernels {
     pub fn launch_fp8_dequantize_e4m3(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<u8>,
         output: &mut CudaSlice<half::bf16>,
         n: u32,
@@ -1256,7 +1291,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(n);
         self.modules.fp8.infers_fp8_dequantize_e4m3(
-            &self.cc_stream, config, &input_view, &mut output_view, n,
+            dispatch_stream, config, &input_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel 'infers_fp8_dequantize_e4m3' failed: {:?}", e))
     }
 
@@ -1264,6 +1299,7 @@ impl OxideKernels {
     pub fn launch_fp8_quantize_e5m2(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<half::bf16>,
         output: &mut CudaSlice<u8>,
         n: u32,
@@ -1273,7 +1309,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(n);
         self.modules.fp8.infers_fp8_quantize_e5m2(
-            &self.cc_stream, config, &input_view, &mut output_view, n,
+            dispatch_stream, config, &input_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel 'infers_fp8_quantize_e5m2' failed: {:?}", e))
     }
 
@@ -1281,6 +1317,7 @@ impl OxideKernels {
     pub fn launch_fp8_dequantize_e5m2(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         input: &CudaSlice<u8>,
         output: &mut CudaSlice<half::bf16>,
         n: u32,
@@ -1290,7 +1327,7 @@ impl OxideKernels {
 
         let config = LaunchConfig::for_num_elems(n);
         self.modules.fp8.infers_fp8_dequantize_e5m2(
-            &self.cc_stream, config, &input_view, &mut output_view, n,
+            dispatch_stream, config, &input_view, &mut output_view, n,
         ).map_err(|e| anyhow::anyhow!("kernel 'infers_fp8_dequantize_e5m2' failed: {:?}", e))
     }
 
@@ -1303,6 +1340,7 @@ impl OxideKernels {
     pub fn launch_paged_attention_decode_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         q: &CudaSlice<half::bf16>,
         page_pool: &CudaSlice<half::bf16>,
         block_table: &CudaSlice<i32>,
@@ -1329,7 +1367,7 @@ impl OxideKernels {
             shared_mem_bytes: ((3 * 256 + MAX_CACHED_TOKENS_FOR_SHARED_MEM) * 4) as u32,
         };
         self.modules.attention.infers_paged_attention_decode_bf16(
-            &self.cc_stream, config, &q_view, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, num_kv_heads, num_query_heads, page_size, kv_dim, &mut output_view,
+            dispatch_stream, config, &q_view, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, num_kv_heads, num_query_heads, page_size, kv_dim, &mut output_view,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_paged_attention_decode_bf16' failed: {:?}", e))
     }
 
@@ -1342,6 +1380,7 @@ impl OxideKernels {
     pub fn launch_gdn_recurrent_step_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         query: &CudaSlice<half::bf16>,
         key: &CudaSlice<half::bf16>,
         value: &CudaSlice<half::bf16>,
@@ -1377,7 +1416,7 @@ impl OxideKernels {
             shared_mem_bytes: smem_bytes as u32,
         };
         self.modules.gdn.infers_gdn_recurrent_step_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &query_view, &key_view, &value_view,
             &a_proj_view, &b_proj_view,
             &a_log_view, &dt_bias_view,
@@ -1395,6 +1434,7 @@ impl OxideKernels {
     pub fn launch_gdn_mamba2_update_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         x_proj: &CudaSlice<half::bf16>,
         b_proj: &CudaSlice<half::bf16>,
         dt_proj: &CudaSlice<half::bf16>,
@@ -1421,7 +1461,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.gdn.infers_gdn_mamba2_update_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &x_proj_view, &b_proj_view, &dt_proj_view,
             &z_gate_view, &a_log_view, &dt_bias_view,
             &mut state_view, &mut output_view,
@@ -1438,6 +1478,7 @@ impl OxideKernels {
     pub fn launch_gdn_update_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         state: &mut CudaSlice<half::bf16>,
         output: &mut CudaSlice<half::bf16>,
         a: &CudaSlice<half::bf16>,
@@ -1461,7 +1502,7 @@ impl OxideKernels {
             shared_mem_bytes: (256 * 4) as u32,
         };
         self.modules.gdn.infers_gdn_update_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &mut state_view, &mut output_view,
             &a_view, &b_view, &dt_view, &x_view,
             hidden_size,
@@ -1477,6 +1518,7 @@ impl OxideKernels {
     pub fn launch_gdn_gated_delta_update_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         query: &CudaSlice<half::bf16>,
         key: &CudaSlice<half::bf16>,
         value: &CudaSlice<half::bf16>,
@@ -1506,7 +1548,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.gdn.infers_gdn_gated_delta_update_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &query_view, &key_view, &value_view,
             &a_proj_view, &b_proj_view,
             &a_log_view, &dt_bias_view,
@@ -1524,6 +1566,7 @@ impl OxideKernels {
     pub fn launch_gdn_gated_delta_prefill_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         query: &CudaSlice<half::bf16>,
         key: &CudaSlice<half::bf16>,
         value: &CudaSlice<half::bf16>,
@@ -1554,7 +1597,7 @@ impl OxideKernels {
         // Dispatch via typed module
         let config = LaunchConfig::for_num_elems(total as u32);
         self.modules.gdn.infers_gdn_gated_delta_prefill_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &query_view, &key_view, &value_view,
             &a_proj_view, &b_proj_view,
             &a_log_view, &dt_bias_view,
@@ -1572,6 +1615,7 @@ impl OxideKernels {
     pub fn launch_gdn_chunked_gated_delta_prefill_bf16(
         &self,
         stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
         query: &CudaSlice<half::bf16>,
         key: &CudaSlice<half::bf16>,
         value: &CudaSlice<half::bf16>,
@@ -1611,7 +1655,7 @@ impl OxideKernels {
             shared_mem_bytes,
         };
         self.modules.gdn.infers_gdn_chunked_gated_delta_prefill_bf16(
-            &self.cc_stream, config,
+            dispatch_stream, config,
             &query_view, &key_view, &value_view,
             &a_proj_view, &b_proj_view,
             &a_log_view, &dt_bias_view,
@@ -1629,6 +1673,11 @@ impl OxideKernels {
     /// Access the loaded module.
     pub fn module(&self) -> &Arc<CudaModule> {
         &self.module
+    }
+
+    /// Access the cuda-core stream used by typed module dispatch.
+    pub fn cc_stream(&self) -> &cuda_core::CudaStream {
+        &self.cc_stream
     }
 }
 
@@ -1656,7 +1705,7 @@ mod tests {
         let mut out_gpu = stream.alloc_zeros::<half::bf16>(n).unwrap();
 
         // 4. Launch via bridge
-        oxide.launch_add_bf16(&stream, &a_gpu, &b_gpu, &mut out_gpu).unwrap();
+        oxide.launch_add_bf16(&stream, &oxide.cc_stream(), &a_gpu, &b_gpu, &mut out_gpu).unwrap();
 
         // 5. Read back + verify
         let result: Vec<half::bf16> = stream.clone_dtoh(&out_gpu).unwrap();

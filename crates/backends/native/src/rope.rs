@@ -111,7 +111,7 @@ pub fn apply_rope(
     };
 
     oxide.launch_rope_bf16(
-        stream, q, k, &cos_gpu, &sin_gpu, &positions_gpu,
+        stream, &oxide.cc_stream(), q, k, &cos_gpu, &sin_gpu, &positions_gpu,
         positions.len() as u32, num_heads as u32, head_dim as u32, rotary_dim as u32,
     )?;
 
@@ -158,7 +158,7 @@ pub fn apply_rope_with_staging(
         .map_err(|e| anyhow::anyhow!("Failed to copy position to staging buffer: {e}"))?;
 
     oxide.launch_rope_bf16(
-        stream, q, k, cos_gpu, sin_gpu, positions_gpu,
+        stream, &oxide.cc_stream(), q, k, cos_gpu, sin_gpu, positions_gpu,
         position_i32.len() as u32, num_heads as u32, head_dim as u32, rotary_dim as u32,
     )?;
 

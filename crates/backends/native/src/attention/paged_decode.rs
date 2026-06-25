@@ -178,7 +178,7 @@ pub fn decode_forward_paged(
     if attn_output_gate {
         // Extract Q and gate portions from q_full (per-head interleaved layout)
         oxide.launch_split_qgate_bf16(
-            stream, &ws.q_full, &mut ws.q_buf, &mut ws.gate_buf,
+            stream, &oxide.cc_stream(), &ws.q_full, &mut ws.q_buf, &mut ws.gate_buf,
             num_heads as u32, head_dim as u32,
         )?;
 
@@ -255,7 +255,7 @@ pub fn decode_forward_paged(
 
         // Gate application: attn_output = attn_output * sigmoid(gate)
         oxide.launch_attn_output_gate_bf16(
-            stream, &ws.attn_output, &ws.gate_buf, &mut ws.gated, per_gpu_head_dim as u32,
+            stream, &oxide.cc_stream(), &ws.attn_output, &ws.gate_buf, &mut ws.gated, per_gpu_head_dim as u32,
         ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gated", &ws.gated, &[1, per_gpu_head_dim], "decode");
 

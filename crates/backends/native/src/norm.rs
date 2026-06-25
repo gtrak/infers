@@ -41,7 +41,7 @@ pub fn rms_norm(
     let mut output = stream.alloc_zeros::<bf16>(elem_count)
         .map_err(|e| anyhow::anyhow!("Failed to allocate RMSNorm output: {e}"))?;
 
-    oxide.launch_rmsnorm_bf16(stream, hidden, weight, &mut output, hidden_size as u32, eps)?;
+    oxide.launch_rmsnorm_bf16(stream, &oxide.cc_stream(), hidden, weight, &mut output, hidden_size as u32, eps)?;
 
     Ok(output)
 }
@@ -84,7 +84,7 @@ pub fn rms_norm_into(
     anyhow::ensure!(weight.len() >= hidden_size, "Weight vector too short for hidden_size");
     anyhow::ensure!(output.len() >= elem_count, "Output buffer too small: {} < {}", output.len(), elem_count);
 
-    oxide.launch_rmsnorm_bf16(stream, hidden, weight, output, hidden_size as u32, eps)?;
+    oxide.launch_rmsnorm_bf16(stream, &oxide.cc_stream(), hidden, weight, output, hidden_size as u32, eps)?;
 
     Ok(())
 }

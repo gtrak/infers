@@ -395,7 +395,7 @@ pub fn greedy_sample_bf16(
         .map_err(|e| anyhow::anyhow!("Failed to copy logits for argmax: {e}"))?;
 
     oxide.launch_argmax_bf16(
-        stream, &logits_slice, &mut result_gpu, 1u32, vocab_size as u32,
+        stream, &oxide.cc_stream(), &logits_slice, &mut result_gpu, 1u32, vocab_size as u32,
     ).map_err(|e| anyhow::anyhow!("Argmax BF16 kernel launch failed: {e}"))?;
 
     // Copy result back to host (single i32 — minimal transfer)

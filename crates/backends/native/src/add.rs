@@ -33,7 +33,7 @@ pub fn add(
     let mut output = stream.alloc_zeros::<bf16>(elem_count)
         .map_err(|e| anyhow::anyhow!("Failed to allocate add output: {e}"))?;
 
-    oxide.launch_add_bf16(stream, a, b, &mut output)?;
+    oxide.launch_add_bf16(stream, &oxide.cc_stream(), a, b, &mut output)?;
 
     Ok(output)
 }
@@ -57,7 +57,7 @@ pub fn add_into(
     anyhow::ensure!(a.len() == b.len(), "Add inputs must have same size ({} != {})", a.len(), b.len());
     anyhow::ensure!(output.len() >= elem_count, "Output buffer too small: {} < {}", output.len(), elem_count);
 
-    oxide.launch_add_bf16(stream, a, b, output)?;
+    oxide.launch_add_bf16(stream, &oxide.cc_stream(), a, b, output)?;
 
     Ok(())
 }

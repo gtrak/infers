@@ -125,7 +125,7 @@ pub fn forward(
         .map_err(|e| anyhow::anyhow!("Failed to copy positions to device: {e}"))?;
 
    oxide.launch_kv_cache_write_bf16(
-        stream, &k_full, &v_full, kv_cache.buffer.as_mut().unwrap(), &positions_gpu,
+        stream, &oxide.cc_stream(), &k_full, &v_full, kv_cache.buffer.as_mut().unwrap(), &positions_gpu,
         seq_len as u32, kv_dim as u32, max_seq_len as u32,
     ).map_err(|e| anyhow::anyhow!("KV cache write kernel launch failed: {e}"))?;
 
@@ -301,7 +301,7 @@ pub fn forward(
             .map_err(|e| anyhow::anyhow!("Failed to allocate softmax output buffer: {e}"))?;
 
         oxide.launch_softmax_bf16(
-            stream, &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
+            stream, &oxide.cc_stream(), &scores_h, &mut softmax_out_h, seq_len as u32, 1u32,
         ).map_err(|e| anyhow::anyhow!("Softmax kernel launch failed: {e}"))?;
 
         // --- Attention output: softmax_out_h @ V_h → [seq_len × head_dim] ---
@@ -347,7 +347,7 @@ pub fn forward(
         let mut gated = stream.alloc_zeros::<bf16>(attn_combined_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate gated output buffer: {e}"))?;
         oxide.launch_attn_output_gate_bf16(
-            stream, &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
+            stream, &oxide.cc_stream(), &attn_combined, gate_heads, &mut gated, attn_combined_size as u32,
         ).map_err(|e| anyhow::anyhow!("Gate application kernel failed: {e}"))?;
         gated
     } else {

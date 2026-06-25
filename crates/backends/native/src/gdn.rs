@@ -224,7 +224,7 @@ fn repeat_interleave_heads_into(
 ) -> Result<()> {
     let ratio = h_dst / h_src;
     oxide.launch_repeat_interleave_bf16(
-        stream, src, dst, seq_len as u32, h_src as u32, head_dim as u32, ratio as u32,
+        stream, &oxide.cc_stream(), src, dst, seq_len as u32, h_src as u32, head_dim as u32, ratio as u32,
     ).map_err(|e| anyhow::anyhow!("repeat_interleave kernel failed: {e}"))
 }
 
@@ -304,7 +304,7 @@ fn repeat_interleave_heads_into(
 
     // Note: conv1d_weight is a weight, not an intermediate — skipped for probing
     oxide.launch_conv1d_depthwise_silu_bf16(
-        stream, &mixed_qkv, conv1d_gpu, &mut conv_out,
+        stream, &oxide.cc_stream(), &mixed_qkv, conv1d_gpu, &mut conv_out,
         1, conv_dim as u32, seq_len as u32, config.linear_conv_kernel_dim as u32,
     ).map_err(|e| anyhow::anyhow!("conv1d kernel launch failed: {e}"))?;
  probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &conv_out, &[seq_len, conv_dim], "prefill");
@@ -437,7 +437,7 @@ fn repeat_interleave_heads_into(
     let head_v_dim_i32 = head_v_dim as i32;
     // Launch sequential kernel via oxide bridge
     oxide.launch_gdn_gated_delta_prefill_bf16(
-        stream, &query_expanded, &key_expanded, &value_flat,
+        stream, &oxide.cc_stream(), &query_expanded, &key_expanded, &value_flat,
         &a_proj, &b_proj, &a_log_f32, &dt_bias_f32,
         state_ref, &mut gdn_output,
         seq_len as u32, num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
@@ -474,7 +474,7 @@ fn repeat_interleave_heads_into(
 
         unsafe {
             oxide.launch_rms_norm_gated_bf16(
-                stream, &gdn_output, &z_gate_raw, norm_weight, &mut norm_out,
+                stream, &oxide.cc_stream(), &gdn_output, &z_gate_raw, norm_weight, &mut norm_out,
                 n_rows as u32, norm_dim as u32, 1e-6f32,
             ).map_err(|e| anyhow::anyhow!("RMSNormGated kernel launch failed: {e}"))?;
         }
@@ -599,7 +599,7 @@ pub fn decode_forward(
     let conv1d_gpu = cache.get_bf16(&weights.conv1d_weight.name)
         .ok_or_else(|| anyhow::anyhow!("conv1d weight not in cache"))?;
     oxide.launch_conv1d_depthwise_silu_bf16(
-        stream, &ws.conv_input, conv1d_gpu, &mut ws.conv_out,
+        stream, &oxide.cc_stream(), &ws.conv_input, conv1d_gpu, &mut ws.conv_out,
         1, conv_dim as u32, kernel_size_usize as u32, kernel_size as u32,
     ).map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
 
@@ -683,7 +683,7 @@ pub fn decode_forward(
     let head_k_dim_i32 = head_k_dim as i32;
     let head_v_dim_i32 = head_v_dim as i32;
   oxide.launch_gdn_recurrent_step_bf16(
-        stream, query_expanded_ref, key_expanded_ref, &ws.value,
+        stream, &oxide.cc_stream(), query_expanded_ref, key_expanded_ref, &ws.value,
         &ws.a_proj, &ws.b_proj, a_log_f32, dt_bias_f32,
         state_ref, &mut ws.gdn_output,
         num_v_heads_i32 as u32, head_k_dim_i32 as u32, head_v_dim_i32 as u32,
@@ -712,7 +712,7 @@ pub fn decode_forward(
 
         unsafe {
             oxide.launch_rms_norm_gated_bf16(
-                stream, &ws.gdn_output, &ws.z_gate, norm_weight, &mut ws.norm_out,
+                stream, &oxide.cc_stream(), &ws.gdn_output, &ws.z_gate, norm_weight, &mut ws.norm_out,
                 n_rows as u32, norm_dim as u32, 1e-6f32,
             ).map_err(|e| anyhow::anyhow!("Decode RMSNormGated kernel launch failed: {e}"))?;
         }

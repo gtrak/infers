@@ -217,7 +217,7 @@ pub fn prefill(
         let mut silu_out = stream
             .alloc_zeros::<bf16>(gate_size)
             .map_err(|e| anyhow::anyhow!("Failed to allocate silu_out buffer: {e}"))?;
-        kernels.oxide.launch_silu_glu_bf16(stream, &up, &gate, &mut silu_out, gate_size as u32)
+        kernels.oxide.launch_silu_glu_bf16(stream, &kernels.oxide.cc_stream(), &up, &gate, &mut silu_out, gate_size as u32)
             .map_err(|e| anyhow::anyhow!("SiLU+GLU kernel launch failed: {e}"))?;
 
         // output = GEMM(silu_out, down_proj^T)  [seq_len × hidden_size]

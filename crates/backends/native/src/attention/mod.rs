@@ -192,7 +192,7 @@ pub fn paged_kv_write(
     page_size: usize,
 ) -> Result<()> {
     oxide.launch_paged_kv_write_bf16(
-        stream, k, v, page_pool, block_table_gpu, positions_gpu,
+        stream, &oxide.cc_stream(), k, v, page_pool, block_table_gpu, positions_gpu,
         seq_len as u32, head_dim as u32, page_size as u32, kv_dim as u32,
     ).map_err(|e| anyhow::anyhow!("Paged KV write kernel launch failed: {e}"))?;
 
@@ -238,7 +238,7 @@ pub fn paged_attention_decode(
         .map_err(|e| anyhow::anyhow!("Failed to allocate attention output buffer: {e}"))?;
 
     oxide.launch_paged_attention_decode_bf16(
-        stream, q, page_pool, block_table_gpu, cached_tokens_count, &mut output,
+        stream, &oxide.cc_stream(), q, page_pool, block_table_gpu, cached_tokens_count, &mut output,
         num_pages as u32, head_dim as u32,
         num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
     ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel launch failed: {e}"))?;
@@ -264,7 +264,7 @@ pub fn paged_attention_decode_into(
     kv_dim: usize,
 ) -> Result<()> {
     oxide.launch_paged_attention_decode_bf16(
-        stream, q, page_pool, block_table_gpu, cached_tokens_count, output,
+        stream, &oxide.cc_stream(), q, page_pool, block_table_gpu, cached_tokens_count, output,
         num_pages as u32, head_dim as u32,
         num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
     ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel failed: {e}"))?;

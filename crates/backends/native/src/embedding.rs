@@ -50,7 +50,7 @@ pub fn embed_tokens(
     // vocab_size is not used by the kernel but validates caller invariants
     let _ = vocab_size;
 
-    oxide.launch_embedding_gather_bf16(stream, embedding_table, &token_ids_gpu, &mut output, seq_len as u32, hidden_size as u32)?;
+    oxide.launch_embedding_gather_bf16(stream, &oxide.cc_stream(), embedding_table, &token_ids_gpu, &mut output, seq_len as u32, hidden_size as u32)?;
 
     Ok(output)
 }
@@ -88,7 +88,7 @@ pub fn embed_tokens_into(
     stream.memcpy_htod(token_ids_i32, token_ids_gpu)
         .map_err(|e| anyhow::anyhow!("Failed to copy token IDs to staging buffer: {e}"))?;
 
-    oxide.launch_embedding_gather_bf16(stream, embedding_table, token_ids_gpu, output, seq_len as u32, hidden_size as u32)?;
+    oxide.launch_embedding_gather_bf16(stream, &oxide.cc_stream(), embedding_table, token_ids_gpu, output, seq_len as u32, hidden_size as u32)?;
 
     Ok(())
 }

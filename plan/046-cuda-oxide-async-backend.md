@@ -12,8 +12,14 @@
 
 Transform the synchronous per-kernel decode loop into a lazy `DeviceOperation` pipeline that submits all GPU work in one burst, eliminating ~6ms CPU launch overhead per decode step.
 
-**Current**: 0.036s/step (27.8 tok/s)
-**Target**: 0.030s/step (33.3 tok/s) — closing 6ms of CPU launch overhead
+**Current**: 0.036s/step (27.8 tok/s) — GPU-bound, no CPU overhead gap
+**Target**: 0.036s/step (27.8 tok/s) for single-token decode — **parity, not speedup**
+
+The GPU is fully utilized (36ms GPU time = 36ms wall time). The async pipeline does NOT improve single-token decode latency. The value is architectural:
+- Clean buffer ownership (replace CudaSliceView hack)
+- Composable pipelines (and_then / zip! for future prefill overlap)
+- Foundation for continuous batching (multiple sequences on different streams)
+- Future multi-stream scheduling via round-robin pool
 
 ## Architecture
 
@@ -66,84 +72,135 @@ Async pipeline:
 - **No continuous batching**: Future phase. The async pipeline foundation enables it, but decode-only first.
 - **No prefill migration**: Decode path only. Prefill stays synchronous.
 
+## Architecture: Arc'd GPU Resources + with_context Closures
+
+### The Problem with and_then + Mutable State
+
+The `DeviceOperation` trait requires `Send + 'static` on outputs and `Send` on closures.
+`ForwardEngine` holds all GPU state as `&mut self` fields. Multiple `and_then` closures
+can't each capture `&mut ForwardEngine` — Rust's borrow checker prevents multiple mutable borrows,
+even though they execute sequentially.
+
+### The Solution: Split GPU Resources into Arc'd Components
+
+Refactor the GPU resources that `ForwardEngine` holds into `Arc`'d, `Send + Sync` components:
+
+1. **`Arc<GpuResources>`**: Holds `OxideKernels`, `GemmEngine`, `NcclCommunicator`, `GpuWeightCache` — all immutable, shared across sequences
+2. **`DecodeWorkspace`**: Per-sequence mutable workspace buffers (already separate, just needs to be `Arc<Mutex<DecodeWorkspace>>` or allocated per-sequence)
+3. **`Arc<ModelConfig>`**: Already `Arc`'d
+
+Each layer's forward pass is a `with_context` closure that captures `Arc<GpuResources>` and `&mut DecodeWorkspace`:
+
+```rust
+fn build_layer_decode(
+    res: Arc<GpuResources>,
+    ws: Arc<Mutex<DecodeWorkspace>>,
+    layer_idx: usize,
+    config: Arc<ModelConfig>,
+) -> impl DeviceOperation<Output = ()> {
+    with_context(move |ctx| {
+        let stream = ctx.get_cuda_stream();
+        let mut ws = ws.lock().unwrap();
+        
+        // Call existing sync methods — they use the stream parameter
+        res.norm1(stream, &mut ws, layer_idx)?;
+        res.attn_decode(stream, &mut ws, layer_idx)?;
+        res.all_reduce(stream, &mut ws.attn_out)?;
+        res.residual_add(stream, &mut ws)?;
+        res.norm2(stream, &mut ws, layer_idx)?;
+        res.mlp(stream, &mut ws, layer_idx)?;
+        res.all_reduce(stream, &mut ws.mlp_out)?;
+        res.residual_add(stream, &mut ws)?;
+        
+        value(())
+    })
+}
+```
+
+### Stream Handling
+
+The `with_context` closure gets `ctx.get_cuda_stream()` — a `&Arc<cuda_core::CudaStream>`.
+But our sync methods use cudarc streams (`&Arc<cudarc::driver::CudaStream>`).
+
+**Solution**: Create a cudarc `CudaStream` and a cuda-core `CudaStream` that share the same
+underlying `CUstream` handle. The `OxideKernels.cc_stream` and the cudarc `StreamPool` stream
+both wrap the same `CUstream`. The `with_context` closure gets the cuda-core stream for
+`module.kernel_async()` calls, while sync methods use the cudarc stream.
+
+For the MVP (single stream), both use the null stream — no new stream needed.
+
+### Execution
+
+```rust
+let pipeline = value(())
+    .and_then(move |()| build_layer_decode(res.clone(), ws.clone(), 0, config.clone()))
+    .and_then(move |()| build_layer_decode(res.clone(), ws.clone(), 1, config.clone()))
+    // ... 48 layers
+    .and_then(move |()| build_final_norm_and_lm_head(res, ws, config));
+
+// Execute
+pipeline.sync()?;
+```
+
+For continuous batching later: each sequence gets its own `DecodeWorkspace` + `and_then` chain,
+spawned as `tokio::spawn(pipeline.into_future())`.
+
 ## Implementation Plan
 
-### Task 1: Enable async feature + add dependencies (XS)
+### Task 1: Enable async feature + add dependencies (XS) ✅
 
-Add `cuda-async` as a dependency and enable the `async` feature on `cuda-host`.
+Done. `cuda-async` added, `async` feature enabled on `cuda-host` and `infers-kernel-lib`.
+
+### Task 2: Split GPU resources into Arc'd components (M)
+
+Refactor `ForwardEngine` to extract an `Arc<GpuResources>` struct that holds all the
+immutable GPU resources (kernels, GEMM engines, weight caches, NCCL communicator, config).
+Workspace buffers remain per-sequence mutable state.
 
 **Files**:
-- `crates/cuda/Cargo.toml`
-- `crates/backends/native/Cargo.toml`
+- `crates/backends/native/src/engine.rs` — extract `GpuResources` struct
+- `crates/backends/native/src/resources.rs` (new) — `GpuResources` definition
 
 **Acceptance criteria**:
-- `cargo check --release` passes
-- `cuda-async` crate is in the dependency tree
-- `cuda-host` has `async` feature enabled
+- `GpuResources` is `Send + Sync` (all fields `Arc`'d or `Send + Sync`)
+- `ForwardEngine` holds `Arc<GpuResources>` instead of individual fields
+- Existing sync code still compiles and passes smoke test
+- `DecodeWorkspace` referenced via `Arc<Mutex<DecodeWorkspace>>`
 
-### Task 2: Async kernel launch wrappers (S)
+### Task 3: Make OxideKernels stream dynamic (S)
 
-Add async launch methods to `OxideKernels` that return `AsyncKernelLaunch` (a `DeviceOperation`). These use the `module.kernel_async()` methods generated by `#[cuda_module]` when the `async` feature is enabled.
-
-Also add `with_context` wrappers for:
-- cuBLASLt GEMMs (`matmul_bf16`, `matmul_int4`)
-- NCCL all-reduce (`all_reduce_in_place`)
-- memcpy operations (`memcpy_htod`, `memcpy_dtod`)
-
-These wrappers get the stream from `ExecutionContext` at execution time.
+Change all 44 launch methods to accept a `&cuda_core::CudaStream` parameter for kernel dispatch,
+instead of using `&self.cc_stream`. The cudarc stream parameter (for `CudaSliceView` guards) stays.
 
 **Files**:
 - `crates/cuda/src/oxide_bridge.rs`
-- `crates/cuda/src/gemm.rs` (async GEMM wrapper)
-- `crates/cuda/src/nccl.rs` (async NCCL wrapper)
 
 **Acceptance criteria**:
-- All 34 kernel methods have async variants
-- cuBLASLt GEMM wrapped as `DeviceOperation` via `with_context`
-- NCCL all-reduce wrapped as `DeviceOperation` via `with_context`
-- Unit test: build a simple `and_then` chain with two kernel launches, execute via `async_on`, verify correctness
+- All 44 launch methods accept `dispatch_stream: &cuda_core::CudaStream` parameter
+- Kernel dispatch uses `dispatch_stream` instead of `&self.cc_stream`
+- Smoke test passes (parity with 0.036s/step)
 
-### Task 3: Non-blocking stream infrastructure (XS)
+### Task 4: Build per-layer decode pipeline as and_then chain (M)
 
-Replace the null stream with non-blocking streams in `StreamPool`. This is required because `async_on` needs a real stream (not the null stream, which has special synchronization semantics).
+Rewrite `decode.rs` to build the decode forward pass as `with_context` closures chained
+with `and_then`. Each closure calls the existing sync methods (norm, GEMM, attention/GDN,
+NCCL, residual_add).
 
 **Files**:
-- `crates/cuda/src/stream.rs`
+- `crates/backends/native/src/decode.rs` — rewrite as pipeline builder
 
 **Acceptance criteria**:
-- `StreamPool` creates non-blocking streams via `ctx.new_stream()`
-- Existing sync code still works (smoke test passes)
-- `OxideKernels.cc_stream` updated to use the non-blocking stream
-
-### Task 4: Build per-layer decode pipeline (M)
-
-Refactor `decode.rs` to build the decode forward pass as an `and_then` chain of `DeviceOperation`s. Each layer becomes a sub-pipeline:
-
-```
-norm1 → (attn/GDN sub-pipeline) → NCCL all_reduce → residual_add →
-norm2 → MLP GEMMs → silu_glu → NCCL all_reduce → residual_add
-```
-
-The full 48-layer decode is one big `and_then` chain, terminated by final norm + lm_head + argmax.
-
-**Files**:
-- `crates/backends/native/src/decode.rs` (rewrite)
-- `crates/backends/native/src/attention/paged_decode.rs` (adapt to return DeviceOperations)
-- `crates/backends/native/src/gdn.rs` (adapt decode_forward to return DeviceOperations)
-
-**Acceptance criteria**:
-- `decode_paged()` builds an `and_then` chain and executes via `async_on` + `synchronize`
+- `decode_paged()` builds `and_then` chain, executes via `pipeline.sync()`
 - Smoke test produces "Paris"
-- nsys profile shows all kernels on one stream with minimal gaps between them
+- Decode latency: 0.036s/step (parity)
 
 ### Task 5: Benchmark + verify (XS)
 
-Run the smoke test with timing and nsys profile.
+Run smoke test with timing, verify parity.
 
 **Acceptance criteria**:
 - Smoke test: "Paris" output, 30 tokens generated
-- Decode latency: ≤ 0.032s/step (improvement from 0.036s)
-- nsys: single stream per GPU, minimal gaps between kernel launches
+- Decode latency: ≤ 0.037s/step (parity ± 1ms)
 - No regressions in prefill path
 
 ## Risks
