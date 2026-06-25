@@ -189,6 +189,14 @@ impl ForwardEngine {
         group_size: usize,
     ) -> Result<Self> {
         let num_gpus = streams.len();
+
+        // Initialize cuda-async thread-local device contexts for async pipeline
+        // scheduling. Required for DeviceOperation::sync() / .await / async_on().
+        // Must be called before any async operations. Uses the default device (0)
+        // and prepares the context map for num_gpus devices.
+        cuda_async::device_context::init_device_contexts(0, num_gpus)
+            .map_err(|e| anyhow::anyhow!("Failed to init cuda-async device contexts: {e:?}"))?;
+
         let mut weights = weights; // mutable for clear_data() after GPU upload
         let per_gpu_kernels = Self::load_per_gpu_kernels(&contexts, num_gpus)?;
         let gemm_engines = Self::create_gemm_engines(&streams, num_gpus)?;

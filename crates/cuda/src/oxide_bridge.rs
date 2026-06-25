@@ -113,6 +113,10 @@ impl OxideKernels {
 
         // Create cuda-core default stream for typed module dispatch.
         // StreamPool also uses default streams so both share the null stream.
+        // This ensures cross-library synchronization: cudarc memcpy_dtod calls
+        // on the null stream are correctly ordered with kernel dispatches on
+        // the same null stream. Using a separate non-blocking stream would
+        // break ordering between cudarc operations and cuda-core kernel launches.
         let cc_stream = ctx.default_stream();
 
         // Restore the previous thread context.
