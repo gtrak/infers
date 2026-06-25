@@ -68,15 +68,76 @@ The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher th
 
 **Result:** Swapped v3_ksplit_sm → v4_ksplit in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.040s/step. No type mismatches (scales already f16). Affects: `int4_kernels.rs`, `oxide_bridge.rs`, `gemm_dispatch.rs`.
 
-### EXP-018: INT4 GEMV warp_split kernel — DONE
+### EXP-018: INT4 GEMV warp_split kernel — REVERTED
 
-Replace `int4_gemm_v3_ksplit_sm` with `int4_gemm_warp_split` in the m==1 decode path. Warp split uses block (32,8,1) with warp shuffle reduction instead of v3's (64,1,1). Hypothesis: better GPU occupancy from 8 warps/block vs single warp/block.
+Replaced `int4_gemm_v3_ksplit_sm` with `int4_gemm_warp_split` in the m==1 decode path. Warp split uses block (32,8,1) with warp shuffle reduction instead of v3's shared memory tiling. Eliminates shared memory entirely (0 bytes vs v3's SM tile).
 
-**Result:** Swapped v3_ksplit_sm → warp_split in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.219s/step. Shared mem: 0 bytes (warp shuffle replaces shared memory reduction). Affects: `gemm_dispatch.rs`.
+- **Correctness**: Smoke test PASSED — 30 tokens decoded
+- **Latency**: 0.219s/step — **6x slower** than v3_ksplit_sm (0.036s). Warp-cooperative approach is fundamentally wrong for M=1 GEMV — 256 threads/block with inter-warp coordination overhead far worse than v3's simple 64-thread blocks with ksplit grid.
+- **Status**: REVERTED. v3_ksplit_sm remains the production INT4 GEMM kernel.
 
-### EXP-019: Attention Q+gate split kernel — DONE
+### EXP-021: Custom BF16 GEMV for small projections — REVERTED
 
-Replaces 2×num_heads per-head `memcpy_dtod` calls with a single CUDA kernel. Kernel in `common_kernels.rs`. Affects: `attention.rs`, `oxide_bridge.rs`.
+Attempted custom BF16 GEMV kernels to replace cuBLASLt for `in_proj_a`/`in_proj_b` (N=24, K=5120). AutoRound excluded these from INT4 quantization, leaving them as BF16 cuBLASLt calls (9.7% of decode time). Two designs tested:
+
+1. **128-thread block** with shared memory cross-warp reduction: 0.037s/step (+1ms regression)
+2. **32-thread single-warp** block with pure warp shuffle: 0.040s/step (+4ms regression)
+
+Both worse than cuBLASLt. cuBLASLt is already well-optimized for tiny GEMVs — kernel launch overhead dominates and custom kernels can't amortize it better. Low GPU occupancy with few blocks (N=24 → 24 blocks) is the fundamental problem. The 9.7% cuBLASLt decode time is dominated by `lm_head` (N=152064), not the small a_proj/b_proj projections.
+
+- **Status**: REVERTED. cuBLASLt remains for all BF16 GEMVs.
+
+### EXP-022: Attention Q+gate split kernel — DONE
+
+Replaces per-head memcpy with single split kernel. Affects: `attention.rs`, `oxide_bridge.rs`.
+
+Replaced 2×num_heads per-head `memcpy_dtod` calls with a single `infers_split_qgate_bf16` kernel. Kernel in `common_kernels.rs` scatter-gathers from interleaved `[Q_h0, G_h0, Q_h1, G_h1, ...]` layout into separate `q_buf` and `gate_buf` buffers. 768 memcpy calls/step → 16 kernel launches.
+
+- **Correctness**: Smoke test PASSED — 30 tokens decoded
+- **Latency**: 0.036s/step (no measurable change — memcpy overhead was within noise)
+- **Status**: Integrated. Cleaner code, fewer D2D calls.
+
+## Nsight Systems Profile (Round 3 — post EXP-015/022)
+
+GPU kernel time breakdown from nsys profile (2× RTX 5060 Ti, 23 decode steps, current 0.036s/step):
+
+| Kernel | Total (µs) | Calls | Avg (µs) | % Decode |
+|--------|-----------|-------|----------|----------|
+| `int4_gemm_v3_ksplit_sm` | 885,715 | 18,543 | 47.8 | 57.9% |
+| `ncclDevKernel_AllReduce` | 299,946 | 6,188 | 48.5 | 19.6% |
+| `cublasGemvParamsEx<bf16>` | 149,115 | 4,475 | 33.3 | 9.7% |
+| `infers_gdn_recurrent_step` | 112,174 | 2,226 | 50.4 | 7.3% |
+| `infers_paged_attention_decode` | 76,822 | 741 | 103.7 | 5.0% |
+| `infers_rmsnorm_bf16` | 35,831 | 7,440 | 4.8 | 2.3% |
+| `reduce_partial_sums_bf16` | 20,118 | 18,543 | 1.1 | 1.3% |
+| All others | ~17,000 | — | — | ~1.1% |
+
+**Decode D2D memcpy:** 55,686 calls across all steps. Decode-specific: ~1,345 calls/step (GDN conv state: 288, GDN Q/K/V split: 288, Attention Q/gate: 768→16 after EXP-022, sampling: 1).
+
+**Updated bottlenecks:**
+1. **INT4 GEMM = 57.9%** — near bandwidth limit at 48µs/call
+2. **NCCL AllReduce = 19.6%** — residual dependency prevents pipeline overlap within a layer
+3. **cuBLASLt BF16 = 9.7%** — dominated by lm_head (N=152064), small a_proj/b_proj are fast
+4. **GDN recurrent = 7.3%** — low occupancy (24 blocks, 3072 threads on 40 SMs)
+
+## Round 3 Analysis: Kernel-Level Optimization Exhausted
+
+Three rounds of kernel optimization have reduced decode latency from 0.050s to 0.036s (28% improvement). The remaining 11ms gap to target (0.025s) is dominated by overheads that kernel-level changes cannot address:
+
+- **INT4 GEMM (57.9%)**: Near memory bandwidth limit. K-split grid gives good occupancy. Fused ksplit+reduce (EXP-013) was 3x slower. Alternative block structures (v4, warp_split) are worse.
+- **NCCL (19.6%)**: Residual add dependency creates strict serialization — MLP cannot start until AR(attn) completes. Cross-layer pipeline overlap requires multi-stream architecture, double-buffered workspaces, and Oxide bridge stream dispatch fix.
+- **cuBLASLt (9.7%)**: Custom GEMV kernels are slower (EXP-021). cuBLASLt is already efficient. The dominant lm_head call is bandwidth-limited.
+- **CPU-side kernel launch overhead (~6ms)**: ~3,400 kernel launches per step with ~2µs CPU overhead each. This is the largest remaining optimization opportunity.
+
+## Next Steps: Engine-Level Optimization
+
+The path from 0.036s to 0.025s requires engine-level changes:
+
+1. **CUDA graphs for decode loop**: Pre-record the ~3,400 kernel launches as a CUDA graph, replay with near-zero CPU overhead. Requires: (a) expose cudarc CudaGraph API, (b) replace H→D copies with pre-allocated device buffers, (c) pre-allocate sampling buffers, (d) remove GPU timing sync points. Estimated savings: 5-7ms.
+
+2. **NCCL pipeline overlap (cross-layer)**: Use separate CUDA streams for NCCL all-reduce vs compute. Overlap layer N's AR(mlp) with layer N+1's norm1+Attn. Requires: (a) non-blocking compute stream, (b) Oxide bridge stream dispatch fix, (c) double-buffered hidden state, (d) CUDA event synchronization. Estimated savings: 3-5ms.
+
+3. **Batched INT4 GEMV**: Fuse q/k/v projections (same input) into single batched kernel. Saves ~448 kernel launches/step. Estimated savings: 1-2ms.
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.
