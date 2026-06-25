@@ -28,7 +28,7 @@ Replace shared-memory halving reduction (7 barriers) with warp-shuffle for intra
 
 ### EXP-005: SiLU vectorized loads
 
-Kernel: `silu_glu_bf16`. Change: replace scalar u16 loads with u64 vectorized loads (4 bf16 elements at once). Hypothesis: 4x fewer memory transactions. Affects: `activation_kernels.rs`.
+Replace scalar u16 loads with `[u16;4]` 8-byte vectorized loads (4 bf16 at once) in `infers_silu_bf16` and `infers_silu_glu_bf16`. Scalar remainder loop handles tail.
 
 ### EXP-006: Paged attention K-cache caching
 
@@ -61,3 +61,19 @@ Replaced `int4_gemm_v3_ksplit` with `int4_gemm_v3_ksplit_sm`. Tiles input bf16 v
 - **Correctness**: cosine=1.00000 vs dumped reference output (N=8704, K=5120, group_size=128, k_split=28)
 - **Latency**: 55.7 µs/call (mean), 55.1 µs/call (min) — ksplit + reduce together
 - **Status**: Integrated. Old `int4_gemm_v3_ksplit` kernel and `launch_int4_gemm_v3_ksplit` bridge shim removed.
+
+### EXP-002: INT4 GEMM vectorized weight loads — DONE
+
+Replaced scalar u32 weight loads with `[u32; 4]` 128-bit loads in `int4_gemm_v3_ksplit_sm` for non-transposed path.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris")
+- **Latency**: 0.049s/step (vs 0.050s baseline) — marginal improvement from fewer LDG instructions. INT4 GEMM is likely not the bottleneck.
+- **Status**: Integrated.
+
+### EXP-005: SiLU vectorized loads — DONE
+
+Replaced scalar u16 loads with `[u16;4]` 8-byte vectorized loads in both SiLU kernels. Tail handled by scalar loop.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris")
+- **Latency**: 0.050s/step (vs 0.050s baseline) — no measurable improvement. SiLU kernels are likely not the bottleneck (compute-bound from libm::expf, not memory-bound).
+- **Status**: Integrated.

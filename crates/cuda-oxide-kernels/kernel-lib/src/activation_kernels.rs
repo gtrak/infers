@@ -9,6 +9,7 @@ pub mod activation {
 
     /// SiLU activation: output[i] = x[i] * sigmoid(x[i])
     /// where sigmoid(v) = 1.0 / (1.0 + exp(-v))
+    // @lat: [[kernel-optimization#Kernel Optimization Experiments#Experiment Queue#EXP-005: SiLU vectorized loads]]
     #[kernel]
     #[launch_bounds(256)]
     pub fn infers_silu_bf16(
@@ -23,7 +24,22 @@ pub mod activation {
         let stride = thread::blockDim_x() * thread::gridDim_x();
         let total = total_elements as usize;
 
-        for i in (tid as usize..total).step_by(stride as usize) {
+        let vec_total = total / 4 * 4;
+        let vec_stride = stride as usize * 4;
+        for base in (tid as usize * 4..vec_total).step_by(vec_stride) {
+            let x4: [u16; 4] = unsafe { *(x.as_ptr().add(base) as *const [u16; 4]) };
+            let mut o4 = [0u16; 4];
+            for j in 0..4 {
+                let val = f32::from_bits((x4[j] as u32) << 16);
+                let sigmoid = 1.0 / (1.0 + libm::expf(-val));
+                o4[j] = f32_to_bf16(val * sigmoid);
+            }
+            unsafe {
+                let ptr = output.get_unchecked_mut(base) as *mut u16 as *mut [u16; 4];
+                *ptr = o4;
+            }
+        }
+        for i in (vec_total + tid as usize..total).step_by(stride as usize) {
             let val = f32::from_bits((x[i] as u32) << 16);
             let sigmoid = 1.0 / (1.0 + libm::expf(-val));
             unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(val * sigmoid); }
@@ -31,6 +47,7 @@ pub mod activation {
     }
 
     /// SiLU Gated Linear Unit: output[i] = x[i] * gate[i] * sigmoid(gate[i])
+    // @lat: [[kernel-optimization#Kernel Optimization Experiments#Experiment Queue#EXP-005: SiLU vectorized loads]]
     #[kernel]
     #[launch_bounds(256)]
     pub fn infers_silu_glu_bf16(
@@ -46,7 +63,24 @@ pub mod activation {
         let stride = thread::blockDim_x() * thread::gridDim_x();
         let total = total_elements as usize;
 
-        for i in (tid as usize..total).step_by(stride as usize) {
+        let vec_total = total / 4 * 4;
+        let vec_stride = stride as usize * 4;
+        for base in (tid as usize * 4..vec_total).step_by(vec_stride) {
+            let x4: [u16; 4] = unsafe { *(x.as_ptr().add(base) as *const [u16; 4]) };
+            let g4: [u16; 4] = unsafe { *(gate.as_ptr().add(base) as *const [u16; 4]) };
+            let mut o4 = [0u16; 4];
+            for j in 0..4 {
+                let x_val = f32::from_bits((x4[j] as u32) << 16);
+                let g_val = f32::from_bits((g4[j] as u32) << 16);
+                let sigmoid_g = 1.0 / (1.0 + libm::expf(-g_val));
+                o4[j] = f32_to_bf16(x_val * g_val * sigmoid_g);
+            }
+            unsafe {
+                let ptr = output.get_unchecked_mut(base) as *mut u16 as *mut [u16; 4];
+                *ptr = o4;
+            }
+        }
+        for i in (vec_total + tid as usize..total).step_by(stride as usize) {
             let x_val = f32::from_bits((x[i] as u32) << 16);
             let g_val = f32::from_bits((gate[i] as u32) << 16);
             let sigmoid_g = 1.0 / (1.0 + libm::expf(-g_val));
