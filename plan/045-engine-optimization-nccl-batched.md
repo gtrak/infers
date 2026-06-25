@@ -1,12 +1,52 @@
 # Phase 045: Engine-Level Optimization — NCCL Pipeline Overlap + Batched GEMV
 
 ---
-**Status**: ACTIVE — next optimization target (Phase 044 CUDA graphs deferred)
+**Status**: PARTIALLY COMPLETE — micro-optimizations done, major items reassessed
 **Last Updated**: 2026-06-25
 **Blocks**: None (final optimization layer)
 **Blocked by**: None — Phase 044 (CUDA graphs) is deferred due to NCCL incompatibility
 **Rationale**: With CUDA graphs blocked by NCCL/stream-capture incompatibility (see Phase 044 assessment), the remaining path from 0.036s to 0.025s is engine-level changes: NCCL pipeline overlap (3-5ms) and batched GEMV (1-2ms). Combined target: 4-7ms savings, closing most of the 11ms gap without requiring graph capture.
 ---
+
+## Assessment (2026-06-25)
+
+### NCCL pipeline overlap — NOT FEASIBLE for M=1 decode
+
+The decode path has strict data dependencies: every operation depends on the
+previous allreduce completing. The residual add reads `hidden + attn_AR`, so
+norm2 cannot start until AR(attn) finishes. Similarly, the next layer's norm1
+cannot start until AR(mlp) finishes. There is no opportunity to overlap NCCL
+with compute for M=1 (single-token decode). This optimization only works for
+prefill with large batch sizes where GEMMs are long enough to hide NCCL latency.
+
+### Batched INT4 GEMV — LOW IMPACT
+
+With 12 FullAttention layers × 3 projections = 36 GEMV calls, fusing q/k/v
+saves only ~24 kernel launches = ~0.05ms. Not worth the implementation effort.
+
+### Micro-optimizations DONE (sub-millisecond savings each)
+
+1. **Removed NCCL group_start/group_end from decode path** — eliminates 4 NCCL API calls per layer × 48 layers = 192 API calls per step. Prefill path keeps group_start/end (removing caused hangs).
+
+2. **Removed tracing::debug_span from NCCL sync wrappers** — eliminates 72 span creations per step.
+
+3. **Cached ProbeConfig on ForwardEngine** — avoids `std::env::var()` syscalls per decode step (previously called `ProbeConfig::from_env()` every step, which does 3+ env::var calls).
+
+4. **Removed `probe::dump_config()` call per decode step** — was calling `eprintln!` + env checks every step.
+
+### What remains (ungated)
+
+The 11ms gap from 0.036s to 0.025s is dominated by:
+- INT4 GEMM (57.9% = 20.9ms) — near bandwidth limit, kernel-level optimizations exhausted
+- NCCL (19.6% = 7.1ms) — no overlap opportunity for M=1
+- cuBLASLt (9.7% = 3.5ms) — lm_head is BF16 (2.54GB), model author's choice not to quantize
+- GDN (7.3% = 2.6ms) — near memory-bandwidth limit for state reads/writes
+- CPU launch overhead (~6ms) — only addressable via CUDA graphs (blocked)
+
+**Conclusion**: The 0.025s target requires either CUDA graphs (blocked by NCCL)
+or a different model (single-GPU, quantized lm_head, or smaller vocab).
+At 0.036s/step (27.8 tok/s) we are near the practical limit for this 2-GPU
+configuration with the current model.
 
 ## Goal
 
