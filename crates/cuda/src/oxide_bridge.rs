@@ -1293,8 +1293,6 @@ impl OxideKernels {
         head_k_dim: u32,
         head_v_dim: u32,
     ) -> anyhow::Result<()> {
-        let total = (num_heads as usize) * (head_v_dim as usize);
-
         // Create CudaSliceViews wrapping the cudarc slices
         let query_view = CudaSliceView::new(&query, stream, &self.ctx);
         let key_view = CudaSliceView::new(&key, stream, &self.ctx);
@@ -1306,8 +1304,16 @@ impl OxideKernels {
         let mut state_view = CudaSliceView::new_mut(state, stream, &self.ctx);
         let mut output_view = CudaSliceView::new_mut(output, stream, &self.ctx);
 
-        // Dispatch via typed module
-        let config = LaunchConfig::for_num_elems(total as u32);
+        // 2D grid: blockIdx.y = head, blockIdx.x tiles over v_dim
+        // Shared memory: 2*K f32s for key + query caching
+        let block_dim = 128u32;
+        let grid_x = (head_v_dim + block_dim - 1) / block_dim;
+        let smem_bytes = 2 * (head_k_dim as usize) * std::mem::size_of::<f32>();
+        let config = LaunchConfig {
+            grid_dim: (grid_x, num_heads, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: smem_bytes as u32,
+        };
         self.modules.gdn.infers_gdn_recurrent_step_bf16(
             &self.cc_stream, config,
             &query_view, &key_view, &value_view,

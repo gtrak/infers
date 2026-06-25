@@ -8,9 +8,10 @@ pub mod gdn {
     use super::*;
 
     /// GDN recurrent step: single-token decode kernel.
-    /// One thread per (head, v_dim) element. No shared memory.
+    /// 2D grid: blockIdx.y = head, blockIdx.x tiles over v_dim.
+    /// All threads in a block share the same head → key/query cached in shared memory.
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(128)]
     pub fn infers_gdn_recurrent_step_bf16(
         query: &[u16],           // [H, K] bf16
         key: &[u16],             // [H, K] bf16
@@ -26,16 +27,45 @@ pub mod gdn {
         head_v_dim: u32,
     ) {
         use cuda_device::tcgen05::f32_to_bf16;
-        let total = (num_heads * head_v_dim) as usize;
-        let idx = thread::index_1d();
-        let tid = idx.get() as usize;
-        if tid >= total { return; }
 
-        let h = tid / head_v_dim as usize;
-        let v = tid % head_v_dim as usize;
+        let h = thread::blockIdx_y() as usize;
+        let v = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
         let K = head_k_dim as usize;
         let V = head_v_dim as usize;
+        let H = num_heads as usize;
         let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
+
+        if h >= H || v >= V { return; }
+
+        // Shared memory: key[K] + query[K]
+        let smem = DynamicSharedArray::<f32>::get();
+        let smem_key = smem;
+        let smem_query = unsafe { smem.add(K) };
+
+        // Cooperative load: all threads in block load key and query
+        let block_size = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+
+        for i in (tid..K).step_by(block_size) {
+            unsafe {
+                *smem_key.add(i) = f32::from_bits((key[h * K + i] as u32) << 16);
+                *smem_query.add(i) = f32::from_bits((query[h * K + i] as u32) << 16);
+            }
+        }
+        cuda_device::sync_threads();
+
+        // L2-normalize key and query from shared memory
+        let mut k_l2_sq = 0.0f32;
+        let mut q_l2_sq = 0.0f32;
+        for k in 0..K {
+            let kv = unsafe { *smem_key.add(k) };
+            let qv = unsafe { *smem_query.add(k) };
+            k_l2_sq += kv * kv;
+            q_l2_sq += qv * qv;
+        }
+
+        let k_rcp = 1.0f32 / (k_l2_sq + 1e-6f32).sqrt();
+        let q_rcp = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt() * rcp_sqrt_k;
 
         // Compute g[h] and beta[h]
         let decay_rate_h = fast_expf(a_log[h]);
@@ -54,36 +84,21 @@ pub mod gdn {
         let g_val = -decay_rate_h * softplus_val;
         let decay = fast_expf(g_val);
 
-        // beta[h] = sigmoid(b_proj[h])
         let b_val = f32::from_bits((b_proj[h] as u32) << 16);
         let beta_val = 1.0f32 / (1.0f32 + fast_expf(-b_val));
 
-        // L2-normalize key and query
-        let mut k_l2_sq = 0.0f32;
-        let mut q_l2_sq = 0.0f32;
-        for k in 0..K {
-            let kv = f32::from_bits((key[h * K + k] as u32) << 16);
-            let qv = f32::from_bits((query[h * K + k] as u32) << 16);
-            k_l2_sq += kv * kv;
-            q_l2_sq += qv * qv;
-        }
-
-        let eps = 1e-6f32;
-        let k_rcp = 1.0f32 / (k_l2_sq + eps).sqrt();
-        let q_rcp = 1.0f32 / (q_l2_sq + eps).sqrt() * rcp_sqrt_k;
-
         let state_base = h * K * V + v;
 
-        // Step 1: State decay
+        // Step 1: State decay (no key/query needed)
         for k in 0..K {
             state[state_base + k * V] *= decay;
         }
 
-        // Step 2: kv_mem = sum_k S[h][k][v] * key_normed[h][k]
+        // Step 2: kv_mem = sum_k S[h][k][v] * key_normed[h][k] (from smem)
         let mut kv_mem = 0.0f32;
         for k in 0..K {
             let s_val = state[state_base + k * V];
-            let k_val = f32::from_bits((key[h * K + k] as u32) << 16) * k_rcp;
+            let k_val = unsafe { *smem_key.add(k) } * k_rcp;
             kv_mem += s_val * k_val;
         }
 
@@ -91,17 +106,17 @@ pub mod gdn {
         let v_val = f32::from_bits((value[h * V + v] as u32) << 16);
         let delta = beta_val * (v_val - kv_mem);
 
-        // Step 4: State update
+        // Step 4: State update (from smem)
         for k in 0..K {
-            let k_val = f32::from_bits((key[h * K + k] as u32) << 16) * k_rcp;
+            let k_val = unsafe { *smem_key.add(k) } * k_rcp;
             state[state_base + k * V] += k_val * delta;
         }
 
-        // Step 5: Output
+        // Step 5: Output (from smem)
         let mut y_val = 0.0f32;
         for k in 0..K {
             let s_val = state[state_base + k * V];
-            let q_val = f32::from_bits((query[h * K + k] as u32) << 16) * q_rcp;
+            let q_val = unsafe { *smem_query.add(k) } * q_rcp;
             y_val += s_val * q_val;
         }
 
