@@ -73,6 +73,10 @@ The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher th
 Replace `int4_gemm_v3_ksplit_sm` with `int4_gemm_warp_split` in the m==1 decode path. Warp split uses block (32,8,1) with warp shuffle reduction instead of v3's (64,1,1). Hypothesis: better GPU occupancy from 8 warps/block vs single warp/block.
 
 **Result:** Swapped v3_ksplit_sm → warp_split in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.219s/step. Shared mem: 0 bytes (warp shuffle replaces shared memory reduction). Affects: `gemm_dispatch.rs`.
+
+### EXP-019: Attention Q+gate split kernel — DONE
+
+Replaces 2×num_heads per-head `memcpy_dtod` calls with a single CUDA kernel. Kernel in `common_kernels.rs`. Affects: `attention.rs`, `oxide_bridge.rs`.
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.

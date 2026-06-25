@@ -300,4 +300,36 @@ pub mod common {
             unsafe { *buf.get_unchecked_mut(idx) = 0u16; }
         }
     }
+
+    /// Split interleaved Q+gate into separate contiguous buffers.
+    /// q_full layout: [Q_h0, G_h0, Q_h1, G_h1, ...] where each Q/G is head_dim bf16 values.
+    /// q_buf output: [Q_h0, Q_h1, ...] — contiguous Q per head.
+    /// gate_buf output: [G_h0, G_h1, ...] — contiguous gate per head.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_split_qgate_bf16(
+        q_full: &[u16],
+        mut q_buf: DisjointSlice<u16>,
+        mut gate_buf: DisjointSlice<u16>,
+        num_heads: u32,
+        head_dim: u32,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let total = (num_heads as usize) * (head_dim as usize) * 2;
+
+        for i in (tid as usize..total).step_by(stride as usize) {
+            let head = i / (head_dim as usize * 2);
+            let offset = i % (head_dim as usize * 2);
+            let val = q_full[i];
+            if offset < head_dim as usize {
+                // Q portion
+                unsafe { *q_buf.get_unchecked_mut(head * head_dim as usize + offset) = val; }
+            } else {
+                // Gate portion
+                unsafe { *gate_buf.get_unchecked_mut(head * head_dim as usize + offset - head_dim as usize) = val; }
+            }
+        }
+    }
 }

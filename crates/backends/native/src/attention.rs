@@ -1227,25 +1227,10 @@ pub fn decode_forward_paged(
     // Q-norm, and RoPE inside each branch to satisfy mutable borrow requirements.
     if attn_output_gate {
         // Extract Q and gate portions from q_full (per-head interleaved layout)
-        for h in 0..num_heads {
-            let src_offset = h * (head_dim * 2);
-            let dst_offset = h * head_dim;
-            let src_slice = ws.q_full.slice(src_offset..src_offset + head_dim);
-            let mut dst_slice = ws.q_buf.slice_mut(dst_offset..dst_offset + head_dim);
-            stream
-                .memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Copy Q from q_full failed: {e}"))?;
-        }
-
-        for h in 0..num_heads {
-            let src_offset = h * (head_dim * 2) + head_dim;
-            let dst_offset = h * head_dim;
-            let src_slice = ws.q_full.slice(src_offset..src_offset + head_dim);
-            let mut dst_slice = ws.gate_buf.slice_mut(dst_offset..dst_offset + head_dim);
-            stream
-                .memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Copy gate from q_full failed: {e}"))?;
-        }
+        oxide.launch_split_qgate_bf16(
+            stream, &ws.q_full, &mut ws.q_buf, &mut ws.gate_buf,
+            num_heads as u32, head_dim as u32,
+        )?;
 
         probe::dump(stream, probe, layer_idx, gpu_idx, "attn.gate", &ws.gate_buf, &[1, per_gpu_head_dim], "decode");
 

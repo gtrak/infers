@@ -189,6 +189,31 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Launch the `infers_split_qgate_bf16` kernel: split interleaved Q+gate into separate buffers.
+
+    /// Replaces 2×num_heads per-head memcpy calls with a single kernel launch.
+    /// Grid: LaunchConfig::for_num_elems(num_heads * head_dim * 2), Block: (256, 1, 1).
+    pub fn launch_split_qgate_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q_full: &CudaSlice<half::bf16>,
+        q_buf: &mut CudaSlice<half::bf16>,
+        gate_buf: &mut CudaSlice<half::bf16>,
+        num_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<()> {
+        let q_full_view = CudaSliceView::new(&q_full, stream, &self.ctx);
+        let mut q_buf_view = CudaSliceView::new_mut(q_buf, stream, &self.ctx);
+        let mut gate_buf_view = CudaSliceView::new_mut(gate_buf, stream, &self.ctx);
+
+        let total = (num_heads as u32) * (head_dim as u32) * 2;
+        let config = LaunchConfig::for_num_elems(total);
+        self.modules.common.infers_split_qgate_bf16(
+            &self.cc_stream, config, &q_full_view, &mut q_buf_view, &mut gate_buf_view,
+            num_heads, head_dim,
+        ).map_err(|e| anyhow::anyhow!("kernel 'infers_split_qgate_bf16' failed: {:?}", e))
+    }
+
     /// Launch the `infers_embedding_gather_bf16` kernel: gather embeddings by token ids.
     ///
     /// The kernel signature is:

@@ -454,7 +454,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 | File | Module Name | Kernels / Helpers |
 |------|-------------|-------------------|
 | `shared.rs` | (none) | dev_sqrtf, f16_to_f32, fp4_e2m1_to_f32, Fp8Format trait + impls, Dequantize trait + impls, KvCacheFormat trait + impl, fp8_quantize/dequantize_inner, int4_gemm_inner |
-| `common_kernels.rs` | `common` | infers_add_bf16, infers_embedding_gather_bf16, infers_argmax_bf16, infers_softmax_bf16, infers_kv_cache_write_bf16, sanitize_nan_bf16 |
+| `common_kernels.rs` | `common` | infers_add_bf16, infers_embedding_gather_bf16, infers_argmax_bf16, infers_softmax_bf16, infers_kv_cache_write_bf16, infers_split_qgate_bf16, sanitize_nan_bf16 |
 | `norm_kernels.rs` | `norm` | infers_rmsnorm_bf16, infers_rms_norm_gated_bf16, infers_l2norm_bf16 |
 | `activation_kernels.rs` | `activation` | infers_silu_bf16, infers_silu_glu_bf16, infers_attn_output_gate_bf16, infers_conv1d_depthwise_silu_bf16 |
 | `attention_kernels.rs` | `attention` | infers_paged_kv_write_bf16, infers_paged_kv_read_bf16, infers_paged_attention_decode_bf16, infers_rope_bf16 |
