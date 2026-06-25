@@ -9,11 +9,16 @@ pub struct StreamPool {
 }
 
 impl StreamPool {
-    /// Create a stream pool with one stream per context.
+    /// Create a stream pool with one default (null) stream per context.
+    ///
+    /// Uses default streams (not non-blocking) so that cuda-core's `cc_stream`
+    /// (also the null stream) shares the same stream and operations are ordered
+    /// FIFO. Non-blocking streams would NOT synchronize with the null stream,
+    /// causing race conditions between cudarc and cuda-core kernel launches.
     pub fn new(contexts: &[std::sync::Arc<CudaContext>]) -> anyhow::Result<Self> {
         let mut streams = Vec::with_capacity(contexts.len());
         for ctx in contexts {
-            let stream = ctx.new_stream()?;
+            let stream = ctx.default_stream();
             streams.push(stream);
         }
         Ok(Self { streams })

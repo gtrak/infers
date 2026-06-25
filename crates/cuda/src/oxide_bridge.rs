@@ -50,13 +50,17 @@ impl<'a, T, U> std::ops::Deref for CudaSliceView<'a, T, U> {
 impl<'a, T, U> std::ops::DerefMut for CudaSliceView<'a, T, U> {
     fn deref_mut(&mut self) -> &mut DeviceBuffer<U> { &mut self.db }
 }
+
 /// Pre-loaded cuda-oxide kernels from a compiled cubin file.
 pub struct OxideKernels {
     ctx: Arc<CudaContext>,
     module: Arc<CudaModule>,
     /// Typed kernel modules for direct dispatch (avoids raw arg packing).
     modules: KernelModules,
-    /// cuda-core stream used by typed module methods.
+    /// cuda-core stream used by typed module dispatch. This is the null/default
+    /// stream (stream 0). StreamPool must also use default streams so both
+    /// systems share the null stream — non-blocking streams do NOT synchronize
+    /// with the null stream.
     cc_stream: Arc<cuda_core::CudaStream>,
 }
 
@@ -65,6 +69,20 @@ impl OxideKernels {
     pub fn new(ordinal: usize, cubin_path: &str) -> anyhow::Result<Self> {
         // Create cuda-oxide context on the specified device (primary context shared with cudarc)
         let ctx = CudaContext::new(ordinal)?;
+
+        // Save the current thread context so we can restore it after loading.
+        // OxideKernels::new() is often called in a loop for multiple GPUs, and
+        // bind_to_thread() changes the current context. Leaving GPU N's context
+        // active breaks cuBLASLt which was initialized with a different context.
+        let saved_ctx = {
+            let mut current = std::mem::MaybeUninit::uninit();
+            let result = unsafe { sys::cuCtxGetCurrent(current.as_mut_ptr()) };
+            if result != 0 {
+                anyhow::bail!("cuCtxGetCurrent failed (error code {})", result);
+            }
+            unsafe { current.assume_init() }
+        };
+
         // Bind the context to the current thread before loading
         ctx.bind_to_thread()?;
 
@@ -92,8 +110,14 @@ impl OxideKernels {
         // Create typed kernel modules from the same loaded module (no double-load)
         let modules = KernelModules::from_module(module.clone())?;
 
-        // Create a cuda-core stream for typed module dispatch
+        // Create cuda-core default stream for typed module dispatch.
+        // StreamPool also uses default streams so both share the null stream.
         let cc_stream = ctx.default_stream();
+
+        // Restore the previous thread context.
+        if !saved_ctx.is_null() {
+            let _ = unsafe { sys::cuCtxSetCurrent(saved_ctx) };
+        }
 
         Ok(Self { ctx, module, modules, cc_stream })
     }

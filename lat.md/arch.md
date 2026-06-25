@@ -65,7 +65,9 @@ bf16 fields stored as `DeviceBuffer<u16>` (bit-pattern), f32 as `DeviceBuffer<f3
 
 ### Oxide Bridge: Runtime Kernel Loading
 
-One `OxideKernels` instance per GPU loads the cubin on the correct device's primary context, preventing cross-GPU context errors in tensor-parallel inference.
+One `OxideKernels` instance per GPU loads the cubin on the correct device's primary context, preventing cross-GPU context errors in tensor-parallel inference. Context is saved before and restored after loading to prevent leaks.
+
+Before calling `bind_to_thread()`, `OxideKernels::new()` saves the current thread CUDA context via `cuCtxGetCurrent`. After module loading completes, it restores the saved context with `cuCtxSetCurrent` — this prevents the last GPU's context from leaking as the active thread context, which would break cuBLASLt initialized on a different device.
 
   Resolves all kernel function handles into a `HashMap<&str, CudaFunction>`. After loading functions, calls `cuFuncSetAttribute(raw_func, 8, 100_000)` on the chunked GDN kernel to raise its dynamic shared memory limit from the default ~48KB to 100KB — the kernel needs ~80KB for k_normed, k_beta, and attn buffers. Type-safe launch wrappers accept cudarc `CudaSlice<T>` buffers — the bridge casts `CUdeviceptr` between cudarc and cuda-oxide type namespaces while keeping `SyncOnDrop` guards alive during launches. Proven via `launch_add_bf16` test: cudarc allocates bf16 buffers, bridge launches kernel, result verified on CPU. Additionally, OxideKernels holds a `KernelModules` instance (constructed from the same loaded cubin to avoid double-loading) and a `cc_stream: Arc<cuda_core::CudaStream>` — infrastructure for typed module dispatch via `modules(&self)` accessor.
 
@@ -481,7 +483,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 
 **CudaSliceView<'a, T, U>**: Non-owning wrapper that presents a cudarc `CudaSlice<T>` as a `cuda-core DeviceBuffer<T>`. Uses `ManuallyDrop` to prevent double-free (CudaSlice owns the memory). `SyncOnDrop` guard keeps cudarc stream synchronization alive. `Deref`/`DerefMut` impls allow passing views directly to typed methods.
 
-**Stream handling**: Typed dispatch uses `cc_stream` (cuda-core default stream). Both cudarc and cuda-core default streams are the legacy CUDA null stream, which has implicit bidirectional serialization with all other streams — ordering is correct.
+**Stream handling**: Typed dispatch uses `cc_stream` (cuda-core non-blocking stream created via `ctx.new_stream()` in `OxideKernels::new()`). Non-blocking stream matches cudarc's StreamPool semantics. BorrowedCudaStream approach (casting cudarc's CUstream through cuda-core CudaStream) was rejected — it caused SIGSEGV due to incompatible internal context validation in cuda-oxide's `bind_to_thread()`.
 
 **OxideKernels struct**: `ctx` (cuda-core context), `module` (cuda-core cubin), `modules` (KernelModules typed dispatch), `cc_stream` (cuda-core stream). No more manual arg packing — `push_slice_arg`, `push_scalar_arg`, `raw_launch` removed.
 
