@@ -96,7 +96,7 @@ pub fn gemm_projection_cached(
                 // K_SPLIT is correct regardless of divisibility (40, 136, 9, 34 groups
                 // all handled). K_SPLIT=20 gives ~1.25 waves on 40 SMs for the main
                 // hidden=5120 layers (2 groups/split, 1600 blocks).
-                const K_SPLIT: u32 = 28;
+                const K_SPLIT: u32 = 20;
                 let required_len = K_SPLIT as usize * n;
                 // Use the provided buffer if large enough; else fall back to unsafe alloc (no memset needed — kernel writes every position).
                 let mut local_ps_owner: Option<CudaSlice<f32>> = None;
@@ -146,7 +146,7 @@ pub fn gemm_projection_cached(
 
             if m == 1 {
                 // K-split for M=1: v3 with 4 accumulators + ceil-grouped K-split + 2-u32 stride
-                const K_SPLIT: u32 = 28;
+                const K_SPLIT: u32 = 20;
                 let required_len = K_SPLIT as usize * n;
                 // Use the provided buffer if large enough; else fall back to unsafe alloc (no memset needed — kernel writes every position).
                 let mut local_ps_owner: Option<CudaSlice<f32>> = None;

@@ -76,7 +76,7 @@ impl DecodeWorkspace {
         vocab_size: usize,
         num_gpus: usize,
     ) -> Result<Self> {
-        const K_SPLIT: u32 = 28;
+        const K_SPLIT: u32 = 20;
         Ok(Self {
             norm1_out: stream.alloc_zeros::<bf16>(hidden_size)?,
             norm2_out: stream.alloc_zeros::<bf16>(hidden_size)?,
