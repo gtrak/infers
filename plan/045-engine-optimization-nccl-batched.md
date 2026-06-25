@@ -1,11 +1,11 @@
 # Phase 045: Engine-Level Optimization — NCCL Pipeline Overlap + Batched GEMV
 
 ---
-**Status**: NOT STARTED
+**Status**: ACTIVE — next optimization target (Phase 044 CUDA graphs deferred)
 **Last Updated**: 2026-06-25
 **Blocks**: None (final optimization layer)
-**Blocked by**: Phase 044 (CUDA graphs — eliminates launch overhead first)
-**Rationale**: After CUDA graphs eliminate CPU launch overhead, the remaining bottlenecks are GPU-side: INT4 GEMM (58%), NCCL (20%), and kernel-level compute. NCCL pipeline overlap can hide 3-5ms of all-reduce latency behind compute. Batched GEMV can fuse q/k/v projections into a single kernel launch.
+**Blocked by**: None — Phase 044 (CUDA graphs) is deferred due to NCCL incompatibility
+**Rationale**: With CUDA graphs blocked by NCCL/stream-capture incompatibility (see Phase 044 assessment), the remaining path from 0.036s to 0.025s is engine-level changes: NCCL pipeline overlap (3-5ms) and batched GEMV (1-2ms). Combined target: 4-7ms savings, closing most of the 11ms gap without requiring graph capture.
 ---
 
 ## Goal

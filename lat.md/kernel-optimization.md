@@ -133,11 +133,11 @@ Three rounds of kernel optimization have reduced decode latency from 0.050s to 0
 
 The path from 0.036s to 0.025s requires engine-level changes:
 
-1. **CUDA graphs for decode loop**: Pre-record the ~3,400 kernel launches as a CUDA graph, replay with near-zero CPU overhead. Requires: (a) expose cudarc CudaGraph API, (b) replace H→D copies with pre-allocated device buffers, (c) pre-allocate sampling buffers, (d) remove GPU timing sync points. Estimated savings: 5-7ms.
+1. **CUDA graphs for decode loop — BLOCKED**: Stream capture succeeds but NCCL operations leave the stream in a deadlocked state after `end_capture`. NCCL internally creates its own streams/events that conflict with graph capture. Production engines (vLLM, TensorRT-LLM) use `ncclGraphAddAllReduce` (explicit graph API) or per-layer compute-only graphs (NCCL outside graph). Deferred until we implement one of these approaches. See `plan/044-cuda-graphs-decode.md` for full analysis.
 
-2. **NCCL pipeline overlap (cross-layer)**: Use separate CUDA streams for NCCL all-reduce vs compute. Overlap layer N's AR(mlp) with layer N+1's norm1+Attn. Requires: (a) non-blocking compute stream, (b) Oxide bridge stream dispatch fix, (c) double-buffered hidden state, (d) CUDA event synchronization. Estimated savings: 3-5ms.
+2. **NCCL pipeline overlap (cross-layer)**: Use separate CUDA streams for NCCL all-reduce vs compute. Overlap layer N's AR(mlp) with layer N+1's norm1+Attn. Requires: (a) non-blocking compute stream, (b) Oxide bridge stream dispatch fix, (c) double-buffered hidden state, (d) CUDA event synchronization. Estimated savings: 3-5ms. **NEXT TARGET** — see `plan/045-engine-optimization-nccl-batched.md`.
 
-3. **Batched INT4 GEMV**: Fuse q/k/v projections (same input) into single batched kernel. Saves ~448 kernel launches/step. Estimated savings: 1-2ms.
+3. **Batched INT4 GEMV**: Fuse q/k/v projections (same input) into single batched kernel. Saves ~448 kernel launches/step. Estimated savings: 1-2ms. Combine with NCCL overlap.
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.

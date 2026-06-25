@@ -1,12 +1,73 @@
 # Phase 044: CUDA Graph Capture/Replay for Decode
 
 ---
-**Status**: IN PROGRESS
+**Status**: BLOCKED — NCCL + stream capture fundamentally incompatible
 **Last Updated**: 2026-06-25
 **Blocks**: Phase 045 (NCCL pipeline overlap)
-**Blocked by**: Phase 043 (graph prerequisites — H2D elimination, pre-allocated buffers, dynamic params)
+**Blocked by**: None — blocked by architectural constraint (see Assessment below)
 **Rationale**: The decode step executes ~3,400 kernel launches per token. Each launch has ~2µs CPU overhead. That's ~6.8ms of pure CPU dispatch overhead — the single largest remaining optimization target. CUDA graphs capture the entire computation graph once, then replay it with a single API call (~10µs), eliminating all per-kernel launch overhead. This is what vLLM does for its decode step.
 ---
+
+## Assessment (2026-06-25)
+
+After extensive investigation across multiple implementation attempts, CUDA graph
+capture for the decode loop is **blocked** by a fundamental incompatibility between
+NCCL and CUDA stream capture in our multi-GPU architecture.
+
+### What we verified works
+
+- `begin_capture(CU_STREAM_CAPTURE_MODE_RELAXED)` succeeds on non-blocking streams
+- Kernel launches (cuda-oxide + cuBLASLt) are captured correctly
+- Raw `cuMemcpyHtoDAsync_v2` from pinned host memory works during capture
+- NCCL `ncclAllReduce` calls inside `group_start`/`group_end` are accepted during capture
+- `end_capture` returns a valid `CudaGraph` object
+
+### What fails
+
+After `end_capture` + `graph.upload()` + `cuStreamSynchronize`, the stream
+**deadlocks** on the next operation — even raw `cuMemcpyDtoDAsync_v2` hangs.
+This includes operations that should be completely independent of the captured graph.
+
+Additionally, during the capture step, the operations are **recorded, not executed**.
+This means the logits buffer is not populated during the capture step — the model
+output is only available after `graph.launch()` on a subsequent step.
+
+### Root cause analysis
+
+NCCL internally creates its own streams and events. When NCCL operations are
+captured during stream capture, these internal streams interact with the capture
+machinery in ways that leave the stream in an invalid state after `end_capture`.
+The `cuStreamSynchronize` call appears to succeed (returns immediately) but
+subsequent operations on the stream hang indefinitely.
+
+This is consistent with known NCCL + CUDA graph limitations documented in the
+NCCL issue tracker and NVIDIA forums.
+
+### How production engines solve this
+
+vLLM, TensorRT-LLM, and similar engines do **NOT** capture NCCL operations via
+stream capture. Instead they use one of:
+
+1. **NCCL graph API** (`ncclGraphAddAllReduce`): NCCL 2.18+ provides an explicit
+   graph API that adds allreduce as a graph node without using stream capture.
+   This is the correct approach but requires restructuring all NCCL calls.
+
+2. **Per-GPU graph capture without NCCL**: Capture only the compute portion of
+   each layer (norm, GEMM, attention, residual) as a graph. NCCL allreduce
+   runs as a normal stream operation between graph replays. This means smaller
+   graphs (per-layer, not full decode loop) but avoids the NCCL incompatibility.
+
+3. **Single-GPU graphs**: Not viable for our 18GB model on 16GB GPUs.
+
+### Recommendation
+
+Defer CUDA graphs until either:
+- We implement the NCCL graph API (`ncclGraphAddAllReduce`)
+- We restructure to per-layer graph capture (compute-only, NCCL outside graph)
+- We move to a single-GPU deployment (different model or larger VRAM)
+
+Pursue **Phase 045** (NCCL pipeline overlap + batched GEMV) instead, which
+provides similar savings without the NCCL/graph incompatibility.
 
 ## Goal
 
