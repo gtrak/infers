@@ -234,15 +234,15 @@ Callback-based eviction store connecting the backend engine to the scheduler's e
 
 ## PagedKvCache
 
-GPU-resident paged KV cache storage with interleaved per-page layout for K and V tensors, addressing via block tables in paged attention kernels. See [[crates/backends/native/src/attention.rs#PagedKvCache]].
+GPU-resident paged KV cache storage with interleaved per-page layout for K and V tensors, addressing via block tables in paged attention kernels. See [[crates/backends/native/src/attention/mod.rs#PagedKvCache]].
 
 ## Paged Kernel Dispatch
 
-Dispatch logic for paged attention CUDA kernels, translating logical positions to physical page offsets via block tables before kernel launch. See [[crates/backends/native/src/attention.rs]].
+Dispatch logic for paged attention CUDA kernels, translating logical positions to physical page offsets via block tables before kernel launch. See [[crates/backends/native/src/attention/mod.rs]].
 
 ## Attention Output Gate
 
-Qwen3.5-specific attention output gating: Q projection is doubled (Q + gate) with per-head interleaved layout. The gate is applied as `attn_out * sigmoid(gate)` to produce the final attention output. See [[crates/backends/native/src/attention.rs]].
+Qwen3.5-specific attention output gating: Q projection is doubled (Q + gate) with per-head interleaved layout. The gate is applied as `attn_out * sigmoid(gate)` to produce the final attention output. See [[crates/backends/native/src/attention/mod.rs]].
 
 # Forward Engine
 
@@ -337,7 +337,7 @@ The `attn` field holds a nested `AttnWorkspace` with 11 pre-allocated buffers co
 The `partial_sums: CudaSlice<f32>` field (sized K_SPLIT x sharded_intermediate, ~1.4MB) is pre-allocated once at engine init and threaded through GEMM dispatch, eliminating ~800 alloc_zeros calls per token. The `lm_head_partial_sums: CudaSlice<f32>` field (sized K_SPLIT x vocab_size, ~12MB) handles the LM head GEMM which previously allocated dynamically each step. See [[lat.md/lat#Forward Engine#Quantized GEMM Dispatch (Fused INT4, Dequant NVFP4)#K-Split GEMM for M=1 Decode]].
 `gdn::decode_forward` is now fully wired to use workspace buffers: takes `ws: &mut GdnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros`, zero `.clone()` calls). The `_into` helper variants (`copy_view_into`, `repeat_interleave_heads_into`) replace their allocating counterparts. `repeat_interleave_heads_into` now dispatches to a single CUDA kernel (`infers_repeat_interleave_bf16`) instead of per-head memcpy loops, reducing 48 memcpy calls to 2 kernel launches. The conv_out_last intermediate buffer was eliminated — q/k/v splits now copy directly from conv_out using offset-based ranges via `copy_view_into`. NCCL all-reduce and residual add operate directly on `workspace.attn_out`. See [[crates/backends/native/src/gdn.rs#decode_forward]].
 
-`attention::decode_forward_paged` is now fully wired to use workspace buffers: takes `ws: &mut AttnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros` calls). The Q/gate extraction uses device-to-device memcpy into workspace buffers instead of allocating new ones. K-norm and Q-norm use `rms_norm_into` writing into `ws.k_norm_out`/`ws.q_norm_out`. Paged attention decode uses `paged_attention_decode_into` writing directly into `ws.attn_output`. The final O-projection writes directly into `output` (i.e., `workspace.attn_out`), eliminating the post-attention `memcpy_dtod` copy in engine.rs. See [[crates/backends/native/src/attention.rs#decode_forward_paged]].
+`attention::decode_forward_paged` is now fully wired to use workspace buffers: takes `ws: &mut AttnWorkspace` and `output: &mut CudaSlice<bf16>` parameters, returns `Result<()>`, and eliminates all per-token allocations (zero `alloc_zeros` calls). The Q/gate extraction uses device-to-device memcpy into workspace buffers instead of allocating new ones. K-norm and Q-norm use `rms_norm_into` writing into `ws.k_norm_out`/`ws.q_norm_out`. Paged attention decode uses `paged_attention_decode_into` writing directly into `ws.attn_output`. The final O-projection writes directly into `output` (i.e., `workspace.attn_out`), eliminating the post-attention `memcpy_dtod` copy in engine.rs. See [[crates/backends/native/src/attention/paged_decode.rs#decode_forward_paged]].
 
 H2D staging buffers eliminate per-step `clone_htod` allocations for small host-to-device transfers: `embed_out: CudaSlice<bf16>` (size hidden_size) replaces dynamic allocation in `embed_tokens`; `token_ids_staging: CudaSlice<i32>` (size 1) replaces `clone_htod` in embedding; `position_staging: CudaSlice<i32>` (size 1) replaces position uploads for paged KV write; `rope_position_staging: CudaSlice<i32>` (size 1) replaces `clone_htod` in every `apply_rope` call during decode; `block_table_staging: CudaSlice<i32>` (size max_position_embeddings upper bound) replaces per-step block table uploads. Data is written into these buffers via `memcpy_htod` each step instead of allocating. The `embed_tokens_into` function takes pre-allocated staging and output buffers for zero-allocation embedding gather. The `apply_rope_with_staging` function writes position into the staging buffer before launching RoPE, avoiding `clone_htod`. See [[crates/backends/native/src/embedding.rs#embed_tokens_into]], [[crates/backends/native/src/rope.rs#apply_rope_with_staging]].
 
