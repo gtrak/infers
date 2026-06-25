@@ -1316,6 +1316,7 @@ dependencies = [
 name = "infers-kernel-lib"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cuda-core",
  "cuda-device",
  "cuda-host",

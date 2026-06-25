@@ -484,3 +484,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 **Stream handling**: Typed dispatch uses `cc_stream` (cuda-core default stream). Both cudarc and cuda-core default streams are the legacy CUDA null stream, which has implicit bidirectional serialization with all other streams — ordering is correct.
 
 **OxideKernels struct**: `ctx` (cuda-core context), `module` (cuda-core cubin), `modules` (KernelModules typed dispatch), `cc_stream` (cuda-core stream). No more manual arg packing — `push_slice_arg`, `push_scalar_arg`, `raw_launch` removed.
+
+**Test binary migration**: The standalone test binary at `crates/cuda-oxide-kernels/` uses a local copy of `KernelModules` (aggregating all 9 `LoadedModule` structs) loaded from embedded cubin artifacts via `load_modules()`. All 34 call sites were migrated from `infers_kernel_lib::kernels::load(ctx)` (deleted) to `load_modules(ctx)` which returns `KernelModules`. Method calls updated from `module.kernel_name(...)` to `module.{module_field}.kernel_name(...)` (e.g., `module.int4.int4_gemm_v3_ksplit_sm(...)`).
+
+**int4_gemm_v3_ksplit_sm**: Production INT4 GEMM kernel. Replaces the old `int4_gemm_v3_ksplit` with shared memory input tiling. Strided cooperative load (each thread loads `ceil(gs/64)` elements) handles `group_size > block_size`. Old kernel and bridge shim removed.

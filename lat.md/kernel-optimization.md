@@ -16,7 +16,7 @@ Tile input bf16 vector into shared memory so all 64 threads cooperatively load o
 
 ### EXP-002: INT4 GEMM vectorized weight loads
 
-Kernel: `int4_gemm_v3_ksplit`. Change: replace scalar u32 weight loads with 128-bit `[u32;4]` loads (pattern from v4 kernel). Hypothesis: 4x fewer LDG instructions, better memory throughput. Affects: `int4_kernels.rs`.
+Kernel: `int4_gemm_v3_ksplit_sm`. Change: replace scalar u32 weight loads with 128-bit `[u32;4]` loads (pattern from v4 kernel). Hypothesis: 4x fewer LDG instructions, better memory throughput. Affects: `int4_kernels.rs`.
 
 ### EXP-003: GDN register-cache key/query
 
@@ -54,4 +54,10 @@ Kernel: `paged_attention_decode_bf16`. Change: cache physical_page across consec
 
 Measured outcomes from completed experiments, sorted by execution order.
 
-<!-- Append results here as experiments complete -->
+### EXP-001: INT4 GEMM shared memory input tiling — DONE
+
+Replaced `int4_gemm_v3_ksplit` with `int4_gemm_v3_ksplit_sm`. Tiles input bf16 vector into shared memory per group, eliminating 64x redundant DRAM reads. Strided load handles group_size=128 > block_size=64.
+
+- **Correctness**: cosine=1.00000 vs dumped reference output (N=8704, K=5120, group_size=128, k_split=28)
+- **Latency**: 55.7 µs/call (mean), 55.1 µs/call (min) — ksplit + reduce together
+- **Status**: Integrated. Old `int4_gemm_v3_ksplit` kernel and `launch_int4_gemm_v3_ksplit` bridge shim removed.

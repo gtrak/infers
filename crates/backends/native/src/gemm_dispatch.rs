@@ -111,7 +111,7 @@ pub fn gemm_projection_cached(
                     local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
                     local_ps_owner.as_mut().unwrap()
                 };
-                oxide.launch_int4_gemm_v3_ksplit(
+                oxide.launch_int4_gemm_v3_ksplit_sm(
                     stream, partial_sums,
                     &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
                     input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,

@@ -274,9 +274,18 @@ pub mod int4 {
     /// Requires `k % group_size == 0` (AutoRound pads K to group_size).
     /// - Grid: (ceil(N/64), k_split, 1)  ·  Block: (64, 1, 1)
     /// - blockIdx.x: output column tile  ·  blockIdx.y: K-split index
+    /// INT4 GEMM v3 with K-splitting and shared memory input tiling.
+    ///
+    /// Same as [`int4_gemm_v3_ksplit`] but tiles the input vector into shared
+    /// memory per group, eliminating 64x redundant DRAM reads of the same data.
+    /// All 64 threads cooperatively load one copy of each group's input tile,
+    /// then read from shared memory for GEMM computation.
+    ///
+    /// - Block: (64, 1, 1) · Grid: (ceil(N/64), k_split, 1)
+    /// - Smem: group_size * sizeof(u16) = 128 * 2 = 256 bytes per block
     #[kernel]
     #[launch_bounds(64)]
-    pub fn int4_gemm_v3_ksplit(
+    pub fn int4_gemm_v3_ksplit_sm(
         partial_sums: &mut [f32],
         weight: &[u32],
         scales: &[u16],
@@ -287,6 +296,7 @@ pub mod int4 {
         transposed: u32,
         k_split: u32,
     ) {
+        let tid = thread::threadIdx_x() as usize;
         let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
         let split_idx = thread::blockIdx_y() as usize;
         let n_usize = n as usize;
@@ -295,17 +305,17 @@ pub mod int4 {
         let ks = k_split as usize;
         let num_groups = k_usize / gs;
 
-        if col >= n_usize {
-            return;
-        }
-
         // v3: distribute full groups across splits via ceil-grouping so every
         // group is covered exactly once regardless of divisibility. Last split(s)
         // may be shorter or empty. Per-element inner loop stays branchless.
         let groups_per_split = (num_groups + ks - 1) / ks;
         let group_start = split_idx * groups_per_split;
+
         if group_start >= num_groups {
-            partial_sums[split_idx * n_usize + col] = 0.0;
+            // Empty split — write zero only for valid columns.
+            if col < n_usize {
+                partial_sums[split_idx * n_usize + col] = 0.0;
+            }
             return;
         }
         let group_end = if group_start + groups_per_split > num_groups {
@@ -313,6 +323,9 @@ pub mod int4 {
         } else {
             group_start + groups_per_split
         };
+
+        // Shared memory: one tile per group (group_size bf16 values)
+        let smem = DynamicSharedArray::<u16>::get();
 
         let mut acc0: f32 = 0.0;
         let mut acc1: f32 = 0.0;
@@ -324,6 +337,17 @@ pub mod int4 {
 
         for group_idx in group_start..group_end {
             let kg = group_idx * gs;
+
+            // Cooperative load: strided pattern so each thread loads multiple elements
+            // when group_size > block_dim.x (e.g. gs=128, block=64 → 2 iterations).
+            let mut i = tid;
+            while i < gs {
+                unsafe {
+                    *smem.add(i) = *input.get_unchecked(kg + i);
+                }
+                i += 64; // block_dim x
+            }
+            cuda_device::sync_threads();
 
             // Per-group scale (fp16 → f32).
             let scale_bits: u16 = if transposed != 0 {
@@ -354,15 +378,16 @@ pub mod int4 {
                 let packed0: u32 = unsafe { *weight.get_unchecked(w_idx0) };
 
                 // packed0: 8 INT4 → acc0 (even lanes) / acc1 (odd lanes).
+                // Read input from shared memory instead of global memory.
                 unsafe {
-                    let a0 = f32::from_bits((*input.get_unchecked(k0 + 0) as u32) << 16);
-                    let a1 = f32::from_bits((*input.get_unchecked(k0 + 1) as u32) << 16);
-                    let a2 = f32::from_bits((*input.get_unchecked(k0 + 2) as u32) << 16);
-                    let a3 = f32::from_bits((*input.get_unchecked(k0 + 3) as u32) << 16);
-                    let a4 = f32::from_bits((*input.get_unchecked(k0 + 4) as u32) << 16);
-                    let a5 = f32::from_bits((*input.get_unchecked(k0 + 5) as u32) << 16);
-                    let a6 = f32::from_bits((*input.get_unchecked(k0 + 6) as u32) << 16);
-                    let a7 = f32::from_bits((*input.get_unchecked(k0 + 7) as u32) << 16);
+                    let a0 = f32::from_bits((*smem.add(u32_idx * 8 + 0) as u32) << 16);
+                    let a1 = f32::from_bits((*smem.add(u32_idx * 8 + 1) as u32) << 16);
+                    let a2 = f32::from_bits((*smem.add(u32_idx * 8 + 2) as u32) << 16);
+                    let a3 = f32::from_bits((*smem.add(u32_idx * 8 + 3) as u32) << 16);
+                    let a4 = f32::from_bits((*smem.add(u32_idx * 8 + 4) as u32) << 16);
+                    let a5 = f32::from_bits((*smem.add(u32_idx * 8 + 5) as u32) << 16);
+                    let a6 = f32::from_bits((*smem.add(u32_idx * 8 + 6) as u32) << 16);
+                    let a7 = f32::from_bits((*smem.add(u32_idx * 8 + 7) as u32) << 16);
 
                     let w0 = (packed0 & 0xF) as i8;
                     let w1 = ((packed0 >> 4) & 0xF) as i8;
@@ -394,14 +419,14 @@ pub mod int4 {
                     let packed1: u32 = unsafe { *weight.get_unchecked(w_idx1) };
 
                     unsafe {
-                        let b0 = f32::from_bits((*input.get_unchecked(k1 + 0) as u32) << 16);
-                        let b1 = f32::from_bits((*input.get_unchecked(k1 + 1) as u32) << 16);
-                        let b2 = f32::from_bits((*input.get_unchecked(k1 + 2) as u32) << 16);
-                        let b3 = f32::from_bits((*input.get_unchecked(k1 + 3) as u32) << 16);
-                        let b4 = f32::from_bits((*input.get_unchecked(k1 + 4) as u32) << 16);
-                        let b5 = f32::from_bits((*input.get_unchecked(k1 + 5) as u32) << 16);
-                        let b6 = f32::from_bits((*input.get_unchecked(k1 + 6) as u32) << 16);
-                        let b7 = f32::from_bits((*input.get_unchecked(k1 + 7) as u32) << 16);
+                        let b0 = f32::from_bits((*smem.add(u32_idx * 8 + 8) as u32) << 16);
+                        let b1 = f32::from_bits((*smem.add(u32_idx * 8 + 9) as u32) << 16);
+                        let b2 = f32::from_bits((*smem.add(u32_idx * 8 + 10) as u32) << 16);
+                        let b3 = f32::from_bits((*smem.add(u32_idx * 8 + 11) as u32) << 16);
+                        let b4 = f32::from_bits((*smem.add(u32_idx * 8 + 12) as u32) << 16);
+                        let b5 = f32::from_bits((*smem.add(u32_idx * 8 + 13) as u32) << 16);
+                        let b6 = f32::from_bits((*smem.add(u32_idx * 8 + 14) as u32) << 16);
+                        let b7 = f32::from_bits((*smem.add(u32_idx * 8 + 15) as u32) << 16);
 
                         let v0 = (packed1 & 0xF) as i8;
                         let v1 = ((packed1 >> 4) & 0xF) as i8;
@@ -423,10 +448,15 @@ pub mod int4 {
                     }
                 }
             }
+
+            // Sync before next group overwrites shared memory.
+            cuda_device::sync_threads();
         }
 
         let acc = acc0 + acc1 + acc2 + acc3;
-        partial_sums[split_idx * n_usize + col] = acc;
+        if col < n_usize {
+            partial_sums[split_idx * n_usize + col] = acc;
+        }
     }
 
     /// INT4 GEMM v4 with K-splitting — 128-bit LDG loads, 4 columns per thread.

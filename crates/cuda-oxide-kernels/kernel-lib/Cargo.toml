@@ -6,6 +6,7 @@ edition = "2024"
 # Device kernel library for infers — compiled to PTX by cuda-oxide.
 
 [dependencies]
+anyhow      = "1.0"
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
 cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide" }
 cuda-core   = { git = "https://github.com/NVlabs/cuda-oxide" }

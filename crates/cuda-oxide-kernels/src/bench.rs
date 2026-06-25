@@ -152,7 +152,7 @@ fn cosine_similarity(a: &[u16], b: &[u16]) -> f64 {
 /// Benchmark infers_rmsnorm_bf16 with real dumped inputs.
 pub fn bench_rmsnorm(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
     let stream = ctx.default_stream();
-    let module = infers_kernel_lib::kernels::load(ctx)?;
+    let module = crate::load_modules(ctx)?;
 
     println!("=== BENCH: infers_rmsnorm_bf16 ({}) ===", cfg.stage);
 
@@ -196,7 +196,7 @@ pub fn bench_rmsnorm(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
 
     // Warmup
     for _ in 0..cfg.warmup {
-        module.infers_rmsnorm_bf16(
+        module.norm.infers_rmsnorm_bf16(
             &stream,
             launch.clone(),
             &input_dev,
@@ -215,7 +215,7 @@ pub fn bench_rmsnorm(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
         cfg.warmup,
         cfg.iterations,
         || {
-            module.infers_rmsnorm_bf16(
+            module.norm.infers_rmsnorm_bf16(
                 &stream,
                 launch.clone(),
                 &input_dev,
@@ -254,12 +254,12 @@ pub fn bench_rmsnorm(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
     Ok(())
 }
 
-/// Benchmark int4_gemm_v3_ksplit with real dumped inputs and weights.
-pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
+/// Benchmark int4_gemm_v3_ksplit_sm with real dumped inputs and weights.
+pub fn bench_int4_gemm_ksplit_sm(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
     let stream = ctx.default_stream();
-    let module = infers_kernel_lib::kernels::load(ctx)?;
+    let module = crate::load_modules(ctx)?;
 
-    println!("=== BENCH: int4_gemm_v3_ksplit ({}) ===", cfg.stage);
+    println!("=== BENCH: int4_gemm_v3_ksplit_sm ({}) ===", cfg.stage);
 
     // Input: norm2 output (input to mlp.gate_proj) — for mlp.gate_proj stage
     let input_stage = match cfg.stage.as_str() {
@@ -375,11 +375,11 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
     // output: [N] bf16
     let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, n)?;
 
-    // Launch config for ksplit kernel
+    // Launch config for ksplit kernel with shared memory
     let launch_ksplit = LaunchConfig {
         grid_dim: (((n + 63) / 64) as u32, k_split, 1),
         block_dim: (64, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: (group_size as usize * 2) as u32,
     };
 
     // Launch config for reduce kernel
@@ -391,7 +391,7 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
 
     // Warmup
     for _ in 0..cfg.warmup {
-        module.int4_gemm_v3_ksplit(
+        module.int4.int4_gemm_v3_ksplit_sm(
             &stream,
             launch_ksplit.clone(),
             &mut partial_sums_dev,
@@ -406,7 +406,7 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
             k_split,
         )?;
 
-        module.reduce_partial_sums_bf16(
+        module.int4.reduce_partial_sums_bf16(
             &stream,
             launch_reduce.clone(),
             &mut out_dev,
@@ -424,7 +424,7 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
         cfg.warmup,
         cfg.iterations,
         || {
-            module.int4_gemm_v3_ksplit(
+            module.int4.int4_gemm_v3_ksplit_sm(
                 &stream,
                 launch_ksplit.clone(),
                 &mut partial_sums_dev,
@@ -439,7 +439,7 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
                 k_split,
             ).unwrap();
 
-            module.reduce_partial_sums_bf16(
+            module.int4.reduce_partial_sums_bf16(
                 &stream,
                 launch_reduce.clone(),
                 &mut out_dev,
@@ -480,7 +480,7 @@ pub fn bench_int4_gemm_ksplit(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Resu
 /// Benchmark reduce_partial_sums_bf16 with synthetic input.
 pub fn bench_reduce_partial_sums(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
     let stream = ctx.default_stream();
-    let module = infers_kernel_lib::kernels::load(ctx)?;
+    let module = crate::load_modules(ctx)?;
 
     println!("=== BENCH: reduce_partial_sums_bf16 ({}) ===", cfg.stage);
 
@@ -514,7 +514,7 @@ pub fn bench_reduce_partial_sums(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> R
 
     // Warmup
     for _ in 0..cfg.warmup {
-        module.reduce_partial_sums_bf16(
+        module.int4.reduce_partial_sums_bf16(
             &stream,
             launch_reduce.clone(),
             &mut out_dev,
@@ -532,7 +532,7 @@ pub fn bench_reduce_partial_sums(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> R
         cfg.warmup,
         cfg.iterations,
         || {
-            module.reduce_partial_sums_bf16(
+            module.int4.reduce_partial_sums_bf16(
                 &stream,
                 launch_reduce.clone(),
                 &mut out_dev,
@@ -559,7 +559,7 @@ pub fn bench_reduce_partial_sums(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> R
 /// Benchmark infers_silu_glu_bf16 with real dumped inputs.
 pub fn bench_silu_glu(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
     let stream = ctx.default_stream();
-    let module = infers_kernel_lib::kernels::load(ctx)?;
+    let module = crate::load_modules(ctx)?;
 
     println!("=== BENCH: infers_silu_glu_bf16 ({}) ===", cfg.stage);
 
@@ -593,7 +593,7 @@ pub fn bench_silu_glu(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
 
     // Warmup
     for _ in 0..cfg.warmup {
-        module.infers_silu_glu_bf16(
+        module.activation.infers_silu_glu_bf16(
             &stream,
             LaunchConfig::for_num_elems(n as u32),
             &x_dev,
@@ -611,7 +611,7 @@ pub fn bench_silu_glu(ctx: &Arc<CudaContext>, cfg: &BenchConfig) -> Result<()> {
         cfg.warmup,
         cfg.iterations,
         || {
-            module.infers_silu_glu_bf16(
+            module.activation.infers_silu_glu_bf16(
                 &stream,
                 LaunchConfig::for_num_elems(n as u32),
                 &x_dev,

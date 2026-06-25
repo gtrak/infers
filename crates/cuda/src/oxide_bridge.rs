@@ -709,46 +709,6 @@ impl OxideKernels {
         ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_auto_round_ksplit' failed: {:?}", e))
     }
 
-    /// Launch the `int4_gemm_v3_ksplit` kernel: bandwidth-optimized INT4 GEMM
-    /// with K-splitting (4 accumulators + group-aligned K_SPLIT + two-u32 stride).
-    ///
-    /// Same interface as `launch_int4_gemm_auto_round_ksplit`. Precondition:
-    /// `k_split` must divide `k / group_size` evenly (no alignment fixups).
-    ///
-    /// The kernel signature is:
-    /// ```ignore
-    /// int4_gemm_v3_ksplit(partial_sums: &mut [f32], weight: &[u32], scales: &[u16], zeros: &[u32], input: &[u16], n: u32, k: u32, group_size: u32, transposed: u32, k_split: u32)
-    /// ```
-    pub fn launch_int4_gemm_v3_ksplit(
-        &self,
-        stream: &Arc<CudaStream>,
-        partial_sums: &mut CudaSlice<f32>,
-        weight: &CudaSlice<u32>,
-        scales: &CudaSlice<half::f16>,
-        zeros: &CudaSlice<u32>,
-        input: &CudaSlice<half::bf16>,
-        n: u32,
-        k: u32,
-        group_size: u32,
-        transposed: u32,
-        k_split: u32,
-    ) -> anyhow::Result<()> {
-        let mut ps_view = CudaSliceView::new_mut(partial_sums, stream, &self.ctx);
-        let weight_view = CudaSliceView::new(&weight, stream, &self.ctx);
-        let scales_view = CudaSliceView::new(&scales, stream, &self.ctx);
-        let zeros_view = CudaSliceView::new(&zeros, stream, &self.ctx);
-        let input_view = CudaSliceView::new(&input, stream, &self.ctx);
-
-        let config = LaunchConfig {
-            grid_dim: ((n + 63) / 64, k_split, 1),
-            block_dim: (64, 1, 1),
-            shared_mem_bytes: (group_size as u32) * 2,
-        };
-        self.modules.int4.int4_gemm_v3_ksplit_sm(
-            &self.cc_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
-            n, k, group_size, transposed, k_split,
-        ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_v3_ksplit' failed: {:?}", e))
-    }
     /// Launch the `int4_gemm_v3_ksplit_sm` kernel: same as v3 but with shared memory
     /// input tiling. Tiles group_size bf16 values per group into shared memory to
     /// eliminate redundant DRAM reads.
