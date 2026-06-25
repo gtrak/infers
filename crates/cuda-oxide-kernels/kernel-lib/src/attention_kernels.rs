@@ -54,13 +54,14 @@ pub mod attention {
         page_pool: &[u16],
         block_table: &[i32],
         _num_pages: u32,
-        num_cached_tokens: u32,
+        cached_tokens_count: &[u32],
         _head_dim: u32,
         page_size: u32,
         kv_dim: u32,
         mut k_out: DisjointSlice<u16>,
         mut v_out: DisjointSlice<u16>,
     ) {
+        let num_cached_tokens = cached_tokens_count[0];
         let idx = thread::index_1d();
         let tid = idx.get();
         let stride = thread::blockDim_x() * thread::gridDim_x();
@@ -96,7 +97,7 @@ pub mod attention {
         page_pool: &[u16],
         block_table: &[i32],
         num_pages: u32,
-        num_cached_tokens: u32,
+        cached_tokens_count: &[u32],
         head_dim: u32,
         num_kv_heads: u32,
         num_query_heads: u32,
@@ -104,6 +105,7 @@ pub mod attention {
         kv_dim: u32,
         mut output: DisjointSlice<u16>,
     ) {
+        let num_cached_tokens = cached_tokens_count[0];
         use cuda_device::tcgen05::f32_to_bf16;
 
         let kv_head_idx = thread::blockIdx_x() as usize;

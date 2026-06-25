@@ -640,7 +640,7 @@ impl OxideKernels {
     ///
     /// The kernel signature is:
     /// ```ignore
-    /// infers_paged_kv_read_bf16(page_pool: &[u16], block_table: &[i32], _num_pages: u32, num_cached_tokens: u32, _head_dim: u32, page_size: u32, kv_dim: u32, mut k_out: DisjointSlice<u16>, mut v_out: DisjointSlice<u16>)
+    /// infers_paged_kv_read_bf16(page_pool: &[u16], block_table: &[i32], _num_pages: u32, cached_tokens_count: &[u32], _head_dim: u32, page_size: u32, kv_dim: u32, mut k_out: DisjointSlice<u16>, mut v_out: DisjointSlice<u16>)
     /// ```
     pub fn launch_paged_kv_read_bf16(
         &self,
@@ -648,23 +648,25 @@ impl OxideKernels {
         page_pool: &CudaSlice<half::bf16>,
         block_table: &CudaSlice<i32>,
         num_pages: u32,
-        num_cached_tokens: u32,
+        cached_tokens_count: &CudaSlice<u32>,
         head_dim: u32,
         page_size: u32,
         kv_dim: u32,
         k_out: &mut CudaSlice<half::bf16>,
         v_out: &mut CudaSlice<half::bf16>,
     ) -> anyhow::Result<()> {
-        let total = (num_cached_tokens as usize) * (kv_dim as usize);
-
         let page_pool_view = CudaSliceView::new(&page_pool, stream, &self.ctx);
         let block_table_view = CudaSliceView::new(&block_table, stream, &self.ctx);
+        let cached_tokens_count_view = CudaSliceView::new(cached_tokens_count, stream, &self.ctx);
         let mut k_out_view = CudaSliceView::new_mut(k_out, stream, &self.ctx);
         let mut v_out_view = CudaSliceView::new_mut(v_out, stream, &self.ctx);
 
-        let config = LaunchConfig::for_num_elems(total as u32);
+        // Use a fixed max total for launch config (CUDA graph compatible).
+        // The kernel reads actual count from device and uses grid-stride loop.
+        const MAX_KV_READ_TOTAL: u32 = 4096 * 16384; // up to 4096 tokens × kv_dim 16384
+        let config = LaunchConfig::for_num_elems(MAX_KV_READ_TOTAL);
         self.modules.attention.infers_paged_kv_read_bf16(
-            &self.cc_stream, config, &page_pool_view, &block_table_view, num_pages, num_cached_tokens, head_dim, page_size, kv_dim, &mut k_out_view, &mut v_out_view,
+            &self.cc_stream, config, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, page_size, kv_dim, &mut k_out_view, &mut v_out_view,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_paged_kv_read_bf16' failed: {:?}", e))
     }
 
@@ -1295,7 +1297,7 @@ impl OxideKernels {
     ///
     /// The kernel signature is:
     /// ```ignore
-    /// infers_paged_attention_decode_bf16(q: &[u16], page_pool: &[u16], block_table: &[i32], num_pages: u32, num_cached_tokens: u32, head_dim: u32, num_kv_heads: u32, num_query_heads: u32, page_size: u32, kv_dim: u32, mut output: DisjointSlice<u16>)
+    /// infers_paged_attention_decode_bf16(q: &[u16], page_pool: &[u16], block_table: &[i32], num_pages: u32, cached_tokens_count: &[u32], head_dim: u32, num_kv_heads: u32, num_query_heads: u32, page_size: u32, kv_dim: u32, mut output: DisjointSlice<u16>)
     /// ```
     pub fn launch_paged_attention_decode_bf16(
         &self,
@@ -1303,9 +1305,9 @@ impl OxideKernels {
         q: &CudaSlice<half::bf16>,
         page_pool: &CudaSlice<half::bf16>,
         block_table: &CudaSlice<i32>,
+        cached_tokens_count: &CudaSlice<u32>,
         output: &mut CudaSlice<half::bf16>,
         num_pages: u32,
-        num_cached_tokens: u32,
         head_dim: u32,
         num_kv_heads: u32,
         num_query_heads: u32,
@@ -1315,16 +1317,18 @@ impl OxideKernels {
         let q_view = CudaSliceView::new(&q, stream, &self.ctx);
         let page_pool_view = CudaSliceView::new(&page_pool, stream, &self.ctx);
         let block_table_view = CudaSliceView::new(&block_table, stream, &self.ctx);
+        let cached_tokens_count_view = CudaSliceView::new(cached_tokens_count, stream, &self.ctx);
         let mut output_view = CudaSliceView::new_mut(output, stream, &self.ctx);
 
+        const MAX_CACHED_TOKENS_FOR_SHARED_MEM: usize = 4096;
         let config = LaunchConfig {
             grid_dim: (num_kv_heads, 1, 1),
             block_dim: (256, 1, 1),
             // 3 regions: Q values + max scratch + sum scratch + cached attention weights
-            shared_mem_bytes: ((3 * 256 + num_cached_tokens as usize) * 4) as u32,
+            shared_mem_bytes: ((3 * 256 + MAX_CACHED_TOKENS_FOR_SHARED_MEM) * 4) as u32,
         };
         self.modules.attention.infers_paged_attention_decode_bf16(
-            &self.cc_stream, config, &q_view, &page_pool_view, &block_table_view, num_pages, num_cached_tokens, head_dim, num_kv_heads, num_query_heads, page_size, kv_dim, &mut output_view,
+            &self.cc_stream, config, &q_view, &page_pool_view, &block_table_view, num_pages, &cached_tokens_count_view, head_dim, num_kv_heads, num_query_heads, page_size, kv_dim, &mut output_view,
         ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_paged_attention_decode_bf16' failed: {:?}", e))
     }
 

@@ -979,8 +979,12 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             // Write position into staging buffer via memcpy_htod
             gpu_stream.memcpy_htod(&position_i32, &mut ws.position_staging)
                 .map_err(|e| anyhow::anyhow!("Failed to copy position to staging: {e}"))?;
-        }
 
+            // Write num_cached_tokens into staging buffer via memcpy_htod (CUDA graph compatible)
+            let num_cached_tokens_u32 = [num_cached_tokens as u32];
+            gpu_stream.memcpy_htod(&num_cached_tokens_u32, &mut ws.num_cached_tokens_staging)
+                .map_err(|e| anyhow::anyhow!("Failed to copy num_cached_tokens to staging: {e}"))?;
+        }
         // Ensure page pools allocated on each GPU
         for gpu_idx in 0..num_gpus {
             for cache in &mut self.paged_kv_caches[gpu_idx] {
@@ -1094,7 +1098,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                                 attn_weights, &ws.norm1_out,
                                 &mut self.paged_kv_caches[gpu_idx][layer_idx],
                                 &ws.block_table_staging, &ws.position_staging,
-                                position, num_cached_tokens,
+                                position,
+                                &ws.num_cached_tokens_staging,
                                 head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
                                 config.rope_theta, config.partial_rotary_factor,
                                 config.rms_norm_eps, self.group_size, &self.weight_caches[gpu_idx],

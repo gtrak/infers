@@ -97,7 +97,7 @@ Error mapping: `DriverError` from the typed method is wrapped in `anyhow::anyhow
 | `launch_kv_cache_write_bf16` | `infers_kv_cache_write_bf16` | k: bf16, v: bf16, kv_cache: bf16, positions: i32, seq_len, head_dim, max_seq_len |
 | `launch_conv1d_depthwise_silu_bf16` | `infers_conv1d_depthwise_silu_bf16` | input: bf16, weight: bf16, output: bf16, batch_size, conv_dim, seq_len, kernel_size |
 | `launch_paged_kv_write_bf16` | `infers_paged_kv_write_bf16` | k: bf16, v: bf16, page_pool: bf16 (write), block_table: i32, positions: i32, seq_len, head_dim, page_size, kv_dim |
-| `launch_paged_kv_read_bf16` | `infers_paged_kv_read_bf16` | page_pool: bf16, block_table: i32, num_pages, num_cached_tokens, head_dim, page_size, kv_dim, k_out: bf16 (write), v_out: bf16 (write) |
+| `launch_paged_kv_read_bf16` | `infers_paged_kv_read_bf16` | page_pool: bf16, block_table: i32, num_pages, cached_tokens_count: u32, head_dim, page_size, kv_dim, k_out: bf16 (write), v_out: bf16 (write) |
 | `launch_fp8_quantize_e4m3` | `infers_fp8_quantize_e4m3` | input: bf16, output: u8 (write), n |
 | `launch_fp8_dequantize_e4m3` | `infers_fp8_dequantize_e4m3` | input: u8, output: bf16 (write), n |
 | `launch_fp8_quantize_e5m2` | `infers_fp8_quantize_e5m2` | input: bf16, output: u8 (write), n |
@@ -151,7 +151,7 @@ Error mapping: `DriverError` from the typed method is wrapped in `anyhow::anyhow
 
 | Method | Kernel | Config |
 |--------|--------|--------|
-| `launch_paged_attention_decode_bf16` | `infers_paged_attention_decode_bf16` | grid=(num_kv_heads), block=(256), smem=head_dim*4 bytes (Q storage) |
+| `launch_paged_attention_decode_bf16` | `infers_paged_attention_decode_bf16` | grid=(num_kv_heads), block=(256), smem=((3*256 + MAX_CACHED_TOKENS)*4) bytes — Q, max/sum scratch, cached weights (fixed max 4096 for CUDA graph compat) |
 
 **GDN kernels** (state as f32 for recurrent/gated_delta; bf16 for mamba2/update):
 

@@ -70,6 +70,8 @@ pub struct DecodeWorkspace {
     pub rope_position_staging: CudaSlice<i32>,
     /// Pre-allocated device staging buffer for block table [max_pages] i32. Replaces per-step clone_htod for paged attention.
     pub block_table_staging: CudaSlice<i32>,
+    /// Pre-allocated device staging buffer for num_cached_tokens [1] u32. Written each step via memcpy_htod so the kernel reads it from device memory (CUDA graph compatible).
+    pub num_cached_tokens_staging: CudaSlice<u32>,
 }
 
 impl DecodeWorkspace {
@@ -115,6 +117,7 @@ impl DecodeWorkspace {
             position_staging: stream.alloc_zeros::<i32>(1)?,
             rope_position_staging: stream.alloc_zeros::<i32>(1)?,
             block_table_staging: stream.alloc_zeros::<i32>(max_pages_upper_bound)?,
+            num_cached_tokens_staging: stream.alloc_zeros::<u32>(1)?,
         })
     }
 }

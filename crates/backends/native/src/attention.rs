@@ -212,7 +212,7 @@ pub fn paged_kv_write(
 /// * `page_pool` — Flat GPU buffer for paged KV data
 /// * `block_table_gpu` — Block table on GPU `[num_pages]`
 /// * `num_pages` — Number of pages in block table
-/// * `num_cached_tokens` — Number of cached tokens
+/// * `cached_tokens_count` — Device buffer [1] u32 holding num cached tokens (CUDA graph compatible)
 /// * `head_dim` — Per-head dimension
 /// * `num_query_heads` — Number of query heads (for GQA)
 /// * `num_kv_heads` — Number of KV heads
@@ -224,8 +224,8 @@ pub fn paged_attention_decode(
     q: &CudaSlice<bf16>,
     page_pool: &CudaSlice<bf16>,
     block_table_gpu: &CudaSlice<i32>,
+    cached_tokens_count: &CudaSlice<u32>,  // device buffer with 1 element
     num_pages: usize,
-    num_cached_tokens: usize,
     head_dim: usize,
     num_query_heads: usize,
     num_kv_heads: usize,
@@ -238,8 +238,8 @@ pub fn paged_attention_decode(
         .map_err(|e| anyhow::anyhow!("Failed to allocate attention output buffer: {e}"))?;
 
     oxide.launch_paged_attention_decode_bf16(
-        stream, q, page_pool, block_table_gpu, &mut output,
-        num_pages as u32, num_cached_tokens as u32, head_dim as u32,
+        stream, q, page_pool, block_table_gpu, cached_tokens_count, &mut output,
+        num_pages as u32, head_dim as u32,
         num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
     ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel launch failed: {e}"))?;
 
@@ -254,9 +254,9 @@ pub fn paged_attention_decode_into(
     q: &CudaSlice<bf16>,
     page_pool: &CudaSlice<bf16>,
     block_table_gpu: &CudaSlice<i32>,
+    cached_tokens_count: &CudaSlice<u32>,  // device buffer with 1 element
     output: &mut CudaSlice<bf16>,
     num_pages: usize,
-    num_cached_tokens: usize,
     head_dim: usize,
     num_query_heads: usize,
     num_kv_heads: usize,
@@ -264,8 +264,8 @@ pub fn paged_attention_decode_into(
     kv_dim: usize,
 ) -> Result<()> {
     oxide.launch_paged_attention_decode_bf16(
-        stream, q, page_pool, block_table_gpu, output,
-        num_pages as u32, num_cached_tokens as u32, head_dim as u32,
+        stream, q, page_pool, block_table_gpu, cached_tokens_count, output,
+        num_pages as u32, head_dim as u32,
         num_kv_heads as u32, num_query_heads as u32, page_size as u32, kv_dim as u32,
     ).map_err(|e| anyhow::anyhow!("Paged attention decode kernel failed: {e}"))?;
     Ok(())
@@ -1081,7 +1081,8 @@ pub fn decode_forward_paged(
     block_table_gpu: &CudaSlice<i32>,
     positions_gpu: &CudaSlice<i32>,
     position: u32,
-    num_cached_tokens: i32,
+    // num_cached_tokens removed — now read from cached_tokens_count device buffer
+    cached_tokens_count: &CudaSlice<u32>,  // device buffer with 1 element
     head_dim: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -1300,9 +1301,9 @@ pub fn decode_forward_paged(
                 q_for_attn,
                 paged_cache.page_pool.as_ref().unwrap(),
                 block_table_gpu,
+                cached_tokens_count,
                 &mut ws.attn_output,
                 num_pages,
-                num_cached_tokens as usize,
                 head_dim,
                 num_heads,
                 num_kv_heads,
@@ -1386,9 +1387,9 @@ pub fn decode_forward_paged(
                 q_for_attn,
                 paged_cache.page_pool.as_ref().unwrap(),
                 block_table_gpu,
+                cached_tokens_count,
                 &mut ws.attn_output,
                 num_pages,
-                num_cached_tokens as usize,
                 head_dim,
                 num_heads,
                 num_kv_heads,

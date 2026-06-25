@@ -670,10 +670,14 @@ fn test_paged_kv(ctx: &Arc<CudaContext>) -> bool {
     let mut k_out_dev = DeviceBuffer::<u16>::zeroed(&stream, SEQ_LEN * KV_DIM).unwrap();
     let mut v_out_dev = DeviceBuffer::<u16>::zeroed(&stream, SEQ_LEN * KV_DIM).unwrap();
 
+    // Create device buffer for cached_tokens_count (1 element)
+    let cached_tokens_count_host: Vec<u32> = vec![SEQ_LEN as u32];
+    let cached_tokens_count_dev = DeviceBuffer::from_host(&stream, &cached_tokens_count_host).unwrap();
+
     module.attention.infers_paged_kv_read_bf16(
         &stream,
         LaunchConfig::for_num_elems((SEQ_LEN * KV_DIM) as u32),
-        &pool_dev, &bt_dev, NUM_PAGES as u32, SEQ_LEN as u32,
+        &pool_dev, &bt_dev, NUM_PAGES as u32, &cached_tokens_count_dev,
         KV_DIM as u32, PAGE_SIZE as u32, KV_DIM as u32,
         &mut k_out_dev, &mut v_out_dev,
     ).unwrap();
@@ -2463,10 +2467,14 @@ fn test_paged_attention_decode(ctx: &Arc<CudaContext>) -> bool {
         shared_mem_bytes: shared_mem_bytes as u32,
     };
 
+    // Create device buffer for cached_tokens_count (1 element)
+    let cached_tokens_count_host: Vec<u32> = vec![NUM_CACHED_TOKENS as u32];
+    let cached_tokens_count_dev = DeviceBuffer::from_host(&stream, &cached_tokens_count_host).unwrap();
+
     module.attention.infers_paged_attention_decode_bf16(
         &stream, launch, &q_dev, &pool_dev, &bt_dev,
         (MAX_PHYS_PAGE) as u32,
-        NUM_CACHED_TOKENS as u32,
+        &cached_tokens_count_dev,
         HEAD_DIM as u32,
         NUM_KV_HEADS as u32,
         NUM_QUERY_HEADS as u32,
