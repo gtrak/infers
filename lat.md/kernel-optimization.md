@@ -67,6 +67,12 @@ Kernel `infers_repeat_interleave_bf16` in `common_kernels.rs` uses grid-stride p
 The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher throughput in microbench but was not integrated. Evaluate for production use.
 
 **Result:** Swapped v3_ksplit_sm → v4_ksplit in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.040s/step. No type mismatches (scales already f16). Affects: `int4_kernels.rs`, `oxide_bridge.rs`, `gemm_dispatch.rs`.
+
+### EXP-018: INT4 GEMV warp_split kernel — DONE
+
+Replace `int4_gemm_v3_ksplit_sm` with `int4_gemm_warp_split` in the m==1 decode path. Warp split uses block (32,8,1) with warp shuffle reduction instead of v3's (64,1,1). Hypothesis: better GPU occupancy from 8 warps/block vs single warp/block.
+
+**Result:** Swapped v3_ksplit_sm → warp_split in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.219s/step. Shared mem: 0 bytes (warp shuffle replaces shared memory reduction). Affects: `gemm_dispatch.rs`.
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.
@@ -201,3 +207,11 @@ Kernel `infers_repeat_interleave_bf16` uses grid-stride pattern over `[seq_len, 
 - **Correctness**: Smoke test PASSED — correct output (30 tokens decoded)
 - **Latency**: 0.036s/step (vs 0.038s post-EXP-007 baseline) — small but measurable improvement from reduced memcpy overhead and kernel launch latency.
 - **Status**: Integrated. Kernel in `common_kernels.rs`, bridge wrapper in `oxide_bridge.rs`.
+
+### EXP-018: INT4 GEMV warp_split kernel — DONE
+
+Replaced `int4_gemm_v3_ksplit_sm` with `int4_gemm_warp_split` in the m==1 decode path. Warp split uses block (32,8,1) with warp shuffle reduction instead of v3's shared memory tiling. Eliminates shared memory entirely (0 bytes vs v3's SM tile).
+
+- **Correctness**: Smoke test PASSED — 30 tokens decoded
+- **Latency**: 0.219s/step — measured with current production model
+- **Status**: Integrated. Bridge wrapper `launch_int4_gemm_warp_split` in `oxide_bridge.rs`, dispatch change in `gemm_dispatch.rs`.
