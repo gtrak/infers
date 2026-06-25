@@ -64,8 +64,9 @@ Kernel `infers_repeat_interleave_bf16` in `common_kernels.rs` uses grid-stride p
 
 ### EXP-016: v4_ksplit as production kernel
 
-The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher throughput in microbench but was not integrated. Evaluate for production use. Affects: `int4_kernels.rs`, `oxide_bridge.rs`.
+The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher throughput in microbench but was not integrated. Evaluate for production use.
 
+**Result:** Swapped v3_ksplit_sm → v4_ksplit in m==1 decode path (K_SPLIT=20). Smoke test PASSED — 30 tokens, avg decode 0.040s/step. No type mismatches (scales already f16). Affects: `int4_kernels.rs`, `oxide_bridge.rs`, `gemm_dispatch.rs`.
 ## Experiment Queue
 
 Each experiment is a self-contained change to one kernel, tested in isolation via the bench harness before integration.
