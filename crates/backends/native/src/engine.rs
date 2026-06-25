@@ -488,6 +488,53 @@ impl ForwardEngine {
             .unwrap_or(0)
     }
 
+    /// Allocate a new DecodeState for a sequence.
+
+    /// Creates separate per-GPU workspaces and GDN recurrent states that can be
+
+    /// used with [[Self::decode_with_state]]. The PagedKvManager is NOT included
+
+    /// in the returned state — it stays owned by the engine as shared CPU-side
+
+    /// bookkeeping (page pool, block tables per sequence). Callers must provide
+
+    /// it via `decode_with_state`'s engine borrow.
+
+    // @lat: [[lat.md/lat#Forward Engine#GpuResources and DecodeState Architecture#Per-Sequence DecodeState Management]]
+    pub fn create_decode_state(&self) -> Result<DecodeState> {
+        let res = &self.resources;
+        let num_gpus = res.metadata.len();
+        let config = &res.config;
+
+        // Allocate workspaces — same logic as ForwardEngine::new
+        let sharded_intermediate = config.intermediate_size / num_gpus;
+        let mut workspaces = Vec::with_capacity(num_gpus);
+        for gpu_idx in 0..num_gpus {
+            let gpu_stream = res.streams.get(gpu_idx).unwrap().clone();
+            workspaces.push(DecodeWorkspace::new(
+                &gpu_stream, config.as_ref(),
+                config.hidden_size, sharded_intermediate,
+                config.vocab_size, num_gpus,
+            )?);
+        }
+
+        // GDN states — same logic as ForwardEngine::new / init_layer_states
+        let gdn_states = (0..num_gpus)
+            .map(|_| (0..config.num_hidden_layers).map(|_| GdnState::new()).collect())
+            .collect();
+
+        // PagedKV caches are NOT allocated here — they live on the engine and
+        // are shared across sequences via the global page pool.
+        let paged_kv_caches = Vec::new();
+
+        Ok(DecodeState {
+            workspaces,
+            paged_kv_caches,
+            gdn_states,
+            paged_kv_manager: None, // managed by engine, not per-sequence
+        })
+    }
+
     /// Run paged prefill — writes K/V to paged cache for all layers.
     ///
     /// Allocates pages for the sequence, uploads the block table to GPU,

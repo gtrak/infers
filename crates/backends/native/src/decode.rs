@@ -565,6 +565,97 @@ impl ForwardEngine {
 
         Ok(sampled)
     }
+
+    /// Decode a token using a standalone [[DecodeState]].
+
+    /// Takes the engine's `&mut self` to access the shared PagedKvManager and
+    /// PagedKvCaches (swapped temporarily into state), plus a per-sequence
+    /// DecodeState with workspaces and GDN states.
+
+    /// The returned DecodeState can be reused for subsequent decode steps on the
+    /// same sequence, or dropped when the sequence is finished.
+
+    /// # Arguments
+    /// * `stream` — CUDA stream for kernel launches
+    /// * `token_id` — Previous token ID to continue generation
+    /// * `position` — Current position in the sequence (for RoPE)
+    /// * `seq_id` — Sequence ID from PagedKvManager
+    /// * `state` — Per-sequence DecodeState (workspaces + GDN states)
+    /// * `sampling_config` — Sampling configuration
+    /// * `token_history` — Full token history for sampling
+    /// * `num_prompt_tokens` — Number of prompt tokens (for position offset)
+    /// * `rng` — RNG for sampling
+    /// * `step` — Step counter for debugging
+
+    /// # Returns
+    /// Tuple of (sampled_token, DecodeState) — state is returned for reuse.
+    // @lat: [[lat.md/lat#Forward Engine#GpuResources and DecodeState Architecture#Per-Sequence DecodeState Management]]
+    pub fn decode_with_state(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        seq_id: infers_kv::SequenceId,
+        state: DecodeState,
+        sampling_config: &infers_scheduler::SamplingConfig,
+        token_history: &[u32],
+        num_prompt_tokens: usize,
+        rng: &mut Xoshiro256PlusPlus,
+        step: usize,
+    ) -> Result<(u32, DecodeState)> {
+        use cuda_async::device_operation::{DeviceOperation, with_context, value};
+
+        let res = self.resources.clone();
+
+        // Swap engine's shared state into the per-sequence DecodeState.
+        // paged_kv_manager is CPU-side bookkeeping (page pool + block tables).
+        // paged_kv_caches are GPU page pools shared across sequences.
+        let mgr = std::mem::replace(&mut self.paged_kv_manager, None);
+        let caches = std::mem::replace(&mut self.paged_kv_caches, Vec::new());
+
+        let mut st = state;
+        st.paged_kv_manager = mgr;
+        st.paged_kv_caches = caches;
+
+        let state_arc = Arc::new(Mutex::new(st));
+        let res_clone = res.clone();
+        let state_clone = state_arc.clone();
+
+        let pipeline = with_context(move |_ctx| {
+            let mut st = state_clone.lock().unwrap();
+            let result = decode_paged_async_inner(
+                &res_clone,
+                &mut st,
+                stream,
+                token_id,
+                position,
+                seq_id,
+                sampling_config,
+                token_history,
+                num_prompt_tokens,
+                rng,
+                step,
+            );
+            match result {
+                Ok(sampled) => value(sampled),
+                Err(e) => value::<u32>(panic!("decode error: {:?}", e)),
+            }
+        });
+
+        let sampled = pipeline.sync()?;
+
+        // Extract state and restore engine's shared state.
+        let mut st = Arc::try_unwrap(state_arc)
+            .expect("DecodeState should be the only Arc reference")
+            .into_inner()
+            .expect("Mutex should not be poisoned");
+
+        // Restore engine's shared state from the DecodeState (via swap to avoid move).
+        self.paged_kv_manager = std::mem::replace(&mut st.paged_kv_manager, None);
+        self.paged_kv_caches = std::mem::replace(&mut st.paged_kv_caches, Vec::new());
+
+        Ok((sampled, st))
+    }
 }
 
 /// Inner decode logic for the async pipeline.

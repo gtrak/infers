@@ -286,7 +286,11 @@ Async variant of [[lat.md/lat#Forward Engine#Paged Decode Path]]. Uses `with_con
 
 The `gemm_projection_cached` function was changed from `&mut GemmEngine` to `&GemmEngine` since `matmul_bf16()` only needs immutable access. All downstream functions (`prefill`, `gdn::forward`, `gdn::decode_forward`, `attention::forward_paged`, `attention::decode_forward_paged`) follow this change, enabling GemmEngine behind Arc<GpuResources>.
 
+### Per-Sequence DecodeState Management
 
+`create_decode_state` allocates a new DecodeState with separate workspaces and GDN states per sequence, while shared PagedKvManager and PagedKvCaches stay on the engine. `decode_with_state` uses this state for decode via `with_context`. See [[crates/backends/native/src/engine.rs#ForwardEngine#create_decode_state]], [[crates/backends/native/src/decode.rs#ForwardEngine#decode_with_state]].
+
+`paged_kv_manager` is None in per-sequence DecodeState (shared CPU-side bookkeeping). `paged_kv_caches` is empty (shared GPU page pool). The engine swaps these into state temporarily during decode, then restores them after.
 ## INT4 Triplet Upload
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].
