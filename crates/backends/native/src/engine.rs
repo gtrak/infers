@@ -12,7 +12,7 @@ use infers_cuda::gemm::GemmEngine;
 use infers_cuda::nccl::NcclCommunicator;
 use infers_cuda::stream::StreamPool;
 use infers_cuda::PinnedHostBuffer;
-use infers_cuda::{CudaContext, CudaGraph, CudaStream};
+use infers_cuda::{CudaContext, CudaStream};
 use infers_model::{LayerType, MmapWeightRegistry, ModelConfig, WeightRegistry};
 
 use crate::attention::{KvCache, PagedKvCache};
@@ -103,12 +103,6 @@ pub struct ForwardEngine {
     /// Per-GPU pre-allocated workspace buffers for the decode hot path.
     /// Eliminates per-token alloc_zeros calls.
     workspaces: Vec<DecodeWorkspace>,
-
-    /// CUDA graph for decode loop replay (one per GPU). None until first capture.
-    decode_graphs: Vec<Option<CudaGraph>>,
-
-    /// Step counter for graph capture scheduling. 0 = warmup, 1 = capture, 2+ = replay.
-    decode_step_count: usize,
 }
 
 impl ForwardEngine {
@@ -280,8 +274,6 @@ impl ForwardEngine {
             rope_sin: Some(rope_sin),
             group_size,
             workspaces,
-            decode_graphs: (0..num_gpus).map(|_| None).collect(),
-            decode_step_count: 0,
         })
     }
 
@@ -400,8 +392,6 @@ impl ForwardEngine {
             rope_sin: Some(rope_sin),
             group_size,
             workspaces,
-            decode_graphs: (0..num_gpus).map(|_| None).collect(),
-            decode_step_count: 0,
         })
     }
 
@@ -927,14 +917,6 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         let _enter = span.enter();
         let num_gpus = self.metadata.len();
 
-        // Determine graph capture mode based on decode step count.
-        // Step 0 = warmup (run normally to initialize GPU caches), 
-        // Step 1 = capture (record the computation graph),
-        // Steps 2+ = replay (launch the captured graph).
-        let is_warmup = self.decode_step_count == 0;
-        let is_capture = !is_warmup && self.decode_graphs[0].is_none();
-        let is_replay = !is_warmup && self.decode_graphs[0].is_some();
-
         // GPU timing: create events on each GPU's context
         let gpu_start_events: Vec<_> = (0..num_gpus)
             .map(|gpu_idx| {
@@ -949,7 +931,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Record start events (outside of graph capture window)
+        // Record start events
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
             gpu_start_events[gpu_idx].record(&gpu_stream)
@@ -1010,30 +992,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
             }
         }
 
-        // === CUDA Graph Capture Logic ===
-        // Step 0: warmup (run normally to initialize GPU caches)
-        // Step 1: capture the computation graph
-        // Steps 2+: replay the captured graph (bypass per-kernel launches)
-        if is_replay && self.decode_graphs[0].is_some() {
-            // Replay mode: write staging buffers already done above, just launch the graph.
-            for gpu_idx in 0..num_gpus {
-                if let Some(ref graph) = self.decode_graphs[gpu_idx] {
-                    graph.launch().map_err(|e| anyhow::anyhow!("Failed to launch decode graph on GPU {}: {:?}", gpu_idx, e))?;
-                }
-            }
-        } else {
-            // Warmup or capture mode: execute the full compute loop.
-            if is_capture {
-                // Begin capturing on all GPU streams before any compute operations.
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    gpu_stream.begin_capture(
-                        cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
-                    ).map_err(|e| anyhow::anyhow!("Failed to begin graph capture on GPU {}: {:?}", gpu_idx, e))?;
-                }
-            }
-
-            // Embed single token on each GPU — using pre-allocated staging + output buffers (zero-alloc)
+        // Embed single token on each GPU — using pre-allocated staging + output buffers (zero-alloc)
         let mut hidden_states: Vec<CudaSlice<bf16>> = Vec::new();
         for gpu_idx in 0..num_gpus {
             let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
@@ -1178,7 +1137,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, &format!("{}.after_ar", stage_prefix), &self.workspaces[gpu_idx].attn_out, &[1, config.hidden_size], "decode");
             }
 
-            // Phase B: Residual add on each GPU (zero-alloc via workspace + copy back)
+            // Phase B: Residual add on each GPU (zero-alloc via workspace + swap)
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let ws = &mut self.workspaces[gpu_idx];
@@ -1187,10 +1146,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &mut ws.residual_buf,
                     &hidden_states[gpu_idx], &ws.attn_out,
                 )?;
-                // Copy result from residual_buf back to embed_out so that hidden_states[gpu_idx]
-                // keeps the same device address throughout the layer loop (required for CUDA graph capture).
-                gpu_stream.memcpy_dtod(&ws.residual_buf, &mut ws.embed_out)
-                    .map_err(|e| anyhow::anyhow!("Failed to copy residual attn result: {e}"))?;
+                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
             }
 
             for gpu_idx in 0..num_gpus {
@@ -1283,7 +1239,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                 probe::dump(&gpu_stream, &probe, layer_idx, gpu_idx, "mlp.down_ar", &self.workspaces[gpu_idx].mlp_out, &[1, config.hidden_size], "decode");
             }
 
-            // Phase D: Residual add on each GPU (zero-alloc via workspace + copy back)
+            // Phase D: Residual add on each GPU (zero-alloc via workspace + swap)
             for gpu_idx in 0..num_gpus {
                 let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
                 let ws = &mut self.workspaces[gpu_idx];
@@ -1292,10 +1248,7 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
                     &mut ws.residual_buf,
                     &hidden_states[gpu_idx], &ws.mlp_out,
                 )?;
-                // Copy result from residual_buf back to embed_out so that hidden_states[gpu_idx]
-                // keeps the same device address throughout the layer loop (required for CUDA graph capture).
-                gpu_stream.memcpy_dtod(&ws.residual_buf, &mut ws.embed_out)
-                    .map_err(|e| anyhow::anyhow!("Failed to copy residual mlp result: {e}"))?;
+                std::mem::swap(&mut hidden_states[gpu_idx], &mut ws.residual_buf);
             }
 
             for gpu_idx in 0..num_gpus {
@@ -1307,62 +1260,43 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         // ================================================================
         // Final norm + LM head + sample on GPU 0
         // ================================================================
+        let final_stream = self.streams.get(0).unwrap().clone();
+        let final_weights = &self.metadata[0];
+        let final_hidden = hidden_states.into_iter().next().unwrap();
 
-        // During warmup/capture, execute the final norm + LM head.
-        // During replay, these operations are part of the captured graph.
-        if !is_replay {
-            let final_weights = &self.metadata[0];
-            let final_hidden = hidden_states.into_iter().next().unwrap();
+        // Final norm — write into workspace.norm1_out (reusing buffer since layer loop is done)
+        let final_norm_weight = final_weights.norm.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
+        let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
+            .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
+        crate::norm::rms_norm_into(
+            &final_stream, &self.per_gpu_kernels[0].oxide,
+            &mut self.workspaces[0].norm1_out,
+            &final_hidden, &final_norm_gpu,
+            config.rms_norm_eps, config.hidden_size,
+        )?;
 
-            // Final norm — write into workspace.norm1_out (reusing buffer since layer loop is done)
-            let final_norm_weight = final_weights.norm.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
-            let final_norm_gpu = self.weight_caches[0].get_bf16(&final_norm_weight.name)
-                .ok_or_else(|| anyhow::anyhow!("Final norm weight '{}' not in cache", final_norm_weight.name))?;
-            crate::norm::rms_norm_into(
-                &final_stream, &self.per_gpu_kernels[0].oxide,
-                &mut self.workspaces[0].norm1_out,
-                &final_hidden, &final_norm_gpu,
-                config.rms_norm_eps, config.hidden_size,
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &self.workspaces[0].norm1_out, &[1, config.hidden_size], "decode");
+
+        // LM head — write into workspace.logits
+        let lm_head_weight = final_weights.lm_head.as_ref()
+            .or_else(|| final_weights.embedding.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
+        {
+            let ws = &mut self.workspaces[0];
+            let mut lm_head_ps = Some(&mut ws.lm_head_partial_sums);
+            crate::gemm_dispatch::gemm_projection_cached(
+                &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
+                &self.weight_caches[0],
+                &lm_head_weight.name,
+                &ws.norm1_out, &mut ws.logits,
+                1, config.vocab_size, config.hidden_size,
+                self.group_size,
+                &mut lm_head_ps,
             )?;
-
-            probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.norm", &self.workspaces[0].norm1_out, &[1, config.hidden_size], "decode");
-
-            // LM head — write into workspace.logits
-            let lm_head_weight = final_weights.lm_head.as_ref()
-                .or_else(|| final_weights.embedding.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding weights found"))?;
-            {
-                let ws = &mut self.workspaces[0];
-                let mut lm_head_ps = Some(&mut ws.lm_head_partial_sums);
-                crate::gemm_dispatch::gemm_projection_cached(
-                    &mut self.gemm_engines[0], &self.per_gpu_kernels[0].oxide, &final_stream,
-                    &self.weight_caches[0],
-                    &lm_head_weight.name,
-                    &ws.norm1_out, &mut ws.logits,
-                    1, config.vocab_size, config.hidden_size,
-                    self.group_size,
-                    &mut lm_head_ps,
-                )?;
-            }
-
-            probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &self.workspaces[0].logits, &[1, config.vocab_size], "decode");
-
-            // End graph capture on all GPU streams (after LM head, before sampling)
-            if is_capture {
-                for gpu_idx in 0..num_gpus {
-                    let gpu_stream = self.streams.get(gpu_idx).unwrap().clone();
-                    let graph = gpu_stream.end_capture(0u64)
-                        .map_err(|e| anyhow::anyhow!("Failed to end graph capture on GPU {}: {:?}", gpu_idx, e))?;
-                    if let Some(g) = graph {
-                        // Upload the graph for faster first replay.
-                        g.upload().ok();
-                        self.decode_graphs[gpu_idx] = Some(g);
-                    }
-                }
-            }
         }
-        }  // end of else block (warmup/capture mode)
+
+        probe::dump(&final_stream, &probe, config.num_hidden_layers - 1, 0, "final.logits", &self.workspaces[0].logits, &[1, config.vocab_size], "decode");
 
         // Debug logit dump (only when INFERS_DUMP_LOGITS is set)
         // @lat: [[lat.md/lat#Forward Engine#Logit Dump Debug Tool]]
