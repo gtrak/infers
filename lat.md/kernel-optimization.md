@@ -22,9 +22,9 @@ Kernel: `int4_gemm_v3_ksplit_sm`. Change: replace scalar u32 weight loads with 1
 
 Load key vector once into registers during L2-norm, reuse for steps 2 and 4 (currently 3 separate global memory loads).
 
-### EXP-004: RMSNorm warp-level reduction
+### EXP-004: RMSNorm warp-level reduction — DONE
 
-Replace shared-memory halving reduction (7 barriers) with warp-shuffle for intra-warp phase.
+Replace shared-memory halving reduction (9 barriers) with two-phase reduction: shared-memory warp-fold + warp-shuffle. Reduces sync barriers from 9 to 2. Affects: `norm_kernels.rs` (all 3 norm kernels).
 
 ### EXP-005: SiLU vectorized loads
 
@@ -93,6 +93,14 @@ Replaced all 39 `libm::expf` calls with `fast_expf` (Schraudolph bit-manip, ~0.3
 - **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
 - **Latency**: 0.049s/step (vs 0.049s baseline) — no measurable change. The fast exp avoids slow libm software emulation but the overall pipeline is INT4 GEMM bound.
 - **Status**: Integrated. `fast_expf` lives in `shared.rs`.
+
+### EXP-004: RMSNorm warp-level reduction — DONE
+
+Replaced 9-barrier shared-memory halving reduction with 2-barrier warp-shuffle reduction across all 3 norm kernels.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
+- **Latency**: 0.049s/step (vs 0.049s baseline) — no measurable change. Norm kernels are already fast relative to the INT4 GEMM bottleneck.
+- **Status**: Integrated.
 
 ### EXP-006: Paged attention K-cache caching — DONE
 
