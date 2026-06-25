@@ -4,3 +4,4 @@
 *.d
 tests/compare/__pycache__/
 *.pyc
+infers_kernel_lib.ll
