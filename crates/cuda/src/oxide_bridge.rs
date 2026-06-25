@@ -157,6 +157,38 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Launch the `infers_repeat_interleave_bf16` kernel: replicate each head kv_ratio times.
+    ///
+    /// The kernel signature is:
+    /// ```ignore
+    /// infers_repeat_interleave_bf16(src: &[u16], mut dst: DisjointSlice<u16>, seq_len: u32, num_src_heads: u32, head_dim: u32, kv_ratio: u32)
+    /// ```
+    pub fn launch_repeat_interleave_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<half::bf16>,
+        dst: &mut CudaSlice<half::bf16>,
+        seq_len: u32,
+        num_src_heads: u32,
+        head_dim: u32,
+        kv_ratio: u32,
+    ) -> anyhow::Result<()> {
+        let num_dst_heads = (num_src_heads as usize) * (kv_ratio as usize);
+        let total = (seq_len as usize) * num_dst_heads * (head_dim as usize);
+
+        // Create CudaSliceViews wrapping the cudarc slices
+        let src_view = CudaSliceView::new(&src, stream, &self.ctx);
+        let mut dst_view = CudaSliceView::new_mut(dst, stream, &self.ctx);
+
+        // Dispatch via typed module
+        let config = LaunchConfig::for_num_elems(total as u32);
+        self.modules.common.infers_repeat_interleave_bf16(
+            &self.cc_stream, config, &src_view, &mut dst_view, seq_len, num_src_heads, head_dim, kv_ratio,
+        ).map_err(|e| anyhow::anyhow!("kernel launch 'infers_repeat_interleave_bf16' failed: {:?}", e))?;
+
+        Ok(())
+    }
+
     /// Launch the `infers_embedding_gather_bf16` kernel: gather embeddings by token ids.
     ///
     /// The kernel signature is:

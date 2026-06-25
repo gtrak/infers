@@ -211,7 +211,9 @@ fn copy_view_into(
 }
 
 /// Repeat-interleave heads into a pre-allocated buffer (zero-alloc variant).
+/// Dispatches to a single CUDA kernel instead of per-head memcpy loops.
 fn repeat_interleave_heads_into(
+    oxide: &OxideKernels,
     stream: &Arc<CudaStream>,
     src: &CudaSlice<bf16>,
     seq_len: usize,
@@ -221,19 +223,9 @@ fn repeat_interleave_heads_into(
     dst: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let ratio = h_dst / h_src;
-    for t in 0..seq_len {
-        for h in 0..h_dst {
-            let src_h = h / ratio;
-            let src_offset = (t * h_src + src_h) * head_dim;
-            let dst_offset = (t * h_dst + h) * head_dim;
-            let copy_len = head_dim;
-            let src_slice = src.slice(src_offset..src_offset + copy_len);
-            let mut dst_slice = dst.slice_mut(dst_offset..dst_offset + copy_len);
-            stream.memcpy_dtod(&src_slice, &mut dst_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to copy head {h}: {e}"))?;
-        }
-    }
-    Ok(())
+    oxide.launch_repeat_interleave_bf16(
+        stream, src, dst, seq_len as u32, h_src as u32, head_dim as u32, ratio as u32,
+    ).map_err(|e| anyhow::anyhow!("repeat_interleave kernel failed: {e}"))
 }
 
 // ──────────────────────────────────────────────
@@ -611,21 +603,16 @@ pub fn decode_forward(
         1, conv_dim as u32, kernel_size_usize as u32, kernel_size as u32,
     ).map_err(|e| anyhow::anyhow!("Decode conv1d kernel launch failed: {e}"))?;
 
- // Extract the last position's output (the conv result for the current token)
-        // conv_out is [kernel_size, conv_dim], take the last row
-        {
-            let last_row_offset = conv_state_len * conv_dim;
-            let src_view = ws.conv_out.slice(last_row_offset..kernel_size_usize * conv_dim);
-            stream.memcpy_dtod(&src_view, &mut ws.conv_out_last)?;
-        }
-    probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.conv_out", &ws.conv_out_last, &[1, conv_dim], "decode");
+ // Extract the last position's output directly from conv_out (no intermediate buffer)
+        // conv_out is [kernel_size, conv_dim], take the last row via offset-based copies
+        let last_row_offset = conv_state_len * conv_dim;
 
     // =========================================================================
-    // Phase 3: Split
+    // Phase 3: Split (direct from conv_out via offsets — no conv_out_last memcpy)
     // =========================================================================
-    copy_view_into(stream, &ws.conv_out_last, 0..key_dim, &mut ws.query)?;
-    copy_view_into(stream, &ws.conv_out_last, key_dim..2 * key_dim, &mut ws.key)?;
-    copy_view_into(stream, &ws.conv_out_last, 2 * key_dim..2 * key_dim + value_dim, &mut ws.value)?;
+    copy_view_into(stream, &ws.conv_out, last_row_offset..last_row_offset + key_dim, &mut ws.query)?;
+    copy_view_into(stream, &ws.conv_out, last_row_offset + key_dim..last_row_offset + 2 * key_dim, &mut ws.key)?;
+    copy_view_into(stream, &ws.conv_out, last_row_offset + 2 * key_dim..last_row_offset + 2 * key_dim + value_dim, &mut ws.value)?;
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query", &ws.query, &[1, key_dim], "decode");
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.key", &ws.key, &[1, key_dim], "decode");
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.value", &ws.value, &[1, value_dim], "decode");
@@ -634,14 +621,14 @@ pub fn decode_forward(
     // Phase 4: repeat_interleave q/k
     // =========================================================================
     let query_expanded_ref: &CudaSlice<bf16> = if kv_ratio > 1 {
-        repeat_interleave_heads_into(stream, &ws.query, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.query_expanded)?;
+        repeat_interleave_heads_into(oxide, stream, &ws.query, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.query_expanded)?;
         &ws.query_expanded
     } else {
         &ws.query
     };
     probe::dump(stream, probe, layer_idx, gpu_idx, "gdn.query_expanded", query_expanded_ref, &[1, num_v_heads * head_k_dim], "decode");
     let key_expanded_ref: &CudaSlice<bf16> = if kv_ratio > 1 {
-        repeat_interleave_heads_into(stream, &ws.key, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.key_expanded)?;
+        repeat_interleave_heads_into(oxide, stream, &ws.key, 1, num_k_heads, num_v_heads, head_k_dim, &mut ws.key_expanded)?;
         &ws.key_expanded
     } else {
         &ws.key

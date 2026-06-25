@@ -257,6 +257,38 @@ pub mod common {
         }
     }
 
+    /// Repeat-interleave: replicate each of `num_src_heads` heads `kv_ratio` times.
+    ///
+    /// src layout: [seq_len, num_src_heads, head_dim]
+    /// dst layout: [seq_len, num_src_heads * kv_ratio, head_dim]
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn infers_repeat_interleave_bf16(
+        src: &[u16],
+        mut dst: DisjointSlice<u16>,
+        seq_len: u32,
+        num_src_heads: u32,
+        head_dim: u32,
+        kv_ratio: u32,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let num_dst_heads = (num_src_heads as usize) * (kv_ratio as usize);
+        let total = (seq_len as usize) * num_dst_heads * (head_dim as usize);
+
+        for i in (tid as usize..total).step_by(stride as usize) {
+            let dst_head = (i / head_dim as usize) % num_dst_heads;
+            let src_head = dst_head / (kv_ratio as usize);
+            let d = i % head_dim as usize;
+            let src_t = i / (num_src_heads as usize * (head_dim as usize));
+            let src_idx = src_t * (num_src_heads as usize) * (head_dim as usize) + src_head * (head_dim as usize) + d;
+            unsafe {
+                *dst.get_unchecked_mut(i) = src[src_idx];
+            }
+        }
+    }
+
     /// Replace NaN values in a bf16 buffer with 0.0.
     #[kernel]
     pub fn sanitize_nan_bf16(buf: &mut [u16], len: u32) {

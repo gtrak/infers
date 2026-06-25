@@ -105,13 +105,11 @@ pub struct GdnWorkspace {
     pub conv_input: CudaSlice<bf16>,
     /// Conv1d output buffer. Size: kernel_size * conv_dim.
     pub conv_out: CudaSlice<bf16>,
-    /// Last row of conv_out (the result for the current token). Size: conv_dim.
-    pub conv_out_last: CudaSlice<bf16>,
-    /// Query sub-slice from conv_out_last. Size: key_dim.
+    /// Query sub-slice from conv_out (via offset). Size: key_dim.
     pub query: CudaSlice<bf16>,
-    /// Key sub-slice from conv_out_last. Size: key_dim.
+    /// Key sub-slice from conv_out (via offset). Size: key_dim.
     pub key: CudaSlice<bf16>,
-    /// Value sub-slice from conv_out_last. Size: value_dim.
+    /// Value sub-slice from conv_out (via offset). Size: value_dim.
     pub value: CudaSlice<bf16>,
     /// Repeat-interleaved query (num_v_heads * head_k_dim). Only used when kv_ratio > 1.
     pub query_expanded: CudaSlice<bf16>,
@@ -158,7 +156,6 @@ impl GdnWorkspace {
             mixed_qkv: stream.alloc_zeros::<bf16>(conv_dim)?,
             conv_input: stream.alloc_zeros::<bf16>(kernel_size * conv_dim)?,
             conv_out: stream.alloc_zeros::<bf16>(kernel_size * conv_dim)?,
-            conv_out_last: stream.alloc_zeros::<bf16>(conv_dim)?,
             query: stream.alloc_zeros::<bf16>(key_dim)?,
             key: stream.alloc_zeros::<bf16>(key_dim)?,
             value: stream.alloc_zeros::<bf16>(value_dim)?,

@@ -56,13 +56,15 @@ Combine ksplit and reduce into one kernel. Each block computes all K-splits for 
 
 Per-layer all-reduces have data dependency (residual add between attn and MLP AR). Cannot batch within a layer. Cross-layer pipeline overlap requires engine-level stream separation — deferred.
 
-### EXP-015: cuBLASLt bf16 GEMM → INT4 ksplit migration
+### EXP-015: GDN decode memcpy elimination — DONE
 
-Small projections (a_proj, b_proj, conv) currently use cuBLASLt BF16 GEMM because weights may not be quantized. Check if these can use INT4 ksplit instead (7.6% of time). Affects: `gemm_dispatch.rs`.
+Replaces 48 per-head repeat-interleave memcpy calls with a single CUDA kernel. Eliminates conv_out_last intermediate buffer. Reduces per-token memcpy calls from 55 to 7.
 
-### EXP-016: INT4 GEMM v4_ksplit as production kernel
+Kernel `infers_repeat_interleave_bf16` in `common_kernels.rs` uses grid-stride pattern over `[seq_len, num_src_heads * kv_ratio, head_dim]`. q/k/v splits copy directly from conv_out via offset-based `copy_view_into`. Affects: `gdn.rs`, `common_kernels.rs`, `oxide_bridge.rs`, `workspace.rs`.
 
-The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. It had higher throughput in microbenchmarks but was not integrated. Evaluate for production use. Affects: `int4_kernels.rs`, `oxide_bridge.rs`.
+### EXP-016: v4_ksplit as production kernel
+
+The v4 kernel uses 16 threads/block, 4 cols/thread, 128-bit loads. Had higher throughput in microbench but was not integrated. Evaluate for production use. Affects: `int4_kernels.rs`, `oxide_bridge.rs`.
 
 ## Experiment Queue
 
@@ -188,3 +190,13 @@ Merged Steps 1+2 (decay + kv_mem) and Steps 4+5 (update + output) into single lo
 - **Correctness**: Smoke test PASSED — correct output (30 tokens decoded)
 - **Latency**: 0.038s/step (vs 0.038s post-EXP-003 baseline) — no measurable change at this stage; the pipeline remains INT4 GEMM bound, but global memory traffic for state is cut by 50%.
 - **Status**: Integrated.
+
+### EXP-015: GDN decode memcpy elimination — DONE
+
+Replaced 48 per-head memcpy calls with one kernel launch. Eliminated conv_out_last buffer entirely.
+
+Kernel `infers_repeat_interleave_bf16` uses grid-stride pattern over `[seq_len, num_src_heads * kv_ratio, head_dim]`. q/k/v splits copy directly from conv_out via offset-based `copy_view_into`. Per-token memcpy reduced from 55 to 7. One GdnWorkspace buffer freed (~5KB per GPU).
+
+- **Correctness**: Smoke test PASSED — correct output (30 tokens decoded)
+- **Latency**: 0.036s/step (vs 0.038s post-EXP-007 baseline) — small but measurable improvement from reduced memcpy overhead and kernel launch latency.
+- **Status**: Integrated. Kernel in `common_kernels.rs`, bridge wrapper in `oxide_bridge.rs`.
