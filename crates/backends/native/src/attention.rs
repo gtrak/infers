@@ -1259,7 +1259,7 @@ pub fn decode_forward_paged(
                 head_dim,
                 rope_theta,
                 partial_rotary_factor,
-                None, None,
+                cached_cos, cached_sin,
             )?;
         } else {
             rope::apply_rope(
@@ -1272,7 +1272,7 @@ pub fn decode_forward_paged(
                 head_dim,
                 rope_theta,
                 partial_rotary_factor,
-                None, None,
+                cached_cos, cached_sin,
             )?;
         }
 
@@ -1340,7 +1340,7 @@ pub fn decode_forward_paged(
                 head_dim,
                 rope_theta,
                 partial_rotary_factor,
-                None, None,
+                cached_cos, cached_sin,
             )?;
         } else {
             rope::apply_rope(
@@ -1353,7 +1353,7 @@ pub fn decode_forward_paged(
                 head_dim,
                 rope_theta,
                 partial_rotary_factor,
-                None, None,
+                cached_cos, cached_sin,
             )?;
         }
 
