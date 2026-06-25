@@ -525,6 +525,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-async"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide#baa1773ad834e6869f5341ff6dd0ba1b48c3e1b8"
+dependencies = [
+ "anyhow",
+ "cuda-bindings",
+ "cuda-core",
+ "futures",
+ "rustc-hash",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide#baa1773ad834e6869f5341ff6dd0ba1b48c3e1b8"
@@ -557,6 +570,7 @@ name = "cuda-host"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide#baa1773ad834e6869f5341ff6dd0ba1b48c3e1b8"
 dependencies = [
+ "cuda-async",
  "cuda-core",
  "cuda-macros",
  "half",
@@ -1280,6 +1294,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "cuda-async",
  "cuda-core",
  "cudarc",
  "half",
@@ -1303,6 +1318,7 @@ name = "infers-cuda"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cuda-async",
  "cuda-core",
  "cuda-device",
  "cuda-host",

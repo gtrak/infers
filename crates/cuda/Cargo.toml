@@ -15,6 +15,7 @@ cudarc = { workspace = true }
 # CUDA (cuda-oxide) — bridge module for loading pre-compiled kernels
 cuda-core = { workspace = true }
 cuda-host = { workspace = true }
+cuda-async = { workspace = true }
 cuda-device = { workspace = true }
 
 infers-kernel-lib = { path = "../cuda-oxide-kernels/kernel-lib" }
