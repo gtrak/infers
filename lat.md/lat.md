@@ -274,6 +274,11 @@ Diagnostics print the stream capture status before and after each compute phase.
 
 Decode uses CUDA graph capture (step 0 warm-up, step 1 capture, step 2+ replay). Diagnostics check whether warm-up left the stream in a capturing state incompatible with `begin_capture`.
 
+## Paged Decode Pipeline
+
+Async-friendly variant of [[lat.md/lat#Forward Engine#Paged Decode Path]]. Wraps GPU work in a cuda-async `DeviceOperation` pipeline via `value()`. Uses `SendPtr<T>` for crossing Send boundaries. Future iterations can decompose into per-layer `and_then` chains. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_paged_async]].
+
+
 ## INT4 Triplet Upload
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].

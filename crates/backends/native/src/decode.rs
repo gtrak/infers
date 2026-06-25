@@ -17,6 +17,12 @@ use crate::probe;
 use crate::sync;
 use crate::sample::Xoshiro256PlusPlus;
 
+/// Raw-pointer wrapper for crossing `Send` boundaries in cuda-async closures.
+/// Sound because `and_then::execute()` calls closures sequentially on the same thread — no aliasing possible.
+#[allow(clippy::missing_safety_doc)]
+pub struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+
 impl ForwardEngine {
     /// Run paged single-token decode — zero CPU round-trips.
     ///
@@ -480,5 +486,38 @@ impl ForwardEngine {
         tracing::info!(gpu_time_ms = max_gpu_ms as f64, phase = "decode", "GPU execution complete");
 
         Ok(sampled)
+    }
+
+    /// Run paged single-token decode as a cuda-async `DeviceOperation` pipeline.
+    ///
+    /// This is the async-friendly counterpart to [[Self::decode_paged]]. It calls
+    /// decode_paged synchronously, then wraps the result in a completed
+    /// `DeviceOperation`. For future work, the inner layer loop can be decomposed
+    /// into per-layer operations using `and_then` chains.
+    // @lat: [[lat.md/lat#Forward Engine#Paged Decode Pipeline]]
+    pub fn decode_paged_async(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        seq_id: infers_kv::SequenceId,
+        sampling_config: &infers_scheduler::SamplingConfig,
+        token_history: &[u32],
+        num_prompt_tokens: usize,
+        rng: &mut Xoshiro256PlusPlus,
+        step: usize,
+    ) -> Result<u32> {
+        use cuda_async::device_operation::{DeviceOperation, value};
+
+        // Execute decode synchronously, then wrap the result as a completed DeviceOperation.
+        // The GPU work happens inside decode_paged; value() marks it as done on the pipeline.
+        let sampled = self.decode_paged(
+            stream, token_id, position, seq_id,
+            sampling_config, token_history, num_prompt_tokens, rng, step,
+        )?;
+
+        // Sync the completed operation — blocks until GPU is idle (decode_paged already synced).
+        let result = value(sampled).sync()?;
+        Ok(result)
     }
 }

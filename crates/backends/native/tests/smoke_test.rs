@@ -178,7 +178,7 @@ fn smoke_test_real_model() -> Result<(), Box<dyn std::error::Error>> {
     for step in 0..30 {
         let decode_start = Instant::now();
         let pos = (token_ids.len() + step) as u32;
-        token = engine.decode_paged(&external_stream, token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng, step)?;
+        token = engine.decode_paged_async(&external_stream, token, pos, seq_id, &sampling_config, &all_tokens, token_ids.len(), &mut rng, step)?;
         all_tokens.push(token);
         let decode_elapsed = decode_start.elapsed();
         total_decode_time += decode_elapsed;
