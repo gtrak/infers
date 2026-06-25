@@ -5,7 +5,7 @@
 //! and sampling. It holds references to CUDA resources, model weights, and kernels.
 
 use crate::probe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use infers_cuda::gemm::GemmEngine;
@@ -68,7 +68,7 @@ pub struct ForwardEngine {
     pub(crate) resources: Arc<GpuResources>,
 
     /// Paged KV cache manager (pool + prefix cache + COW).
-    pub(crate) paged_kv_manager: Option<PagedKvManager>,
+    pub(crate) paged_kv_manager: Option<Arc<Mutex<PagedKvManager>>>,
 
     /// Per-GPU, per-layer KV caches for full-attention layers (flat cache, legacy).
     pub(crate) kv_caches: Vec<Vec<KvCache>>,          // [gpu_idx][layer_idx]
@@ -468,7 +468,7 @@ impl ForwardEngine {
             })
             .collect();
 
-        self.paged_kv_manager = Some(manager);
+        self.paged_kv_manager = Some(Arc::new(Mutex::new(manager)));
         self.paged_kv_caches = caches;
         tracing::info!(
             "Paged KV system initialized: {} pages, page_size={}, {} layers",
@@ -483,8 +483,8 @@ impl ForwardEngine {
     /// Create a new sequence in the paged KV manager, returning its ID.
     pub fn create_sequence(&mut self) -> infers_kv::SequenceId {
         self.paged_kv_manager
-            .as_mut()
-            .map(|m| m.create_sequence())
+            .as_ref()
+            .map(|m| m.lock().unwrap().create_sequence())
             .unwrap_or(0)
     }
 
@@ -581,31 +581,38 @@ impl ForwardEngine {
             gpu_start_events[gpu_idx].record(&gpu_stream)
                 .map_err(|e| anyhow::anyhow!("Failed to record start event on GPU {gpu_idx}: {:?}", e))?;
         }
-       let manager = self.paged_kv_manager.as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
+       let (page_size, block_table_i32, positions_i32): (usize, Vec<i32>, Vec<i32>) = {
+           let mut manager = self.paged_kv_manager.as_ref()
+               .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?
+               .lock()
+               .unwrap();
 
-        let num_gpus = res.metadata.len();
-        let config = &res.config;
-        let page_size = manager.page_size();
-        let head_dim = config.head_dim;
-        let seq_len = token_ids.len();
+           let page_size = manager.page_size();
 
-        // Probe instrumentation
-        let probe = probe::ProbeConfig::from_env();
-        probe::dump_config(&res.config, num_gpus, res.group_size);
+           // Allocate pages for the sequence
+           let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
+           for _ in 0..num_pages_needed {
+               manager.append_page(seq_id)?;
+           }
 
-        // Allocate pages for the sequence
-        let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
-        for _ in 0..num_pages_needed {
-            manager.append_page(seq_id)?;
-        }
-
-        // Upload block table and positions to ALL GPUs
-
-        let block_table = manager.block_table(seq_id)?;
-        let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
-        let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
-        let positions_i32: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
+           let block_table = manager.block_table(seq_id)?;
+           let block_table_i32: Vec<i32> = block_table.iter().map(|p| *p as i32).collect();
+           let positions_i32: Vec<i32> = (0..token_ids.len() as i32).collect();
+           (page_size, block_table_i32, positions_i32)
+       };
+       let num_gpus = res.metadata.len();
+       let config = &res.config;
+       let head_dim = config.head_dim;
+       let seq_len = token_ids.len();
+       let probe = probe::ProbeConfig::from_env();
+       probe::dump_config(&res.config, num_gpus, res.group_size);
+       let page_size = self.paged_kv_manager.as_ref()
+           .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?
+           .lock()
+           .unwrap()
+           .page_size();
+       let num_pages_needed = (token_ids.len().saturating_sub(1) / page_size) + 1;
+       let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
 
         // Per-GPU block tables and positions
         let mut block_tables_gpu: Vec<CudaSlice<i32>> = Vec::new();
@@ -870,8 +877,8 @@ group_end().map_err(|e| anyhow::anyhow!("NCCL group_end failed: {:?}", e))?;
         }
 
         // Record prefill tokens in the KV manager so decode sees the correct count
-        if let Some(mgr) = self.paged_kv_manager.as_mut() {
-            mgr.add_tokens(seq_id, seq_len)
+        if let Some(m) = &self.paged_kv_manager {
+            m.lock().unwrap().add_tokens(seq_id, seq_len)
                 .map_err(|e| anyhow::anyhow!("Failed to record prefill tokens: {:?}", e))?;
         }
 

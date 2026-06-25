@@ -284,13 +284,20 @@ Async variant of [[lat.md/lat#Forward Engine#Paged Decode Path]]. Uses `with_con
 
 `DecodeState` holds mutable per-sequence state: workspaces, paged_kv_caches, gdn_states, and paged_kv_manager. During async decode, these are temporarily moved from ForwardEngine into an `Arc<Mutex<DecodeState>>`, used inside the closure, then restored afterward. See [[crates/backends/native/src/resources.rs#DecodeState]].
 
+`PagedKvManager` is wrapped in `Arc<Mutex<>>` on both ForwardEngine and DecodeState. This allows concurrent access from spawned tasks — each task locks the mutex briefly to modify CPU-side bookkeeping (page pool, block tables). Arc clones are passed into closures instead of taking/restoring the manager. See [[crates/backends/native/src/engine.rs#ForwardEngine]], [[crates/backends/native/src/resources.rs#DecodeState]].
+
 The `gemm_projection_cached` function was changed from `&mut GemmEngine` to `&GemmEngine` since `matmul_bf16()` only needs immutable access. All downstream functions (`prefill`, `gdn::forward`, `gdn::decode_forward`, `attention::forward_paged`, `attention::decode_forward_paged`) follow this change, enabling GemmEngine behind Arc<GpuResources>.
 
 ### Per-Sequence DecodeState Management
 
 `create_decode_state` allocates a new DecodeState with separate workspaces and GDN states per sequence, while shared PagedKvManager and PagedKvCaches stay on the engine. `decode_with_state` uses this state for decode via `with_context`. See [[crates/backends/native/src/engine.rs#ForwardEngine#create_decode_state]], [[crates/backends/native/src/decode.rs#ForwardEngine#decode_with_state]].
 
-`paged_kv_manager` is None in per-sequence DecodeState (shared CPU-side bookkeeping). `paged_kv_caches` is empty (shared GPU page pool). The engine swaps these into state temporarily during decode, then restores them after.
+`paged_kv_manager` holds an `Arc<Mutex<PagedKvManager>>` in DecodeState (cloned from engine). `paged_kv_caches` is empty (shared GPU page pool). The engine swaps paged_kv_caches into state temporarily during decode, then restores them after. PagedKvManager is shared via Arc — no take/restore needed.
+
+### Spawnable Decode Pipeline
+
+`decode_spawnable` builds a `DeviceOperation` with owned captures (`'static + Send`) for continuous batching. The caller provides an owned `DecodeState` and receives `(sampled_token, DecodeState)` for state reuse. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_spawnable]].
+
 ## INT4 Triplet Upload
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].

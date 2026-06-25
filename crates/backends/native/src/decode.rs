@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use half::bf16;
 use infers_cuda::{CudaSlice, CudaStream};
+use cuda_async::device_operation::DeviceOperation;
 use infers_model::LayerType;
 
 use crate::engine::ForwardEngine;
@@ -81,8 +82,10 @@ impl ForwardEngine {
         // then read the (possibly updated) block table and cached-token count.
         // Use a scope to drop the mutable borrow before using `self` again.
         let (page_size, num_cached_tokens, block_table_i32): (usize, i32, Vec<i32>) = {
-            let mgr = self.paged_kv_manager.as_mut()
-                .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
+            let mut mgr = self.paged_kv_manager.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?
+                .lock()
+                .unwrap();
             let ps = mgr.page_size();
 
             // Allocate pages up to the page index that `position` falls in.
@@ -461,8 +464,8 @@ impl ForwardEngine {
 
         // Record the new token in the KV manager so the next decode step
         // sees the correct block table and cached-token count.
-        if let Some(mgr) = self.paged_kv_manager.as_mut() {
-            mgr.add_token(seq_id)
+        if let Some(m) = &self.paged_kv_manager {
+            m.lock().unwrap().add_token(seq_id)
                 .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
         }
 
@@ -512,7 +515,7 @@ impl ForwardEngine {
             workspaces: std::mem::take(&mut self.workspaces),
             paged_kv_caches: std::mem::take(&mut self.paged_kv_caches),
             gdn_states: std::mem::take(&mut self.gdn_states),
-            paged_kv_manager: self.paged_kv_manager.take(),
+            paged_kv_manager: self.paged_kv_manager.clone(),
         };
 
         // Wrap mutable state in Arc<Mutex<>> for sharing across closure.
@@ -561,7 +564,6 @@ impl ForwardEngine {
         self.workspaces = st.workspaces;
         self.paged_kv_caches = st.paged_kv_caches;
         self.gdn_states = st.gdn_states;
-        self.paged_kv_manager = st.paged_kv_manager;
 
         Ok(sampled)
     }
@@ -610,7 +612,7 @@ impl ForwardEngine {
         // Swap engine's shared state into the per-sequence DecodeState.
         // paged_kv_manager is CPU-side bookkeeping (page pool + block tables).
         // paged_kv_caches are GPU page pools shared across sequences.
-        let mgr = std::mem::replace(&mut self.paged_kv_manager, None);
+        let mgr = self.paged_kv_manager.clone();
         let caches = std::mem::replace(&mut self.paged_kv_caches, Vec::new());
 
         let mut st = state;
@@ -651,10 +653,70 @@ impl ForwardEngine {
             .expect("Mutex should not be poisoned");
 
         // Restore engine's shared state from the DecodeState (via swap to avoid move).
-        self.paged_kv_manager = std::mem::replace(&mut st.paged_kv_manager, None);
         self.paged_kv_caches = std::mem::replace(&mut st.paged_kv_caches, Vec::new());
 
         Ok((sampled, st))
+    }
+
+    /// Build a spawnable `DeviceOperation` for decode.
+    ///
+    /// All captures are owned (`'static + Send`), enabling
+    /// `tokio::spawn(pipeline.into_future())` for continuous batching.
+    ///
+    /// The caller provides owned values — no references to the engine are captured.
+    /// The `DecodeState` is moved into the closure and returned alongside the
+    /// sampled token, allowing it to be reused across decode steps.
+    ///
+    /// # Arguments
+    /// * `stream` — CUDA stream for kernel launches (owned Arc)
+    /// * `token_id` — Previous token ID to continue generation
+    /// * `position` — Current position in the sequence (for RoPE)
+    /// * `seq_id` — Sequence ID from PagedKvManager
+    /// * `state` — Per-sequence DecodeState (owned, with paged_kv_manager set from engine)
+    /// * `sampling_config` — Sampling configuration (owned)
+    /// * `token_history` — Full token history for sampling (owned)
+    /// * `num_prompt_tokens` — Number of prompt tokens (for position offset)
+    /// * `rng` — RNG for sampling (owned)
+    /// * `step` — Step counter for debugging
+    ///
+    /// # Returns
+    /// A pipeline producing `(sampled_token, DecodeState)` via `.sync()` or `.await`.
+    pub fn decode_spawnable(
+        &self,
+        stream: Arc<CudaStream>,
+        token_id: u32,
+        position: u32,
+        seq_id: infers_kv::SequenceId,
+        mut state: DecodeState,
+        sampling_config: infers_scheduler::SamplingConfig,
+        token_history: Vec<u32>,
+        num_prompt_tokens: usize,
+        mut rng: Xoshiro256PlusPlus,
+        step: usize,
+    ) -> impl DeviceOperation<Output = Result<(u32, DecodeState), String>> {
+        use cuda_async::device_operation::{with_context, value};
+
+        let res = self.resources.clone();
+
+        with_context(move |_ctx| {
+            let result = decode_paged_async_inner(
+                &res,
+                &mut state,
+                &stream,
+                token_id,
+                position,
+                seq_id,
+                &sampling_config,
+                &token_history,
+                num_prompt_tokens,
+                &mut rng,
+                step,
+            );
+            match result {
+                Ok(sampled) => value(Ok((sampled, state))),
+                Err(e) => value(Err(format!("{:?}", e))),
+            }
+        })
     }
 }
 
@@ -681,8 +743,10 @@ fn decode_paged_async_inner(
 
     // Dynamically allocate pages as needed for the target position.
     let (page_size, num_cached_tokens, block_table_i32): (usize, i32, Vec<i32>) = {
-        let mgr = state.paged_kv_manager.as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?;
+        let mut mgr = state.paged_kv_manager.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?
+            .lock()
+            .unwrap();
         let ps = mgr.page_size();
 
         let needed_pages = (position as usize / ps) + 1;
@@ -980,8 +1044,8 @@ fn decode_paged_async_inner(
     )?;
 
     // Record the new token in the KV manager.
-    if let Some(mgr) = state.paged_kv_manager.as_mut() {
-        mgr.add_token(seq_id)
+    if let Some(m) = &state.paged_kv_manager {
+        m.lock().unwrap().add_token(seq_id)
             .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
     }
 

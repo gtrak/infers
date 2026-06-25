@@ -4,7 +4,7 @@
 //! cheap cloning across cuda-async closures. `DecodeState` holds per-sequence
 //! mutable state wrapped in `Arc<Mutex<>>` for sharing across `and_then` closures.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use infers_cuda::{CudaSlice, CudaStream};
 use infers_cuda::gemm::GemmEngine;
@@ -77,7 +77,7 @@ pub struct DecodeState {
     pub gdn_states: Vec<Vec<GdnState>>,
 
     /// Paged KV cache manager (pool + prefix cache + COW).
-    pub paged_kv_manager: Option<PagedKvManager>,
+    pub paged_kv_manager: Option<Arc<Mutex<PagedKvManager>>>,
 }
 
 impl std::fmt::Debug for DecodeState {
