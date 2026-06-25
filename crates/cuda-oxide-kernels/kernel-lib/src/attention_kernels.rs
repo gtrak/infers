@@ -117,7 +117,8 @@ pub mod attention {
         let page_stride = 2 * (page_size as usize) * (kv_dim as usize);
         let scale = 1.0f32 / dev_sqrtf(head_dim as f32);
 
-        // Dynamic shared memory: 3 * bdim f32s
+        // Dynamic shared memory layout:
+        // [Q: bdim f32s] [max_reduc: bdim f32s] [sum_reduc: bdim f32s] [weights: num_cached_tokens f32s]
         let smem = DynamicSharedArray::<f32>::get();
 
         // Each block handles all query heads that share this KV head
@@ -199,12 +200,40 @@ pub mod attention {
                 s >>= 1;
             }
             let global_sum = unsafe { *smem.add(2 * bdim) };
-
-            // ================================================================
-            // Phase 2: Compute weighted V accumulation
-            // ================================================================
             let inv_sum = if global_sum > 0.0f32 { 1.0 / global_sum } else { 0.0 };
 
+            // ================================================================
+            // Phase 1b: Cache softmax weights in shared memory
+            // ================================================================
+            // Each thread re-iterates its tokens, recomputes dot product (one K read),
+            // applies softmax weight, and stores the result. This avoids head_dim
+            // redundant K reads per token in Phase 2.
+            let weights_base = 3 * bdim;
+            for token_pos in (tid as usize..num_cached_tokens as usize).step_by(bdim) {
+                let logical_page = token_pos / page_size as usize;
+                let token_in_page = token_pos % page_size as usize;
+                let physical_page = block_table[logical_page] as usize;
+
+                let mut dot: f32 = 0.0;
+                for d in 0..head_dim as usize {
+                    let q_v = unsafe { *smem.add(d) };
+                    let k_off = physical_page * page_stride
+                        + token_in_page * (kv_dim as usize)
+                        + kv_head_idx * (head_dim as usize)
+                        + d;
+                    let k_v = KvBf16::read_kv(page_pool, k_off);
+                    dot += q_v * k_v;
+                }
+                dot *= scale;
+
+                let weight = fast_expf(dot - global_max) * inv_sum;
+                unsafe { *smem.add(weights_base + token_pos) = weight; }
+            }
+            cuda_device::sync_threads();
+
+            // ================================================================
+            // Phase 2: Compute weighted V accumulation using cached weights
+            // ================================================================
             if tid < head_dim as usize {
                 let mut out_val: f32 = 0.0;
                 for token_pos in 0..num_cached_tokens as usize {
@@ -212,19 +241,7 @@ pub mod attention {
                     let token_in_page = token_pos % page_size as usize;
                     let physical_page = block_table[logical_page] as usize;
 
-                    let mut dot: f32 = 0.0;
-                    for d in 0..head_dim as usize {
-                        let q_v = unsafe { *smem.add(d) };
-                        let k_off = physical_page * page_stride
-                            + token_in_page * (kv_dim as usize)
-                            + kv_head_idx * (head_dim as usize)
-                            + d;
-                        let k_v = KvBf16::read_kv(page_pool, k_off);
-                        dot += q_v * k_v;
-                    }
-                    dot *= scale;
-
-                    let weight = fast_expf(dot - global_max) * inv_sum;
+                    let weight = unsafe { *smem.add(weights_base + token_pos) };
                     let v_off = physical_page * page_stride
                         + (page_size as usize) * (kv_dim as usize)
                         + token_in_page * (kv_dim as usize)

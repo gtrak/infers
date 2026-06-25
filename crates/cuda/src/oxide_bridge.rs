@@ -1263,7 +1263,8 @@ impl OxideKernels {
         let config = LaunchConfig {
             grid_dim: (num_kv_heads, 1, 1),
             block_dim: (256, 1, 1),
-            shared_mem_bytes: 3 * 256 * 4,  // 3 regions: Q values + max scratch + sum scratch
+            // 3 regions: Q values + max scratch + sum scratch + cached attention weights
+            shared_mem_bytes: ((3 * 256 + num_cached_tokens as usize) * 4) as u32,
         };
         self.modules.attention.infers_paged_attention_decode_bf16(
             &self.cc_stream, config, &q_view, &page_pool_view, &block_table_view, num_pages, num_cached_tokens, head_dim, num_kv_heads, num_query_heads, page_size, kv_dim, &mut output_view,

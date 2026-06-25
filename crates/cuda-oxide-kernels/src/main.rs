@@ -2456,7 +2456,7 @@ fn test_paged_attention_decode(ctx: &Arc<CudaContext>) -> bool {
     let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, NUM_QUERY_HEADS * HEAD_DIM).unwrap();
 
     let bdim = (HEAD_DIM.min(256)) as u32;
-    let shared_mem_bytes = 3 * bdim as usize * std::mem::size_of::<f32>();
+    let shared_mem_bytes = (3 * bdim as usize + NUM_CACHED_TOKENS) * std::mem::size_of::<f32>();
     let launch = LaunchConfig {
         grid_dim: (NUM_KV_HEADS as u32, 1, 1),
         block_dim: (bdim, 1, 1),

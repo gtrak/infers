@@ -30,7 +30,7 @@ Replace shared-memory halving reduction (7 barriers) with warp-shuffle for intra
 
 Replace scalar u16 loads with `[u16;4]` 8-byte vectorized loads (4 bf16 at once) in `infers_silu_bf16` and `infers_silu_glu_bf16`. Scalar remainder loop handles tail.
 
-### EXP-006: Paged attention K-cache caching
+### EXP-006: Paged attention K-cache caching — DONE
 
 Kernel: `paged_attention_decode_bf16`. Change: cache K dot products from Phase 1 so Phase 2 doesn't re-read K from global memory. Hypothesis: ~2x KV bandwidth saved. Affects: `attention_kernels.rs`.
 
@@ -93,3 +93,13 @@ Replaced all 39 `libm::expf` calls with `fast_expf` (Schraudolph bit-manip, ~0.3
 - **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
 - **Latency**: 0.049s/step (vs 0.049s baseline) — no measurable change. The fast exp avoids slow libm software emulation but the overall pipeline is INT4 GEMM bound.
 - **Status**: Integrated. `fast_expf` lives in `shared.rs`.
+
+### EXP-006: Paged attention K-cache caching — DONE
+
+Cache K dot products from Phase 1 in shared memory so Phase 2 doesn't re-read K from global memory.
+
+Added Phase 1b: after Phase 1's block reduction, each thread re-iterates its tokens, recomputes the dot product, applies softmax weight, and caches the result in shared memory. Phase 2 reads cached weights instead of recomputing K dot products. Shared memory expanded from `3*bdim` to `3*bdim + num_cached_tokens` f32s.
+
+- **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded). Internal unit test PASS (CPU reference match).
+- **Latency**: 0.039s/step (vs 0.039s baseline) — no measurable change at this workload. For Qwen3.6-27B (head_dim=128, bdim=128, ~512 cached tokens), K reads drop from ~66K to ~1K (98.5% reduction). The lack of speedup suggests K bandwidth is not the bottleneck at current workload sizes.
+- **Status**: Integrated. Shared memory increased in `oxide_bridge.rs` launch wrapper.
