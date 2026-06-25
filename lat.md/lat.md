@@ -264,7 +264,7 @@ Run with `cargo test -- --nocapture`. Seven checkpoints: events recorded, pages 
 
 ## Paged Decode Path
 
-Paged decode: reads K/V from pages via block tables, single-token generation with paged attention kernels. Zero-allocation — intermediate buffers use pre-allocated [[lat.md/lat#Forward Engine#Decode Workspace]]. See [[crates/backends/native/src/engine.rs]].
+Paged decode: reads K/V from pages via block tables, single-token generation with paged attention kernels. Zero-allocation — intermediate buffers use pre-allocated [[lat.md/lat#Forward Engine#Decode Workspace]]. Extracted to a standalone `decode` module for file size reduction. See [[crates/backends/native/src/decode.rs]].
 
 ## INT4 Triplet Upload
 
@@ -315,7 +315,7 @@ Per-layer probe infrastructure for dumping intermediate tensors during inference
 
 Debug feature for diagnosing stuck-token issues by printing top-5 logits at each decode step.
 
-Enabled via `INFERS_DUMP_LOGITS=1` environment variable. Downloads the full logits tensor from GPU 0 to CPU after LM head projection, computes statistics (max, min, standard deviation), sorts descending to find top-5 tokens, and prints to stderr in the format `[LOGIT-DUMP] step={step} top5=[(token_id, logit_value), ...] max_logit={max} min_logit={min} logit_std={std}`. See [[crates/backends/native/src/engine.rs]].
+Enabled via `INFERS_DUMP_LOGITS=1` environment variable. Downloads the full logits tensor from GPU 0 to CPU after LM head projection, computes statistics (max, min, standard deviation), sorts descending to find top-5 tokens, and prints to stderr in the format `[LOGIT-DUMP] step={step} top5=[(token_id, logit_value), ...] max_logit={max} min_logit={min} logit_std={std}`. See [[crates/backends/native/src/decode.rs]].
 
 ## Zero-Allocation _into Variants
 

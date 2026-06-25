@@ -12,6 +12,7 @@ pub mod chat_template;
 pub mod add;
 pub mod engine;
 pub mod prefill;
+pub mod decode;
 
 pub mod gdn;
 pub mod attention;
