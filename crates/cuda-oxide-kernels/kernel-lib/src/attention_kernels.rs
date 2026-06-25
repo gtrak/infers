@@ -158,8 +158,8 @@ pub mod attention {
                 dot *= scale;
 
                 let new_max = local_max.max(dot);
-                let correction = libm::expf(local_max - new_max);
-                local_sum = local_sum * correction + libm::expf(dot - new_max);
+                let correction = fast_expf(local_max - new_max);
+                local_sum = local_sum * correction + fast_expf(dot - new_max);
                 local_max = new_max;
             }
 
@@ -182,7 +182,7 @@ pub mod attention {
             let global_max = unsafe { *smem.add(bdim) };
 
             // --- Adjust per-thread sums to global max, then reduce ---
-            let adjusted_sum = local_sum * libm::expf(local_max - global_max);
+            let adjusted_sum = local_sum * fast_expf(local_max - global_max);
             unsafe { *smem.add(2 * bdim + tid) = adjusted_sum; }
             cuda_device::sync_threads();
 
@@ -224,7 +224,7 @@ pub mod attention {
                     }
                     dot *= scale;
 
-                    let weight = libm::expf(dot - global_max) * inv_sum;
+                    let weight = fast_expf(dot - global_max) * inv_sum;
                     let v_off = physical_page * page_stride
                         + (page_size as usize) * (kv_dim as usize)
                         + token_in_page * (kv_dim as usize)

@@ -31,7 +31,7 @@ pub mod activation {
             let mut o4 = [0u16; 4];
             for j in 0..4 {
                 let val = f32::from_bits((x4[j] as u32) << 16);
-                let sigmoid = 1.0 / (1.0 + libm::expf(-val));
+                let sigmoid = 1.0 / (1.0 + fast_expf(-val));
                 o4[j] = f32_to_bf16(val * sigmoid);
             }
             unsafe {
@@ -41,7 +41,7 @@ pub mod activation {
         }
         for i in (vec_total + tid as usize..total).step_by(stride as usize) {
             let val = f32::from_bits((x[i] as u32) << 16);
-            let sigmoid = 1.0 / (1.0 + libm::expf(-val));
+            let sigmoid = 1.0 / (1.0 + fast_expf(-val));
             unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(val * sigmoid); }
         }
     }
@@ -72,7 +72,7 @@ pub mod activation {
             for j in 0..4 {
                 let x_val = f32::from_bits((x4[j] as u32) << 16);
                 let g_val = f32::from_bits((g4[j] as u32) << 16);
-                let sigmoid_g = 1.0 / (1.0 + libm::expf(-g_val));
+                let sigmoid_g = 1.0 / (1.0 + fast_expf(-g_val));
                 o4[j] = f32_to_bf16(x_val * g_val * sigmoid_g);
             }
             unsafe {
@@ -83,7 +83,7 @@ pub mod activation {
         for i in (vec_total + tid as usize..total).step_by(stride as usize) {
             let x_val = f32::from_bits((x[i] as u32) << 16);
             let g_val = f32::from_bits((gate[i] as u32) << 16);
-            let sigmoid_g = 1.0 / (1.0 + libm::expf(-g_val));
+            let sigmoid_g = 1.0 / (1.0 + fast_expf(-g_val));
             unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(x_val * g_val * sigmoid_g); }
         }
     }
@@ -108,7 +108,7 @@ pub mod activation {
         for i in (tid as usize..total).step_by(stride as usize) {
             let x_val = f32::from_bits((x[i] as u32) << 16);
             let g_val = f32::from_bits((gate[i] as u32) << 16);
-            let sigmoid_g = 1.0 / (1.0 + libm::expf(-g_val));
+            let sigmoid_g = 1.0 / (1.0 + fast_expf(-g_val));
             unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(x_val * sigmoid_g); }
         }
     }
@@ -154,7 +154,7 @@ pub mod activation {
             }
 
             // SiLU activation: sum / (1 + exp(-sum))
-            let silu = sum / (1.0 + libm::expf(-sum));
+            let silu = sum / (1.0 + fast_expf(-sum));
             unsafe { *output.get_unchecked_mut(i) = f32_to_bf16(silu); }
         }
     }

@@ -130,7 +130,7 @@ pub mod norm {
             let g_val = f32::from_bits((gate[row_offset + i] as u32) << 16);
             let w_val = f32::from_bits((weight[i] as u32) << 16);
             let x_norm = x_val * inv_rms;
-            let silu_gate = g_val / (1.0 + libm::expf(-g_val));
+            let silu_gate = g_val / (1.0 + fast_expf(-g_val));
             let result = w_val * x_norm * silu_gate;
             unsafe { *output.get_unchecked_mut(row_offset + i) = f32_to_bf16(result); }
         }

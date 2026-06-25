@@ -184,7 +184,7 @@ pub mod common {
         for c in (tid..sl_usize).step_by(256) {
             if use_causal == 0 || c <= row {
                 let val = f32::from_bits((scores[row * sl_usize + c] as u32) << 16);
-                local_sum += libm::expf(val - row_max);
+                local_sum += fast_expf(val - row_max);
             }
         }
 
@@ -210,7 +210,7 @@ pub mod common {
             let out_idx = row * sl_usize + c;
             if use_causal == 0 || c <= row {
                 let val = f32::from_bits((scores[out_idx] as u32) << 16);
-                let result = libm::expf(val - row_max) / row_sum;
+                let result = fast_expf(val - row_max) / row_sum;
                 unsafe { *output.get_unchecked_mut(out_idx) = f32_to_bf16(result); }
             } else {
                 // Masked position → zero

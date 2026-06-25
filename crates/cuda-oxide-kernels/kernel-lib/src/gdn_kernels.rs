@@ -38,7 +38,7 @@ pub mod gdn {
         let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
 
         // Compute g[h] and beta[h]
-        let decay_rate_h = libm::expf(a_log[h]);
+        let decay_rate_h = fast_expf(a_log[h]);
         let a_val = f32::from_bits((a_proj[h] as u32) << 16);
         let sp_val = a_val + dt_bias[h];
 
@@ -48,15 +48,15 @@ pub mod gdn {
         } else if sp_val < -20.0f32 {
             softplus_val = 0.0f32;
         } else {
-            softplus_val = libm::logf(1.0f32 + libm::expf(sp_val));
+            softplus_val = libm::logf(1.0f32 + fast_expf(sp_val));
         }
 
         let g_val = -decay_rate_h * softplus_val;
-        let decay = libm::expf(g_val);
+        let decay = fast_expf(g_val);
 
         // beta[h] = sigmoid(b_proj[h])
         let b_val = f32::from_bits((b_proj[h] as u32) << 16);
-        let beta_val = 1.0f32 / (1.0f32 + libm::expf(-b_val));
+        let beta_val = 1.0f32 / (1.0f32 + fast_expf(-b_val));
 
         // L2-normalize key and query
         let mut k_l2_sq = 0.0f32;
@@ -134,7 +134,7 @@ pub mod gdn {
 
         // Pre-compute per-head constants
         let a_val = f32::from_bits((a_log[head] as u32) << 16);
-        let decay = 1.0f32 / (1.0f32 + libm::expf(-a_val));
+        let decay = 1.0f32 / (1.0f32 + fast_expf(-a_val));
         let bias_val = f32::from_bits((dt_bias[head] as u32) << 16);
 
         // delta = softplus(dt_proj + dt_bias)
@@ -145,7 +145,7 @@ pub mod gdn {
         } else if dt_val < -20.0f32 {
             delta = 0.0f32;
         } else {
-            delta = libm::logf(1.0f32 + libm::expf(dt_val));
+            delta = libm::logf(1.0f32 + fast_expf(dt_val));
         }
 
         // b contribution
@@ -162,9 +162,9 @@ pub mod gdn {
         // SiLU: numerically stable formulation
         let silu_z: f32;
         if z_val > 0.0f32 {
-            silu_z = z_val / (1.0f32 + libm::expf(-z_val));
+            silu_z = z_val / (1.0f32 + fast_expf(-z_val));
         } else {
-            let exp_z = libm::expf(z_val);
+            let exp_z = fast_expf(z_val);
             silu_z = z_val * exp_z / (1.0f32 + exp_z);
         }
 
@@ -291,7 +291,7 @@ pub mod gdn {
         let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
 
         // Compute g[h] and beta[h]
-        let decay_rate_h = libm::expf(a_log[h]);
+        let decay_rate_h = fast_expf(a_log[h]);
         let a_val = f32::from_bits((a_proj[h] as u32) << 16);
         let sp_val = a_val + dt_bias[h];
 
@@ -301,13 +301,13 @@ pub mod gdn {
         } else if sp_val < -20.0f32 {
             softplus_val = 0.0f32;
         } else {
-            softplus_val = libm::logf(1.0f32 + libm::expf(sp_val));
+            softplus_val = libm::logf(1.0f32 + fast_expf(sp_val));
         }
 
         let g_val = -decay_rate_h * softplus_val;
         let b_val = f32::from_bits((b_proj[h] as u32) << 16);
-        let beta_val = 1.0f32 / (1.0f32 + libm::expf(-b_val));
-        let decay = libm::expf(g_val);
+        let beta_val = 1.0f32 / (1.0f32 + fast_expf(-b_val));
+        let decay = fast_expf(g_val);
 
         // L2-normalize key and query
         let mut k_l2_sq = 0.0f32;
@@ -390,7 +390,7 @@ pub mod gdn {
         let H = num_heads as usize;
         let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
 
-        let decay_rate_h = libm::expf(a_log[h]);
+        let decay_rate_h = fast_expf(a_log[h]);
 
         for t in 0..S {
             // Compute g[t][h] and beta[t][h]
@@ -403,13 +403,13 @@ pub mod gdn {
             } else if sp_val < -20.0f32 {
                 softplus_val = 0.0f32;
             } else {
-                softplus_val = libm::logf(1.0f32 + libm::expf(sp_val));
+                softplus_val = libm::logf(1.0f32 + fast_expf(sp_val));
             }
 
             let g_val = -decay_rate_h * softplus_val;
             let b_val = f32::from_bits((b_proj[t * H + h] as u32) << 16);
-            let beta_val = 1.0f32 / (1.0f32 + libm::expf(-b_val));
-            let decay = libm::expf(g_val);
+            let beta_val = 1.0f32 / (1.0f32 + fast_expf(-b_val));
+            let decay = fast_expf(g_val);
 
             // L2-normalize query and key
             let mut k_l2_sq = 0.0f32;
@@ -497,7 +497,7 @@ pub mod gdn {
         let num_chunks = (seq_len as usize + C - 1) / C;
 
         let rcp_sqrt_k = 1.0f32 / (K as f32).sqrt();
-        let decay_rate = libm::expf(a_log[h]);            // A = exp(A_log[h])
+        let decay_rate = fast_expf(a_log[h]);            // A = exp(A_log[h])
 
         // Shared memory layout:
         // k_normed[C*K], k_beta[C*K], attn[C*C], g_cs[C], beta_arr[C], row_buf[C]
@@ -536,14 +536,14 @@ pub mod gdn {
                     } else if sp_val < -20.0f32 {
                         softplus = 0.0f32;
                     } else {
-                        softplus = libm::logf(1.0f32 + libm::expf(sp_val));
+                        softplus = libm::logf(1.0f32 + fast_expf(sp_val));
                     }
 
                     let g_val = -decay_rate * softplus;
 
                     // beta = sigmoid(b_proj[seq_pos][h])
                     let b_val = f32::from_bits((b_proj[seq_pos * num_heads as usize + h] as u32) << 16);
-                    let beta_v = 1.0f32 / (1.0f32 + libm::expf(-b_val));
+                    let beta_v = 1.0f32 / (1.0f32 + fast_expf(-b_val));
 
                     unsafe { *g_cs.add(i) = g_val; }
                     unsafe { *beta_arr.add(i) = beta_v; }
@@ -651,7 +651,7 @@ pub mod gdn {
                     let attn_val: f32;
                     if row > col {
                         let g_diff = unsafe { *g_cs.add(row) - *g_cs.add(col) };
-                        attn_val = -sum * libm::expf(g_diff);
+                        attn_val = -sum * fast_expf(g_diff);
                     } else {
                         attn_val = 0.0f32;
                     }
@@ -717,7 +717,7 @@ pub mod gdn {
                         q_l2_sq += qv * qv;
                     }
                     let q_norm_rational = 1.0f32 / (q_l2_sq + 1e-6f32).sqrt();
-                    let exp_g_row = unsafe { libm::expf(*g_cs.add(row)) };
+                    let exp_g_row = unsafe { fast_expf(*g_cs.add(row)) };
                     // ── attn_inter[row][col_v] = (q_normed * exp(g_cs) @ S) ──
                     // @lat: [[tests/gdn_chunked_prefill_test#GDN Chunked Prefill Kernel Test#rcp_sqrt_k Double Application Bug Fix]]
                     let mut attn_inter_val = 0.0f32;
@@ -740,7 +740,7 @@ pub mod gdn {
                             }
                         }
                         let g_diff = unsafe { *g_cs.add(row) - *g_cs.add(j) };
-                        let attn_qk_val = qk_dot_j * libm::expf(g_diff);
+                        let attn_qk_val = qk_dot_j * fast_expf(g_diff);
                         // v_new[j][col_v] = attn @ (v * beta)
                         let mut v_new_j = 0.0f32;
                         for ii in 0..actual_len {
@@ -760,7 +760,7 @@ pub mod gdn {
                                 unsafe {
                                     k_cd_j += *attn.add(j * C + ii)
                                         * *k_beta.add(ii * K + d)
-                                        * libm::expf(*g_cs.add(ii));
+                                        * fast_expf(*g_cs.add(ii));
                                 }
                             }
                             v_prime_j += k_cd_j * state[state_base + d * V + col_v];
@@ -788,13 +788,13 @@ pub mod gdn {
 
                     let d = flat_s / V;
                     let col_v = flat_s % V;
-                    let exp_g_last = unsafe { libm::expf(*g_cs.add(actual_len - 1)) };
+                    let exp_g_last = unsafe { fast_expf(*g_cs.add(actual_len - 1)) };
                     // S[d][col_v] *= exp(g_cs[-1])
                     let mut s_val = state[state_base + d * V + col_v] * exp_g_last;
 
                     // Add: sum_j exp_diff[j] * k_normed[j][d] * v_nc[j][col_v]
                     for j in 0..actual_len {
-                        let exp_diff_j = unsafe { libm::expf(*g_cs.add(actual_len - 1) - *g_cs.add(j)) };
+                        let exp_diff_j = unsafe { fast_expf(*g_cs.add(actual_len - 1) - *g_cs.add(j)) };
                         // v_new[j][col_v] = attn @ (v * beta)
                         let mut v_new_j = 0.0f32;
                         for ii in 0..actual_len {
@@ -814,7 +814,7 @@ pub mod gdn {
                                 unsafe {
                                     k_cd_j += *attn.add(j * C + ii)
                                         * *k_beta.add(ii * K + dd)
-                                        * libm::expf(*g_cs.add(ii));
+                                        * fast_expf(*g_cs.add(ii));
                                 }
                             }
                             v_prime_j += k_cd_j * state[state_base + dd * V + col_v];
