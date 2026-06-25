@@ -167,12 +167,12 @@ Added Phase 1b: after Phase 1's block reduction, each thread re-iterates its tok
 - **Latency**: 0.040s/step (vs 0.050s baseline) — **20% improvement (20.8→25 tok/s)**. For Qwen3.6-27B (head_dim=128, bdim=128, ~512 cached tokens), K reads drop from ~66K to ~1K (98.5% reduction).
 - **Status**: Integrated. Shared memory increased in `oxide_bridge.rs` launch wrapper.
 
-### EXP-010: Paged attention block table hoisting — DONE
+### EXP-015: GDN decode memcpy elimination — DONE
 
-Cached `physical_page` across consecutive positions sharing the same logical page in Phase 1, 1b, and 2. Three separate `prev_logical_page`/`cached_physical_page` pairs.
+Replaced 48 tiny repeat-interleave memcpy calls (256 bytes each) with single `infers_repeat_interleave_bf16` kernel. Eliminated `conv_out_last` intermediate buffer — q/k/v split now reads directly from conv_out offset.
 
-- **Correctness**: Smoke test PASSED — correct output ("Paris", 30 tokens decoded)
-- **Latency**: 0.040s/step (same as EXP-006) — no measurable change. Block table reads are a tiny fraction of total memory traffic.
+- **Correctness**: Smoke test PASSED — 30 tokens decoded
+- **Latency**: 0.036s/step (vs 0.038s baseline) — **5% improvement**. Eliminated 48 memcpy→2 kernel launches.
 - **Status**: Integrated.
 
 ### EXP-003: GDN shared memory key/query caching — DONE
