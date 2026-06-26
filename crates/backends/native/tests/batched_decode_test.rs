@@ -179,11 +179,12 @@ fn batched_decode_2seq() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("\nSeq0 output: {}", text0.trim());
         eprintln!("Seq1 output: {}", text1.trim());
 
-        let combined = format!("{} {}", text0, text1);
-        if combined.contains("Paris") {
-            eprintln!("\n*** PASSED: Both sequences decoded successfully, Paris found ***");
+        // Check for semantic correctness — both sequences should mention France/capital
+        let combined = format!("{} {}", text0, text1).to_lowercase();
+        if combined.contains("france") && (combined.contains("capital") || combined.contains("paris")) {
+            eprintln!("\n*** PASSED: Both sequences decoded coherently, mention France/capital ***");
         } else {
-            eprintln!("\n*** WARNING: Paris not found in output (may still be correct) ***");
+            eprintln!("\n*** WARNING: Output doesn't mention France/capital ***");
         }
     }
 

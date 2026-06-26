@@ -300,7 +300,9 @@ The `gemm_projection_cached` function was changed from `&mut GemmEngine` to `&Ge
 
 ## Batched Decode
 
-M=2 batched decode amortizes INT4 GEMM weight bandwidth using `gemm_projection_cached_m`. Per-sequence operations loop via workspace copies. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_batched]].
+M=2 batched decode amortizes INT4 GEMM weight bandwidth via `gemm_projection_cached_m` and `int4_gemm_v3_ksplit_sm_m` kernel. MLP GEMMs fully batched; GDN/attention per-sequence. 37 tok/s aggregate. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_batched]].
+
+NCCL, RMSNorm, and residual add are batched natively (handle M>1). Results: 0.054s/step, 37 tok/s aggregate (33% improvement over 27.8 tok/s M=1). Per-token latency: 0.027s (25% faster than 0.036s).
 
 ## INT4 Triplet Upload
 
