@@ -194,3 +194,176 @@ pub fn gemm_projection_cached(
 
     Ok(output.clone())
 }
+
+/// M-batched INT4 GEMM projection. Uses v3_ksplit_sm_m kernel for INT4 weights
+/// when M>1, amortizing weight bandwidth across M sequences.
+/// For BF16 weights, delegates to cuBLASLt (already handles M>1).
+///
+/// Input: [M, K] bf16 row-major
+/// Output: [M, N] bf16 row-major
+pub fn gemm_projection_cached_m(
+    gemm: &GemmEngine,
+    oxide: &OxideKernels,
+    stream: &Arc<CudaStream>,
+    cache: &crate::gpu_cache::GpuWeightCache,
+    weight_name: &str,
+    input: &CudaSlice<bf16>,
+    output: &mut CudaSlice<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    partial_sums_buf: &mut Option<&mut CudaSlice<f32>>,
+) -> Result<CudaSlice<bf16>> {
+    // Gate eprintln behind INFERS_DEBUG env var — only prints once at first call.
+    static DEBUG_GEMM_M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let debug = *DEBUG_GEMM_M.get_or_init(|| std::env::var("INFERS_DEBUG").is_ok());
+
+    match cache.get(weight_name) {
+        Some(crate::gpu_cache::CachedWeight::Bf16(weight_gpu)) => {
+            if debug { eprintln!("[GEMM-DISPATCH-M] Bf16 weight '{}': len={}", weight_name, weight_gpu.len()); }
+            gemm.matmul_bf16(
+                &GemmConfig {
+                    m: n,
+                    n: m,
+                    k,
+                    transa: true,
+                    transb: false,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    lda: None,
+                    ldb: None,
+                    ldc: None,
+                    activation: None,
+                },
+                weight_gpu,
+                input,
+                output,
+            )?;
+        }
+        Some(crate::gpu_cache::CachedWeight::Int4(int4_bufs)) => {
+            if debug { eprintln!("[GEMM-DISPATCH-M] Int4 weight '{}': m={}, n={}, k={}", weight_name, m, n, k); }
+
+            // Determine transposition from weight shape: [K/8, N] is transposed layout.
+            let transposed: u32 = if int4_bufs.shape.len() >= 2 {
+                if int4_bufs.shape[1] == n { 1 } else { 0 }
+            } else { 1 };
+
+            if m == 1 {
+                // M=1: use the same K-split GEMV as gemm_projection_cached
+                const K_SPLIT: u32 = 20;
+                let required_len = K_SPLIT as usize * n;
+                let mut local_ps_owner: Option<CudaSlice<f32>> = None;
+                let partial_sums: &mut CudaSlice<f32> = if let Some(buf) = partial_sums_buf.as_mut() {
+                    if buf.len() >= required_len {
+                        buf
+                    } else {
+                        local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                        local_ps_owner.as_mut().unwrap()
+                    }
+                } else {
+                    local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                    local_ps_owner.as_mut().unwrap()
+                };
+                oxide.launch_int4_gemm_v3_ksplit_sm(
+                    stream, &oxide.cc_stream(), partial_sums,
+                    &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
+                    input, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,
+                )?;
+                oxide.launch_reduce_partial_sums_bf16(
+                    stream, &oxide.cc_stream(), output, partial_sums, n as u32, K_SPLIT,
+                )?;
+            } else if m == 2 {
+                // M=2: use the M-batched K-split kernel (hardcoded for M=2)
+                const K_SPLIT: u32 = 20;
+                let required_len = K_SPLIT as usize * n * m;
+                let mut local_ps_owner: Option<CudaSlice<f32>> = None;
+                let partial_sums: &mut CudaSlice<f32> = if let Some(buf) = partial_sums_buf.as_mut() {
+                    if buf.len() >= required_len {
+                        buf
+                    } else {
+                        local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                        local_ps_owner.as_mut().unwrap()
+                    }
+                } else {
+                    local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                    local_ps_owner.as_mut().unwrap()
+                };
+                oxide.launch_int4_gemm_v3_ksplit_sm_m(
+                    stream, &oxide.cc_stream(), partial_sums,
+                    &int4_bufs.qweight, &int4_bufs.scales, &int4_bufs.qzeros,
+                    input, m as u32, n as u32, k as u32, group_size as u32, transposed, K_SPLIT,
+                )?;
+                oxide.launch_reduce_partial_sums_bf16_m(
+                    stream, &oxide.cc_stream(), output, partial_sums, n as u32, m as u32, K_SPLIT,
+                )?;
+            } else {
+                // M > 2: fall back to generic kernel
+                oxide.launch_int4_gemm_auto_round(
+                    stream, &oxide.cc_stream(),
+                    output,
+                    &int4_bufs.qweight,
+                    &int4_bufs.scales,
+                    &int4_bufs.qzeros,
+                    input,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    group_size as u32,
+                    transposed,
+                )?;
+            }
+        }
+        Some(crate::gpu_cache::CachedWeight::Nvfp4(nvfp4_bufs)) => {
+            // NVFP4: same as existing — no M-batched kernel for NVFP4 yet
+            const NVFP4_GROUP_SIZE: u32 = 16;
+
+            if debug { eprintln!("[GEMM-DISPATCH-M] Nvfp4 weight '{}': m={}, n={}, k={}", weight_name, m, n, k); }
+
+            if m == 1 {
+                const K_SPLIT: u32 = 20;
+                let required_len = K_SPLIT as usize * n;
+                let mut local_ps_owner: Option<CudaSlice<f32>> = None;
+                let partial_sums: &mut CudaSlice<f32> = if let Some(buf) = partial_sums_buf.as_mut() {
+                    if buf.len() >= required_len {
+                        buf
+                    } else {
+                        local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                        local_ps_owner.as_mut().unwrap()
+                    }
+                } else {
+                    local_ps_owner = Some(unsafe { stream.alloc::<f32>(required_len)? });
+                    local_ps_owner.as_mut().unwrap()
+                };
+                oxide.launch_nvfp4_gemm_v3_ksplit(
+                    stream, &oxide.cc_stream(), partial_sums,
+                    &nvfp4_bufs.weight_packed, &nvfp4_bufs.weight_scale,
+                    input, nvfp4_bufs.weight_global_scale,
+                    n as u32, k as u32, NVFP4_GROUP_SIZE, K_SPLIT,
+                )?;
+                oxide.launch_reduce_partial_sums_bf16(
+                    stream, &oxide.cc_stream(), output, partial_sums, n as u32, K_SPLIT,
+                )?;
+            } else {
+                oxide.launch_nvfp4_gemm_fused(
+                    stream, &oxide.cc_stream(),
+                    output,
+                    &nvfp4_bufs.weight_packed,
+                    &nvfp4_bufs.weight_scale,
+                    input,
+                    nvfp4_bufs.weight_global_scale,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    NVFP4_GROUP_SIZE,
+                )?;
+            }
+        }
+        None => {
+            if debug { eprintln!("[GEMM-DISPATCH-M] Weight '{}' NOT FOUND in cache", weight_name); }
+            anyhow::bail!("Weight '{}' not found in GpuWeightCache", weight_name);
+        }
+    }
+
+    Ok(output.clone())
+}

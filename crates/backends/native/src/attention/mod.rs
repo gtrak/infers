@@ -88,7 +88,7 @@ impl KvCache {
 /// - Copy-on-write page sharing
 ///
 /// @lat: [[lat.md/lat#Paged Attention Implementation#PagedKvCache]]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PagedKvCache {
     /// GPU buffer holding all paged KV data: [num_pages * 2 * page_size * kv_dim].
     /// Layout per page: [K tokens | V tokens], each side = page_size * kv_dim elements.

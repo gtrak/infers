@@ -535,6 +535,15 @@ impl ForwardEngine {
         })
     }
 
+    /// Prepare a DecodeState for batched decode by cloning shared paged KV state.
+    ///
+    /// Clones the paged_kv_manager Arc and paged_kv_caches (shallow GPU handle clones)
+    /// into the state. Each state gets its own handle to the shared page pool.
+    pub fn prepare_batched_state(&mut self, state: &mut DecodeState) {
+        state.paged_kv_manager = self.paged_kv_manager.clone();
+        state.paged_kv_caches = self.paged_kv_caches.clone();
+    }
+
     /// Run paged prefill — writes K/V to paged cache for all layers.
     ///
     /// Allocates pages for the sequence, uploads the block table to GPU,

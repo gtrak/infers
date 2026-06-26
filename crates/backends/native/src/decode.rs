@@ -718,6 +718,352 @@ impl ForwardEngine {
             }
         })
     }
+
+    /// Batched decode for M=2 sequences. Amortizes INT4 GEMM weight bandwidth
+    /// by processing 2 tokens simultaneously through all GEMMs.
+    // @lat: [[lat.md/lat#Forward Engine#Batched Decode]]
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batched(
+        &mut self,
+        tokens: &[u32],             // M token IDs
+        positions: &[u32],         // M positions
+        seq_ids: &[infers_kv::SequenceId], // M sequence IDs
+        states: &mut [DecodeState],       // M states
+        sampling_configs: &[infers_scheduler::SamplingConfig], // M configs
+        token_histories: &[Vec<u32>],     // M histories
+        num_prompt_tokens: &[usize],      // M counts
+        rngs: &mut [Xoshiro256PlusPlus],  // M RNGs
+        _step: usize,
+    ) -> Result<Vec<u32>> {
+        const M: usize = 2;
+        assert_eq!(tokens.len(), M);
+        assert_eq!(positions.len(), M);
+        assert_eq!(seq_ids.len(), M);
+        assert_eq!(states.len(), M);
+
+        let res = &self.resources;
+        let config = &res.config;
+        let hidden_size = config.hidden_size;
+        let vocab_size = config.vocab_size;
+        let sharded_intermediate = config.intermediate_size / res.metadata.len();
+        let num_gpus = res.metadata.len();
+        let group_size = res.group_size;
+
+        // Allocate batched buffers per GPU: [M, hidden_size] or [M, intermediate]
+        let mut batched_hidden: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_residual_buf: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_norm1_out: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_norm2_out: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_attn_out: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_mlp_gate: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_mlp_up: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_mlp_silu: Vec<CudaSlice<bf16>> = Vec::new();
+        let mut batched_mlp_out: Vec<CudaSlice<bf16>> = Vec::new();
+
+        // Partial sums per GPU — sized for largest GEMM (lm_head with M=2)
+        const K_SPLIT: u32 = 20;
+        let max_ps = K_SPLIT as usize * vocab_size * M;
+        let mut batched_partial_sums: Vec<CudaSlice<f32>> = Vec::new();
+
+        for gpu_idx in 0..num_gpus {
+            let stream = res.streams.get(gpu_idx).unwrap().clone();
+            batched_hidden.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_residual_buf.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_norm1_out.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_norm2_out.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_attn_out.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_mlp_gate.push(unsafe { stream.alloc::<bf16>(M * sharded_intermediate)? });
+            batched_mlp_up.push(unsafe { stream.alloc::<bf16>(M * sharded_intermediate)? });
+            batched_mlp_silu.push(unsafe { stream.alloc::<bf16>(M * sharded_intermediate)? });
+            batched_mlp_out.push(unsafe { stream.alloc::<bf16>(M * hidden_size)? });
+            batched_partial_sums.push(unsafe { stream.alloc::<f32>(max_ps)? });
+        }
+
+        // Embed M tokens on each GPU into batched_hidden [M, hidden_size]
+        for gpu_idx in 0..num_gpus {
+            let stream = res.streams.get(gpu_idx).unwrap().clone();
+            let embed_weight = res.metadata[gpu_idx].embedding.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Embedding weights not found"))?;
+            let embed_table = res.weight_caches[gpu_idx].get_bf16(&embed_weight.name)
+                .ok_or_else(|| anyhow::anyhow!("Embedding weight not in cache"))?;
+            let token_ids_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            // Allocate M-sized staging buffer (workspace's token_ids_staging is sized for M=1)
+            let mut token_ids_staging = stream.alloc_zeros::<i32>(M)?;
+            crate::embedding::embed_tokens_into(
+                &stream, &res.per_gpu_kernels[gpu_idx].oxide, &embed_table,
+                &token_ids_i32, &mut token_ids_staging,
+                &mut batched_hidden[gpu_idx], M, hidden_size,
+            )?;
+        }
+
+        // Per-GPU sharded head counts
+        let num_kv_heads_per_gpu = config.num_key_value_heads / num_gpus;
+        let num_heads_per_gpu = config.num_attention_heads / num_gpus;
+
+        // Allocate pages for each sequence
+        for seq_i in 0..M {
+            let mut mgr = states[seq_i].paged_kv_manager.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Paged KV system not initialized"))?
+                .lock().unwrap();
+            let ps = mgr.page_size();
+            let needed_pages = (positions[seq_i] as usize / ps) + 1;
+            let current_pages = mgr.block_table(seq_ids[seq_i])?.len();
+            for _ in current_pages..needed_pages {
+                mgr.append_page(seq_ids[seq_i])
+                    .map_err(|e| anyhow::anyhow!("Failed to allocate KV page: {:?}", e))?;
+            }
+            for gpu_idx in 0..num_gpus {
+                for cache in &mut states[seq_i].paged_kv_caches[gpu_idx] {
+                    cache.ensure_allocated(res.streams.get(gpu_idx).unwrap())?;
+                }
+            }
+        }
+
+        // Layer loop
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer_type = config.get_layer_type(layer_idx);
+
+            // Phase A: Norm1 + attention/GDN on each GPU
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &res.gemm_engines[gpu_idx];
+                let oxide = &res.per_gpu_kernels[gpu_idx].oxide;
+                let layer = &res.metadata[gpu_idx].layers[layer_idx];
+
+                // Norm1 — batched RMSNorm on [M, hidden_size]
+                let norm1_weight = res.weight_caches[gpu_idx].get_bf16(&layer.norm1.name)
+                    .ok_or_else(|| anyhow::anyhow!("Norm1 weight not in cache"))?;
+                crate::norm::rms_norm_into(
+                    &stream, oxide, &mut batched_norm1_out[gpu_idx],
+                    &batched_hidden[gpu_idx], &norm1_weight,
+                    config.rms_norm_eps, hidden_size,
+                )?;
+
+                if layer_type == LayerType::GatedDeltaNet {
+                    // GDN: call existing decode_forward per-sequence (M=2 calls)
+                    let gdn_weights = layer.gdn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GDN weights not found"))?;
+                    for seq_i in 0..M {
+                        let ws = &mut states[seq_i].workspaces[gpu_idx];
+                        let gdn_state = &mut states[seq_i].gdn_states[gpu_idx][layer_idx];
+
+                        // Copy row seq_i from batched_norm1_out into workspace
+                        let src = batched_norm1_out[gpu_idx].slice(seq_i * hidden_size..(seq_i + 1) * hidden_size);
+                        stream.memcpy_dtod(&src, &mut ws.norm1_out)
+                            .map_err(|e| anyhow::anyhow!("Copy norm1 row: {e}"))?;
+
+                        // Run per-sequence GDN decode_forward (takes [1,hidden] input/output)
+                        let mut ps = Some(&mut batched_partial_sums[gpu_idx]);
+                        crate::gdn::decode_forward(
+                            gemm, &stream, oxide, gdn_weights,
+                            &ws.norm1_out, gdn_state, hidden_size, config.as_ref(),
+                            group_size, &res.weight_caches[gpu_idx], layer_idx, gpu_idx,
+                            &res.probe_config, &mut ws.gdn, &mut ws.attn_out,
+                            &mut ps,
+                        )?;
+
+                        // Copy from ws.attn_out (row seq_i) into batched_attn_out
+                        let mut dst = batched_attn_out[gpu_idx].slice_mut(seq_i * hidden_size..(seq_i + 1) * hidden_size);
+                        stream.memcpy_dtod(&ws.attn_out, &mut dst)
+                            .map_err(|e| anyhow::anyhow!("Copy GDN output: {e}"))?;
+                    }
+                } else {
+                    // FullAttention: call existing decode_forward_paged per-sequence (M=2 calls)
+                    let attn_weights = layer.attn.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Attention weights not found"))?;
+
+                    for seq_i in 0..M {
+                        let ws = &mut states[seq_i].workspaces[gpu_idx];
+                        let position = positions[seq_i];
+                        let seq_id = seq_ids[seq_i];
+
+                        // Copy row seq_i from batched_norm1_out into workspace
+                        let src = batched_norm1_out[gpu_idx].slice(seq_i * hidden_size..(seq_i + 1) * hidden_size);
+                        stream.memcpy_dtod(&src, &mut ws.norm1_out)
+                            .map_err(|e| anyhow::anyhow!("Copy norm1 row: {e}"))?;
+
+                        // Get block table and position for this sequence
+                        let mut mgr = states[seq_i].paged_kv_manager.as_ref()
+                            .unwrap().lock().unwrap();
+                        let bt = mgr.block_table(seq_id)
+                            .map_err(|e| anyhow::anyhow!("Failed to get block table: {:?}", e))?;
+                        let bt_i32: Vec<i32> = bt.iter().map(|p| *p as i32).collect();
+                        stream.memcpy_htod(&bt_i32, &mut ws.block_table_staging)
+                            .map_err(|e| anyhow::anyhow!("Copy block table: {e}"))?;
+
+                        let num_cached = mgr.num_tokens(seq_id)? as i32 + 1;
+                        stream.memcpy_htod(&[num_cached as u32], &mut ws.num_cached_tokens_staging)
+                            .map_err(|e| anyhow::anyhow!("Copy num_cached: {e}"))?;
+                        stream.memcpy_htod(&[position as i32], &mut ws.position_staging)
+                            .map_err(|e| anyhow::anyhow!("Copy position: {e}"))?;
+
+                        let page_size = mgr.page_size();
+                        let mut ps = Some(&mut batched_partial_sums[gpu_idx]);
+                        crate::attention::decode_forward_paged(
+                            gemm, &stream, oxide, attn_weights,
+                            &ws.norm1_out,
+                            &mut states[seq_i].paged_kv_caches[gpu_idx][layer_idx],
+                            &ws.block_table_staging, &ws.position_staging, position,
+                            &ws.num_cached_tokens_staging,
+                            config.head_dim, num_heads_per_gpu, num_kv_heads_per_gpu, page_size,
+                            config.rope_theta, config.partial_rotary_factor,
+                            config.rms_norm_eps, group_size, &res.weight_caches[gpu_idx],
+                            hidden_size, config.attn_output_gate, layer_idx, gpu_idx,
+                            &res.probe_config,
+                            res.rope_cos.as_ref().map(|v| &v[gpu_idx]),
+                            res.rope_sin.as_ref().map(|v| &v[gpu_idx]),
+                            &mut ws.attn, &mut ws.attn_out,
+                            &mut ps, &mut ws.rope_position_staging,
+                            &[position as i32],
+                        )?;
+
+                        // Copy from ws.attn_out (row seq_i) into batched_attn_out
+                        let mut dst = batched_attn_out[gpu_idx].slice_mut(seq_i * hidden_size..(seq_i + 1) * hidden_size);
+                        stream.memcpy_dtod(&ws.attn_out, &mut dst)
+                            .map_err(|e| anyhow::anyhow!("Copy attn output: {e}"))?;
+                    }
+                }
+
+            }
+
+            // All-reduce attention outputs across GPUs — batched buffer [M, hidden]
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_attention(&res.nccl, &stream, &mut batched_attn_out[gpu_idx])?;
+            }
+
+            // Phase B: Residual add — batched element-wise add into [M, hidden]
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                crate::add::add_into(
+                    &stream, &res.per_gpu_kernels[gpu_idx].oxide,
+                    &mut batched_residual_buf[gpu_idx],
+                    &batched_hidden[gpu_idx], &batched_attn_out[gpu_idx],
+                )?;
+                std::mem::swap(&mut batched_hidden[gpu_idx], &mut batched_residual_buf[gpu_idx]);
+            }
+
+            // Phase C: MLP on each GPU — batched GEMMs [M, hidden] → [M, intermediate]
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                let gemm = &res.gemm_engines[gpu_idx];
+                let oxide = &res.per_gpu_kernels[gpu_idx].oxide;
+                let mlp_weights = &res.metadata[gpu_idx].layers[layer_idx].mlp;
+
+                // Norm2 — batched RMSNorm on [M, hidden_size]
+                let norm2_weight = res.weight_caches[gpu_idx].get_bf16(
+                    &res.metadata[gpu_idx].layers[layer_idx].norm2.name,
+                )
+                    .ok_or_else(|| anyhow::anyhow!("Norm2 weight not in cache"))?;
+                crate::norm::rms_norm_into(
+                    &stream, oxide, &mut batched_norm2_out[gpu_idx],
+                    &batched_hidden[gpu_idx], &norm2_weight,
+                    config.rms_norm_eps, hidden_size,
+                )?;
+
+                // Gate projection — batched [M, sharded_intermediate]
+                let mut ps = Some(&mut batched_partial_sums[gpu_idx]);
+                crate::gemm_dispatch::gemm_projection_cached_m(
+                    gemm, oxide, &stream, &res.weight_caches[gpu_idx],
+                    &mlp_weights.gate_proj.name, &batched_norm2_out[gpu_idx],
+                    &mut batched_mlp_gate[gpu_idx], M, sharded_intermediate, hidden_size,
+                    group_size, &mut ps,
+                )?;
+
+                // Up projection — batched [M, sharded_intermediate]
+                let mut ps = Some(&mut batched_partial_sums[gpu_idx]);
+                crate::gemm_dispatch::gemm_projection_cached_m(
+                    gemm, oxide, &stream, &res.weight_caches[gpu_idx],
+                    &mlp_weights.up_proj.name, &batched_norm2_out[gpu_idx],
+                    &mut batched_mlp_up[gpu_idx], M, sharded_intermediate, hidden_size,
+                    group_size, &mut ps,
+                )?;
+
+                // SiLU+GLU — batched over [M * sharded_intermediate]
+                oxide.launch_silu_glu_bf16(
+                    &stream, &oxide.cc_stream(),
+                    &batched_mlp_up[gpu_idx], &batched_mlp_gate[gpu_idx],
+                    &mut batched_mlp_silu[gpu_idx], (M * sharded_intermediate) as u32,
+                )?;
+
+                // Down projection — batched [M, hidden_size]
+                let mut ps = Some(&mut batched_partial_sums[gpu_idx]);
+                crate::gemm_dispatch::gemm_projection_cached_m(
+                    gemm, oxide, &stream, &res.weight_caches[gpu_idx],
+                    &mlp_weights.down_proj.name, &batched_mlp_silu[gpu_idx],
+                    &mut batched_mlp_out[gpu_idx], M, hidden_size, sharded_intermediate,
+                    group_size, &mut ps,
+                )?;
+            }
+
+            // All-reduce MLP outputs across GPUs — batched buffer [M, hidden]
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                sync::all_reduce_mlp(&res.nccl, &stream, &mut batched_mlp_out[gpu_idx])?;
+            }
+
+            // Phase D: Residual add — batched element-wise add into [M, hidden]
+            for gpu_idx in 0..num_gpus {
+                let stream = res.streams.get(gpu_idx).unwrap().clone();
+                crate::add::add_into(
+                    &stream, &res.per_gpu_kernels[gpu_idx].oxide,
+                    &mut batched_residual_buf[gpu_idx],
+                    &batched_hidden[gpu_idx], &batched_mlp_out[gpu_idx],
+                )?;
+                std::mem::swap(&mut batched_hidden[gpu_idx], &mut batched_residual_buf[gpu_idx]);
+            }
+        }
+
+        // ================================================================
+        // Final norm + LM head + sample on GPU 0
+        // ================================================================
+
+        // Record new tokens in KV manager (once per sequence, not per layer)
+        for seq_i in 0..M {
+            if let Some(m) = &states[seq_i].paged_kv_manager {
+                m.lock().unwrap().add_token(seq_ids[seq_i])
+                    .map_err(|e| anyhow::anyhow!("Failed to record decode token: {:?}", e))?;
+            }
+        }
+
+        let final_stream = res.streams.get(0).unwrap().clone();
+        let final_norm_weight = res.metadata[0].norm.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Final norm weights not found"))?;
+        let final_norm_gpu = res.weight_caches[0].get_bf16(&final_norm_weight.name)
+            .ok_or_else(|| anyhow::anyhow!("Final norm weight not in cache"))?;
+        crate::norm::rms_norm_into(
+            &final_stream, &res.per_gpu_kernels[0].oxide,
+            &mut batched_norm1_out[0], &batched_hidden[0],
+            &final_norm_gpu, config.rms_norm_eps, hidden_size,
+        )?;
+
+        let mut batched_logits = unsafe { final_stream.alloc::<bf16>(M * vocab_size)? };
+        let lm_head_weight = res.metadata[0].lm_head.as_ref()
+            .or_else(|| res.metadata[0].embedding.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Neither LM head nor embedding found"))?;
+
+        let mut lm_head_ps = Some(&mut batched_partial_sums[0]);
+        crate::gemm_dispatch::gemm_projection_cached_m(
+            &res.gemm_engines[0], &res.per_gpu_kernels[0].oxide, &final_stream,
+            &res.weight_caches[0], &lm_head_weight.name,
+            &batched_norm1_out[0], &mut batched_logits,
+            M, vocab_size, hidden_size, group_size, &mut lm_head_ps,
+        )?;
+
+        // Sample per sequence from [M, vocab] logits
+        let mut sampled: Vec<u32> = Vec::with_capacity(M);
+        for seq_i in 0..M {
+            let logit_view = batched_logits.slice(seq_i * vocab_size..(seq_i + 1) * vocab_size);
+            let token = crate::sample::sample_with_config(
+                &final_stream, &logit_view, &res.per_gpu_kernels[0].oxide,
+                &sampling_configs[seq_i], &token_histories[seq_i],
+                num_prompt_tokens[seq_i], &mut rngs[seq_i],
+            )?;
+            sampled.push(token);
+        }
+
+        Ok(sampled)
+    }
 }
 
 /// Inner decode logic for the async pipeline.

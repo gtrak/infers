@@ -507,6 +507,385 @@ pub mod int4 {
             partial_sums[split_idx * n_usize + col] = acc;
         }
     }
+
+    /// M-batched INT4 GEMM with shared memory input tiling and K-splitting.
+    /// Same as v3_ksplit_sm but processes M rows simultaneously, amortizing
+    /// weight bandwidth. Each thread handles 4 output columns per row, with M
+    /// independent accumulators (hardcoded M=2 → 8 accumulators total).
+    ///
+    /// - Block: (64, 1, 1) · Grid: (ceil(N/64), k_split, 1)
+    /// - Smem: m * group_size * sizeof(u16) — M input rows in shared memory
+    /// - partial_sums: [k_split, N, M] f32 (M is the last dim)
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn int4_gemm_v3_ksplit_sm_m(
+        partial_sums: &mut [f32],
+        weight: &[u32],
+        scales: &[u16],
+        zeros: &[u32],
+        input: &[u16],   // [M, K] row-major
+        m: u32, n: u32, k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let split_idx = thread::blockIdx_y() as usize;
+        let n_usize = n as usize;
+        let k_usize = k as usize;
+        let m_usize = m as usize;
+        let gs = group_size as usize;
+        let ks = k_split as usize;
+        let num_groups = k_usize / gs;
+
+        // v3: distribute full groups across splits via ceil-grouping
+        let groups_per_split = (num_groups + ks - 1) / ks;
+        let group_start = split_idx * groups_per_split;
+
+        if group_start >= num_groups {
+            // Empty split — write zero only for valid columns.
+            if col < n_usize {
+                for row in 0..m_usize {
+                    partial_sums[split_idx * n_usize * m_usize + col * m_usize + row] = 0.0;
+                }
+            }
+            return;
+        }
+        let group_end = if group_start + groups_per_split > num_groups {
+            num_groups
+        } else {
+            group_start + groups_per_split
+        };
+
+        // Shared memory: m tiles, each of group_size bf16 values.
+        // Row i is at offset i * gs in shared memory.
+        let smem = DynamicSharedArray::<u16>::get();
+
+        // M=2 × 4 accumulators = 8 total
+        let mut acc0_0: f32 = 0.0;
+        let mut acc1_0: f32 = 0.0;
+        let mut acc2_0: f32 = 0.0;
+        let mut acc3_0: f32 = 0.0;
+        let mut acc0_1: f32 = 0.0;
+        let mut acc1_1: f32 = 0.0;
+        let mut acc2_1: f32 = 0.0;
+        let mut acc3_1: f32 = 0.0;
+
+        let n_packed = (n_usize + 7) / 8;
+        let u32s_per_group = gs / 8;
+
+        for group_idx in group_start..group_end {
+            let kg = group_idx * gs;
+
+            // Cooperative load: load M rows into shared memory.
+            // Row i at offset i * gs. Each thread strided-loads its row's tile.
+            for row in 0..m_usize {
+                let smem_base = row * gs;
+                let mut i = tid;
+                while i < gs {
+                    unsafe {
+                        *smem.add(smem_base + i) = *input.get_unchecked(row * k_usize + kg + i);
+                    }
+                    i += 64; // block_dim x
+                }
+            }
+            cuda_device::sync_threads();
+
+            // Per-group scale and zero per row (M rows, same column)
+            let mut scale_0: f32 = 0.0;
+            let mut scaled_zero_0: f32 = 0.0;
+            let mut scale_1: f32 = 0.0;
+            let mut scaled_zero_1: f32 = 0.0;
+
+            if m_usize >= 1 {
+                let scale_bits: u16 = if transposed != 0 {
+                    unsafe { *scales.get_unchecked(group_idx * n_usize + col) }
+                } else {
+                    unsafe { *scales.get_unchecked(col * num_groups + group_idx) }
+                };
+                scale_0 = f16_to_f32(scale_bits);
+
+                let (zero_packed_idx, zero_shift): (usize, usize) = if transposed != 0 {
+                    (group_idx * n_packed + col / 8, (col % 8) * 4)
+                } else {
+                    let flat_idx = col * num_groups + group_idx;
+                    (flat_idx / 8, (flat_idx % 8) * 4)
+                };
+                let raw_zero = ((unsafe { *zeros.get_unchecked(zero_packed_idx) } >> zero_shift) & 0xF) as i8;
+                scaled_zero_0 = (raw_zero as f32 + 1.0) * scale_0;
+            }
+            if m_usize >= 2 {
+                let scale_bits: u16 = if transposed != 0 {
+                    unsafe { *scales.get_unchecked(group_idx * n_usize + col) }
+                } else {
+                    unsafe { *scales.get_unchecked(col * num_groups + group_idx) }
+                };
+                scale_1 = f16_to_f32(scale_bits);
+
+                let (zero_packed_idx, zero_shift): (usize, usize) = if transposed != 0 {
+                    (group_idx * n_packed + col / 8, (col % 8) * 4)
+                } else {
+                    let flat_idx = col * num_groups + group_idx;
+                    (flat_idx / 8, (flat_idx % 8) * 4)
+                };
+                let raw_zero = ((unsafe { *zeros.get_unchecked(zero_packed_idx) } >> zero_shift) & 0xF) as i8;
+                scaled_zero_1 = (raw_zero as f32 + 1.0) * scale_1;
+            }
+
+            if transposed == 0 {
+                // Non-transposed: 128-bit LDG.128 loads, 4 u32s at a time = 32 INT4 values.
+                for u32_chunk in (0..u32s_per_group).step_by(4) {
+                    let k_base = kg + u32_chunk * 8;
+                    let w_idx = (col * k_usize + k_base) / 8;
+
+                    #[cfg(debug_assertions)]
+                    assert!(w_idx % 4 == 0, "128-bit load requires 16-byte alignment, w_idx={}", w_idx);
+
+                    let packed4: [u32; 4] = unsafe { *(weight.as_ptr().add(w_idx) as *const [u32; 4]) };
+
+                    for chunk_lane in 0..4usize {
+                        let packed = packed4[chunk_lane];
+                        let smem_off_base = (u32_chunk + chunk_lane) * 8;
+
+                        unsafe {
+                            // Load inputs from M rows via shared memory
+                            if m_usize >= 1 {
+                                let a0 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 0) as u32) << 16);
+                                let a1 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 1) as u32) << 16);
+                                let a2 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 2) as u32) << 16);
+                                let a3 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 3) as u32) << 16);
+                                let a4 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 4) as u32) << 16);
+                                let a5 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 5) as u32) << 16);
+                                let a6 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 6) as u32) << 16);
+                                let a7 = f32::from_bits((*smem.add(0 * gs + smem_off_base + 7) as u32) << 16);
+
+                                let w0 = (packed & 0xF) as i8;
+                                let w1 = ((packed >> 4) & 0xF) as i8;
+                                let w2 = ((packed >> 8) & 0xF) as i8;
+                                let w3 = ((packed >> 12) & 0xF) as i8;
+                                let w4 = ((packed >> 16) & 0xF) as i8;
+                                let w5 = ((packed >> 20) & 0xF) as i8;
+                                let w6 = ((packed >> 24) & 0xF) as i8;
+                                let w7 = ((packed >> 28) & 0xF) as i8;
+
+                                if chunk_lane % 2 == 0 {
+                                    acc0_0 += (w0 as f32 * scale_0 - scaled_zero_0) * a0;
+                                    acc1_0 += (w1 as f32 * scale_0 - scaled_zero_0) * a1;
+                                    acc0_0 += (w2 as f32 * scale_0 - scaled_zero_0) * a2;
+                                    acc1_0 += (w3 as f32 * scale_0 - scaled_zero_0) * a3;
+                                    acc0_0 += (w4 as f32 * scale_0 - scaled_zero_0) * a4;
+                                    acc1_0 += (w5 as f32 * scale_0 - scaled_zero_0) * a5;
+                                    acc0_0 += (w6 as f32 * scale_0 - scaled_zero_0) * a6;
+                                    acc1_0 += (w7 as f32 * scale_0 - scaled_zero_0) * a7;
+                                } else {
+                                    acc2_0 += (w0 as f32 * scale_0 - scaled_zero_0) * a0;
+                                    acc3_0 += (w1 as f32 * scale_0 - scaled_zero_0) * a1;
+                                    acc2_0 += (w2 as f32 * scale_0 - scaled_zero_0) * a2;
+                                    acc3_0 += (w3 as f32 * scale_0 - scaled_zero_0) * a3;
+                                    acc2_0 += (w4 as f32 * scale_0 - scaled_zero_0) * a4;
+                                    acc3_0 += (w5 as f32 * scale_0 - scaled_zero_0) * a5;
+                                    acc2_0 += (w6 as f32 * scale_0 - scaled_zero_0) * a6;
+                                    acc3_0 += (w7 as f32 * scale_0 - scaled_zero_0) * a7;
+                                }
+                            }
+
+                            if m_usize >= 2 {
+                                let b0 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 0) as u32) << 16);
+                                let b1 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 1) as u32) << 16);
+                                let b2 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 2) as u32) << 16);
+                                let b3 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 3) as u32) << 16);
+                                let b4 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 4) as u32) << 16);
+                                let b5 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 5) as u32) << 16);
+                                let b6 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 6) as u32) << 16);
+                                let b7 = f32::from_bits((*smem.add(1 * gs + smem_off_base + 7) as u32) << 16);
+
+                                let w0 = (packed & 0xF) as i8;
+                                let w1 = ((packed >> 4) & 0xF) as i8;
+                                let w2 = ((packed >> 8) & 0xF) as i8;
+                                let w3 = ((packed >> 12) & 0xF) as i8;
+                                let w4 = ((packed >> 16) & 0xF) as i8;
+                                let w5 = ((packed >> 20) & 0xF) as i8;
+                                let w6 = ((packed >> 24) & 0xF) as i8;
+                                let w7 = ((packed >> 28) & 0xF) as i8;
+
+                                if chunk_lane % 2 == 0 {
+                                    acc0_1 += (w0 as f32 * scale_1 - scaled_zero_1) * b0;
+                                    acc1_1 += (w1 as f32 * scale_1 - scaled_zero_1) * b1;
+                                    acc0_1 += (w2 as f32 * scale_1 - scaled_zero_1) * b2;
+                                    acc1_1 += (w3 as f32 * scale_1 - scaled_zero_1) * b3;
+                                    acc0_1 += (w4 as f32 * scale_1 - scaled_zero_1) * b4;
+                                    acc1_1 += (w5 as f32 * scale_1 - scaled_zero_1) * b5;
+                                    acc0_1 += (w6 as f32 * scale_1 - scaled_zero_1) * b6;
+                                    acc1_1 += (w7 as f32 * scale_1 - scaled_zero_1) * b7;
+                                } else {
+                                    acc2_1 += (w0 as f32 * scale_1 - scaled_zero_1) * b0;
+                                    acc3_1 += (w1 as f32 * scale_1 - scaled_zero_1) * b1;
+                                    acc2_1 += (w2 as f32 * scale_1 - scaled_zero_1) * b2;
+                                    acc3_1 += (w3 as f32 * scale_1 - scaled_zero_1) * b3;
+                                    acc2_1 += (w4 as f32 * scale_1 - scaled_zero_1) * b4;
+                                    acc3_1 += (w5 as f32 * scale_1 - scaled_zero_1) * b5;
+                                    acc2_1 += (w6 as f32 * scale_1 - scaled_zero_1) * b6;
+                                    acc3_1 += (w7 as f32 * scale_1 - scaled_zero_1) * b7;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Transposed: scalar loads (weights are stride-N between columns, not contiguous).
+                for u32_idx in (0..u32s_per_group).step_by(2) {
+                    let k0 = kg + u32_idx * 8;
+                    let w_idx0: usize = (k0 >> 3) * n_usize + col;
+                    let packed0: u32 = unsafe { *weight.get_unchecked(w_idx0) };
+
+                    if m_usize >= 1 {
+                        unsafe {
+                            let a0 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 0) as u32) << 16);
+                            let a1 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 1) as u32) << 16);
+                            let a2 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 2) as u32) << 16);
+                            let a3 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 3) as u32) << 16);
+                            let a4 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 4) as u32) << 16);
+                            let a5 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 5) as u32) << 16);
+                            let a6 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 6) as u32) << 16);
+                            let a7 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 7) as u32) << 16);
+
+                            let w0 = (packed0 & 0xF) as i8;
+                            let w1 = ((packed0 >> 4) & 0xF) as i8;
+                            let w2 = ((packed0 >> 8) & 0xF) as i8;
+                            let w3 = ((packed0 >> 12) & 0xF) as i8;
+                            let w4 = ((packed0 >> 16) & 0xF) as i8;
+                            let w5 = ((packed0 >> 20) & 0xF) as i8;
+                            let w6 = ((packed0 >> 24) & 0xF) as i8;
+                            let w7 = ((packed0 >> 28) & 0xF) as i8;
+
+                            acc0_0 += (w0 as f32 * scale_0 - scaled_zero_0) * a0;
+                            acc1_0 += (w1 as f32 * scale_0 - scaled_zero_0) * a1;
+                            acc0_0 += (w2 as f32 * scale_0 - scaled_zero_0) * a2;
+                            acc1_0 += (w3 as f32 * scale_0 - scaled_zero_0) * a3;
+                            acc0_0 += (w4 as f32 * scale_0 - scaled_zero_0) * a4;
+                            acc1_0 += (w5 as f32 * scale_0 - scaled_zero_0) * a5;
+                            acc0_0 += (w6 as f32 * scale_0 - scaled_zero_0) * a6;
+                            acc1_0 += (w7 as f32 * scale_0 - scaled_zero_0) * a7;
+                        }
+                    }
+
+                    if m_usize >= 2 {
+                        unsafe {
+                            let b0 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 0) as u32) << 16);
+                            let b1 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 1) as u32) << 16);
+                            let b2 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 2) as u32) << 16);
+                            let b3 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 3) as u32) << 16);
+                            let b4 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 4) as u32) << 16);
+                            let b5 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 5) as u32) << 16);
+                            let b6 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 6) as u32) << 16);
+                            let b7 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 7) as u32) << 16);
+
+                            let w0 = (packed0 & 0xF) as i8;
+                            let w1 = ((packed0 >> 4) & 0xF) as i8;
+                            let w2 = ((packed0 >> 8) & 0xF) as i8;
+                            let w3 = ((packed0 >> 12) & 0xF) as i8;
+                            let w4 = ((packed0 >> 16) & 0xF) as i8;
+                            let w5 = ((packed0 >> 20) & 0xF) as i8;
+                            let w6 = ((packed0 >> 24) & 0xF) as i8;
+                            let w7 = ((packed0 >> 28) & 0xF) as i8;
+
+                            acc0_1 += (w0 as f32 * scale_1 - scaled_zero_1) * b0;
+                            acc1_1 += (w1 as f32 * scale_1 - scaled_zero_1) * b1;
+                            acc0_1 += (w2 as f32 * scale_1 - scaled_zero_1) * b2;
+                            acc1_1 += (w3 as f32 * scale_1 - scaled_zero_1) * b3;
+                            acc0_1 += (w4 as f32 * scale_1 - scaled_zero_1) * b4;
+                            acc1_1 += (w5 as f32 * scale_1 - scaled_zero_1) * b5;
+                            acc0_1 += (w6 as f32 * scale_1 - scaled_zero_1) * b6;
+                            acc1_1 += (w7 as f32 * scale_1 - scaled_zero_1) * b7;
+                        }
+                    }
+
+                    // Second u32 in pair
+                    if u32_idx + 1 < u32s_per_group {
+                        let k1 = k0 + 8;
+                        let w_idx1: usize = (k1 >> 3) * n_usize + col;
+                        let packed1: u32 = unsafe { *weight.get_unchecked(w_idx1) };
+
+                        if m_usize >= 1 {
+                            unsafe {
+                                let c0 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 8) as u32) << 16);
+                                let c1 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 9) as u32) << 16);
+                                let c2 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 10) as u32) << 16);
+                                let c3 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 11) as u32) << 16);
+                                let c4 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 12) as u32) << 16);
+                                let c5 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 13) as u32) << 16);
+                                let c6 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 14) as u32) << 16);
+                                let c7 = f32::from_bits((*smem.add(0 * gs + u32_idx * 8 + 15) as u32) << 16);
+
+                                let v0 = (packed1 & 0xF) as i8;
+                                let v1 = ((packed1 >> 4) & 0xF) as i8;
+                                let v2 = ((packed1 >> 8) & 0xF) as i8;
+                                let v3 = ((packed1 >> 12) & 0xF) as i8;
+                                let v4 = ((packed1 >> 16) & 0xF) as i8;
+                                let v5 = ((packed1 >> 20) & 0xF) as i8;
+                                let v6 = ((packed1 >> 24) & 0xF) as i8;
+                                let v7 = ((packed1 >> 28) & 0xF) as i8;
+
+                                acc2_0 += (v0 as f32 * scale_0 - scaled_zero_0) * c0;
+                                acc3_0 += (v1 as f32 * scale_0 - scaled_zero_0) * c1;
+                                acc2_0 += (v2 as f32 * scale_0 - scaled_zero_0) * c2;
+                                acc3_0 += (v3 as f32 * scale_0 - scaled_zero_0) * c3;
+                                acc2_0 += (v4 as f32 * scale_0 - scaled_zero_0) * c4;
+                                acc3_0 += (v5 as f32 * scale_0 - scaled_zero_0) * c5;
+                                acc2_0 += (v6 as f32 * scale_0 - scaled_zero_0) * c6;
+                                acc3_0 += (v7 as f32 * scale_0 - scaled_zero_0) * c7;
+                            }
+                        }
+
+                        if m_usize >= 2 {
+                            unsafe {
+                                let d0 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 8) as u32) << 16);
+                                let d1 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 9) as u32) << 16);
+                                let d2 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 10) as u32) << 16);
+                                let d3 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 11) as u32) << 16);
+                                let d4 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 12) as u32) << 16);
+                                let d5 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 13) as u32) << 16);
+                                let d6 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 14) as u32) << 16);
+                                let d7 = f32::from_bits((*smem.add(1 * gs + u32_idx * 8 + 15) as u32) << 16);
+
+                                let v0 = (packed1 & 0xF) as i8;
+                                let v1 = ((packed1 >> 4) & 0xF) as i8;
+                                let v2 = ((packed1 >> 8) & 0xF) as i8;
+                                let v3 = ((packed1 >> 12) & 0xF) as i8;
+                                let v4 = ((packed1 >> 16) & 0xF) as i8;
+                                let v5 = ((packed1 >> 20) & 0xF) as i8;
+                                let v6 = ((packed1 >> 24) & 0xF) as i8;
+                                let v7 = ((packed1 >> 28) & 0xF) as i8;
+
+                                acc2_1 += (v0 as f32 * scale_1 - scaled_zero_1) * d0;
+                                acc3_1 += (v1 as f32 * scale_1 - scaled_zero_1) * d1;
+                                acc2_1 += (v2 as f32 * scale_1 - scaled_zero_1) * d2;
+                                acc3_1 += (v3 as f32 * scale_1 - scaled_zero_1) * d3;
+                                acc2_1 += (v4 as f32 * scale_1 - scaled_zero_1) * d4;
+                                acc3_1 += (v5 as f32 * scale_1 - scaled_zero_1) * d5;
+                                acc2_1 += (v6 as f32 * scale_1 - scaled_zero_1) * d6;
+                                acc3_1 += (v7 as f32 * scale_1 - scaled_zero_1) * d7;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sync before next group overwrites shared memory.
+            cuda_device::sync_threads();
+        }
+
+        if col < n_usize {
+            let sum_0 = acc0_0 + acc1_0 + acc2_0 + acc3_0;
+            partial_sums[split_idx * n_usize * m_usize + col * m_usize + 0] = sum_0;
+            if m_usize >= 2 {
+                let sum_1 = acc0_1 + acc1_1 + acc2_1 + acc3_1;
+                partial_sums[split_idx * n_usize * m_usize + col * m_usize + 1] = sum_1;
+            }
+        }
+    }
+
     ///
     /// Each thread (16/block) handles 4 output columns. Weight loads are 128-bit
     /// ([u32;4]) and input loads are 128-bit ([u16;8]). Hardcodes transposed=1 layout.
@@ -868,6 +1247,41 @@ pub mod int4 {
             *output.get_unchecked_mut(col) = f32_to_bf16(sum);
         }
     }
+
+    /// Reduce K-split partial sums to BF16 output for M-batched GEMM.
+    /// Each thread reduces k_split partial sums for one (col, row) pair.
+    /// Output: [M, N] bf16, row-major.
+    #[kernel]
+    #[launch_bounds(64)]
+    pub fn reduce_partial_sums_bf16_m(
+        mut output: DisjointSlice<u16>,  // [M * N] bf16, row-major
+        partial_sums: &[f32],            // [k_split, N, M] f32
+        n: u32,
+        m: u32,
+        k_split: u32,
+    ) {
+        use cuda_device::tcgen05::f32_to_bf16;
+
+        let col = (thread::blockIdx_x() * 64u32 + thread::threadIdx_x()) as usize;
+        let row = thread::blockIdx_y() as usize;
+
+        let n_usize = n as usize;
+        let m_usize = m as usize;
+
+        if col >= n_usize || row >= m_usize {
+            return;
+        }
+
+        let mut sum: f32 = 0.0;
+        for s in 0..k_split as usize {
+            sum += partial_sums[s * n_usize * m_usize + col * m_usize + row];
+        }
+
+        unsafe {
+            *output.get_unchecked_mut(row * n_usize + col) = f32_to_bf16(sum);
+        }
+    }
+
 
     /// Warp-cooperative INT4 GEMV for M=1 decode (AutoRound format).
 

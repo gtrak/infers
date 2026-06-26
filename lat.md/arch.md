@@ -137,6 +137,8 @@ Error mapping: `DriverError` from the typed method is wrapped in `anyhow::anyhow
 | `launch_int4_gemm_warp_split` | `int4_gemm_warp_split` | grid=(ceil(n/8), k_split, 1), block=(32,8,1), smem=0 — warp + K-split: each warp computes one column over a K-slice, shuffle reduces within warp, lane 0 writes to partial_sums |
 | `launch_int4_gemm_v3_ksplit` | `int4_gemm_v3_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — v3 bandwidth-optimized K-split: 4 f32 accumulators (ILP), branchless ceil-grouped K-split, two-u32 outer stride, scaled_zero hoist. Production kernel for INT4 decode |
 | `launch_reduce_partial_sums_bf16` | `reduce_partial_sums_bf16` | grid=(ceil(n/64), 1, 1), block=(64,1), smem=0 — reduces K-split partial sums (f32) into final bf16 output |
+| `launch_int4_gemm_v3_ksplit_sm_m` | `int4_gemm_v3_ksplit_sm_m` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=m*group_size*2 — M-batched v3: processes M rows simultaneously (hardcoded M=2), 8 f32 accumulators, partial_sums layout [k_split, N, M] |
+| `launch_reduce_partial_sums_bf16_m` | `reduce_partial_sums_bf16_m` | grid=(ceil(n/64), m, 1), block=(64,1), smem=0 — reduces K-split partial sums [k_split, N, M] into bf16 output [M*N] row-major |
 | `launch_int4_gemm_gguf` | `int4_gemm_gguf` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 |
 | `launch_nvfp4_gemm_fused` | `nvfp4_gemm_fused` | grid=(ceil(n/64), ceil(m/4)), block=(64,4), smem=0 — reads packed FP4 + fp8_e4m3 scales directly, dequantizes in registers, no intermediate bf16 buffer. Optimized: reads 4 bytes as u32 (8 nibbles per load vs 2 per byte), precomputes effective_scale = scale / global_scale once per group |
 | `launch_nvfp4_gemm_fused_ksplit` | `nvfp4_gemm_fused_ksplit` | grid=(ceil(n/64), k_split, 1), block=(64,1), smem=0 — K-split for M=1 decode: each thread block computes partial sums over a portion of K, writes to f32 buffer. Same dequant logic as nvfp4_gemm_fused |
@@ -459,7 +461,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 | `activation_kernels.rs` | `activation` | infers_silu_bf16, infers_silu_glu_bf16, infers_attn_output_gate_bf16, infers_conv1d_depthwise_silu_bf16 |
 | `attention_kernels.rs` | `attention` | infers_paged_kv_write_bf16, infers_paged_kv_read_bf16, infers_paged_attention_decode_bf16, infers_rope_bf16 |
 | `gdn_kernels.rs` | `gdn` | infers_gdn_recurrent_step_bf16, infers_gdn_mamba2_update_bf16, infers_gdn_update_bf16, infers_gdn_gated_delta_update_bf16, infers_gdn_gated_delta_prefill_bf16, infers_gdn_chunked_gated_delta_prefill_bf16 |
-| `int4_kernels.rs` | `int4` | int4_gemm_auto_round, int4_gemm_auto_round_tiled, int4_gemm_auto_round_ksplit, int4_gemm_v3_ksplit, int4_gemm_v4_ksplit, reduce_partial_sums_bf16, int4_gemm_warp, int4_gemm_warp_split, int4_gemm_gguf, int4_dequant_to_bf16 |
+| `int4_kernels.rs` | `int4` | int4_gemm_auto_round, int4_gemm_auto_round_tiled, int4_gemm_auto_round_ksplit, int4_gemm_v3_ksplit, int4_gemm_v3_ksplit_sm, int4_gemm_v3_ksplit_sm_m, int4_gemm_v4_ksplit, reduce_partial_sums_bf16, reduce_partial_sums_bf16_m, int4_gemm_warp, int4_gemm_warp_split, int4_gemm_gguf, int4_dequant_to_bf16 |
 | `nvfp4_kernels.rs` | `nvfp4` | nvfp4_dequant_to_bf16, nvfp4_gemm_fused, nvfp4_gemm_fused_ksplit, nvfp4_gemm_v3_ksplit |
 | `fp8_kernels.rs` | `fp8` | infers_fp8_quantize_e4m3, infers_fp8_dequantize_e4m3, infers_fp8_quantize_e5m2, infers_fp8_dequantize_e5m2 |
 | `bf16_kernels.rs` | `bf16` | bf16_gemm_tiled |
@@ -479,7 +481,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 
 ### Oxide Bridge: Typed Module Dispatch (Phase 041+)
 
-`oxide_bridge.rs` bridges cudarc buffer/stream types to cuda-core typed kernel modules. All 44 dispatch methods use `CudaSliceView` wrapper + typed module methods with a dynamic `dispatch_stream` parameter.
+`oxide_bridge.rs` bridges cudarc buffer/stream types to cuda-core typed kernel modules. All 46 dispatch methods use `CudaSliceView` wrapper + typed module methods with a dynamic `dispatch_stream` parameter.
 
 **CudaSliceView<'a, T, U>**: Non-owning wrapper that presents a cudarc `CudaSlice<T>` as a `cuda-core DeviceBuffer<T>`. Uses `ManuallyDrop` to prevent double-free (CudaSlice owns the memory). `SyncOnDrop` guard keeps cudarc stream synchronization alive. `Deref`/`DerefMut` impls allow passing views directly to typed methods.
 
@@ -492,3 +494,7 @@ Six GDN (Gated DeltaNet) kernels ported from nvcc to Rust in cuda-oxide-kernel-l
 **Test binary migration**: The standalone test binary at `crates/cuda-oxide-kernels/` uses a local copy of `KernelModules` (aggregating all 9 `LoadedModule` structs) loaded from embedded cubin artifacts via `load_modules()`. All 34 call sites were migrated from `infers_kernel_lib::kernels::load(ctx)` (deleted) to `load_modules(ctx)` which returns `KernelModules`. Method calls updated from `module.kernel_name(...)` to `module.{module_field}.kernel_name(...)` (e.g., `module.int4.int4_gemm_v3_ksplit_sm(...)`).
 
 **int4_gemm_v3_ksplit_sm**: Production INT4 GEMM kernel. Replaces the old `int4_gemm_v3_ksplit` with shared memory input tiling. Strided cooperative load (each thread loads `ceil(gs/64)` elements) handles `group_size > block_size`. Old kernel and bridge shim removed.
+
+**int4_gemm_v3_ksplit_sm_m**: M-batched INT4 GEMM kernel for processing multiple rows simultaneously, amortizing weight bandwidth. Extends v3_ksplit_sm with M independent accumulators per thread (hardcoded M=2 → 8 accumulators: acc0_0..acc3_1). Loads M input rows into shared memory (row i at offset i * group_size), loads weights once and multiplies against M input values. Output layout: `partial_sums[k_split, N, M]` f32 — M is the last dimension for coalesced access. Includes both non-transposed (128-bit `[u32;4]` weight loads) and transposed (scalar loads) paths. Bridge method: `launch_int4_gemm_v3_ksplit_sm_m`.
+
+**reduce_partial_sums_bf16_m**: M-batched reduce kernel for the M GEMM path. Each thread reduces k_split partial sums for one (col, row) pair across the [k_split, N, M] layout. Grid: `(ceil(N/64), M, 1)` with block (64,1,1). Writes to `output[row * N + col]` in bf16. Bridge method: `launch_reduce_partial_sums_bf16_m`.

@@ -298,6 +298,10 @@ The `gemm_projection_cached` function was changed from `&mut GemmEngine` to `&Ge
 
 `decode_spawnable` builds a `DeviceOperation` with owned captures (`'static + Send`) for continuous batching. The caller provides an owned `DecodeState` and receives `(sampled_token, DecodeState)` for state reuse. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_spawnable]].
 
+## Batched Decode
+
+M=2 batched decode amortizes INT4 GEMM weight bandwidth using `gemm_projection_cached_m`. Per-sequence operations loop via workspace copies. See [[crates/backends/native/src/decode.rs#ForwardEngine#decode_batched]].
+
 ## INT4 Triplet Upload
 
 GPU weight upload for INT4 quantized weights: handles qweight, scales, and qzeros as a triplet with proper dequantization layout. See [[crates/backends/native/src/upload.rs]].
@@ -334,6 +338,12 @@ When `m==1` (single-token decode), the naive INT4 kernel has only `ceil(N/64)` t
 ### eprintln Gating in GEMM Dispatch
 
 GEMM debug output is gated behind `INFERS_DEBUG` env var via `OnceLock<bool>`, eliminating ~400 stderr writes per decode step. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached]].
+
+### M-Batched INT4 GEMM Dispatch
+
+`gemm_projection_cached_m` dispatches M-batched INT4 GEMMs, using the v3_ksplit_sm_m kernel for M=2 to amortize weight bandwidth. See [[crates/backends/native/src/gemm_dispatch.rs#gemm_projection_cached_m]].
+
+Partial sums buffer grows to `[k_split, N, M]` (e.g., K_SPLIT × N × 2 f32). For M=1 it falls back to the standard v3_ksplit_sm path. For M>2 it falls back to `int4_gemm_auto_round`. BF16 weights delegate to cuBLASLt (handles any M). NVFP4 is unchanged — no M-batched kernel yet.
 
 ## RoPE Table Caching
 

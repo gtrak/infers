@@ -954,6 +954,67 @@ impl OxideKernels {
         ).map_err(|e| anyhow::anyhow!("kernel launch 'reduce_partial_sums_bf16' failed: {:?}", e))
     }
 
+    /// Launch the `int4_gemm_v3_ksplit_sm_m` kernel: M-batched INT4 GEMM with shared memory
+    /// input tiling and K-splitting. Same as v3_ksplit_sm but processes M rows simultaneously,
+    /// amortizing weight bandwidth.
+    pub fn launch_int4_gemm_v3_ksplit_sm_m(
+        &self,
+        stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
+        partial_sums: &mut CudaSlice<f32>,       // [k_split, N, M] f32
+        weight: &CudaSlice<u32>,
+        scales: &CudaSlice<half::f16>,
+        zeros: &CudaSlice<u32>,
+        input: &CudaSlice<half::bf16>,            // [M, K] row-major
+        m: u32,
+        n: u32,
+        k: u32,
+        group_size: u32,
+        transposed: u32,
+        k_split: u32,
+    ) -> anyhow::Result<()> {
+        let mut ps_view = CudaSliceView::new_mut(partial_sums, stream, &self.ctx);
+        let weight_view = CudaSliceView::new(&weight, stream, &self.ctx);
+        let scales_view = CudaSliceView::new(&scales, stream, &self.ctx);
+        let zeros_view = CudaSliceView::new(&zeros, stream, &self.ctx);
+        let input_view = CudaSliceView::new(&input, stream, &self.ctx);
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 63) / 64, k_split, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: m * group_size * 2, // M * group_size bf16 values
+        };
+        self.modules.int4.int4_gemm_v3_ksplit_sm_m(
+            dispatch_stream, config, &mut ps_view, &weight_view, &scales_view, &zeros_view, &input_view,
+            m, n, k, group_size, transposed, k_split,
+        ).map_err(|e| anyhow::anyhow!("kernel 'int4_gemm_v3_ksplit_sm_m' failed: {:?}", e))
+    }
+
+    /// Launch the `reduce_partial_sums_bf16_m` kernel: reduce K-split partial sums to bf16 for M-batched GEMM.
+    pub fn launch_reduce_partial_sums_bf16_m(
+        &self,
+        stream: &Arc<CudaStream>,
+        dispatch_stream: &cuda_core::CudaStream,
+        output: &mut CudaSlice<half::bf16>,       // [M * N] bf16, row-major
+        partial_sums: &CudaSlice<f32>,             // [k_split, N, M] f32
+        n: u32,
+        m: u32,
+        k_split: u32,
+    ) -> anyhow::Result<()> {
+        let mut output_view = CudaSliceView::new_mut(output, stream, &self.ctx);
+        let partial_sums_view = CudaSliceView::new(&partial_sums, stream, &self.ctx);
+
+        let config = LaunchConfig {
+            grid_dim: ((n + 63) / 64, m, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.modules.int4.reduce_partial_sums_bf16_m(
+            dispatch_stream, config, &mut output_view, &partial_sums_view, n, m, k_split,
+        ).map_err(|e| anyhow::anyhow!("kernel launch 'reduce_partial_sums_bf16_m' failed: {:?}", e))
+    }
+
+
     /// Launch the `int4_gemm_warp` kernel: warp-cooperative INT4 GEMV for M=1 decode.
 
     /// Each warp (32 lanes) computes one output column. Lanes split the K
